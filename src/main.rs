@@ -3147,8 +3147,15 @@ impl eframe::App for HpsdrApp {
                                 connected.db_low = smoothed.clamp(-180.0, connected.db_high - 1.0);
                             }
                             if connected.waterfall_db_low_auto {
+                                // See AUTO_WATERFALL_ZOOM_REFERENCE/
+                                // AUTO_WATERFALL_ZOOM_COMPENSATION_STRENGTH's own doc comments --
+                                // renormalises the physically-correct (but zoom-dependent)
+                                // reading to a consistent look across zoom levels.
+                                let zoom_compensation_db = AUTO_WATERFALL_ZOOM_COMPENSATION_STRENGTH
+                                    * (10.0 * (connected.spectrum_zoom.max(1) as f32).log10()
+                                        - 10.0 * AUTO_WATERFALL_ZOOM_REFERENCE.log10());
                                 connected.waterfall_db_low =
-                                    smoothed.clamp(-180.0, connected.waterfall_db_high - 1.0);
+                                    (smoothed + zoom_compensation_db).clamp(-180.0, connected.waterfall_db_high - 1.0);
                             }
                         }
                     }
@@ -8749,20 +8756,6 @@ impl eframe::App for HpsdrApp {
                                              from Discover. The full history is also saved to \
                                              radioberry-juice.log next to the juice executable.",
                                         );
-                                        if !crate::radioberry_juice::is_elevated() {
-                                            ui.horizontal(|ui| {
-                                                ui.colored_label(
-                                                    egui::Color32::from_rgb(180, 110, 0),
-                                                    "hpsdr-rs is not running as Administrator -- Stop/\
-                                                     Restart can fail silently without it.",
-                                                );
-                                                if ui.button("Relaunch as Administrator").clicked() {
-                                                    if crate::radioberry_juice::relaunch_elevated().is_ok() {
-                                                        std::process::exit(0);
-                                                    }
-                                                }
-                                            });
-                                        }
                                         ui.horizontal(|ui| {
                                             let running = console.is_running();
                                             ui.label(if running { "Status: running" } else { "Status: stopped" });
@@ -8781,6 +8774,26 @@ impl eframe::App for HpsdrApp {
                                                 .clicked()
                                             {
                                                 let _ = console.restart();
+                                            }
+                                            // Quiet, always-available option rather than an
+                                            // alarmist banner -- the graceful shutdown path
+                                            // needs no elevation at all (a process closing
+                                            // itself never does), so most people will never
+                                            // actually need this. It only matters for the rare
+                                            // force-kill fallback, where Windows can silently
+                                            // refuse without it -- the console already says so,
+                                            // reactively, exactly if/when that happens.
+                                            if ui
+                                                .button("Run as Administrator")
+                                                .on_hover_text(
+                                                    "Only needed if Stop ever fails with a \
+                                                     permissions error -- most people never hit \
+                                                     this.",
+                                                )
+                                                .clicked()
+                                                && crate::radioberry_juice::relaunch_elevated().is_ok()
+                                            {
+                                                std::process::exit(0);
                                             }
                                         });
                                         ui.separator();
@@ -9243,6 +9256,44 @@ const AUTO_DB_LOW_MIN_EDGE_EXCLUDE: usize = 4;
 /// floor quietly settles in over a few seconds" than "the display is
 /// visibly moving".
 const AUTO_DB_LOW_SMOOTHING_ALPHA: f32 = 0.01;
+
+/// Zoom compensation for waterfall_db_low_auto only (not db_low_auto/
+/// the spectrum trace, which keeps the physically-correct reading) --
+/// see that field's own doc comment for the full reasoning. Zooming in
+/// by a factor Z narrows WDSP's per-pixel resolution bandwidth by the
+/// same factor Z (see Analyzer::set_zoom_pan's doc comment: zoom grows
+/// the underlying FFT size while keeping pixel count fixed), and
+/// thermal noise power scales with bandwidth -- so at a wider (lower-
+/// zoom) view, each pixel genuinely integrates more noise power, and
+/// the true noise floor reads roughly 10*log10(Z) dB higher there than
+/// at a narrower (higher-zoom) view. That's correct physics, not a
+/// display bug -- but it does mean an operator who picked a favourite
+/// waterfall "look" at one zoom level sees it change at another,
+/// purely from the RBW difference, not from anything actually
+/// different in the band. This is a deliberately requested cosmetic
+/// override: it renormalises whatever zoom is active back to how
+/// AUTO_WATERFALL_ZOOM_REFERENCE's zoom level would look, using the
+/// same 10*log10(ratio) relationship, so the waterfall's appearance
+/// stays consistent across zoom levels instead of tracking the real
+/// RBW-driven noise floor shift.
+const AUTO_WATERFALL_ZOOM_REFERENCE: f32 = 2.0;
+
+/// Extra multiplier on top of the plain 10*log10(ratio) RBW physics
+/// above -- a real report found the plain physics-only prediction
+/// under-corrected in practice. Likely cause: WDSP's own averaging
+/// (SetDisplayAverageMode's AVERAGE_MODE_LOG_RECURSIVE, confirmed in
+/// spectrum.rs's open()) runs in the LOG (dB) domain, not linear
+/// power -- averaging noise in dB is a well-known biased estimator
+/// (log of a mean isn't the mean of the log; for typical noise power
+/// distributions the log-domain average reads a couple dB lower than
+/// the true linear-power average), stacking an extra, harder-to-
+/// derive-exactly bias on top of the clean RBW relationship. Rather
+/// than chase that bias analytically, this is left as a plain tunable
+/// multiplier: 1.0 would be the physics-only prediction; raise it if
+/// the waterfall still looks too bright/shallow at lower zoom than at
+/// AUTO_WATERFALL_ZOOM_REFERENCE, lower it if low zoom overshoots
+/// (looks darker/deeper than the reference instead of matching it).
+const AUTO_WATERFALL_ZOOM_COMPENSATION_STRENGTH: f32 = 2.0;
 
 /// Draggable divider between the spectrum and waterfall displays.
 /// Updates `ratio` (spectrum's share of their combined height, see

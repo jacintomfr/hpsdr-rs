@@ -563,26 +563,6 @@ impl DiscoveryWindow {
                          fitted to your board.",
                     );
 
-                    if !crate::radioberry_juice::is_elevated() {
-                        ui.horizontal(|ui| {
-                            ui.colored_label(
-                                egui::Color32::from_rgb(180, 110, 0),
-                                "hpsdr-rs is not running as Administrator -- Stop/Restart/Reset \
-                                 USB below can fail silently (\"Access is denied\") without it, \
-                                 since juice holds a driver-backed USB device open.",
-                            );
-                            if ui.button("Relaunch as Administrator").clicked() {
-                                match crate::radioberry_juice::relaunch_elevated() {
-                                    Ok(()) => std::process::exit(0),
-                                    Err(e) => {
-                                        self.juice_launch_error =
-                                            Some(format!("Couldn't relaunch elevated: {e}"))
-                                    }
-                                }
-                            }
-                        });
-                    }
-
                     ui.horizontal(|ui| {
                         ui.label("Juice executable:");
                         ui.label(
@@ -721,6 +701,27 @@ impl DiscoveryWindow {
                                     self.juice_launch_error = None;
                                     self.juice_refresh_at = Some(Instant::now() + JUICE_REFRESH_DELAY);
                                     ui.ctx().request_repaint_after(JUICE_REFRESH_DELAY);
+                                }
+                            }
+                            // Quiet, always-available option rather than an alarmist banner --
+                            // the graceful shutdown path above needs no special privileges at
+                            // all (a process closing itself never does), so most people will
+                            // never actually need this. It only matters for the rare fallback
+                            // case (a stuck juice that has to be force-killed, or Reset USB),
+                            // where Windows can silently refuse without it -- the console
+                            // already says so, reactively, exactly if/when that happens.
+                            if ui
+                                .button("Run as Administrator")
+                                .on_hover_text(
+                                    "Only needed if Stop/Reset USB ever fails with a permissions \
+                                     error -- most people never hit this.",
+                                )
+                                .clicked()
+                            {
+                                if let Err(e) = crate::radioberry_juice::relaunch_elevated() {
+                                    self.juice_launch_error = Some(format!("Couldn't relaunch elevated: {e}"));
+                                } else {
+                                    std::process::exit(0);
                                 }
                             }
                         });
