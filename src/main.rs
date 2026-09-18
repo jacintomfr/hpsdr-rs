@@ -1221,6 +1221,20 @@ struct ConnectedState {
     db_high: f32,
     waterfall_db_low: f32,
     waterfall_db_high: f32,
+    /// "Auto" mode for the Waterfall Low slider (Settings -> Spectrum) --
+    /// same tracking as db_low_auto above (in fact reuses its smoothed
+    /// state, since both would otherwise independently compute the
+    /// exact same tracked minimum from the exact same spectrum_row
+    /// data), applied to waterfall_db_low instead of/as well as
+    /// db_low. Added because changing RX Gain/Attenuation shifts the
+    /// absolute level of everything shown -- including the waterfall's
+    /// color mapping, which previously had no way to follow that shift
+    /// automatically the way the spectrum trace's own Auto Low already
+    /// could, matching piHPSDR's rx->waterfall_automatic (its own
+    /// approach re-averages every frame rather than smoothing, but the
+    /// goal -- not needing to manually re-tune the waterfall levels
+    /// after adjusting gain -- is the same one this mirrors).
+    waterfall_db_low_auto: bool,
     /// Spectrum/waterfall display range while transmitting -- see
     /// Config's field docs for why these are separate from the RX
     /// ones above rather than a fixed offset applied at render time.
@@ -2295,6 +2309,7 @@ fn connect_to_device(device: Device, cfg: &Config) -> Result<ConnectedState, Str
                 db_high: cfg.db_high.unwrap_or(-40.0),
                 waterfall_db_low: cfg.waterfall_db_low.unwrap_or(-140.0),
                 waterfall_db_high: cfg.waterfall_db_high.unwrap_or(-60.0),
+                waterfall_db_low_auto: cfg.waterfall_db_low_auto.unwrap_or(false),
                 tx_db_low: cfg.tx_db_low.unwrap_or(cfg.db_low.unwrap_or(-140.0)),
                 tx_db_high: cfg.tx_db_high.unwrap_or(cfg.db_high.unwrap_or(-40.0) + 60.0),
                 tx_waterfall_db_low: cfg
@@ -3103,8 +3118,13 @@ impl eframe::App for HpsdrApp {
                 // ConnectedState::db_low_auto's doc comment. RX only:
                 // spectrum_row is tx_spectrum's data while transmitting,
                 // which isn't a "find the noise floor" scenario (see the
-                // TX range's own doc comment just below).
-                if connected.db_low_auto && !transmitting {
+                // TX range's own doc comment just below). Drives both
+                // db_low_auto (spectrum trace) and waterfall_db_low_auto
+                // (waterfall color mapping) from the one smoothed
+                // tracked minimum -- see waterfall_db_low_auto's own doc
+                // comment for why they share it rather than each
+                // computing their own copy of the same thing.
+                if (connected.db_low_auto || connected.waterfall_db_low_auto) && !transmitting {
                     let n = spectrum_row.len();
                     let edge = (n / AUTO_DB_LOW_EDGE_EXCLUDE_FRACTION).max(AUTO_DB_LOW_MIN_EDGE_EXCLUDE);
                     if n > edge * 2 {
@@ -3113,7 +3133,13 @@ impl eframe::App for HpsdrApp {
                             let prev = connected.db_low_auto_smoothed.unwrap_or(raw_min);
                             let smoothed = prev + AUTO_DB_LOW_SMOOTHING_ALPHA * (raw_min - prev);
                             connected.db_low_auto_smoothed = Some(smoothed);
-                            connected.db_low = smoothed.clamp(-180.0, connected.db_high - 1.0);
+                            if connected.db_low_auto {
+                                connected.db_low = smoothed.clamp(-180.0, connected.db_high - 1.0);
+                            }
+                            if connected.waterfall_db_low_auto {
+                                connected.waterfall_db_low =
+                                    smoothed.clamp(-180.0, connected.waterfall_db_high - 1.0);
+                            }
                         }
                     }
                 }
@@ -3530,61 +3556,6 @@ impl eframe::App for HpsdrApp {
                     });
 
                     ui.horizontal_wrapped(|ui| {
-                        // Live RX Gain/Attenuation -- matches piHPSDR's own layout
-                        // (sliders.c: RF/ATT sits in the same slot, right before AF_GAIN
-                        // on the main sliders row) rather than piHPSDR's Settings-style
-                        // dialog, since this is something adjusted continuously while
-                        // operating (lower it when the spectrum looks garbled/overloaded,
-                        // raise it when signals seem weak), not a one-off setup step.
-                        // HermesLite/HermesLite2 and standard boards share the SAME
-                        // underlying RadioSession::rx_attenuation storage (see that
-                        // field's own doc comment for the real dB range/semantics of
-                        // each) but are genuinely different controls -- and the
-                        // HermesLite-specific "RX Gain" control only actually exists on
-                        // Protocol 1 (P2 has no equivalent of P1's wire-sharing quirk,
-                        // see that same doc comment), so a HermesLite2 on Protocol 2
-                        // gets the plain "RX Attenuation" slider too, same as any other
-                        // board there.
-                        if connected.device.protocol == 1
-                            && matches!(connected.device.board, Boards::HermesLite | Boards::HermesLite2)
-                        {
-                            // The stored wire value is gain_db+12 (0-60) -- see
-                            // RadioSession::rx_attenuation's doc comment -- so the
-                            // conversion happens at this UI boundary only.
-                            let mut gain_db =
-                                connected.session.rx_attenuation.load(Ordering::Relaxed) as i32 - 12;
-                            ui.label("RX Gain:");
-                            if scroll_slider_i32(
-                                ui,
-                                &mut connected.slider_scroll_accum,
-                                &mut gain_db,
-                                -12..=48,
-                                1,
-                                " dB",
-                            ) {
-                                connected
-                                    .session
-                                    .rx_attenuation
-                                    .store((gain_db + 12).clamp(0, 60) as u32, Ordering::Relaxed);
-                                settings_changed = true;
-                            }
-                        } else {
-                            let mut atten = connected.session.rx_attenuation.load(Ordering::Relaxed) as i32;
-                            ui.label("RX Attenuation:");
-                            if scroll_slider_i32(
-                                ui,
-                                &mut connected.slider_scroll_accum,
-                                &mut atten,
-                                0..=31,
-                                1,
-                                " dB",
-                            ) {
-                                connected.session.rx_attenuation.store(atten as u32, Ordering::Relaxed);
-                                settings_changed = true;
-                            }
-                        }
-                        ui.add_space(12.0);
-
                         ui.label("Audio gain:");
                         let mut gain = current_gain;
                         // ROOT CAUSE FIX: max raised from 1.5 -- a real
@@ -3668,6 +3639,68 @@ impl eframe::App for HpsdrApp {
                                     settings_changed = true;
                                 }
                             }
+                        }
+                    });
+
+                    ui.horizontal_wrapped(|ui| {
+                        // Live RX Gain/Attenuation -- matches piHPSDR's own layout
+                        // (sliders.c: RF/ATT sits in the same slot, right before AF_GAIN
+                        // on the main sliders row) rather than piHPSDR's Settings-style
+                        // dialog, since this is something adjusted continuously while
+                        // operating (lower it when the spectrum looks garbled/overloaded,
+                        // raise it when signals seem weak), not a one-off setup step.
+                        // HermesLite/HermesLite2 and standard boards share the SAME
+                        // underlying RadioSession::rx_attenuation storage (see that
+                        // field's own doc comment for the real dB range/semantics of
+                        // each) but are genuinely different controls -- and the
+                        // HermesLite-specific "RX Gain" control only actually exists on
+                        // Protocol 1 (P2 has no equivalent of P1's wire-sharing quirk,
+                        // see that same doc comment), so a HermesLite2 on Protocol 2
+                        // gets the plain "RX Attenuation" slider too, same as any other
+                        // board there. On its own row, below Audio/Mic/TCI TX gain, with
+                        // TX Power alongside it on the right -- keeps the top row to the
+                        // "how loud" controls and this row to the "how much signal
+                        // in/out" controls.
+                        if connected.device.protocol == 1
+                            && matches!(connected.device.board, Boards::HermesLite | Boards::HermesLite2)
+                        {
+                            // The stored wire value is gain_db+12 (0-60) -- see
+                            // RadioSession::rx_attenuation's doc comment -- so the
+                            // conversion happens at this UI boundary only.
+                            let mut gain_db =
+                                connected.session.rx_attenuation.load(Ordering::Relaxed) as i32 - 12;
+                            ui.label("RX Gain:");
+                            if scroll_slider_i32(
+                                ui,
+                                &mut connected.slider_scroll_accum,
+                                &mut gain_db,
+                                -12..=48,
+                                1,
+                                " dB",
+                            ) {
+                                connected
+                                    .session
+                                    .rx_attenuation
+                                    .store((gain_db + 12).clamp(0, 60) as u32, Ordering::Relaxed);
+                                settings_changed = true;
+                            }
+                        } else {
+                            let mut atten = connected.session.rx_attenuation.load(Ordering::Relaxed) as i32;
+                            ui.label("RX Attenuation:");
+                            if scroll_slider_i32(
+                                ui,
+                                &mut connected.slider_scroll_accum,
+                                &mut atten,
+                                0..=31,
+                                1,
+                                " dB",
+                            ) {
+                                connected.session.rx_attenuation.store(atten as u32, Ordering::Relaxed);
+                                settings_changed = true;
+                            }
+                        }
+
+                        if connected.tx_enabled {
                             // Neither protocol's wire-level drive byte is
                             // linear with actual output watts on real
                             // hardware (P1's is confirmed non-linear against
@@ -7055,23 +7088,38 @@ impl eframe::App for HpsdrApp {
                                     ui.horizontal(|ui| {
                                         let mut wlow = connected.waterfall_db_low;
                                         ui.label("Low:");
-                                        if scroll_slider_f32(
-                                            ui,
-                                            &mut connected.slider_scroll_accum,
-                                            &mut wlow,
-                                            -180.0..=0.0,
-                                            2.0,
-                                        ) {
-                                            connected.waterfall_db_low = wlow;
-                                            remember_band_settings(
-                                                &mut connected.band_memory,
-                                                freq_hz,
-                                                connected.db_low,
-                                                connected.db_high,
-                                                connected.waterfall_db_low,
-                                                connected.waterfall_db_high,
-                                                current_mode,
-                                            );
+                                        ui.add_enabled_ui(!connected.waterfall_db_low_auto, |ui| {
+                                            if scroll_slider_f32(
+                                                ui,
+                                                &mut connected.slider_scroll_accum,
+                                                &mut wlow,
+                                                -180.0..=0.0,
+                                                2.0,
+                                            ) {
+                                                connected.waterfall_db_low = wlow;
+                                                remember_band_settings(
+                                                    &mut connected.band_memory,
+                                                    freq_hz,
+                                                    connected.db_low,
+                                                    connected.db_high,
+                                                    connected.waterfall_db_low,
+                                                    connected.waterfall_db_high,
+                                                    current_mode,
+                                                );
+                                                settings_changed = true;
+                                            }
+                                        });
+                                        if ui
+                                            .selectable_label(connected.waterfall_db_low_auto, "Auto")
+                                            .on_hover_text(
+                                                "Continuously track the lowest level shown, same as \
+                                                 Spectrum's own Auto Low -- keeps the waterfall's \
+                                                 colours from needing to be re-tuned by hand after \
+                                                 changing RX Gain/Attenuation.",
+                                            )
+                                            .clicked()
+                                        {
+                                            connected.waterfall_db_low_auto = !connected.waterfall_db_low_auto;
                                             settings_changed = true;
                                         }
                                         let mut whigh = connected.waterfall_db_high;
@@ -8759,6 +8807,7 @@ impl eframe::App for HpsdrApp {
                         db_high: Some(connected.db_high),
                         waterfall_db_low: Some(connected.waterfall_db_low),
                         waterfall_db_high: Some(connected.waterfall_db_high),
+                        waterfall_db_low_auto: Some(connected.waterfall_db_low_auto),
                         tx_db_low: Some(connected.tx_db_low),
                         tx_db_high: Some(connected.tx_db_high),
                         tx_waterfall_db_low: Some(connected.tx_waterfall_db_low),

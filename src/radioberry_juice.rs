@@ -96,6 +96,27 @@ pub struct JuiceHandle {
 }
 
 impl JuiceHandle {
+    /// A handle for a juice process this session didn't launch itself --
+    /// e.g. discovered/connected to a board whose juice was already
+    /// running from an earlier hpsdr-rs session, or started manually.
+    /// There's no `Child` to hold (Windows/Rust have no way to "adopt" an
+    /// arbitrary running PID as a `Child`), so no live console output is
+    /// available for it -- but Status/Stop/Restart/Reset USB & Restart
+    /// all still work, falling back to name-based checks
+    /// (`is_named_process_running`/`stop_external`) wherever `is_running`
+    /// and `stop` below would otherwise use a `Child`. Once `restart` (or
+    /// `reset_usb_and_restart`) actually launches a fresh instance
+    /// through this same handle, it stops being "adopted" in any
+    /// meaningful sense -- from then on there IS a real `Child`, and a
+    /// live console works normally too.
+    pub fn adopt(exe_path: &Path) -> Self {
+        Self {
+            lines: Arc::new(Mutex::new(VecDeque::new())),
+            process: Arc::new(Mutex::new(None)),
+            exe_path: exe_path.to_path_buf(),
+        }
+    }
+
     fn push_line(&self, line: String) {
         let mut lines = self.lines.lock().unwrap();
         if lines.len() >= MAX_CONSOLE_LINES {
@@ -116,7 +137,11 @@ impl JuiceHandle {
     /// running. Calling this is also what notices and reaps an exit
     /// that happened on its own (a crash, or the user closing it by
     /// hand) -- cheap enough to call every frame the UI needs it,
-    /// same as any other `try_wait()` use.
+    /// same as any other `try_wait()` use. When this handle has no
+    /// `Child` at all (an `adopt`ed handle, or one whose own process
+    /// already exited), falls back to checking by name
+    /// (`is_named_process_running`) -- the right answer either way,
+    /// not just a stand-in for the adopted case.
     pub fn is_running(&self) -> bool {
         let mut guard = self.process.lock().unwrap();
         match guard.as_mut() {
@@ -131,18 +156,22 @@ impl JuiceHandle {
                 // genuinely running process as already gone.
                 Err(_) => true,
             },
-            None => false,
+            None => is_named_process_running(&self.exe_path),
         }
     }
 
     /// Stops juice -- tries a graceful shutdown first (see
     /// `graceful_stop`'s own doc comment for exactly what that does and
     /// why it matters here), only forcibly terminating the process if
-    /// that doesn't work within a few seconds. Also sweeps up any other
-    /// running process with the same executable name regardless of
-    /// whether this handle knows about it -- see `force_kill_all`'s own
-    /// doc comment for why that matters (a real report needed a full
-    /// machine reboot after Stop, traced to exactly this).
+    /// that doesn't work within a few seconds. Works the same whether
+    /// this handle holds a `Child` it spawned itself or is `adopt`ed
+    /// (no `Child` at all) -- the adopted path (`stop_external`) does
+    /// the equivalent graceful-then-forced sequence by process name
+    /// instead of by `Child` handle. Also sweeps up any other running
+    /// process with the same executable name regardless of whether this
+    /// handle knows about it -- see `force_kill_all`'s own doc comment
+    /// for why that matters (a real report needed a full machine reboot
+    /// after Stop, traced to exactly this).
     pub fn stop(&self) {
         let mut guard = self.process.lock().unwrap();
         if let Some(mut child) = guard.take() {
@@ -154,15 +183,25 @@ impl JuiceHandle {
                 let _ = child.wait(); // reap it -- no lingering zombie/handle
                 self.push_line("--- forced kill sent (juice didn't exit on its own in time) ---".to_string());
             }
+        } else {
+            drop(guard);
+            if stop_external(&self.exe_path) {
+                self.push_line("--- stopped (graceful shutdown via network, USB released cleanly) ---".to_string());
+            } else {
+                self.push_line("--- forced kill sent (juice didn't exit on its own in time) ---".to_string());
+            }
         }
-        if force_kill_all(&self.exe_path) && !is_elevated() {
-            self.push_line(
-                "--- warning: hpsdr-rs is NOT running as Administrator -- the kill above may \
-                 have silently failed to fully release the USB device (\"Access is denied\" is \
-                 the typical Windows failure mode here). Use \"Relaunch as Administrator\" and \
-                 try Stop again. ---"
-                    .to_string(),
-            );
+        if is_named_process_running(&self.exe_path) {
+            force_kill_all(&self.exe_path);
+            if !is_elevated() {
+                self.push_line(
+                    "--- warning: hpsdr-rs is NOT running as Administrator -- the kill above may \
+                     have silently failed to fully release the USB device (\"Access is denied\" is \
+                     the typical Windows failure mode here). Use \"Relaunch as Administrator\" and \
+                     try Stop again. ---"
+                        .to_string(),
+                );
+            }
         }
     }
 
@@ -337,6 +376,36 @@ fn graceful_stop(child: &mut Child) -> bool {
             Err(_) => return false,
         }
     }
+    false
+}
+
+/// Same idea as `graceful_stop`, for a juice process this session never
+/// launched and so has no `Child` handle for -- e.g. the "Stop it"
+/// control the Discover window shows when it notices juice already
+/// running from an earlier session (see `is_named_process_running`).
+/// Since there's no `Child` to poll with `try_wait`, this instead polls
+/// `is_named_process_running` after asking for a graceful shutdown;
+/// only falls back to `force_kill_all` (a hard kill) if juice hasn't
+/// actually gone away within the same grace period `graceful_stop`
+/// uses. Using a raw `force_kill_all` unconditionally here (skipping
+/// the graceful attempt entirely) was a real bug: a real report showed
+/// it reintroduced the exact "FPGA gateware upload read failed" stuck
+/// state this whole graceful-shutdown mechanism exists to avoid, since
+/// a hard kill still skips closeRadioberry()'s FT_Close cleanup no
+/// matter which UI control triggers it.
+pub fn stop_external(exe_path: &Path) -> bool {
+    use std::time::{Duration, Instant};
+
+    send_shutdown_packet();
+
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while Instant::now() < deadline {
+        if !is_named_process_running(exe_path) {
+            return true;
+        }
+        std::thread::sleep(Duration::from_millis(150));
+    }
+    force_kill_all(exe_path);
     false
 }
 

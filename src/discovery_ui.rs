@@ -132,6 +132,20 @@ impl DiscoveryWindow {
     pub fn new(ctx: &egui::Context) -> Self {
         let ozy_cfg = Config::load(OZY_CONFIG_MAC);
         let juice_cfg = Config::load(RADIOBERRY_JUICE_CONFIG_MAC);
+        // If juice is already running from an earlier session (or was
+        // started manually) and we know where its executable lives,
+        // adopt it right away -- gives Status/Stop/Restart/Reset USB &
+        // Restart immediately, without the user having to notice it's
+        // running and take some separate action first. See
+        // JuiceHandle::adopt's own doc comment for what "adopted" means
+        // (no live console output until/unless a Restart actually
+        // relaunches it through this handle).
+        let juice_console = juice_cfg
+            .radioberry_juice_path
+            .as_deref()
+            .map(std::path::Path::new)
+            .filter(|path| crate::radioberry_juice::is_named_process_running(path))
+            .map(crate::radioberry_juice::JuiceHandle::adopt);
         let window = Self {
             open: true,
             devices: Arc::new(Mutex::new(Vec::new())),
@@ -148,7 +162,7 @@ impl DiscoveryWindow {
             radioberry_juice_fpga: juice_cfg.radioberry_juice_fpga,
             juice_launch_error: None,
             juice_refresh_at: None,
-            juice_console: None,
+            juice_console,
         };
         window.spawn_discovery(ctx.clone());
         window
@@ -583,6 +597,11 @@ impl DiscoveryWindow {
                                 if let Some(dir) = std::path::Path::new(existing).parent() {
                                     dialog = dialog.set_directory(dir);
                                 }
+                            } else {
+                                // Nothing chosen yet -- pre-fill the expected filename so
+                                // the dialog opens ready to just navigate to the right
+                                // folder, rather than an empty file-name field.
+                                dialog = dialog.set_file_name(crate::radioberry_juice::DEFAULT_EXE_NAME);
                             }
                             if let Some(path) = dialog.pick_file() {
                                 self.radioberry_juice_path = Some(path.display().to_string());
@@ -594,32 +613,17 @@ impl DiscoveryWindow {
                                 let props_path = crate::radioberry_juice::props_path_for(&path);
                                 self.radioberry_juice_fpga = crate::radioberry_juice::read_fpga(&props_path);
                                 self.juice_launch_error = None;
+                                // Same reasoning as new()'s own adoption check -- a
+                                // freshly-chosen executable might already be running
+                                // (e.g. the user picked the exe of a juice they started
+                                // by hand, or that's left over from an earlier session).
+                                if crate::radioberry_juice::is_named_process_running(&path) {
+                                    self.juice_console = Some(crate::radioberry_juice::JuiceHandle::adopt(&path));
+                                }
                                 self.save_radioberry_juice_config();
                             }
                         }
                     });
-
-                    // Detects a juice already running from BEFORE this session (an
-                    // earlier hpsdr-rs run, a crash, or a manual launch) -- self.juice_console
-                    // only ever exists after THIS session's own Launch click, so without this,
-                    // Stop would simply not be offered at all for that case, leaving no way to
-                    // get at it from here except externally.
-                    if self.juice_console.is_none() {
-                        if let Some(exe) = self.radioberry_juice_path.clone() {
-                            if crate::radioberry_juice::is_named_process_running(std::path::Path::new(&exe)) {
-                                ui.horizontal(|ui| {
-                                    ui.colored_label(
-                                        egui::Color32::from_rgb(180, 110, 0),
-                                        "Juice already appears to be running (not started from this \
-                                         Discover session).",
-                                    );
-                                    if ui.button("Stop it").clicked() {
-                                        crate::radioberry_juice::force_kill_all(std::path::Path::new(&exe));
-                                    }
-                                });
-                            }
-                        }
-                    }
 
                     ui.horizontal(|ui| {
                         ui.label("FPGA:");
@@ -696,6 +700,8 @@ impl DiscoveryWindow {
                                     self.juice_launch_error = Some(format!("Couldn't restart juice: {e}"));
                                 } else {
                                     self.juice_launch_error = None;
+                                    self.juice_refresh_at = Some(Instant::now() + JUICE_REFRESH_DELAY);
+                                    ui.ctx().request_repaint_after(JUICE_REFRESH_DELAY);
                                 }
                             }
                             if ui
@@ -713,6 +719,8 @@ impl DiscoveryWindow {
                                     self.juice_launch_error = Some(format!("Couldn't reset USB device: {e}"));
                                 } else {
                                     self.juice_launch_error = None;
+                                    self.juice_refresh_at = Some(Instant::now() + JUICE_REFRESH_DELAY);
+                                    ui.ctx().request_repaint_after(JUICE_REFRESH_DELAY);
                                 }
                             }
                         });

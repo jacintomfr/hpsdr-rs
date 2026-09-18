@@ -59,6 +59,12 @@ pub struct Config {
     pub db_low_auto: Option<bool>,
     pub waterfall_db_low: Option<f32>,
     pub waterfall_db_high: Option<f32>,
+    /// "Auto" mode for the Waterfall Low slider -- see
+    /// ConnectedState::waterfall_db_low_auto's doc comment. Missing
+    /// (a pre-existing config saved before this was added) defaults to
+    /// off, not on, so nobody's waterfall behaviour changes on upgrade
+    /// without them opting in.
+    pub waterfall_db_low_auto: Option<bool>,
     pub waterfall_palette: Option<Palette>,
     /// Spectrum's share (0.0-1.0) of the combined spectrum+waterfall
     /// height -- draggable via the divider between them. Missing falls
