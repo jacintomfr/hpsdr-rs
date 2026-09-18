@@ -22,6 +22,19 @@ use std::time::Duration;
 const DISCOVERY_PORT: u16 = 1024;
 const SOCKET_TIMEOUT: Duration = Duration::from_millis(250);
 
+/// Fixed placeholder MAC the Radioberry Juice host program fills into its
+/// synthetic openHPSDR discovery reply -- Juice has no real Ethernet MAC to
+/// report (it bridges a USB-connected board, not a NIC), so it always uses
+/// this same sequential value. A real report confirmed it appears
+/// identically on every interface a Radioberry-via-Juice setup answers
+/// discovery on (including the loopback interface, since Juice runs on the
+/// same host as hpsdr-rs). Real Hermes-family hardware has a proper
+/// vendor-assigned MAC and would never report this exact value, so it's
+/// used as the signal to tell a Radioberry apart from a real HermesLite2 --
+/// see `Boards::Radioberry`'s own doc comment for why the rest of the
+/// discovery reply can't tell them apart.
+const RADIOBERRY_SENTINEL_MAC: [u8; 6] = [0, 1, 2, 3, 4, 5];
+
 #[derive(Copy, Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub enum Boards {
     Metis,
@@ -33,6 +46,19 @@ pub enum Boards {
     Saturn,
     HermesLite,
     HermesLite2,
+    /// Radioberry 2.x (pa3gsb) -- different hardware from a real HermesLite2,
+    /// but its gateware derives from HL2's, so its Protocol 1 discovery reply
+    /// is otherwise byte-for-byte identical (same board id 6, same version
+    /// range) and would otherwise be misclassified as `HermesLite2` above.
+    /// Distinguished instead by the fixed sentinel MAC its Juice host
+    /// program fills in (see `RADIOBERRY_SENTINEL_MAC` and the override in
+    /// `from_p1_reply`/`from_p2_reply`) -- a real report confirmed this MAC
+    /// (`00:01:02:03:04:05`) shows up identically across every interface a
+    /// Radioberry-via-Juice setup is discovered on, since Juice runs on the
+    /// same host as hpsdr-rs and has no real Ethernet MAC to report.
+    /// Notably lacks the AK4951 audio codec add-on board real HermesLite2
+    /// hardware can have -- see main.rs's `hl2_ak4951_codec` UI gating.
+    Radioberry,
     /// The original HPSDR hardware -- Ozy (Cypress FX2 + FPGA) paired
     /// with separate Mercury/Penny boards, reached over raw USB bulk
     /// transfers instead of Ethernet/UDP. Still Protocol 1 framing
@@ -89,8 +115,11 @@ impl Device {
         let mac = [buf[3], buf[4], buf[5], buf[6], buf[7], buf[8]];
         let version = buf[9];
         let board_id = buf[10];
-        let (board, adcs, supported_receivers, supported_transmitters, frequency_min, frequency_max) =
+        let (mut board, adcs, supported_receivers, supported_transmitters, frequency_min, frequency_max) =
             board_info_p1(board_id, version, buf[19]);
+        if board == Boards::HermesLite2 && mac == RADIOBERRY_SENTINEL_MAC {
+            board = Boards::Radioberry;
+        }
 
         Some(Device {
             address: src,
@@ -119,8 +148,11 @@ impl Device {
         let mac = [buf[5], buf[6], buf[7], buf[8], buf[9], buf[10]];
         let board_id = buf[11];
         let version = buf[13];
-        let (board, adcs, supported_receivers, supported_transmitters, frequency_min, frequency_max) =
+        let (mut board, adcs, supported_receivers, supported_transmitters, frequency_min, frequency_max) =
             board_info_p2(board_id);
+        if board == Boards::HermesLite2 && mac == RADIOBERRY_SENTINEL_MAC {
+            board = Boards::Radioberry;
+        }
 
         Some(Device {
             address: src,

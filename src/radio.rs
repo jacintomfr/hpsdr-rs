@@ -296,7 +296,10 @@ fn ps_feedback_config(protocol: u8, board: Boards) -> Option<(u8, u8, Option<u8>
     match protocol {
         1 => match board {
             Boards::Metis | Boards::HermesLite => Some((0, 1, Some(0))),
-            Boards::Hermes | Boards::Hermes2 | Boards::HermesLite2 => Some((2, 3, Some(2))),
+            // Radioberry's gateware derives from HermesLite2's, so it shares
+            // the same DDC/ADC feedback wiring -- see Boards::Radioberry's
+            // own doc comment.
+            Boards::Hermes | Boards::Hermes2 | Boards::HermesLite2 | Boards::Radioberry => Some((2, 3, Some(2))),
             Boards::Angelia | Boards::Orion | Boards::Orion2 => Some((3, 4, Some(3))),
             // Classic Ozy+Mercury+Penny hardware has no PureSignal
             // feedback ADC wiring in this project's scope (see
@@ -1611,7 +1614,7 @@ fn start_protocol1(
         initial_active_receivers as u8,
         settings.frequency_hz,
         settings.sample_rate,
-        matches!(device.board, Boards::HermesLite | Boards::HermesLite2),
+        matches!(device.board, Boards::HermesLite | Boards::HermesLite2 | Boards::Radioberry),
         rx_attenuation.load(Ordering::Relaxed) as u8,
         ps_tx_attenuation.load(Ordering::Relaxed) as u8,
         device.adcs,
@@ -1672,7 +1675,7 @@ fn start_protocol1(
     let sender_pa_gain_db = Arc::clone(&pa_gain_db);
     let sender_rx_attenuation = Arc::clone(&rx_attenuation);
     let sender_ps_tx_attenuation = Arc::clone(&ps_tx_attenuation);
-    let sender_is_hermes_lite = matches!(device.board, Boards::HermesLite | Boards::HermesLite2);
+    let sender_is_hermes_lite = matches!(device.board, Boards::HermesLite | Boards::HermesLite2 | Boards::Radioberry);
     let sender_disable_pa = Arc::clone(&disable_pa);
     let sender_tune_active = Arc::clone(&tune_active);
     let sender_oc_rx = Arc::clone(&oc_rx);
