@@ -2608,8 +2608,8 @@ impl eframe::App for HpsdrApp {
                 // receiver window's title further down, so both windows
                 // are identifiable by board/protocol/IP at a glance.
                 let base_title = format!(
-                    "hpsdr-rs -- {:?} (P{} v{}.{}) at {}",
-                    connected.device.board,
+                    "hpsdr-rs -- {} (P{} v{}.{}) at {}",
+                    connected.device.board_label(),
                     connected.device.protocol,
                     connected.device.version / 10,
                     connected.device.version % 10,
@@ -7349,7 +7349,7 @@ impl eframe::App for HpsdrApp {
                                     ui.add_space(8.0);
 
                                     ui.horizontal(|ui| {
-                                        ui.label(format!("Max TX Power ({:?}):", connected.device.board));
+                                        ui.label(format!("Max TX Power ({}):", connected.device.board_label()));
                                         let mut max_watts = connected.max_tx_power_watts as i32;
                                         if scroll_slider_i32(
                                             ui,
