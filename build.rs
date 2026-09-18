@@ -287,6 +287,20 @@ fn main() {
     build.flag_if_supported("-D_GNU_SOURCE");
     build.flag_if_supported("-Wno-parentheses");
     build.flag_if_supported("-march=native");
+    // BUG FIX (MinGW-w64 only): analyzer.c calls the Win32 Interlocked*
+    // intrinsics (InterlockedAnd, InterlockedBitTestAndSet, etc.) with a
+    // `volatile int *`, but MinGW-w64's own <psdk_inc/intrin-impl.h>
+    // declares them as taking `volatile long *`. On Windows `long` and
+    // `int` are both 32-bit and ABI-identical, so this is harmless in
+    // practice -- but recent GCC (as shipped by current MSYS2) treats
+    // this specific pointer-type mismatch as a hard error instead of a
+    // warning, which aborts the whole build. Downgrading it back to a
+    // warning (via -Wno-error=...) is the minimal fix, instead of
+    // touching every call site in vendored upstream C. flag_if_supported
+    // means this is silently skipped on Linux/macOS/MSVC, where the
+    // problem doesn't occur (comm.h only pulls in <windows.h>, and thus
+    // this code path, when _WIN32 is defined).
+    build.flag_if_supported("-Wno-error=incompatible-pointer-types");
     // BUG FIX: MSVC's cl.exe, with no explicit /std: flag, defaults to a
     // pre-C11 dialect and doesn't recognize `_Static_assert` -- confirmed
     // by a real build failure on (now-removed) libspecbleach's

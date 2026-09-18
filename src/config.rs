@@ -251,6 +251,25 @@ pub struct Config {
     /// README's Ozy USB section for where to get them.
     pub ozy_firmware_path: Option<String>,
     pub ozy_fpga_path: Option<String>,
+    /// Radioberry "Juice" host program (a separate executable -- see
+    /// radioberry_juice.rs) -- path to that executable, set via the
+    /// Discover window's "Radioberry Juice setup" section, same idiom
+    /// as the two Ozy paths above. The FPGA choice (CL016/CL025) is
+    /// juice's own setting, kept here only so the UI can show the
+    /// last-picked value without re-reading radioberry.props on every
+    /// frame; radioberry.props next to the executable remains the
+    /// actual source of truth juice itself reads at startup.
+    pub radioberry_juice_path: Option<String>,
+    pub radioberry_juice_fpga: Option<crate::radioberry_juice::Fpga>,
+    /// Fixed correction folded into the S-meter/panadapter dBm reading,
+    /// set via Settings -> RX's "RX Gain Cal" control -- matches
+    /// piHPSDR's rx_gain_calibration (its Radio settings dialog's own
+    /// "RX Gain Calibr. (dB)" spin box, -50..50). NOT the live RX
+    /// Gain/Attenuation value (rx_attenuation below) -- this is a
+    /// fixed offset against a known reference signal, set once and
+    /// rarely touched. Missing (not yet set) falls back to 0, same as
+    /// piHPSDR's own uncalibrated default.
+    pub rx_gain_calibration_db: Option<i32>,
     /// Spectrum/waterfall display range while transmitting -- separate
     /// from db_low/db_high/waterfall_db_low/waterfall_db_high (which
     /// are for receiving) because a locally-picked-up TX signal is

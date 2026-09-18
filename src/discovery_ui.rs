@@ -6,7 +6,7 @@ use std::collections::HashMap;
 use std::net::IpAddr;
 use std::sync::{Arc, Mutex};
 use std::thread;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 /// Render one grid cell as a selectable widget rather than a plain label,
 /// so every column in a row participates in click-to-select and shows the
@@ -39,7 +39,13 @@ fn effective_path_label(explicit: &Option<String>, default: fn() -> Option<std::
 pub enum DiscoveryAction {
     None,
     Cancelled,
-    Start(Device),
+    /// The second field carries this session's Radioberry Juice
+    /// console handle onward, if the user launched juice from this
+    /// window before connecting -- so main.rs can hand it to the new
+    /// ConnectedState and keep the live console available after this
+    /// window itself is gone. `None` for every other radio type, or if
+    /// Juice was never launched this session.
+    Start(Device, Option<crate::radioberry_juice::JuiceHandle>),
 }
 
 pub struct DiscoveryWindow {
@@ -77,7 +83,43 @@ pub struct DiscoveryWindow {
     /// see `save_ozy_paths`.
     ozy_firmware_path: Option<String>,
     ozy_fpga_path: Option<String>,
+    /// Radioberry Juice host program -- path to the executable and last
+    /// FPGA choice, same persistence idiom as the two Ozy fields above
+    /// (see save_radioberry_juice_config). `juice_launch_error` holds
+    /// the message from the last failed launch attempt, if any, shown
+    /// inline instead of silently doing nothing on a bad path.
+    radioberry_juice_path: Option<String>,
+    radioberry_juice_fpga: Option<crate::radioberry_juice::Fpga>,
+    juice_launch_error: Option<String>,
+    /// Live console handle for the juice process launched from this
+    /// window, if any -- cloned into DiscoveryAction::Start so it
+    /// survives past this window's own lifetime (see that variant's
+    /// doc comment). Only ever set by a successful Launch click, never
+    /// persisted/reloaded -- a fresh discovery session always starts
+    /// with no console, same as juice itself isn't already running
+    /// until the user explicitly launches it here.
+    juice_console: Option<crate::radioberry_juice::JuiceHandle>,
+    /// Set to "now + JUICE_REFRESH_DELAY" right after a successful
+    /// launch (see the Launch button below) so `show()` can trigger one
+    /// automatic re-discovery pass once juice has had time to load the
+    /// FPGA and come up on the network, without the user having to
+    /// remember to click Refresh themselves. `None` the rest of the
+    /// time -- a manual Refresh is unaffected either way.
+    juice_refresh_at: Option<Instant>,
 }
+
+/// How long to wait after launching juice before automatically
+/// re-running discovery -- long enough to cover USB enumeration + FPGA
+/// bitstream load + the board bringing up its network stack, based on
+/// the timings noted in BUILD-README.md; a manual Refresh still works
+/// immediately if the board takes longer than this on a given machine.
+const JUICE_REFRESH_DELAY: Duration = Duration::from_secs(6);
+
+/// Distinct from OZY_CONFIG_MAC -- Radioberry Juice's settings are
+/// independent of classic Ozy hardware, so they need their own
+/// dedicated Config-file identity rather than sharing Ozy's sentinel
+/// (which would silently mix the two unrelated setting sets together).
+const RADIOBERRY_JUICE_CONFIG_MAC: [u8; 6] = [0, 0, 0, 0, 0, 1];
 
 /// Sentinel MAC discover_ozy_usb's synthetic `Device` uses (Ozy has no
 /// real MAC) -- doubles as a stable, dedicated Config-file identity for
@@ -89,6 +131,7 @@ impl DiscoveryWindow {
     /// pass, same as the original GTK dialog did on open.
     pub fn new(ctx: &egui::Context) -> Self {
         let ozy_cfg = Config::load(OZY_CONFIG_MAC);
+        let juice_cfg = Config::load(RADIOBERRY_JUICE_CONFIG_MAC);
         let window = Self {
             open: true,
             devices: Arc::new(Mutex::new(Vec::new())),
@@ -101,6 +144,11 @@ impl DiscoveryWindow {
             firmware_update: None,
             ozy_firmware_path: ozy_cfg.ozy_firmware_path,
             ozy_fpga_path: ozy_cfg.ozy_fpga_path,
+            radioberry_juice_path: juice_cfg.radioberry_juice_path,
+            radioberry_juice_fpga: juice_cfg.radioberry_juice_fpga,
+            juice_launch_error: None,
+            juice_refresh_at: None,
+            juice_console: None,
         };
         window.spawn_discovery(ctx.clone());
         window
@@ -111,6 +159,13 @@ impl DiscoveryWindow {
         cfg.ozy_firmware_path = self.ozy_firmware_path.clone();
         cfg.ozy_fpga_path = self.ozy_fpga_path.clone();
         cfg.save(OZY_CONFIG_MAC);
+    }
+
+    fn save_radioberry_juice_config(&self) {
+        let mut cfg = Config::load(RADIOBERRY_JUICE_CONFIG_MAC);
+        cfg.radioberry_juice_path = self.radioberry_juice_path.clone();
+        cfg.radioberry_juice_fpga = self.radioberry_juice_fpga;
+        cfg.save(RADIOBERRY_JUICE_CONFIG_MAC);
     }
 
     fn spawn_discovery(&self, ctx: egui::Context) {
@@ -144,6 +199,21 @@ impl DiscoveryWindow {
     pub fn show(&mut self, ui: &mut egui::Ui) -> DiscoveryAction {
         let mut action = DiscoveryAction::None;
         let mut still_open = self.open;
+
+        // Auto re-discovery after a successful Juice launch -- see
+        // juice_refresh_at's own doc comment. Checked once per frame
+        // regardless of what's currently shown, so it still fires even
+        // if the user has since collapsed the "Radioberry Juice setup"
+        // section or switched focus elsewhere within this window.
+        if let Some(at) = self.juice_refresh_at {
+            let now = Instant::now();
+            if now >= at {
+                self.juice_refresh_at = None;
+                self.spawn_discovery(ui.ctx().clone());
+            } else {
+                ui.ctx().request_repaint_after(at - now);
+            }
+        }
 
         // Light theme, matching the Settings window's own override (see
         // its doc comment in main.rs) -- for the same reason: egui only
@@ -346,7 +416,7 @@ impl DiscoveryWindow {
                             }
                             if row_double_clicked && available {
                                 self.selected = Some(i);
-                                action = DiscoveryAction::Start(*dev);
+                                action = DiscoveryAction::Start(*dev, self.juice_console.clone());
                             }
 
                             ui.end_row();
@@ -408,7 +478,7 @@ impl DiscoveryWindow {
 
                     if ui.add_enabled(can_start, egui::Button::new("Start")).clicked() {
                         if let Some(dev) = self.selected.and_then(|i| devices_snapshot.get(i)) {
-                            action = DiscoveryAction::Start(*dev);
+                            action = DiscoveryAction::Start(*dev, self.juice_console.clone());
                         }
                     }
 
@@ -466,6 +536,213 @@ impl DiscoveryWindow {
                             }
                         }
                     });
+                });
+
+                ui.add_space(8.0);
+                egui::CollapsingHeader::new("Radioberry Juice setup").show(ui, |ui| {
+                    ui.label(
+                        "Radioberry boards are driven by a separate program, \"Juice\" \
+                         (radioberry-juice), which talks to the board over USB and then \
+                         exposes it here over normal openHPSDR discovery, same as any \
+                         Metis/Hermes-family board once it's running. Point this at your \
+                         built juice executable, launch it, and pick the FPGA variant \
+                         fitted to your board.",
+                    );
+
+                    if !crate::radioberry_juice::is_elevated() {
+                        ui.horizontal(|ui| {
+                            ui.colored_label(
+                                egui::Color32::from_rgb(180, 110, 0),
+                                "hpsdr-rs is not running as Administrator -- Stop/Restart/Reset \
+                                 USB below can fail silently (\"Access is denied\") without it, \
+                                 since juice holds a driver-backed USB device open.",
+                            );
+                            if ui.button("Relaunch as Administrator").clicked() {
+                                match crate::radioberry_juice::relaunch_elevated() {
+                                    Ok(()) => std::process::exit(0),
+                                    Err(e) => {
+                                        self.juice_launch_error =
+                                            Some(format!("Couldn't relaunch elevated: {e}"))
+                                    }
+                                }
+                            }
+                        });
+                    }
+
+                    ui.horizontal(|ui| {
+                        ui.label("Juice executable:");
+                        ui.label(
+                            self.radioberry_juice_path
+                                .as_deref()
+                                .unwrap_or("(not set -- use Choose... below)"),
+                        );
+                        if ui.button("Choose...").clicked() {
+                            let mut dialog = rfd::FileDialog::new()
+                                .add_filter("Radioberry Juice", &[if cfg!(windows) { "exe" } else { "" }]);
+                            if let Some(existing) = &self.radioberry_juice_path {
+                                if let Some(dir) = std::path::Path::new(existing).parent() {
+                                    dialog = dialog.set_directory(dir);
+                                }
+                            }
+                            if let Some(path) = dialog.pick_file() {
+                                self.radioberry_juice_path = Some(path.display().to_string());
+                                // A freshly-chosen executable may already have its own
+                                // radioberry.props (e.g. from a previous manual setup) --
+                                // reflect whatever FPGA it's currently set to rather than
+                                // silently keeping a stale in-memory value from a
+                                // different executable/board.
+                                let props_path = crate::radioberry_juice::props_path_for(&path);
+                                self.radioberry_juice_fpga = crate::radioberry_juice::read_fpga(&props_path);
+                                self.juice_launch_error = None;
+                                self.save_radioberry_juice_config();
+                            }
+                        }
+                    });
+
+                    // Detects a juice already running from BEFORE this session (an
+                    // earlier hpsdr-rs run, a crash, or a manual launch) -- self.juice_console
+                    // only ever exists after THIS session's own Launch click, so without this,
+                    // Stop would simply not be offered at all for that case, leaving no way to
+                    // get at it from here except externally.
+                    if self.juice_console.is_none() {
+                        if let Some(exe) = self.radioberry_juice_path.clone() {
+                            if crate::radioberry_juice::is_named_process_running(std::path::Path::new(&exe)) {
+                                ui.horizontal(|ui| {
+                                    ui.colored_label(
+                                        egui::Color32::from_rgb(180, 110, 0),
+                                        "Juice already appears to be running (not started from this \
+                                         Discover session).",
+                                    );
+                                    if ui.button("Stop it").clicked() {
+                                        crate::radioberry_juice::force_kill_all(std::path::Path::new(&exe));
+                                    }
+                                });
+                            }
+                        }
+                    }
+
+                    ui.horizontal(|ui| {
+                        ui.label("FPGA:");
+                        let path_set = self.radioberry_juice_path.is_some();
+                        for fpga in crate::radioberry_juice::Fpga::ALL {
+                            let selected = self.radioberry_juice_fpga == Some(fpga);
+                            if ui
+                                .add_enabled(path_set, egui::RadioButton::new(selected, fpga.to_string()))
+                                .clicked()
+                            {
+                                self.radioberry_juice_fpga = Some(fpga);
+                                self.save_radioberry_juice_config();
+                                if let Some(exe) = &self.radioberry_juice_path {
+                                    let props_path =
+                                        crate::radioberry_juice::props_path_for(std::path::Path::new(exe));
+                                    if let Err(e) = crate::radioberry_juice::set_fpga(&props_path, fpga) {
+                                        self.juice_launch_error =
+                                            Some(format!("Couldn't write {}: {e}", props_path.display()));
+                                    } else {
+                                        self.juice_launch_error = None;
+                                    }
+                                }
+                            }
+                        }
+                        if !path_set {
+                            ui.label("(choose the executable first)");
+                        }
+                    });
+
+                    if ui
+                        .add_enabled(
+                            self.radioberry_juice_path.is_some(),
+                            egui::Button::new("Launch Radioberry Juice"),
+                        )
+                        .on_hover_text(
+                            "Starts juice in the background. Once it's up and has \
+                             loaded the FPGA gateware, use Refresh above to discover \
+                             the board like any other radio.",
+                        )
+                        .clicked()
+                    {
+                        if let Some(exe) = &self.radioberry_juice_path {
+                            match crate::radioberry_juice::launch(std::path::Path::new(exe)) {
+                                Ok(handle) => {
+                                    self.juice_launch_error = None;
+                                    self.juice_console = Some(handle);
+                                    self.juice_refresh_at = Some(Instant::now() + JUICE_REFRESH_DELAY);
+                                    ui.ctx().request_repaint_after(JUICE_REFRESH_DELAY);
+                                }
+                                Err(e) => self.juice_launch_error = Some(format!("Couldn't launch juice: {e}")),
+                            }
+                        }
+                    }
+
+                    if let Some(handle) = &self.juice_console {
+                        ui.horizontal(|ui| {
+                            let running = handle.is_running();
+                            ui.label(if running { "Status: running" } else { "Status: stopped" });
+                            if ui.add_enabled(running, egui::Button::new("Stop")).clicked() {
+                                handle.stop();
+                            }
+                            if ui
+                                .button("Restart")
+                                .on_hover_text(
+                                    "Kills juice if it's stuck or unresponsive and starts it \
+                                     again -- an alternative to unplugging the USB cable. Note: \
+                                     if a radio is currently connected through this juice \
+                                     instance, restarting it will drop that connection; you'll \
+                                     need to reconnect from Discover once juice is back up.",
+                                )
+                                .clicked()
+                            {
+                                if let Err(e) = handle.restart() {
+                                    self.juice_launch_error = Some(format!("Couldn't restart juice: {e}"));
+                                } else {
+                                    self.juice_launch_error = None;
+                                }
+                            }
+                            if ui
+                                .button("Reset USB & Restart")
+                                .on_hover_text(
+                                    "For when a plain Restart doesn't unstick it. Disables and \
+                                     re-enables the Radioberry's USB device in Windows -- the \
+                                     same effect as unplugging and replugging the cable, without \
+                                     touching it -- then relaunches juice. Requires running \
+                                     hpsdr-rs as Administrator.",
+                                )
+                                .clicked()
+                            {
+                                if let Err(e) = handle.reset_usb_and_restart() {
+                                    self.juice_launch_error = Some(format!("Couldn't reset USB device: {e}"));
+                                } else {
+                                    self.juice_launch_error = None;
+                                }
+                            }
+                        });
+                    }
+
+                    if let Some(err) = &self.juice_launch_error {
+                        ui.colored_label(egui::Color32::RED, err);
+                    }
+
+                    if let Some(console) = &self.juice_console {
+                        ui.add_space(4.0);
+                        ui.label("Juice output:");
+                        egui::ScrollArea::vertical().max_height(120.0).stick_to_bottom(true).show(
+                            ui,
+                            |ui| {
+                                ui.add(
+                                    egui::TextEdit::multiline(&mut console.snapshot().join("\n"))
+                                        .desired_width(f32::INFINITY)
+                                        .font(egui::TextStyle::Monospace)
+                                        .interactive(false),
+                                );
+                            },
+                        );
+                        // Keeps this panel live-updating while juice is
+                        // producing output, without needing the reader
+                        // threads themselves to know about egui at all
+                        // -- a plain periodic repaint is simpler and
+                        // cheap enough for a console view like this.
+                        ui.ctx().request_repaint_after(Duration::from_millis(300));
+                    }
                 });
                 });
             },

@@ -24,6 +24,7 @@ mod midi;
 mod midi_import;
 mod ozy;
 mod radio;
+mod radioberry_juice;
 mod rigctl;
 mod spectrum;
 mod tci;
@@ -1261,6 +1262,25 @@ struct ConnectedState {
     /// comments. `None` = not open, same toggle idiom as
     /// show_settings_window above.
     firmware_update: Option<bootloader_ui::FirmwareUpdateWindow>,
+    /// Set from DiscoveryAction::Start if the connected radio was
+    /// brought up via a Radioberry Juice launch in the Discover window
+    /// (see discovery_ui.rs's own doc comments) -- lets the "Juice
+    /// Console..." button below stay available for the rest of this
+    /// radio session even though the Discover window itself is long
+    /// gone by the time this is normally looked at (e.g. after losing
+    /// sync, or just to check juice hasn't logged any errors).
+    /// `None` for every other radio type, or if Juice wasn't launched
+    /// this session (e.g. it was already running from an earlier
+    /// launch outside hpsdr-rs).
+    juice_console: Option<crate::radioberry_juice::JuiceHandle>,
+    /// Fixed correction folded into the S-meter/panadapter dBm reading
+    /// -- see the Settings -> RX control's own doc comment (matches
+    /// piHPSDR's rx_gain_calibration). NOT the live RX Gain/Attenuation
+    /// value (that's connected.session.rx_attenuation, on the main
+    /// window's toolbar) -- this is a fixed offset against a known
+    /// reference, set once and rarely touched.
+    rx_gain_calibration_db: i32,
+    show_juice_console_window: bool,
     extra_receivers: Vec<Arc<Mutex<ExtraReceiver>>>,
     settings_dirty: Arc<std::sync::atomic::AtomicBool>,
     band_memory: std::collections::HashMap<String, BandSettings>,
@@ -2293,6 +2313,9 @@ fn connect_to_device(device: Device, cfg: &Config) -> Result<ConnectedState, Str
                 show_settings_window: false,
                 settings_tab: SettingsTab::Agc,
                 firmware_update: None,
+                juice_console: None,
+                show_juice_console_window: false,
+                rx_gain_calibration_db: cfg.rx_gain_calibration_db.unwrap_or(0),
                 extra_receivers,
                 settings_dirty,
                 band_memory: cfg.band_settings.clone(),
@@ -2519,7 +2542,7 @@ impl eframe::App for HpsdrApp {
 
         match &mut self.state {
             AppState::Discovering(window) => match window.show(ui) {
-                DiscoveryAction::Start(device) => {
+                DiscoveryAction::Start(device, juice_console) => {
                     let cfg = Config::load(device.mac);
                     // Move/resize the main window to wherever it was
                     // last left for THIS radio -- see
@@ -2539,7 +2562,10 @@ impl eframe::App for HpsdrApp {
                         )));
                     }
                     match connect_to_device(device, &cfg) {
-                        Ok(connected) => self.state = AppState::Connected(connected),
+                        Ok(mut connected) => {
+                            connected.juice_console = juice_console;
+                            self.state = AppState::Connected(connected);
+                        }
                         Err(e) => self.state = AppState::Error(e),
                     }
                 }
@@ -3047,6 +3073,32 @@ impl eframe::App for HpsdrApp {
                     (d.spectrum.clone(), d.meter_db, d.revision)
                 };
 
+                // Corrects the raw WDSP meter reading for RX Gain Cal and
+                // the live RX Gain/Attenuation slider, matching piHPSDR's
+                // own rx_update_display: `level += calib + attenuation -
+                // gain`. hpsdr-rs stores both of piHPSDR's separate
+                // per-board fields (attenuation OR gain, never both) in
+                // the one rx_attenuation value -- see that field's doc
+                // comment -- so which side of the formula applies depends
+                // on which control is actually shown for this board (same
+                // condition as the toolbar slider above). RX only --
+                // meter_db is tx_spectrum's own (ALC/drive) reading while
+                // transmitting, an unrelated meter this correction has
+                // nothing to say about.
+                let meter_db = if transmitting {
+                    meter_db
+                } else {
+                    let stored_rx_atten = connected.session.rx_attenuation.load(Ordering::Relaxed) as i32;
+                    let correction_db = if connected.device.protocol == 1
+                        && matches!(connected.device.board, Boards::HermesLite | Boards::HermesLite2)
+                    {
+                        connected.rx_gain_calibration_db - (stored_rx_atten - 12)
+                    } else {
+                        connected.rx_gain_calibration_db + stored_rx_atten
+                    };
+                    meter_db + f64::from(correction_db)
+                };
+
                 // "Auto" Low (Settings -> Spectrum) -- see
                 // ConnectedState::db_low_auto's doc comment. RX only:
                 // spectrum_row is tx_spectrum's data while transmitting,
@@ -3478,6 +3530,61 @@ impl eframe::App for HpsdrApp {
                     });
 
                     ui.horizontal_wrapped(|ui| {
+                        // Live RX Gain/Attenuation -- matches piHPSDR's own layout
+                        // (sliders.c: RF/ATT sits in the same slot, right before AF_GAIN
+                        // on the main sliders row) rather than piHPSDR's Settings-style
+                        // dialog, since this is something adjusted continuously while
+                        // operating (lower it when the spectrum looks garbled/overloaded,
+                        // raise it when signals seem weak), not a one-off setup step.
+                        // HermesLite/HermesLite2 and standard boards share the SAME
+                        // underlying RadioSession::rx_attenuation storage (see that
+                        // field's own doc comment for the real dB range/semantics of
+                        // each) but are genuinely different controls -- and the
+                        // HermesLite-specific "RX Gain" control only actually exists on
+                        // Protocol 1 (P2 has no equivalent of P1's wire-sharing quirk,
+                        // see that same doc comment), so a HermesLite2 on Protocol 2
+                        // gets the plain "RX Attenuation" slider too, same as any other
+                        // board there.
+                        if connected.device.protocol == 1
+                            && matches!(connected.device.board, Boards::HermesLite | Boards::HermesLite2)
+                        {
+                            // The stored wire value is gain_db+12 (0-60) -- see
+                            // RadioSession::rx_attenuation's doc comment -- so the
+                            // conversion happens at this UI boundary only.
+                            let mut gain_db =
+                                connected.session.rx_attenuation.load(Ordering::Relaxed) as i32 - 12;
+                            ui.label("RX Gain:");
+                            if scroll_slider_i32(
+                                ui,
+                                &mut connected.slider_scroll_accum,
+                                &mut gain_db,
+                                -12..=48,
+                                1,
+                                " dB",
+                            ) {
+                                connected
+                                    .session
+                                    .rx_attenuation
+                                    .store((gain_db + 12).clamp(0, 60) as u32, Ordering::Relaxed);
+                                settings_changed = true;
+                            }
+                        } else {
+                            let mut atten = connected.session.rx_attenuation.load(Ordering::Relaxed) as i32;
+                            ui.label("RX Attenuation:");
+                            if scroll_slider_i32(
+                                ui,
+                                &mut connected.slider_scroll_accum,
+                                &mut atten,
+                                0..=31,
+                                1,
+                                " dB",
+                            ) {
+                                connected.session.rx_attenuation.store(atten as u32, Ordering::Relaxed);
+                                settings_changed = true;
+                            }
+                        }
+                        ui.add_space(12.0);
+
                         ui.label("Audio gain:");
                         let mut gain = current_gain;
                         // ROOT CAUSE FIX: max raised from 1.5 -- a real
@@ -5183,6 +5290,13 @@ impl eframe::App for HpsdrApp {
                             connected.show_settings_window = !connected.show_settings_window;
                         }
 
+                        if connected.juice_console.is_some() {
+                            ui.add_space(4.0);
+                            if ui.button("Juice Console...").clicked() {
+                                connected.show_juice_console_window = !connected.show_juice_console_window;
+                            }
+                        }
+
                         // Used to be gated to protocol == 2 only -- P1
                         // genuinely supports independent per-receiver
                         // tuning too (classic Metis/Ozy DDC round-robin),
@@ -5417,27 +5531,12 @@ impl eframe::App for HpsdrApp {
                             // user manually shrinking the window (or a
                             // future tab addition) degrades to a second
                             // line instead of reproducing this exact cutoff.
-                            // No .with_window_level(AlwaysOnTop) here --
-                            // REMOVED (2026-09-18, real report). Unlike
-                            // the discovery window (which has its own
-                            // confirmed report of getting buried behind
-                            // a terminal/browser during a long
-                            // unattended wait -- see its own doc comment
-                            // on window_level), this was applied to
-                            // Settings by analogy, not its own report,
-                            // and Settings is something the user is
-                            // actively working in rather than leaving
-                            // open in the background. AlwaysOnTop had a
-                            // real cost: a native file dialog (e.g. the
-                            // MIDI tab's "Import Thetis Midi2Cat
-                            // XML..." button, or the bootloader firmware
-                            // pickers) opened from inside this window is
-                            // an independent OS-level window, not a true
-                            // child of it, so it doesn't inherit the
-                            // always-on-top level -- it opened BEHIND
-                            // this window instead, invisible without
-                            // moving Settings out of the way first.
-                            .with_inner_size([1100.0, 700.0]),
+                            .with_inner_size([1100.0, 700.0])
+                            // Same "keep the window from getting buried
+                            // behind other windows" reasoning as the
+                            // discovery window -- see its own doc
+                            // comment on window_level.
+                            .with_window_level(egui::WindowLevel::AlwaysOnTop),
                         |ui, _class| {
                             if ui.input(|i| i.viewport().close_requested()) {
                                 close_requested = true;
@@ -6637,92 +6736,45 @@ impl eframe::App for HpsdrApp {
                                     // Settings -> Antenna and AntennaMask's doc comment.
                                     ui.separator();
 
-                                    // Shown on both protocols now -- P2's High Priority
-                                    // packet carries this too (bytes 1442/1443, see
-                                    // p2_high_priority_packet), a real gap fixed alongside
-                                    // P1's. HermesLite/HermesLite2 and standard boards share
-                                    // the SAME underlying RadioSession::rx_attenuation
-                                    // storage (see that field's own doc comment for the real
-                                    // dB range/semantics of each) but are genuinely different
-                                    // controls -- and the HermesLite-specific "RX Gain"
-                                    // control only actually exists on Protocol 1 (P2 has no
-                                    // equivalent of P1's wire-sharing quirk, see that same
-                                    // doc comment), so a HermesLite2 on Protocol 2 gets the
-                                    // plain "RX Attenuation" slider too, same as any other
-                                    // board there.
+                                    // RX Gain / RX Attenuation (the live, wire-level
+                                    // control) moved to the main window's own toolbar,
+                                    // next to Audio gain -- see that block's doc comment
+                                    // for why (matches piHPSDR's own layout: its RF/ATT
+                                    // slider lives on the main sliders row, not in a
+                                    // settings dialog, since it's something adjusted
+                                    // continuously while operating, not a one-off
+                                    // setup step). What piHPSDR actually keeps in ITS
+                                    // Radio settings dialog alongside Frequency
+                                    // Calibration is a separate thing entirely: "RX Gain
+                                    // Calibr. (dB)" (radio_menu.c's rx_gain_calibration),
+                                    // a fixed correction folded into the S-meter/
+                                    // panadapter dBm reading (see receiver.c's
+                                    // rx_update_display: level += calib + attenuation -
+                                    // gain) -- NOT a live gain knob at all. That's what
+                                    // belongs here, so that's what's here.
                                     {
-                                        if connected.device.protocol == 1
-                                            && matches!(connected.device.board, Boards::HermesLite | Boards::HermesLite2)
-                                        {
-                                            // ROOT CAUSE FIX: this was hardcoded to wire value 0
-                                            // (-12dB, maximum attenuation) with no UI at all -- a
-                                            // real report (RX Gain control expected, same as
-                                            // other HPSDR radios' RX Attenuation) plus direct
-                                            // inspection of piHPSDR's old_protocol.c/sliders.c
-                                            // confirmed this is meant to be a live, user-
-                                            // adjustable -12..+48 dB value (piHPSDR's own "RX
-                                            // GAIN - ADC-%d (dB)" slider), not a constant. The
-                                            // stored wire value is gain_db+12 (0-60) -- see
-                                            // RadioSession::rx_attenuation's doc comment -- so
-                                            // the conversion happens at this UI boundary only.
-                                            let mut gain_db =
-                                                connected.session.rx_attenuation.load(Ordering::Relaxed) as i32 - 12;
-                                            ui.horizontal(|ui| {
-                                                ui.label("RX Gain:");
-                                                if scroll_slider_i32(
-                                                    ui,
-                                                    &mut connected.slider_scroll_accum,
-                                                    &mut gain_db,
-                                                    -12..=48,
-                                                    1,
-                                                    " dB",
-                                                ) {
-                                                    connected
-                                                        .session
-                                                        .rx_attenuation
-                                                        .store((gain_db + 12).clamp(0, 60) as u32, Ordering::Relaxed);
-                                                    settings_changed = true;
-                                                }
-                                            });
-                                            ui.weak(
-                                                "Extra front-end gain (positive) or attenuation \
-                                                 (negative) -- lower this if the spectrum looks \
-                                                 garbled/overloaded on a strong band, raise it if \
-                                                 signals seem unusually weak.",
-                                            );
-                                        } else {
-                                            // ROOT CAUSE FIX: this was previously hardcoded to
-                                            // 0dB (no attenuation), which real hardware testing
-                                            // (ANAN-100D/Angelia on an HF antenna) confirmed
-                                            // causes front-end overload from ordinary band
-                                            // signals -- visible as an intermod comb pattern or
-                                            // sustained broadband noise depending on band
-                                            // conditions at the moment, which is why it looked
-                                            // random between connects.
-                                            let mut atten =
-                                                connected.session.rx_attenuation.load(Ordering::Relaxed) as i32;
-                                            ui.horizontal(|ui| {
-                                                ui.label("RX Attenuation:");
-                                                if scroll_slider_i32(
-                                                    ui,
-                                                    &mut connected.slider_scroll_accum,
-                                                    &mut atten,
-                                                    0..=31,
-                                                    1,
-                                                    " dB",
-                                                ) {
-                                                    connected
-                                                        .session
-                                                        .rx_attenuation
-                                                        .store(atten as u32, Ordering::Relaxed);
-                                                    settings_changed = true;
-                                                }
-                                            });
-                                            ui.weak(
-                                                "Raise this if the spectrum looks garbled/overloaded on a \
-                                                 strong band -- 0dB is maximum sensitivity, not a safe default.",
-                                            );
-                                        }
+                                        let mut cal = connected.rx_gain_calibration_db;
+                                        ui.horizontal(|ui| {
+                                            ui.label("RX Gain Cal:");
+                                            if scroll_slider_i32(
+                                                ui,
+                                                &mut connected.slider_scroll_accum,
+                                                &mut cal,
+                                                -50..=50,
+                                                1,
+                                                " dB",
+                                            ) {
+                                                connected.rx_gain_calibration_db = cal;
+                                                settings_changed = true;
+                                            }
+                                        });
+                                        ui.weak(
+                                            "Corrects the S-meter/panadapter dBm reading against a \
+                                             known reference signal -- doesn't change what the radio \
+                                             actually receives. Leave at 0 unless you've measured a \
+                                             real offset (piHPSDR calls this same value \"RX Gain \
+                                             Calibr.\" in its Radio settings).",
+                                        );
                                         ui.separator();
                                     }
 
@@ -8508,6 +8560,89 @@ impl eframe::App for HpsdrApp {
                     }
                 }
 
+                if connected.show_juice_console_window {
+                    if let Some(console) = connected.juice_console.clone() {
+                        let light_visuals = egui::Visuals::light();
+                        let light_style = egui::Style { visuals: light_visuals.clone(), ..Default::default() };
+                        let mut close_requested = false;
+                        ui.ctx().show_viewport_immediate(
+                            egui::ViewportId::from_hash_of("juice_console_window"),
+                            egui::ViewportBuilder::default()
+                                .with_title("Radioberry Juice Console")
+                                .with_inner_size([700.0, 420.0])
+                                .with_window_level(egui::WindowLevel::AlwaysOnTop),
+                            |ui, _class| {
+                                if ui.input(|i| i.viewport().close_requested()) {
+                                    close_requested = true;
+                                    return;
+                                }
+                                egui::CentralPanel::default()
+                                    .frame(egui::Frame::central_panel(&light_style))
+                                    .show(ui, |ui| {
+                                        ui.visuals_mut().clone_from(&light_visuals);
+                                        ui.label(
+                                            "Live output from the Radioberry Juice process launched \
+                                             from Discover. The full history is also saved to \
+                                             radioberry-juice.log next to the juice executable.",
+                                        );
+                                        if !crate::radioberry_juice::is_elevated() {
+                                            ui.horizontal(|ui| {
+                                                ui.colored_label(
+                                                    egui::Color32::from_rgb(180, 110, 0),
+                                                    "hpsdr-rs is not running as Administrator -- Stop/\
+                                                     Restart can fail silently without it.",
+                                                );
+                                                if ui.button("Relaunch as Administrator").clicked() {
+                                                    if crate::radioberry_juice::relaunch_elevated().is_ok() {
+                                                        std::process::exit(0);
+                                                    }
+                                                }
+                                            });
+                                        }
+                                        ui.horizontal(|ui| {
+                                            let running = console.is_running();
+                                            ui.label(if running { "Status: running" } else { "Status: stopped" });
+                                            if ui.add_enabled(running, egui::Button::new("Stop")).clicked() {
+                                                console.stop();
+                                            }
+                                            if ui
+                                                .button("Restart")
+                                                .on_hover_text(
+                                                    "Kills juice if it's stuck or unresponsive and \
+                                                     starts it again -- an alternative to \
+                                                     unplugging the USB cable. This will drop the \
+                                                     current radio connection; reconnect from \
+                                                     Discover once juice is back up.",
+                                                )
+                                                .clicked()
+                                            {
+                                                let _ = console.restart();
+                                            }
+                                        });
+                                        ui.separator();
+                                        egui::ScrollArea::vertical().stick_to_bottom(true).show(ui, |ui| {
+                                            ui.add(
+                                                egui::TextEdit::multiline(&mut console.snapshot().join("\n"))
+                                                    .desired_width(f32::INFINITY)
+                                                    .desired_rows(20)
+                                                    .font(egui::TextStyle::Monospace)
+                                                    .interactive(false),
+                                            );
+                                        });
+                                        // Keeps the view live-updating while
+                                        // this window is open, same reasoning
+                                        // as the Discover window's own inline
+                                        // preview (see discovery_ui.rs).
+                                        ui.ctx().request_repaint_after(Duration::from_millis(300));
+                                    });
+                            },
+                        );
+                        if close_requested {
+                            connected.show_juice_console_window = false;
+                        }
+                    }
+                }
+
                 // root_close_requested/stop_clicked (computed earlier
                 // this frame -- see their own declarations) also force a
                 // save here rather than relying on settings_dirty alone,
@@ -8572,6 +8707,9 @@ impl eframe::App for HpsdrApp {
                         })
                         .collect();
                     Config {
+                        radioberry_juice_path: None,
+                        radioberry_juice_fpga: None,
+                        rx_gain_calibration_db: Some(connected.rx_gain_calibration_db),
                         frequency_hz: Some(
                             connected.session.frequency_hz.load(std::sync::atomic::Ordering::Relaxed),
                         ),
@@ -11623,20 +11761,8 @@ fn main() -> eframe::Result<()> {
     // DEFAULT anyway -- native Wayland's own known CPU-pegging bug (see
     // below) is a continuous cost for the whole session, worse than an
     // occasional, self-clearing stall from minimizing one window.
-    // BUG FIX (2026-09-18, real report): unconditionally clearing
-    // WAYLAND_DISPLAY assumed X11/XWayland was always there as a working
-    // fallback -- a real report on Debian (a pure-Wayland session with no
-    // XWayland running/available, DISPLAY unset too) showed winit failing
-    // outright at startup instead ("neither WAYLAND_DISPLAY nor
-    // WAYLAND_SOCKET nor DISPLAY is set"), taking away the only display
-    // connection that would have worked with nothing to fall back to.
-    // Only force X11 when DISPLAY is actually set -- i.e. XWayland (or a
-    // native X11 session) is genuinely available to switch to; otherwise
-    // leave WAYLAND_DISPLAY alone and let winit use native Wayland, which
-    // at least runs (with the known CPU-pegging cost documented above)
-    // instead of not starting at all.
     let force_x11 = std::env::var("HPSDR_FORCE_X11").map(|v| v != "0").unwrap_or(true);
-    if force_x11 && std::env::var_os("DISPLAY").is_some() {
+    if force_x11 {
         unsafe {
             std::env::remove_var("WAYLAND_DISPLAY");
         }
