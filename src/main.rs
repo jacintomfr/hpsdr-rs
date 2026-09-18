@@ -5435,8 +5435,8 @@ impl eframe::App for HpsdrApp {
                                 "ADC1 OVERLOAD"
                             };
                             ui.painter().text(
-                                row_rect.left_center(),
-                                egui::Align2::LEFT_CENTER,
+                                row_rect.center(),
+                                egui::Align2::CENTER_CENTER,
                                 text,
                                 egui::TextStyle::Body.resolve(ui.style()),
                                 egui::Color32::from_rgb(255, 60, 60),
@@ -5472,8 +5472,8 @@ impl eframe::App for HpsdrApp {
                                     "TX Overrun"
                                 };
                                 ui.painter().text(
-                                    fifo_row_rect.left_center(),
-                                    egui::Align2::LEFT_CENTER,
+                                    fifo_row_rect.center(),
+                                    egui::Align2::CENTER_CENTER,
                                     text,
                                     egui::TextStyle::Body.resolve(ui.style()),
                                     egui::Color32::from_rgb(255, 60, 60),
@@ -10003,34 +10003,28 @@ fn draw_s_meter(ui: &mut egui::Ui, rect: egui::Rect, db: f64) {
     let painter = ui.painter();
     painter.rect_filled(rect, 4.0, egui::Color32::from_gray(20));
 
-    // Reserve room at the bottom for the digital readout text (drawn
-    // below) so the arc's flat baseline and the needle's pivot dot --
-    // both sitting right at center.y -- can't overlap it. The previous
-    // fixed 14px gap here was less than a 13pt monospace glyph's actual
-    // height, so the top of the readout visibly clipped through the
-    // arc/pivot. TEXT_ZONE and TOP_MARGIN below derive the radius from
-    // whatever's actually left over instead of a size tuned for one
-    // specific rect, so this keeps working if the meter's rect size
-    // ever changes again.
-    const TEXT_ZONE: f32 = 26.0;
-    const TOP_MARGIN: f32 = 6.0;
-    // Flattens the arc into a shallow, wide curve (a real commercial
-    // S-meter faceplate's look -- a real reference photo was matched
-    // against) instead of a tall half-moon dome -- applied uniformly
-    // via point_at below, so the arc/ticks/labels/needle all follow the
-    // same flattened curve consistently. 1.0 would be a true semicircle.
-    const Y_SQUASH: f32 = 0.55;
-    let center = egui::pos2(rect.center().x, rect.bottom() - TEXT_ZONE);
-    // The S9 tick label (closest to straight up, at angle_for_db(S9))
-    // is the tallest thing drawn above center -- its label sits at
-    // radius*1.16*Y_SQUASH from center (the squash applies to its
-    // height same as everything else), so that's what TOP_MARGIN is
-    // measured against, not the bare arc radius itself.
-    let radius = (rect.width() * 0.45).min((rect.height() - TEXT_ZONE - TOP_MARGIN) / (1.16 * Y_SQUASH));
+    // Labels now live in a header row at the TOP (S-value left, "S-Meter"
+    // center, dBm right -- a real reference image was matched against)
+    // instead of a combined readout below the arc, so the reserved zone
+    // moves to the top and the gauge itself gets the rest of the rect.
+    const TOP_ZONE: f32 = 20.0;
+    const BOTTOM_MARGIN: f32 = 4.0;
+    // Flattens the arc into a shallow, wide curve instead of a tall
+    // half-moon dome -- applied uniformly via point_at below, so the
+    // arc/ticks/needle all follow the same flattened curve consistently.
+    // 1.0 would be a true semicircle.
+    const Y_SQUASH: f32 = 0.62;
+    let center = egui::pos2(rect.center().x, rect.bottom() - BOTTOM_MARGIN);
+    // Tick MARKS sit inside the band, but their number labels stay
+    // outside it at radius*1.18 -- divisor accounts for that, same
+    // reasoning as the original TOP_MARGIN math.
+    let radius = (rect.width() * 0.42).min((rect.height() - TOP_ZONE - BOTTOM_MARGIN) / (1.18 * Y_SQUASH));
 
     const S9: f64 = -73.0;
     const DB_MIN: f64 = S9 - 54.0; // S0
     const DB_MAX: f64 = S9 + 60.0; // S9+60
+    const BAND_WHITE: egui::Color32 = egui::Color32::WHITE;
+    const BAND_RED: egui::Color32 = egui::Color32::from_rgb(235, 60, 60);
 
     let angle_for_db = |v: f64| -> f32 {
         let t = ((v - DB_MIN) / (DB_MAX - DB_MIN)).clamp(0.0, 1.0) as f32;
@@ -10040,97 +10034,129 @@ fn draw_s_meter(ui: &mut egui::Ui, rect: egui::Rect, db: f64) {
         center + egui::vec2(angle.cos() * r, -angle.sin() * r * Y_SQUASH)
     };
 
-    // Face arc -- two segments, split exactly at S9, so the arc LINE
-    // itself (not just the tick marks) turns red past S9, matching a
-    // real S-meter faceplate's printed scale.
+    // Face arc -- a thick colored band (not a thin line), split exactly
+    // at S9 so the band itself turns red past S9, matching the reference
+    // image. This is the gauge's ONE continuous line -- ticks (below)
+    // are drawn entirely outside it, as a visually separate second ring,
+    // rather than crossing through it -- a real reference photo showed
+    // these as two distinct rings, not tick marks straddling the band.
     let arc_points = |db_start: f64, db_end: f64| -> Vec<egui::Pos2> {
         (0..=30)
             .map(|i| point_at(angle_for_db(db_start + (db_end - db_start) * (i as f64 / 30.0)), radius))
             .collect()
     };
-    painter.add(egui::Shape::line(arc_points(DB_MIN, S9), egui::Stroke::new(2.0, egui::Color32::WHITE)));
-    painter.add(egui::Shape::line(arc_points(S9, DB_MAX), egui::Stroke::new(2.0, egui::Color32::RED)));
+    painter.add(egui::Shape::line(arc_points(DB_MIN, S9), egui::Stroke::new(2.0, BAND_WHITE)));
+    painter.add(egui::Shape::line(arc_points(S9, DB_MAX), egui::Stroke::new(2.0, BAND_RED)));
 
-    // S1 (labeled "S"), S3, S5, S7, S9 major ticks, white; S2/S4/S6/S8
-    // minor (shorter, unlabeled) ticks in between -- matches a real
-    // faceplate's odd-numbered-major/even-numbered-minor convention.
-    for s in 1..=9 {
+    // Tick ring INSIDE the band (touching its inner edge at `radius`,
+    // extending in towards the pivot/needle) -- one short unlabeled tick
+    // per S-unit/every 10dB-over-S9, plus longer labeled ticks at
+    // 0/3/5/7/9 and +20/+40, with the numbers further in still. Moved
+    // from outside to inside the band: the needle sweeps below/inside
+    // the band too, so the scale reads naturally next to it instead of
+    // floating above the band with a gap.
+    let labeled_s = [0, 3, 5, 7, 9];
+    for s in 0..=9 {
         let v = S9 - (9 - s) as f64 * 6.0;
         let angle = angle_for_db(v);
-        let major = s % 2 == 1;
-        let inner = if major { radius * 0.85 } else { radius * 0.92 };
-        painter.line_segment(
-            [point_at(angle, inner), point_at(angle, radius)],
-            egui::Stroke::new(2.0, egui::Color32::WHITE),
-        );
-        if major {
+        let labeled = labeled_s.contains(&s);
+        let inner = if labeled { radius * 0.80 } else { radius * 0.88 };
+        // No tick mark at S0 itself -- it sits right at the band's own
+        // start (DB_MIN), so a tick there just doubled up on the band's
+        // own end.
+        if s != 0 {
+            painter.line_segment(
+                [point_at(angle, inner), point_at(angle, radius)],
+                egui::Stroke::new(if labeled { 1.6 } else { 1.0 }, egui::Color32::WHITE),
+            );
+        }
+        if labeled {
+            // Numbers stay OUTSIDE the band (unlike the tick marks
+            // themselves, moved inside above) -- matches the reference
+            // image's label placement. s==0 shows "S" (matching the
+            // original gauge's own convention) rather than "0".
             painter.text(
-                point_at(angle, radius * 1.16),
+                point_at(angle, radius * 1.18),
                 egui::Align2::CENTER_CENTER,
-                if s == 1 { "S".to_string() } else { format!("{s}") },
-                egui::FontId::proportional(11.0),
+                if s == 0 { "S".to_string() } else { format!("{s}") },
+                egui::FontId::proportional(12.0),
                 egui::Color32::WHITE,
             );
         }
     }
-    // +10/+30/+60 major (labeled) and +20/+40/+50 minor (unlabeled)
-    // ticks over S9, red zone -- same major/minor treatment as the
-    // S-side above, matching a real faceplate's own (non-uniform)
-    // labeled steps.
-    for over in [10, 20, 30, 40, 50, 60] {
+    let labeled_over = [20, 40];
+    for over in [10, 20, 30, 40] {
         let angle = angle_for_db(S9 + over as f64);
-        let major = matches!(over, 10 | 30 | 60);
-        let inner = if major { radius * 0.85 } else { radius * 0.92 };
+        let labeled = labeled_over.contains(&over);
+        let inner = if labeled { radius * 0.80 } else { radius * 0.88 };
         painter.line_segment(
             [point_at(angle, inner), point_at(angle, radius)],
-            egui::Stroke::new(2.0, egui::Color32::RED),
+            egui::Stroke::new(if labeled { 1.6 } else { 1.0 }, BAND_RED),
         );
-        if major {
+        if labeled {
             painter.text(
                 point_at(angle, radius * 1.18),
                 egui::Align2::CENTER_CENTER,
                 format!("+{over}"),
-                egui::FontId::proportional(10.0),
-                egui::Color32::RED,
+                egui::FontId::proportional(11.0),
+                BAND_RED,
             );
         }
     }
 
-    // Needle
+    // Tapered white needle -- a thin triangle from the pivot out to the
+    // tip, rather than a uniform-width line, for the reference image's
+    // "real moving-coil needle" look.
     let needle_angle = angle_for_db(db);
-    painter.line_segment(
-        [center, point_at(needle_angle, radius * 0.92)],
-        egui::Stroke::new(2.5, egui::Color32::YELLOW),
-    );
-    painter.circle_filled(center, 4.0, egui::Color32::YELLOW);
+    let tip = point_at(needle_angle, radius * 0.88);
+    let perp = egui::vec2(-(tip.y - center.y), tip.x - center.x).normalized();
+    let base_half_width = 3.0;
+    painter.add(egui::Shape::convex_polygon(
+        vec![center + perp * base_half_width, center - perp * base_half_width, tip],
+        egui::Color32::WHITE,
+        egui::Stroke::NONE,
+    ));
 
-    // Digital readout
+    // Pivot hub -- medium gray, not black, so it doesn't disappear into
+    // the equally-black background.
+    painter.circle_filled(center, 7.0, egui::Color32::from_gray(70));
+
+    // Header row: S-value (left), dBm (right) -- no center "S-Meter"
+    // label, it's self-evident what this gauge is.
     painter.text(
-        egui::pos2(center.x, rect.bottom() - 2.0),
-        egui::Align2::CENTER_BOTTOM,
-        s_meter_label(db, S9),
-        egui::FontId::monospace(13.0),
+        egui::pos2(rect.left() + 4.0, rect.top() + 2.0),
+        egui::Align2::LEFT_TOP,
+        s_meter_label(db, S9).split(' ').next().unwrap_or_default().to_string(),
+        egui::FontId::proportional(16.0),
+        BAND_WHITE,
+    );
+    painter.text(
+        egui::pos2(rect.right() - 4.0, rect.top() + 2.0),
+        egui::Align2::RIGHT_TOP,
+        format!("{db:.0} dBm"),
+        egui::FontId::proportional(15.0),
         egui::Color32::WHITE,
     );
 }
 
-/// Same semicircle-gauge treatment as draw_s_meter, scaled 0..max_watts
-/// instead of S-units, shown in place of it while transmitting. The
-/// needle (and the combined digital readout) turn a more alarming red
-/// once SWR crosses `max_swr` (Settings -> TX, ConnectedState::max_swr)
-/// -- the same threshold the plain-text display this replaces already
-/// flagged, so a bad match is visible at a glance without reading the
-/// number.
+/// Semicircle-gauge treatment scaled 0..max_watts instead of S-units,
+/// shown in place of draw_s_meter while transmitting. The needle (and
+/// the combined digital readout) turn a more alarming red once SWR
+/// crosses `max_swr` (Settings -> TX, ConnectedState::max_swr) -- the
+/// same threshold the plain-text display this replaces already flagged,
+/// so a bad match is visible at a glance without reading the number.
+///
+/// NOTE: draw_s_meter was later restyled (top header row, thick colored
+/// band, radial glow) to match a real reference image the RX side was
+/// asked to match -- this TX gauge was deliberately left as its
+/// original bottom-readout/thin-line style rather than restyled to
+/// match sight-unseen, so it no longer looks like "the same gauge
+/// family" the two used to. Restyle this one too if/when there's a
+/// reference for it.
 fn draw_power_meter(ui: &mut egui::Ui, rect: egui::Rect, watts: f32, swr: f32, max_watts: f32, max_swr: f32) {
     let painter = ui.painter();
     painter.rect_filled(rect, 4.0, egui::Color32::from_gray(20));
 
-    // Same reserved-bottom-space approach as draw_s_meter, and the same
-    // TEXT_ZONE/TOP_MARGIN/Y_SQUASH values -- see its doc comment for
-    // why they exist -- so this gauge ends up the same size/shape, not
-    // a differently-flattened one just because its readout happens to
-    // say more; the two swap in place of each other while transmitting,
-    // so they need to look like the same gauge family.
     const TEXT_ZONE: f32 = 26.0;
     const TOP_MARGIN: f32 = 6.0;
     const Y_SQUASH: f32 = 0.55;
