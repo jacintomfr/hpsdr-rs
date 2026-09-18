@@ -31,8 +31,9 @@ const SOCKET_TIMEOUT: Duration = Duration::from_millis(250);
 /// same host as hpsdr-rs). Real Hermes-family hardware has a proper
 /// vendor-assigned MAC and would never report this exact value, so it's
 /// used as the signal to tell a Radioberry apart from a real HermesLite2 --
-/// see `Boards::Radioberry`'s own doc comment for why the rest of the
-/// discovery reply can't tell them apart.
+/// see `Device::is_radioberry`'s own doc comment for why the rest of the
+/// discovery reply can't tell them apart (deliberately NOT a distinct
+/// `Boards` variant -- see that field's doc comment for why).
 const RADIOBERRY_SENTINEL_MAC: [u8; 6] = [0, 1, 2, 3, 4, 5];
 
 #[derive(Copy, Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -46,19 +47,6 @@ pub enum Boards {
     Saturn,
     HermesLite,
     HermesLite2,
-    /// Radioberry 2.x (pa3gsb) -- different hardware from a real HermesLite2,
-    /// but its gateware derives from HL2's, so its Protocol 1 discovery reply
-    /// is otherwise byte-for-byte identical (same board id 6, same version
-    /// range) and would otherwise be misclassified as `HermesLite2` above.
-    /// Distinguished instead by the fixed sentinel MAC its Juice host
-    /// program fills in (see `RADIOBERRY_SENTINEL_MAC` and the override in
-    /// `from_p1_reply`/`from_p2_reply`) -- a real report confirmed this MAC
-    /// (`00:01:02:03:04:05`) shows up identically across every interface a
-    /// Radioberry-via-Juice setup is discovered on, since Juice runs on the
-    /// same host as hpsdr-rs and has no real Ethernet MAC to report.
-    /// Notably lacks the AK4951 audio codec add-on board real HermesLite2
-    /// hardware can have -- see main.rs's `hl2_ak4951_codec` UI gating.
-    Radioberry,
     /// The original HPSDR hardware -- Ozy (Cypress FX2 + FPGA) paired
     /// with separate Mercury/Penny boards, reached over raw USB bulk
     /// transfers instead of Ethernet/UDP. Still Protocol 1 framing
@@ -102,9 +90,39 @@ pub struct Device {
     /// used anywhere until now.
     pub frequency_min: u64,
     pub frequency_max: u64,
+    /// True for a Radioberry 2.x (pa3gsb) discovered via its Juice host
+    /// program, detected by `RADIOBERRY_SENTINEL_MAC` (see that const's own
+    /// doc comment). Deliberately NOT folded into `board` as its own
+    /// `Boards` variant: Radioberry's gateware derives from HermesLite2's,
+    /// so it genuinely shares every wire-protocol behavior this project
+    /// gates on `Boards::HermesLite2` (RF Gain vs step attenuator, PA/drive
+    /// handling, PureSignal feedback DDC wiring, power calibration) --
+    /// `board` is left as `HermesLite2` so all of that keeps working with
+    /// zero extra code, and so every existing `match`/`matches!` over
+    /// `Boards` (including exhaustive ones) stays untouched, upstream-
+    /// identical, and conflict-free on merge. This flag exists only for
+    /// the one real difference: real HermesLite2 hardware can have the
+    /// AK4951 audio codec add-on board, Radioberry never does -- see
+    /// main.rs's `hl2_ak4951_codec` UI gating, the only place this is
+    /// actually consulted for behavior (plus `Device::board_label` for
+    /// display, so the UI doesn't just say "HermesLite2").
+    pub is_radioberry: bool,
 }
 
 impl Device {
+    /// Display label for this device's board -- same as `{:?}` on `board`
+    /// for every real board, except a Radioberry (which reports as
+    /// `Boards::HermesLite2` at the protocol level -- see `is_radioberry`'s
+    /// own doc comment for why) shows its own name instead, so the UI
+    /// doesn't just call it "HermesLite2".
+    pub fn board_label(&self) -> String {
+        if self.is_radioberry {
+            "Radioberry".to_string()
+        } else {
+            format!("{:?}", self.board)
+        }
+    }
+
     /// Parse a Protocol 1 (Metis) discovery reply.
     /// Layout: <0xEF><0xFE><status><MAC 6 bytes><fw version><board id>...
     fn from_p1_reply(buf: &[u8], src: SocketAddr, my_address: SocketAddr) -> Option<Device> {
@@ -115,11 +133,9 @@ impl Device {
         let mac = [buf[3], buf[4], buf[5], buf[6], buf[7], buf[8]];
         let version = buf[9];
         let board_id = buf[10];
-        let (mut board, adcs, supported_receivers, supported_transmitters, frequency_min, frequency_max) =
+        let (board, adcs, supported_receivers, supported_transmitters, frequency_min, frequency_max) =
             board_info_p1(board_id, version, buf[19]);
-        if board == Boards::HermesLite2 && mac == RADIOBERRY_SENTINEL_MAC {
-            board = Boards::Radioberry;
-        }
+        let is_radioberry = board == Boards::HermesLite2 && mac == RADIOBERRY_SENTINEL_MAC;
 
         Some(Device {
             address: src,
@@ -135,6 +151,7 @@ impl Device {
             adcs,
             frequency_min,
             frequency_max,
+            is_radioberry,
         })
     }
 
@@ -148,11 +165,9 @@ impl Device {
         let mac = [buf[5], buf[6], buf[7], buf[8], buf[9], buf[10]];
         let board_id = buf[11];
         let version = buf[13];
-        let (mut board, adcs, supported_receivers, supported_transmitters, frequency_min, frequency_max) =
+        let (board, adcs, supported_receivers, supported_transmitters, frequency_min, frequency_max) =
             board_info_p2(board_id);
-        if board == Boards::HermesLite2 && mac == RADIOBERRY_SENTINEL_MAC {
-            board = Boards::Radioberry;
-        }
+        let is_radioberry = board == Boards::HermesLite2 && mac == RADIOBERRY_SENTINEL_MAC;
 
         Some(Device {
             address: src,
@@ -168,6 +183,7 @@ impl Device {
             adcs,
             frequency_min,
             frequency_max,
+            is_radioberry,
         })
     }
 }
@@ -379,6 +395,7 @@ fn discover_ozy_usb(devices: &Arc<Mutex<Vec<Device>>>) {
         adcs: 2,
         frequency_min: 0,
         frequency_max: 61_440_000,
+        is_radioberry: false,
     });
 }
 

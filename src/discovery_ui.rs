@@ -341,7 +341,7 @@ impl DiscoveryWindow {
                             let mut row_double_clicked = false;
                             let resp = selectable_cell(
                                 ui,
-                                format!("{:?}", dev.board),
+                                dev.board_label(),
                                 is_selected,
                                 available,
                             );

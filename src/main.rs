@@ -421,7 +421,7 @@ fn midi_knob_range(value: u8, lo: f64, hi: f64) -> f64 {
 fn midi_action_label(action: MidiAction, connected: &ConnectedState) -> &'static str {
     if action == MidiAction::RfAttenuation
         && connected.device.protocol == 1
-        && matches!(connected.device.board, Boards::HermesLite | Boards::HermesLite2 | Boards::Radioberry)
+        && matches!(connected.device.board, Boards::HermesLite | Boards::HermesLite2)
     {
         "RF Gain"
     } else {
@@ -822,7 +822,7 @@ fn dispatch_midi_event(connected: &mut ConnectedState, ev: RawMidiEvent, freq_hz
             // HermesLite2 on Protocol 2, which has no RF Gain concept)
             // is the standard 0-31 dB attenuator.
             if connected.device.protocol == 1
-                && matches!(connected.device.board, Boards::HermesLite | Boards::HermesLite2 | Boards::Radioberry)
+                && matches!(connected.device.board, Boards::HermesLite | Boards::HermesLite2)
             {
                 let gain_db = midi_knob_range(ev.value, -12.0, 48.0);
                 connected.session.rx_attenuation.store((gain_db + 12.0).clamp(0.0, 60.0) as u32, Ordering::Relaxed);
@@ -2015,7 +2015,7 @@ fn connect_to_device(device: Device, cfg: &Config) -> Result<ConnectedState, Str
                     Arc::clone(&session.rit_offset_hz),
                     Arc::clone(&session.xit_enabled),
                     Arc::clone(&session.xit_offset_hz),
-                    format!("{:?}", device.board),
+                    device.board_label(),
                     tci_debug_log.clone(),
                 ) {
                     Ok(s) => Some(s),
@@ -3115,7 +3115,7 @@ impl eframe::App for HpsdrApp {
                 } else {
                     let stored_rx_atten = connected.session.rx_attenuation.load(Ordering::Relaxed) as i32;
                     let correction_db = if connected.device.protocol == 1
-                        && matches!(connected.device.board, Boards::HermesLite | Boards::HermesLite2 | Boards::Radioberry)
+                        && matches!(connected.device.board, Boards::HermesLite | Boards::HermesLite2)
                     {
                         connected.rx_gain_calibration_db - (stored_rx_atten - 12)
                     } else {
@@ -3784,7 +3784,7 @@ impl eframe::App for HpsdrApp {
                         // "how loud" controls and this row to the "how much signal
                         // in/out" controls.
                         if connected.device.protocol == 1
-                            && matches!(connected.device.board, Boards::HermesLite | Boards::HermesLite2 | Boards::Radioberry)
+                            && matches!(connected.device.board, Boards::HermesLite | Boards::HermesLite2)
                         {
                             // The stored wire value is gain_db+12 (0-60) -- see
                             // RadioSession::rx_attenuation's doc comment -- so the
@@ -5854,7 +5854,7 @@ impl eframe::App for HpsdrApp {
                                                 Arc::clone(&connected.session.rit_offset_hz),
                                                 Arc::clone(&connected.session.xit_enabled),
                                                 Arc::clone(&connected.session.xit_offset_hz),
-                                                format!("{:?}", connected.device.board),
+                                                connected.device.board_label(),
                                                 connected.tci_debug_log.clone(),
                                             ) {
                                                 Ok(s) => Some(s),
@@ -6415,7 +6415,7 @@ impl eframe::App for HpsdrApp {
                                     ui.add_space(4.0);
                                     egui::Grid::new("about_grid").num_columns(2).spacing([12.0, 6.0]).show(ui, |ui| {
                                         ui.label("Board:");
-                                        ui.label(format!("{:?}", connected.device.board));
+                                        ui.label(connected.device.board_label());
                                         ui.end_row();
 
                                         ui.label("Protocol:");
@@ -6950,9 +6950,14 @@ impl eframe::App for HpsdrApp {
                                         // original HermesLite, and Protocol 2 has no wire-
                                         // byte conflict to protect against in the first
                                         // place (send_rx_audio_to_radio already just works
-                                        // there, nothing to opt into).
+                                        // there, nothing to opt into). Real HermesLite2
+                                        // hardware only -- a Radioberry (see Device::
+                                        // is_radioberry's doc comment for why it otherwise
+                                        // reports as `Boards::HermesLite2` here) never has
+                                        // this add-on board.
                                         let hl2_p1 = connected.device.protocol == 1
-                                            && matches!(connected.device.board, Boards::HermesLite2);
+                                            && matches!(connected.device.board, Boards::HermesLite2)
+                                            && !connected.device.is_radioberry;
                                         let mut hl2_ak4951_codec = false;
                                         if hl2_p1 {
                                             hl2_ak4951_codec =
@@ -6982,7 +6987,7 @@ impl eframe::App for HpsdrApp {
                                             && connected.device.protocol == 1
                                             && matches!(
                                                 connected.device.board,
-                                                Boards::HermesLite | Boards::HermesLite2 | Boards::Radioberry
+                                                Boards::HermesLite | Boards::HermesLite2
                                             )
                                             && !(hl2_p1 && hl2_ak4951_codec)
                                         {
@@ -7414,7 +7419,7 @@ impl eframe::App for HpsdrApp {
                                     // PureSignal's own settings tab). Same underlying value as
                                     // that tab's "Feedback Attenuation" slider -- adjusting either
                                     // one changes both.
-                                    if !matches!(connected.device.board, Boards::HermesLite | Boards::HermesLite2 | Boards::Radioberry) {
+                                    if !matches!(connected.device.board, Boards::HermesLite | Boards::HermesLite2) {
                                         let mut tx_atten = connected
                                             .session
                                             .ps_tx_attenuation
@@ -8300,7 +8305,7 @@ impl eframe::App for HpsdrApp {
                                             // adjusting either one changes both.
                                             if !matches!(
                                                 connected.device.board,
-                                                Boards::HermesLite | Boards::HermesLite2 | Boards::Radioberry
+                                                Boards::HermesLite | Boards::HermesLite2
                                             ) {
                                                 let mut ps_atten = connected
                                                     .session
@@ -9906,7 +9911,7 @@ fn default_ps_hw_peak(protocol: u8) -> f64 {
 /// overshoots it.
 fn default_max_tx_power_watts(board: Boards) -> u32 {
     match board {
-        Boards::HermesLite | Boards::HermesLite2 | Boards::Radioberry => 5,
+        Boards::HermesLite | Boards::HermesLite2 => 5,
         // Bare Penny/Penelope exciter, no add-on PA -- same low-power
         // bucket as HermesLite rather than a full-power board's default.
         Boards::Ozy => 5,
@@ -9959,16 +9964,15 @@ fn power_watts_and_swr(raw_forward: u32, raw_reverse: u32, board: Boards) -> (f3
         Boards::Orion2 => (5.0, 0.08),
         Boards::Saturn => (3.3, 0.09),
         Boards::HermesLite => (3.3, 1.4),
+        // UNVERIFIED for a Radioberry specifically (see Device::
+        // is_radioberry's doc comment -- it reports as HermesLite2 here,
+        // deliberately, since it shares this board's wire protocol): its
+        // forward/reverse power detector is different physical hardware
+        // from a real HermesLite2's, and no confirmed reference for its
+        // own calibration was found, so this value is a placeholder for
+        // it too. Flag and fix once real hardware is available to compare
+        // an indicated value against a real power meter.
         Boards::HermesLite2 => (3.3, 1.4),
-        // UNVERIFIED: Radioberry's forward/reverse power detector is
-        // different physical hardware from a real HermesLite2's, even
-        // though its gateware derives from HL2's -- no confirmed
-        // reference for its own calibration was found, so this reuses
-        // HL2's constants as a placeholder (same reasoning as Penny's
-        // arm just below) rather than as a known-correct value. Flag and
-        // fix once real hardware is available to compare an indicated
-        // value against a real power meter.
-        Boards::Radioberry => (3.3, 1.4),
         // UNVERIFIED: no confirmed reference for Penny's own forward/
         // reverse power detector calibration was found (piHPSDR's
         // ozyio.c exposes the raw I2C-read ADC values penny_fp/penny_rp
