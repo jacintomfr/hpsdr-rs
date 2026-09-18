@@ -3489,6 +3489,17 @@ impl eframe::App for HpsdrApp {
                                 } else {
                                     ui.weak(format!("All {max} receivers active"));
                                 }
+                                // Belongs with Settings/Add Receiver, not off on its own --
+                                // this whole vertical only renders once for the main
+                                // receiver's own toolbar (Add Receiver above references
+                                // connected.session directly), so this naturally shows up
+                                // exactly once too, never repeated for extra receivers,
+                                // which don't have their own separate juice process to
+                                // control anyway (there's only ever one juice per radio
+                                // session, matching the one board it drives).
+                                if connected.juice_console.is_some() && ui.button("Juice Console...").clicked() {
+                                    connected.show_juice_console_window = !connected.show_juice_console_window;
+                                }
                             });
 
                             (freq_label, vfo_b_label)
@@ -5462,12 +5473,6 @@ impl eframe::App for HpsdrApp {
                                 );
                             } else {
                                 connected.tx_fifo_warning_until = None;
-                            }
-                        }
-                        if connected.juice_console.is_some() {
-                            ui.add_space(4.0);
-                            if ui.button("Juice Console...").clicked() {
-                                connected.show_juice_console_window = !connected.show_juice_console_window;
                             }
                         }
                     });
