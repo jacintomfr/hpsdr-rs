@@ -3736,152 +3736,29 @@ impl eframe::App for HpsdrApp {
                         // Rows can add fewer than 6 cells (e.g. no TX
                         // controls on an RX-only connection); Grid still
                         // aligns whatever's present to its own column.
-                        // Explicit spacing (wider than the default) -- a
-                        // real report: at the default gap, Mic gain's
-                        // slider sitting at its minimum value visually
-                        // crowded TCI TX gain right up against it, making
-                        // the 3 blocks look uneven. A bit more breathing
-                        // room between every cell (labels and sliders
-                        // alike, not just between blocks -- Grid applies
-                        // one spacing uniformly) fixes that without
-                        // needing separate spacer columns.
+                        // No explicit .spacing() override -- REAL BUG FIX
+                        // (a real report): an earlier version set an
+                        // enlarged [16.0, 6.0] here, wider than the rest
+                        // of this window's controls (e.g. the AGC Gain
+                        // slider a few rows below, which uses the plain
+                        // default ui.spacing().item_spacing everywhere --
+                        // label-to-slider, and implicitly slider-to-its-
+                        // own-value too). Leaving Grid's spacing
+                        // unspecified inherits that same default
+                        // (8.0, 3.0) instead, so every gap here --
+                        // label-to-slider, slider-to-value, AND between
+                        // the 3 blocks, all literally the same Grid
+                        // spacing value -- matches the rest of the
+                        // window's own look instead of standing out.
                         // REAL BUG FIX (a real report, twice -- the first
                         // attempt at this, wrapping each slider in a
                         // fixed-size ui.allocate_ui, DIDN'T actually fix
-                        // it: allocate_ui's given size is only a layout
-                        // hint, and egui::Slider doesn't clip itself to a
-                        // parent's max_rect, so the cell kept growing
-                        // with its value text regardless). The real fix:
-                        // egui::Slider's OWN value text is what varies in
-                        // width ("-100 dB" vs "-6 dB"), so turn it off
-                        // entirely (`.show_value(false)`) and draw a
-                        // replacement value label ourselves, formatted to
-                        // a FIXED character count (Rust's `{:>N}` padding)
-                        // in a monospace font -- monospace means fixed
-                        // character count is genuinely fixed pixel width,
-                        // not just usually-similar, so the column Grid
-                        // measures is deterministic regardless of the
-                        // current value. `.desired_width()` fixes the
-                        // slider TRACK itself the same way (this one IS
-                        // respected by Slider, unlike a parent's size).
-                        const TRACK_WIDTH: f32 = 90.0;
-                        // Replaces the rounded gray background the
-                        // Slider's own built-in value box used to draw --
-                        // a real report: turning that box off along with
-                        // its variable-width text (show_value(false), see
-                        // above) also lost this, and it's worth keeping
-                        // purely cosmetically. Same fill/rounding as any
-                        // other inactive widget in the current theme, so
-                        // it matches everything else without hardcoding
-                        // a color.
-                        let value_box = |ui: &mut egui::Ui, text: String| {
-                            let visuals = ui.visuals().widgets.inactive;
-                            egui::Frame::new().fill(visuals.bg_fill).corner_radius(visuals.corner_radius).inner_margin(4).show(
-                                ui,
-                                |ui| {
-                                    ui.label(egui::RichText::new(text).monospace());
-                                },
-                            );
-                        };
-                        let db_slider = |ui: &mut egui::Ui,
-                                          scroll_accum: &mut f32,
-                                          value: &mut f32,
-                                          min_db: f32,
-                                          max_db: f32,
-                                          step_db: f32| {
-                            let mut db = if *value > 0.0 { 20.0 * value.log10() } else { min_db };
-                            let resp = ui.add(egui::Slider::new(&mut db, min_db..=max_db).show_value(false));
-                            let mut changed = resp.changed();
-                            if resp.hovered() {
-                                let scroll_delta = ui.input(|i| i.smooth_scroll_delta);
-                                let delta = if scroll_delta.y.abs() >= scroll_delta.x.abs() {
-                                    scroll_delta.y
-                                } else {
-                                    scroll_delta.x
-                                };
-                                if delta != 0.0 {
-                                    *scroll_accum += delta;
-                                    const NOTCH: f32 = 20.0;
-                                    while scroll_accum.abs() >= NOTCH {
-                                        let sign = scroll_accum.signum();
-                                        *scroll_accum -= sign * NOTCH;
-                                        db = (db + step_db * sign).clamp(min_db, max_db);
-                                        changed = true;
-                                    }
-                                }
-                            }
-                            if changed {
-                                *value = 10f32.powf(db / 20.0);
-                            }
-                            value_box(ui, format!("{db:>5.0} dB"));
-                            changed
-                        };
-                        let i32_slider = |ui: &mut egui::Ui,
-                                           scroll_accum: &mut f32,
-                                           value: &mut i32,
-                                           range: std::ops::RangeInclusive<i32>,
-                                           step: i32,
-                                           suffix: &str| {
-                            let resp = ui.add(egui::Slider::new(value, range.clone()).show_value(false));
-                            let mut changed = resp.changed();
-                            if resp.hovered() {
-                                let scroll_delta = ui.input(|i| i.smooth_scroll_delta);
-                                let delta = if scroll_delta.y.abs() >= scroll_delta.x.abs() {
-                                    scroll_delta.y
-                                } else {
-                                    scroll_delta.x
-                                };
-                                if delta != 0.0 {
-                                    *scroll_accum += delta;
-                                    const NOTCH: f32 = 20.0;
-                                    while scroll_accum.abs() >= NOTCH {
-                                        let sign = scroll_accum.signum();
-                                        *scroll_accum -= sign * NOTCH;
-                                        *value = (*value + step * sign as i32).clamp(*range.start(), *range.end());
-                                        changed = true;
-                                    }
-                                }
-                            }
-                            value_box(ui, format!("{value:>4}{suffix}"));
-                            changed
-                        };
-                        let f64_slider = |ui: &mut egui::Ui,
-                                           scroll_accum: &mut f32,
-                                           value: &mut f64,
-                                           range: std::ops::RangeInclusive<f64>,
-                                           step: f64,
-                                           suffix: &str| {
-                            let resp = ui.add(egui::Slider::new(value, range.clone()).show_value(false));
-                            let mut changed = resp.changed();
-                            if resp.hovered() {
-                                let scroll_delta = ui.input(|i| i.smooth_scroll_delta);
-                                let delta = if scroll_delta.y.abs() >= scroll_delta.x.abs() {
-                                    scroll_delta.y
-                                } else {
-                                    scroll_delta.x
-                                };
-                                if delta != 0.0 {
-                                    *scroll_accum += delta;
-                                    const NOTCH: f32 = 20.0;
-                                    while scroll_accum.abs() >= NOTCH {
-                                        let sign = scroll_accum.signum();
-                                        *scroll_accum -= sign * NOTCH;
-                                        *value = (*value + step * sign as f64).clamp(*range.start(), *range.end());
-                                        changed = true;
-                                    }
-                                }
-                            }
-                            value_box(ui, format!("{value:>5.0}{suffix}"));
-                            changed
-                        };
-                        // This egui version has no per-Slider desired_width
-                        // -- the track width is a style setting
-                        // (Spacing::slider_width), so it's set here (saved/
-                        // restored around just this grid) instead of on
-                        // each Slider individually.
-                        let prev_slider_width = ui.spacing().slider_width;
-                        ui.spacing_mut().slider_width = TRACK_WIDTH;
-                        egui::Grid::new("gain_filter_grid").num_columns(6).spacing([16.0, 6.0]).show(ui, |ui| {
+                        // it): see stable_db_slider/stable_i32_slider/
+                        // stable_f64_slider's own doc comments (defined
+                        // near scroll_slider_f64, since AGC Gain's own
+                        // slider further down uses them too) for the
+                        // actual fix and why.
+                        egui::Grid::new("gain_filter_grid").num_columns(6).show(ui, |ui| {
                         ui.label("Audio gain:");
                         let mut gain = current_gain;
                         // ROOT CAUSE FIX: max raised from 1.5 -- a real
@@ -3898,7 +3775,7 @@ impl eframe::App for HpsdrApp {
                         // 8.0 linear max; -100dB floor is effectively
                         // silent (0.00001 linear) while still being a
                         // finite, draggable slider position.
-                        if db_slider(ui, &mut connected.slider_scroll_accum, &mut gain, -100.0, 18.0, 1.0) {
+                        if stable_db_slider(ui, &mut connected.slider_scroll_accum, &mut gain, -100.0, 18.0, 1.0) {
                             connected.spectrum.set_gain(gain);
                             settings_changed = true;
                         }
@@ -3911,7 +3788,7 @@ impl eframe::App for HpsdrApp {
                                 // scroll_slider_f32_db's doc comment) --
                                 // +6dB ceiling matches the old 2.0 linear
                                 // max, -60dB floor matches Audio gain's own.
-                                if db_slider(ui, &mut connected.slider_scroll_accum, &mut mic_gain, -60.0, 6.0, 1.0) {
+                                if stable_db_slider(ui, &mut connected.slider_scroll_accum, &mut mic_gain, -60.0, 6.0, 1.0) {
                                     connected.mic_gain = mic_gain;
                                     if let Some(tx) = &connected.tx_handle {
                                         tx.set_mic_gain(mic_gain);
@@ -3936,7 +3813,7 @@ impl eframe::App for HpsdrApp {
                                 // gain's own.
                                 ui.label("TCI TX gain:");
                                 let mut tci_tx_gain = connected.tci_tx_gain;
-                                if db_slider(ui, &mut connected.slider_scroll_accum, &mut tci_tx_gain, -60.0, 60.0, 1.0) {
+                                if stable_db_slider(ui, &mut connected.slider_scroll_accum, &mut tci_tx_gain, -60.0, 60.0, 1.0) {
                                     connected.tci_tx_gain = tci_tx_gain;
                                     *connected.session.tci_tx_gain.lock().unwrap() = tci_tx_gain;
                                     settings_changed = true;
@@ -3972,7 +3849,7 @@ impl eframe::App for HpsdrApp {
                             let mut gain_db =
                                 connected.session.rx_attenuation.load(Ordering::Relaxed) as i32 - 12;
                             ui.label("RX Gain:");
-                            if i32_slider(ui, &mut connected.slider_scroll_accum, &mut gain_db, -12..=48, 1, " dB") {
+                            if stable_i32_slider(ui, &mut connected.slider_scroll_accum, &mut gain_db, -12..=48, 1, " dB") {
                                 connected
                                     .session
                                     .rx_attenuation
@@ -3982,7 +3859,7 @@ impl eframe::App for HpsdrApp {
                         } else {
                             let mut atten = connected.session.rx_attenuation.load(Ordering::Relaxed) as i32;
                             ui.label("RX Attenuation:");
-                            if i32_slider(ui, &mut connected.slider_scroll_accum, &mut atten, 0..=31, 1, " dB") {
+                            if stable_i32_slider(ui, &mut connected.slider_scroll_accum, &mut atten, 0..=31, 1, " dB") {
                                 connected.session.rx_attenuation.store(atten as u32, Ordering::Relaxed);
                                 settings_changed = true;
                             }
@@ -4015,7 +3892,7 @@ impl eframe::App for HpsdrApp {
                             let mut watts =
                                 connected.session.tx_power_watts.load(Ordering::Relaxed) as i32;
                             let max_tx_power_watts = connected.max_tx_power_watts as i32;
-                            if i32_slider(ui, &mut connected.slider_scroll_accum, &mut watts, 0..=max_tx_power_watts, 1, "W") {
+                            if stable_i32_slider(ui, &mut connected.slider_scroll_accum, &mut watts, 0..=max_tx_power_watts, 1, "W") {
                                 connected.session.tx_power_watts.store(watts as u32, Ordering::Relaxed);
                                 settings_changed = true;
                                 // A manual adjustment while Tune is active is
@@ -4038,7 +3915,7 @@ impl eframe::App for HpsdrApp {
                         // a row with the mode buttons.
                         ui.label("Filter width:");
                         let mut width = current_width;
-                        if f64_slider(ui, &mut connected.slider_scroll_accum, &mut width, 50.0..=5000.0, 50.0, " Hz") {
+                        if stable_f64_slider(ui, &mut connected.slider_scroll_accum, &mut width, 50.0..=5000.0, 50.0, " Hz") {
                             connected.spectrum.set_width_hz(width);
                             if let Some(tx) = &connected.tx_handle {
                                 tx.set_width_hz(width);
@@ -4050,7 +3927,6 @@ impl eframe::App for HpsdrApp {
                         }
                         ui.end_row();
                         });
-                        ui.spacing_mut().slider_width = prev_slider_width;
                     });
 
                     // Moved here from Settings -> TX (still shown there
@@ -4145,14 +4021,12 @@ impl eframe::App for HpsdrApp {
                         ui.add_space(12.0);
                         ui.label("AGC Gain:");
                         let mut agc_top_db = connected.spectrum.agc_params().agc_top_db;
-                        if scroll_slider_f64(
-                            ui,
-                            &mut connected.slider_scroll_accum,
-                            &mut agc_top_db,
-                            0.0..=140.0,
-                            2.0,
-                            " dB",
-                        ) {
+                        // Same fixed-width value box as the gain/filter
+                        // grid above -- a real request: keep this
+                        // slider's value display looking the same as
+                        // those, not the plain variable-width one every
+                        // other scroll_slider_f64 call site still uses.
+                        if stable_f64_slider(ui, &mut connected.slider_scroll_accum, &mut agc_top_db, 0.0..=140.0, 2.0, " dB") {
                             connected.spectrum.set_agc_top_db(agc_top_db);
                             settings_changed = true;
                         }
@@ -5423,7 +5297,16 @@ impl eframe::App for HpsdrApp {
                         // sliders. Scoped to this row's own child Ui, so
                         // it doesn't affect any other slider elsewhere
                         // in the window.
-                        let reserved = 230.0;
+                        //
+                        // REAL BUG FIX: a real report -- 230.0 under-
+                        // estimated the actual fixed content ("Zoom:" +
+                        // its value box + "Pan:" + its value box + the
+                        // Reset button + the item spacing between all of
+                        // them, roughly 260px), so the two sliders were
+                        // handed a couple more pixels each than the row
+                        // actually had room for, and Reset got pushed
+                        // past the window's own right edge as a result.
+                        let reserved = 260.0;
                         ui.spacing_mut().slider_width = ((ui.available_width() - reserved) / 2.0).max(80.0);
 
                         ui.label("Zoom:");
@@ -9941,6 +9824,141 @@ fn format_frequency(hz: u32) -> String {
         out.push(*b as char);
     }
     format!("{out} Hz")
+}
+
+/// Track width for stable_db_slider/stable_i32_slider/stable_f64_slider
+/// below -- this egui version has no per-Slider desired_width, so the
+/// track width is instead a style setting (Spacing::slider_width),
+/// saved/restored around each call rather than left mutated globally.
+const STABLE_SLIDER_TRACK_WIDTH: f32 = 90.0;
+
+/// Rounded gray box behind a slider's value -- replaces the background
+/// egui::Slider's own built-in value box used to draw before
+/// stable_db_slider/stable_i32_slider/stable_f64_slider below turned it
+/// off (see their own doc comments for why); worth keeping purely
+/// cosmetically. Same fill/rounding as any other inactive widget in the
+/// current theme, so it matches everything else without hardcoding a
+/// color.
+fn stable_value_box(ui: &mut egui::Ui, text: String) {
+    let visuals = ui.visuals().widgets.inactive;
+    egui::Frame::new().fill(visuals.bg_fill).corner_radius(visuals.corner_radius).inner_margin(4).show(ui, |ui| {
+        ui.label(egui::RichText::new(text).monospace());
+    });
+}
+
+/// REAL BUG FIX (a real report, twice -- the first attempt at this,
+/// wrapping each slider in a fixed-size ui.allocate_ui, DIDN'T actually
+/// fix it: allocate_ui's given size is only a layout hint, and
+/// egui::Slider doesn't clip itself to a parent's max_rect, so a
+/// containing Grid cell kept growing with the slider's value text
+/// regardless). The real fix: egui::Slider's OWN value text is what
+/// varies in width ("-100 dB" vs "-6 dB"), so turn it off entirely
+/// (`.show_value(false)`) and draw a replacement value label ourselves,
+/// formatted to a FIXED character count (Rust's `{:>N}` padding) in a
+/// monospace font -- monospace means fixed character count is genuinely
+/// fixed pixel width, not just usually-similar, so anything measuring
+/// this (a Grid column, or just visual alignment against a neighboring
+/// slider like AGC Gain's own) stays put regardless of the current
+/// value. Same scroll-wheel-to-step behavior as scroll_slider_f32_db.
+fn stable_db_slider(
+    ui: &mut egui::Ui,
+    scroll_accum: &mut f32,
+    value: &mut f32,
+    min_db: f32,
+    max_db: f32,
+    step_db: f32,
+) -> bool {
+    let prev_slider_width = ui.spacing().slider_width;
+    ui.spacing_mut().slider_width = STABLE_SLIDER_TRACK_WIDTH;
+    let mut db = if *value > 0.0 { 20.0 * value.log10() } else { min_db };
+    let resp = ui.add(egui::Slider::new(&mut db, min_db..=max_db).show_value(false));
+    ui.spacing_mut().slider_width = prev_slider_width;
+    let mut changed = resp.changed();
+    if resp.hovered() {
+        let scroll_delta = ui.input(|i| i.smooth_scroll_delta);
+        let delta = if scroll_delta.y.abs() >= scroll_delta.x.abs() { scroll_delta.y } else { scroll_delta.x };
+        if delta != 0.0 {
+            *scroll_accum += delta;
+            const NOTCH: f32 = 20.0;
+            while scroll_accum.abs() >= NOTCH {
+                let sign = scroll_accum.signum();
+                *scroll_accum -= sign * NOTCH;
+                db = (db + step_db * sign).clamp(min_db, max_db);
+                changed = true;
+            }
+        }
+    }
+    if changed {
+        *value = 10f32.powf(db / 20.0);
+    }
+    stable_value_box(ui, format!("{db:>5.0} dB"));
+    changed
+}
+
+/// Same fixed-width-value treatment as stable_db_slider above, for a
+/// plain i32 range (RX Gain/Attenuation, TX Power).
+fn stable_i32_slider(
+    ui: &mut egui::Ui,
+    scroll_accum: &mut f32,
+    value: &mut i32,
+    range: std::ops::RangeInclusive<i32>,
+    step: i32,
+    suffix: &str,
+) -> bool {
+    let prev_slider_width = ui.spacing().slider_width;
+    ui.spacing_mut().slider_width = STABLE_SLIDER_TRACK_WIDTH;
+    let resp = ui.add(egui::Slider::new(value, range.clone()).show_value(false));
+    ui.spacing_mut().slider_width = prev_slider_width;
+    let mut changed = resp.changed();
+    if resp.hovered() {
+        let scroll_delta = ui.input(|i| i.smooth_scroll_delta);
+        let delta = if scroll_delta.y.abs() >= scroll_delta.x.abs() { scroll_delta.y } else { scroll_delta.x };
+        if delta != 0.0 {
+            *scroll_accum += delta;
+            const NOTCH: f32 = 20.0;
+            while scroll_accum.abs() >= NOTCH {
+                let sign = scroll_accum.signum();
+                *scroll_accum -= sign * NOTCH;
+                *value = (*value + step * sign as i32).clamp(*range.start(), *range.end());
+                changed = true;
+            }
+        }
+    }
+    stable_value_box(ui, format!("{value:>4}{suffix}"));
+    changed
+}
+
+/// Same fixed-width-value treatment as stable_db_slider above, for a
+/// plain f64 range (Filter width, AGC Gain).
+fn stable_f64_slider(
+    ui: &mut egui::Ui,
+    scroll_accum: &mut f32,
+    value: &mut f64,
+    range: std::ops::RangeInclusive<f64>,
+    step: f64,
+    suffix: &str,
+) -> bool {
+    let prev_slider_width = ui.spacing().slider_width;
+    ui.spacing_mut().slider_width = STABLE_SLIDER_TRACK_WIDTH;
+    let resp = ui.add(egui::Slider::new(value, range.clone()).show_value(false));
+    ui.spacing_mut().slider_width = prev_slider_width;
+    let mut changed = resp.changed();
+    if resp.hovered() {
+        let scroll_delta = ui.input(|i| i.smooth_scroll_delta);
+        let delta = if scroll_delta.y.abs() >= scroll_delta.x.abs() { scroll_delta.y } else { scroll_delta.x };
+        if delta != 0.0 {
+            *scroll_accum += delta;
+            const NOTCH: f32 = 20.0;
+            while scroll_accum.abs() >= NOTCH {
+                let sign = scroll_accum.signum();
+                *scroll_accum -= sign * NOTCH;
+                *value = (*value + step * sign as f64).clamp(*range.start(), *range.end());
+                changed = true;
+            }
+        }
+    }
+    stable_value_box(ui, format!("{value:>5.0}{suffix}"));
+    changed
 }
 
 /// Same accumulate-and-threshold pattern as frequency scroll-to-tune:
