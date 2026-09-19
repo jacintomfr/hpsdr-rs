@@ -3697,27 +3697,6 @@ impl eframe::App for HpsdrApp {
                                 settings_changed = true;
                             }
                         }
-
-                        ui.add_space(12.0);
-                        ui.label("Filter width:");
-                        let mut width = current_width;
-                        if scroll_slider_f64(
-                            ui,
-                            &mut connected.slider_scroll_accum,
-                            &mut width,
-                            50.0..=5000.0,
-                            50.0,
-                            " Hz",
-                        ) {
-                            connected.spectrum.set_width_hz(width);
-                            if let Some(tx) = &connected.tx_handle {
-                                tx.set_width_hz(width);
-                            }
-                            connected
-                                .width_memory
-                                .insert(current_mode.label().to_string(), width);
-                            settings_changed = true;
-                        }
                     });
 
                     ui.scope(|ui| {
@@ -3745,76 +3724,69 @@ impl eframe::App for HpsdrApp {
                         // button label) plus its -10px right margin and
                         // a visible gap.
                         ui.set_max_width((ui.available_width() - 220.0).max(0.0));
-                        ui.horizontal_wrapped(|ui| {
-                        // Each label+slider pair below is its own nested
-                        // ui.horizontal (not just a label call followed by
-                        // a slider call directly in the outer
-                        // horizontal_wrapped) -- BUG FIX for a real report:
-                        // horizontal_wrapped wraps at the granularity of
-                        // its own direct children, so without this
-                        // nesting, a label and its slider are two SEPARATE
-                        // wrap units and can end up split across two
-                        // lines at a narrow window width (e.g. "TX Power:"
-                        // staying on the line above while its slider wraps
-                        // down alone) -- clearly broken-looking, and
-                        // confusing about which slider a wrapped-down
-                        // label even belongs to. Nesting them means the
-                        // whole pair wraps together as one atomic unit.
-                        ui.horizontal(|ui| {
-                            ui.label("Audio gain:");
-                            let mut gain = current_gain;
-                            // ROOT CAUSE FIX: max raised from 1.5 -- a real
-                            // report needed more than that even with the
-                            // system output already at 100%/0dB (pavucontrol).
-                            // WDSP's RXA output level is apparently on the
-                            // conservative side for this radio/setup, and
-                            // this is a plain linear multiply against that
-                            // sample before the -1.0..1.0 clamp (see
-                            // spectrum.rs's run()), so there's no correctness
-                            // reason to cap it as low as 1.5 -- just headroom.
-                            // Displayed/dragged in dB (see scroll_slider_f32_db's
-                            // doc comment) -- +18dB ceiling matches the old
-                            // 8.0 linear max; -100dB floor is effectively
-                            // silent (0.00001 linear) while still being a
-                            // finite, draggable slider position.
-                            if scroll_slider_f32_db(
-                                ui,
-                                &mut connected.slider_scroll_accum,
-                                &mut gain,
-                                -100.0,
-                                18.0,
-                                1.0,
-                            ) {
-                                connected.spectrum.set_gain(gain);
-                                settings_changed = true;
-                            }
-                        });
+                        // Grid (not two separate horizontal_wrapped rows,
+                        // the previous layout) -- a real request: with
+                        // natural flow, each row's label widths differ
+                        // ("Audio gain:" vs "RX Gain:"), so the sliders
+                        // below them never lined up between the two rows.
+                        // egui::Grid sizes each COLUMN to the widest cell
+                        // seen in it across every row added to it, which
+                        // is exactly "same X position in both rows" --
+                        // 6 columns (label/slider x3), one row per group.
+                        // Rows can add fewer than 6 cells (e.g. no TX
+                        // controls on an RX-only connection); Grid still
+                        // aligns whatever's present to its own column.
+                        egui::Grid::new("gain_filter_grid").num_columns(6).show(ui, |ui| {
+                        ui.label("Audio gain:");
+                        let mut gain = current_gain;
+                        // ROOT CAUSE FIX: max raised from 1.5 -- a real
+                        // report needed more than that even with the
+                        // system output already at 100%/0dB (pavucontrol).
+                        // WDSP's RXA output level is apparently on the
+                        // conservative side for this radio/setup, and
+                        // this is a plain linear multiply against that
+                        // sample before the -1.0..1.0 clamp (see
+                        // spectrum.rs's run()), so there's no correctness
+                        // reason to cap it as low as 1.5 -- just headroom.
+                        // Displayed/dragged in dB (see scroll_slider_f32_db's
+                        // doc comment) -- +18dB ceiling matches the old
+                        // 8.0 linear max; -100dB floor is effectively
+                        // silent (0.00001 linear) while still being a
+                        // finite, draggable slider position.
+                        if scroll_slider_f32_db(
+                            ui,
+                            &mut connected.slider_scroll_accum,
+                            &mut gain,
+                            -100.0,
+                            18.0,
+                            1.0,
+                        ) {
+                            connected.spectrum.set_gain(gain);
+                            settings_changed = true;
+                        }
 
                         if connected.tx_enabled {
                             if connected.tx_handle.is_some() {
-                                ui.add_space(12.0);
-                                ui.horizontal(|ui| {
-                                    ui.label("Mic gain:");
-                                    let mut mic_gain = connected.mic_gain;
-                                    // Displayed/dragged in dB (see
-                                    // scroll_slider_f32_db's doc comment) --
-                                    // +6dB ceiling matches the old 2.0 linear
-                                    // max, -60dB floor matches Audio gain's own.
-                                    if scroll_slider_f32_db(
-                                        ui,
-                                        &mut connected.slider_scroll_accum,
-                                        &mut mic_gain,
-                                        -60.0,
-                                        6.0,
-                                        1.0,
-                                    ) {
-                                        connected.mic_gain = mic_gain;
-                                        if let Some(tx) = &connected.tx_handle {
-                                            tx.set_mic_gain(mic_gain);
-                                        }
-                                        settings_changed = true;
+                                ui.label("Mic gain:");
+                                let mut mic_gain = connected.mic_gain;
+                                // Displayed/dragged in dB (see
+                                // scroll_slider_f32_db's doc comment) --
+                                // +6dB ceiling matches the old 2.0 linear
+                                // max, -60dB floor matches Audio gain's own.
+                                if scroll_slider_f32_db(
+                                    ui,
+                                    &mut connected.slider_scroll_accum,
+                                    &mut mic_gain,
+                                    -60.0,
+                                    6.0,
+                                    1.0,
+                                ) {
+                                    connected.mic_gain = mic_gain;
+                                    if let Some(tx) = &connected.tx_handle {
+                                        tx.set_mic_gain(mic_gain);
                                     }
-                                });
+                                    settings_changed = true;
+                                }
 
                                 // Separate from Mic gain above -- a real
                                 // test against WSJT-X found its TCI TX
@@ -3831,28 +3803,24 @@ impl eframe::App for HpsdrApp {
                                 // ceiling matches the old 1000.0 linear
                                 // max exactly, -60dB floor matches Audio
                                 // gain's own.
-                                ui.add_space(12.0);
-                                ui.horizontal(|ui| {
-                                    ui.label("TCI TX gain:");
-                                    let mut tci_tx_gain = connected.tci_tx_gain;
-                                    if scroll_slider_f32_db(
-                                        ui,
-                                        &mut connected.slider_scroll_accum,
-                                        &mut tci_tx_gain,
-                                        -60.0,
-                                        60.0,
-                                        1.0,
-                                    ) {
-                                        connected.tci_tx_gain = tci_tx_gain;
-                                        *connected.session.tci_tx_gain.lock().unwrap() = tci_tx_gain;
-                                        settings_changed = true;
-                                    }
-                                });
+                                ui.label("TCI TX gain:");
+                                let mut tci_tx_gain = connected.tci_tx_gain;
+                                if scroll_slider_f32_db(
+                                    ui,
+                                    &mut connected.slider_scroll_accum,
+                                    &mut tci_tx_gain,
+                                    -60.0,
+                                    60.0,
+                                    1.0,
+                                ) {
+                                    connected.tci_tx_gain = tci_tx_gain;
+                                    *connected.session.tci_tx_gain.lock().unwrap() = tci_tx_gain;
+                                    settings_changed = true;
+                                }
                             }
                         }
-                    });
+                        ui.end_row();
 
-                    ui.horizontal_wrapped(|ui| {
                         // Live RX Gain/Attenuation -- matches piHPSDR's own layout
                         // (sliders.c: RF/ATT sits in the same slot, right before AF_GAIN
                         // on the main sliders row) rather than piHPSDR's Settings-style
@@ -3926,42 +3894,64 @@ impl eframe::App for HpsdrApp {
                             // worked but couldn't be calibrated to match a
                             // real wattmeter reading the way P1's watts
                             // slider already could.
-                            ui.add_space(12.0);
-                            ui.horizontal(|ui| {
-                                ui.label("TX Power:");
-                                // Adjustable during Tune too, not just
-                                // normal TX -- Tune Power only sets the
-                                // starting reduced level when TUNE is
-                                // pressed (see the Tune button handler), it
-                                // doesn't keep re-enforcing a ratio, so
-                                // adjusting here works exactly like normal
-                                // operation while tuning.
-                                let mut watts =
-                                    connected.session.tx_power_watts.load(Ordering::Relaxed) as i32;
-                                if scroll_slider_i32(
-                                    ui,
-                                    &mut connected.slider_scroll_accum,
-                                    &mut watts,
-                                    0..=connected.max_tx_power_watts as i32,
-                                    1,
-                                    "W",
-                                ) {
-                                    connected.session.tx_power_watts.store(watts as u32, Ordering::Relaxed);
-                                    settings_changed = true;
-                                    // A manual adjustment while Tune is active is
-                                    // a real, intentional power change (e.g.
-                                    // gradually raising drive while watching SWR
-                                    // on an antenna tuner) -- it should stick
-                                    // when Tune ends, not get silently discarded
-                                    // by the Tune button's restore-previous-value
-                                    // logic. Clearing pre_tune_power_watts makes
-                                    // that restore a no-op.
-                                    if connected.tune_active || connected.two_tone_active {
-                                        connected.pre_tune_power_watts = None;
-                                    }
+                            ui.label("TX Power:");
+                            // Adjustable during Tune too, not just
+                            // normal TX -- Tune Power only sets the
+                            // starting reduced level when TUNE is
+                            // pressed (see the Tune button handler), it
+                            // doesn't keep re-enforcing a ratio, so
+                            // adjusting here works exactly like normal
+                            // operation while tuning.
+                            let mut watts =
+                                connected.session.tx_power_watts.load(Ordering::Relaxed) as i32;
+                            if scroll_slider_i32(
+                                ui,
+                                &mut connected.slider_scroll_accum,
+                                &mut watts,
+                                0..=connected.max_tx_power_watts as i32,
+                                1,
+                                "W",
+                            ) {
+                                connected.session.tx_power_watts.store(watts as u32, Ordering::Relaxed);
+                                settings_changed = true;
+                                // A manual adjustment while Tune is active is
+                                // a real, intentional power change (e.g.
+                                // gradually raising drive while watching SWR
+                                // on an antenna tuner) -- it should stick
+                                // when Tune ends, not get silently discarded
+                                // by the Tune button's restore-previous-value
+                                // logic. Clearing pre_tune_power_watts makes
+                                // that restore a no-op.
+                                if connected.tune_active || connected.two_tone_active {
+                                    connected.pre_tune_power_watts = None;
                                 }
-                            });
+                            }
                         }
+
+                        // Moved here (from the mode-buttons row above) --
+                        // a real request: grouped with RX Gain/TX Power
+                        // as "how much signal in/out" rather than sharing
+                        // a row with the mode buttons.
+                        ui.label("Filter width:");
+                        let mut width = current_width;
+                        if scroll_slider_f64(
+                            ui,
+                            &mut connected.slider_scroll_accum,
+                            &mut width,
+                            50.0..=5000.0,
+                            50.0,
+                            " Hz",
+                        ) {
+                            connected.spectrum.set_width_hz(width);
+                            if let Some(tx) = &connected.tx_handle {
+                                tx.set_width_hz(width);
+                            }
+                            connected
+                                .width_memory
+                                .insert(current_mode.label().to_string(), width);
+                            settings_changed = true;
+                        }
+                        ui.end_row();
                         });
                     });
 
