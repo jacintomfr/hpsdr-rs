@@ -18,6 +18,50 @@ use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
 pub const BUFFER_SIZE: usize = 1024;
+
+/// Raises the CALLING thread's own OS scheduling priority to
+/// THREAD_PRIORITY_ABOVE_NORMAL -- standard practice for a real-time
+/// audio-producing thread (same reasoning any DAW/pro-audio app uses for
+/// its mixing thread), so ordinary OS scheduling jitter is less likely
+/// to delay it long enough to underrun AudioOutput's cpal callback
+/// ([audio.rs]'s `pop_front().unwrap_or((0.0, 0.0))` -- silence on
+/// underrun, which is itself an audible click, not just missing audio).
+/// A real report: intermittent RX audio clicks unrelated to the TX/RX
+/// crosstalk fix, resembling CPU-starvation symptoms even with nothing
+/// else running and CPU usage nowhere near its limit -- consistent with
+/// this thread (which calls into WDSP and pushes into audio_out/
+/// tci_audio_out/waveform_out every ~BUFFER_SIZE/sample_rate seconds)
+/// occasionally missing its own cadence by enough to run the output
+/// queue dry. ABOVE_NORMAL rather than TIME_CRITICAL deliberately: a
+/// real-time-priority thread that misbehaves (an unexpected long WDSP
+/// call, a lock contended by the UI thread) can start starving the rest
+/// of the app, including the UI itself -- ABOVE_NORMAL still gives a
+/// real scheduling edge without that risk. Best-effort: Windows can
+/// still ignore/clamp this (e.g. no Increase Scheduling Priority
+/// privilege in some locked-down environments), so failure is silently
+/// ignored rather than treated as fatal -- this is a mitigation for a
+/// probabilistic OS-scheduling issue, not a correctness requirement.
+///
+/// RAISED to THREAD_PRIORITY_TIME_CRITICAL (from an initial, more
+/// conservative ABOVE_NORMAL): a real report of continuing intermittent
+/// RX clicks, confirmed via Task Manager to happen on a 22-core/44-
+/// thread Xeon nowhere near CPU-bound -- ABOVE_NORMAL alone wasn't
+/// enough of a scheduling edge. See audio.rs's own output slew limiter
+/// (added alongside this change) for the complementary fix that softens
+/// whatever brief stalls still get through into an inaudible ramp
+/// instead of a click, rather than trying to prevent every stall
+/// through priority alone.
+#[cfg(windows)]
+fn raise_thread_priority() {
+    unsafe {
+        windows_sys::Win32::System::Threading::SetThreadPriority(
+            windows_sys::Win32::System::Threading::GetCurrentThread(),
+            windows_sys::Win32::System::Threading::THREAD_PRIORITY_TIME_CRITICAL,
+        );
+    }
+}
+#[cfg(not(windows))]
+fn raise_thread_priority() {}
 const RXA_FFT_SIZE: i32 = 2048;
 const DSP_RATE: i32 = 48_000;
 const OUTPUT_RATE: i32 = 48_000;
@@ -1392,6 +1436,7 @@ fn run(
     mute_local_for_tci: Arc<AtomicBool>,
     stop: Arc<AtomicBool>,
 ) {
+    raise_thread_priority();
     let mut analyzer = SpectrumAnalyzer::open(channel, sample_rate);
     let mut chunk = Vec::with_capacity(BUFFER_SIZE);
     let mut cw_decoder = CwDecoder::new(Arc::clone(&cw_text));
@@ -1413,6 +1458,12 @@ fn run(
     // component while leaving a real ~1.3kHz tone untouched.
     let mut radio_audio_lpf = RxAudioLowpass::new(OUTPUT_RATE as f32);
 
+    // TX/RX crosstalk silencing -- see the two locals' own doc comments
+    // just below, and the block that uses them right after chunk is
+    // filled each iteration.
+    let mut last_mox = false;
+    let mut txrx_silence_remaining: usize = 0;
+
     while !stop.load(Ordering::Relaxed) {
         chunk.clear();
         {
@@ -1425,6 +1476,37 @@ fn run(
         if chunk.len() < BUFFER_SIZE {
             thread::sleep(Duration::from_millis(5));
             continue;
+        }
+
+        // Zero the first ~30ms of RX IQ right after a TX->RX transition
+        // -- a direct port of piHPSDR's own fix (receiver.c's
+        // rx_add_iq_samples/radio.c's rxtx(): "silenced first RX samples
+        // after a TX/RX transition since they contain the own TX signal
+        // (from crosstalk at the T/R relay)"). Crosstalk into the RX
+        // front end doesn't need a mechanical relay to cause this --
+        // RF/PCB coupling on a relay-less low-power board is enough --
+        // and without this fix the AGC pumps hard trying to track that
+        // brief burst, audible as a click that takes a couple of
+        // seconds to settle back down (confirmed via a real report).
+        // Done here, at the very intake of the raw IQ (before the
+        // spectrum/waterfall tap, TCI's raw IQ tap, and the RXA/AGC
+        // feed below all see it), matching piHPSDR's own insertion
+        // point exactly -- silencing only the audio output tap (as a
+        // fade) would still let the AGC react to the contaminated
+        // samples.
+        const TXRX_SILENCE_SECS: f32 = 0.030;
+        let mox_now = mox.load(Ordering::Relaxed);
+        if last_mox && !mox_now {
+            txrx_silence_remaining = (sample_rate as f32 * TXRX_SILENCE_SECS) as usize;
+        }
+        last_mox = mox_now;
+        if txrx_silence_remaining > 0 {
+            let n = txrx_silence_remaining.min(chunk.len());
+            for s in chunk.iter_mut().take(n) {
+                s.i = 0;
+                s.q = 0;
+            }
+            txrx_silence_remaining -= n;
         }
 
         // Raw wideband IQ tap for TCI's iq_start streaming -- a
@@ -1529,6 +1611,33 @@ fn run(
             let mute_local = mute_local_for_tci.load(Ordering::Relaxed);
             for (l, r) in audio {
                 if mox_active {
+                    // Keep the local speaker's queue topped up with
+                    // explicit silence instead of starving it outright
+                    // (the previous behavior here) -- a real report:
+                    // AudioOutput's cpal callback drains this queue at a
+                    // hard real-time rate regardless of what's feeding
+                    // it, so letting it run completely empty throughout
+                    // TX meant the moment mox dropped, cpal was already
+                    // asking for samples before this thread had produced
+                    // any real ones yet, showing up as a genuine burst of
+                    // underruns (audible as the remaining "quick click"
+                    // right at the TX->RX edge, confirmed via the status
+                    // bar's own underrun-rate reading spiking exactly
+                    // then and nowhere else) -- not a bug in the
+                    // counting, a real gap. Pushing silence instead keeps
+                    // the queue's buffer level steady through the
+                    // transition, so there's nothing to "catch up" from
+                    // once real audio resumes. tci_out/radio_out/
+                    // waveform_out are untouched -- they don't feed a
+                    // hard-real-time consumer the way AudioOutput's cpal
+                    // callback does, so this specific failure mode
+                    // doesn't apply to them.
+                    if !mute_local {
+                        if out.len() >= AUDIO_BUFFER_CAPACITY {
+                            out.pop_front();
+                        }
+                        out.push_back((0.0, 0.0));
+                    }
                     continue;
                 }
                 // Waveform tap and radio-audio-to-radio both stay a

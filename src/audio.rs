@@ -27,7 +27,7 @@
 use crate::radio::{CwKeyerAtomics, CW_KEYER_MODE_IAMBIC_A, CW_KEYER_MODE_IAMBIC_B};
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use std::collections::VecDeque;
-use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -78,6 +78,17 @@ pub struct AudioOutput {
     // Kept alive for as long as playback should continue; dropping this
     // stops the stream.
     _stream: cpal::Stream,
+    /// Cumulative count of real underruns (the queue was empty when the
+    /// cpal callback needed a frame) since this stream started -- see
+    /// the output slew limiter's own doc comment for why an underrun is
+    /// audible as a click in the first place. Exposed for the main
+    /// window's status bar (a real ask: a direct, honest "how often is
+    /// this actually happening" number, cheaper and more trustworthy
+    /// than trying to replicate Windows' own DPC-latency measurement
+    /// from user-mode code). The UI reads/diffs this once a second
+    /// (see underrun_count's own doc comment) rather than this struct
+    /// owning any windowing/rate-limiting policy itself.
+    underruns: Arc<AtomicU64>,
 }
 
 impl AudioOutput {
@@ -87,7 +98,26 @@ impl AudioOutput {
     /// system default output device, same as this always did before
     /// device selection existed -- never a hard error just because a
     /// specific device isn't found.
-    pub fn start(buffer: Arc<Mutex<VecDeque<(f32, f32)>>>, device_name: Option<&str>) -> Result<Self, String> {
+    /// `expect_silence`: when given, an underrun (the queue was empty)
+    /// is only counted while this reads `false` -- for the ordinary RX
+    /// audio path this should be the session's own `mox` flag, since RX
+    /// audio is deliberately not pushed into `buffer` at all while
+    /// transmitting (see spectrum.rs's own `if mox_active { continue }`
+    /// gate), so the queue being empty throughout TX is expected, not a
+    /// real glitch. A real report: without this, the status bar's
+    /// "Audio glitches" rate showed millions per minute while
+    /// transmitting (every single sample counted) and correctly read 0
+    /// in RX, which made the number meaningless as a "is RX audio
+    /// actually glitching" indicator. `None` counts every empty poll
+    /// unconditionally (the original behavior) -- used for output
+    /// streams that don't have an analogous "is silence expected right
+    /// now" signal (e.g. the TX audio monitor tap, silent throughout RX
+    /// for the opposite, equally expected reason).
+    pub fn start(
+        buffer: Arc<Mutex<VecDeque<(f32, f32)>>>,
+        device_name: Option<&str>,
+        expect_silence: Option<Arc<AtomicBool>>,
+    ) -> Result<Self, String> {
         let host = cpal::default_host();
         let device = match device_name {
             Some(name) => host
@@ -112,6 +142,38 @@ impl AudioOutput {
             buffer_size: cpal::BufferSize::Default,
         };
 
+        // Output slew limiter: caps how fast (l, r) can change from one
+        // sample to the next, regardless of source -- a real (l, r) pair
+        // popped normally, or the (0.0, 0.0) underrun fallback below. A
+        // real report: intermittent clicks in RX audio, sporadic (not
+        // tied to any particular action), stronger with a strong signal
+        // and weaker/absent with none -- consistent with an abrupt
+        // sample-to-sample jump (the underrun fallback's instant silence
+        // is exactly that: a real-signal sample one callback, then a
+        // hard 0.0 the next) rather than corrupted data, since a jump's
+        // audible "click" loudness scales with how far it has to jump,
+        // same as the signal's own amplitude. Task Manager confirmed
+        // this PC (a 22-core/44-thread Xeon) is nowhere near CPU-bound
+        // when it happens, which points at brief OS/driver-level
+        // scheduling delays (DPC latency is the classic cause on
+        // Windows) rather than this process losing a fair share of the
+        // CPU -- something raising this thread's own priority
+        // (raise_thread_priority in spectrum.rs) can reduce but not
+        // fully rule out, since a hardware-interrupt-level stall
+        // preempts every thread regardless of its priority. Slew-
+        // limiting the actual output doesn't prevent the underlying
+        // stall, but it does stop it from being audible as a click: any
+        // jump -- into or out of an underrun, or from anywhere else --
+        // gets turned into a ~3ms ramp instead of an instant step, far
+        // faster than any real audio envelope so legitimate fast
+        // transients aren't audibly softened, but well below the ear's
+        // click-detection threshold for a discontinuity this small.
+        const SLEW_RAMP_SECS: f32 = 0.003;
+        let max_step = 2.0 / (SLEW_RAMP_SECS * OUTPUT_SAMPLE_RATE as f32);
+        let mut current: (f32, f32) = (0.0, 0.0);
+        let underruns = Arc::new(AtomicU64::new(0));
+        let cb_underruns = Arc::clone(&underruns);
+
         let stream = device
             .build_output_stream(
                 &config,
@@ -135,10 +197,22 @@ impl AudioOutput {
                 move |data: &mut [f32], _: &cpal::OutputCallbackInfo| {
                     let mut buf = buffer.lock().unwrap();
                     for frame in data.chunks_mut(OUTPUT_CHANNELS as usize) {
-                        let (l, r) = buf.pop_front().unwrap_or((0.0, 0.0)); // silence on underrun
+                        let (l, r) = match buf.pop_front() {
+                            Some(v) => v,
+                            None => {
+                                let silence_expected =
+                                    expect_silence.as_ref().is_some_and(|m| m.load(Ordering::Relaxed));
+                                if !silence_expected {
+                                    cb_underruns.fetch_add(1, Ordering::Relaxed);
+                                }
+                                (0.0, 0.0) // silence on underrun (or on expected silence)
+                            }
+                        };
+                        current.0 += (l - current.0).clamp(-max_step, max_step);
+                        current.1 += (r - current.1).clamp(-max_step, max_step);
                         if let [left, right, ..] = frame {
-                            *left = l;
-                            *right = r;
+                            *left = current.0;
+                            *right = current.1;
                         }
                     }
                 },
@@ -153,7 +227,17 @@ impl AudioOutput {
             .play()
             .map_err(|e| format!("failed to start audio playback: {e}"))?;
 
-        Ok(Self { _stream: stream })
+        Ok(Self { _stream: stream, underruns })
+    }
+
+    /// Cumulative underrun count since this stream started -- see the
+    /// `underruns` field's own doc comment. The status bar reads this
+    /// once a second and diffs against its own last reading to show a
+    /// per-second rate, rather than this method resetting anything
+    /// itself (so multiple readers, if there ever were any, wouldn't
+    /// steal each other's counts).
+    pub fn underrun_count(&self) -> u64 {
+        self.underruns.load(Ordering::Relaxed)
     }
 }
 
@@ -501,10 +585,32 @@ fn run(
     let mut was_keyed = false;
     let mut iambic = IambicSimulator::new();
     while !stop.load(Ordering::Relaxed) {
-        // Short tick: tighter envelope/edge timing than the original
-        // 10ms, and a smaller worst-case burst size for the backlog
-        // trim below to reason about.
-        thread::sleep(Duration::from_millis(2));
+        // Short tick (2ms): tighter envelope/edge timing than the
+        // original 10ms, and a smaller worst-case burst size for the
+        // backlog trim below to reason about. But NOT while there's no
+        // possible way for a keying edge to happen at all (not
+        // transmitting, not in CW mode, or the sidetone feature itself
+        // off) and any prior ramp has already reached silence -- this
+        // thread used to tick at 2ms (500 wakeups/sec) unconditionally,
+        // 24/7, even when CW is never touched all session. A real
+        // report: Windows Task Manager flagged hpsdr-rs's power usage as
+        // "Very High" despite ~3% CPU, and intermittent RX audio clicks
+        // that felt like CPU starvation even with nothing else running
+        // -- both consistent with this thread's constant wakeups adding
+        // scheduling pressure that occasionally delayed the real-time
+        // audio-output thread (spectrum.rs's run()) by enough to
+        // underrun. Sleeping 20ms instead while genuinely idle (matching
+        // this project's own other low-priority poll intervals, e.g.
+        // radio.rs/tx.rs's 20ms UI-frame-cadence loops) cuts the wakeup
+        // rate 10x with no audible cost: the only effect is up to one
+        // extra ~20ms tick before this thread notices TX/CW-mode
+        // starting, a one-time transition delay, not ongoing jitter --
+        // once active it drops straight back to the tight 2ms cadence
+        // this loop always used.
+        let could_key =
+            enabled.load(Ordering::Relaxed) && mox.load(Ordering::Relaxed) && cw_mode_active.load(Ordering::Relaxed);
+        let idle = !could_key && gain <= 0.0;
+        thread::sleep(Duration::from_millis(if idle { 20 } else { 2 }));
         let now = Instant::now();
         let elapsed = now.duration_since(last);
         last = now;

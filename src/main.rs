@@ -27,6 +27,7 @@ mod radio;
 mod radioberry_juice;
 mod rigctl;
 mod spectrum;
+mod sysstats;
 mod tci;
 mod tx;
 mod wdsp_sys;
@@ -1661,6 +1662,18 @@ struct ConnectedState {
     /// ballistic damping for exactly this reason.
     smoothed_fwd_power: f32,
     smoothed_rev_power: f32,
+    /// Status bar's "Audio glitches" reading -- AudioOutput::
+    /// underrun_count() is a lifetime cumulative total (see its own doc
+    /// comment), which isn't actually readable at a glance ("4896 --
+    /// is that bad?", a real report of not being able to interpret it).
+    /// These two, recomputed once a second (not every frame -- see the
+    /// status bar's own read site), turn that into a per-minute RATE
+    /// instead: `underrun_rate_per_min` is what's actually displayed,
+    /// and the other two are just this reading's own bookkeeping for
+    /// computing the next one.
+    underrun_rate_per_min: f32,
+    underrun_rate_baseline: u64,
+    underrun_rate_checked_at: Instant,
     /// See RadioSession::tx_fifo_underrun's doc comment. Latched for a
     /// couple of seconds after last seen set (same reasoning as
     /// piHPSDR's own rx_panadapter.c: a single status packet's worth
@@ -1741,6 +1754,12 @@ struct HpsdrApp {
     /// already exists (it's also the Discovery screen) by the time a
     /// radio -- and so its saved geometry -- is even known.
     main_window_geometry: Option<WindowGeometry>,
+    /// CPU/memory/ping sampler for the status bar next to the Stop
+    /// button -- see sysstats.rs's own module doc comment. Lives here
+    /// (not on ConnectedState) so it keeps running/sampling across a
+    /// disconnect-then-reconnect rather than being torn down and its
+    /// CPU% baseline reset each time.
+    sys_stats: sysstats::SysStats,
 }
 
 /// Orange (instead of egui's default blue) for every "active" widget --
@@ -1778,6 +1797,7 @@ impl HpsdrApp {
             was_focused: true,
             ignore_interaction_until: None,
             main_window_geometry: None,
+            sys_stats: sysstats::SysStats::start(),
         }
     }
 }
@@ -1914,7 +1934,11 @@ fn connect_to_device(device: Device, cfg: &Config) -> Result<ConnectedState, Str
             );
             let audio_output_device = cfg.audio_output_device.clone();
             let audio_output =
-                match AudioOutput::start(Arc::clone(&spectrum.audio_out), audio_output_device.as_deref()) {
+                match AudioOutput::start(
+                    Arc::clone(&spectrum.audio_out),
+                    audio_output_device.as_deref(),
+                    Some(Arc::clone(&session.mox)),
+                ) {
                     Ok(a) => Some(a),
                     Err(e) => {
                         eprintln!("audio output unavailable: {e}");
@@ -2450,6 +2474,9 @@ fn connect_to_device(device: Device, cfg: &Config) -> Result<ConnectedState, Str
                 cw_text_sending: false,
                 smoothed_fwd_power: 0.0,
                 smoothed_rev_power: 0.0,
+                underrun_rate_per_min: 0.0,
+                underrun_rate_baseline: 0,
+                underrun_rate_checked_at: Instant::now(),
                 tx_fifo_warning_until: None,
                 tx_spectrum_mox_was_active: false,
                 puresignal_enabled: settings.puresignal_enabled,
@@ -2565,8 +2592,16 @@ impl eframe::App for HpsdrApp {
             self.ignore_interaction_until = None;
         }
 
+        // Borrowed separately from self.state (a disjoint field) so it's
+        // usable inside the match arms below without fighting the `&mut
+        // self.state` borrow those need -- see sysstats.rs's own doc
+        // comment for why this lives on HpsdrApp rather than
+        // ConnectedState.
+        let sys_stats = &self.sys_stats;
         match &mut self.state {
-            AppState::Discovering(window) => match window.show(ui) {
+            AppState::Discovering(window) => {
+                sys_stats.set_radio_ip(None);
+                match window.show(ui) {
                 DiscoveryAction::Start(device, juice_console) => {
                     let cfg = Config::load(device.mac);
                     // Move/resize the main window to wherever it was
@@ -2598,8 +2633,10 @@ impl eframe::App for HpsdrApp {
                     self.state = AppState::Error("Discovery cancelled.".to_string());
                 }
                 DiscoveryAction::None => {}
-            },
+                }
+            }
             AppState::Connected(connected) => {
+                sys_stats.set_radio_ip(Some(connected.device.address.ip()));
                 // Shown in the OS window title bar rather than as an
                 // in-UI heading -- frees up vertical space for the
                 // spectrum/waterfall, which is at a premium in the
@@ -5273,7 +5310,17 @@ impl eframe::App for HpsdrApp {
                     });
 
                     ui.add_space(8.0);
-                    ui.horizontal(|ui| {
+                    // Single row, deliberately -- see the status-bar
+                    // indicators' own comment just below for why they're
+                    // packed into this SAME horizontal_wrapped row
+                    // instead of a second one: a real report confirmed
+                    // there's only room for one text line's worth of
+                    // height here before content starts clipping off the
+                    // bottom of the (fixed-size, non-scrolling) main
+                    // window. horizontal_wrapped (not plain horizontal)
+                    // so it still degrades to wrapping instead of
+                    // overflowing horizontally on a narrower window.
+                    ui.horizontal_wrapped(|ui| {
                         if ui.button("Stop").clicked() {
                             stop_clicked = true;
                         }
@@ -5291,6 +5338,65 @@ impl eframe::App for HpsdrApp {
                         } else if let Some(msg) = &connected.status_message {
                             ui.weak(msg);
                         }
+                        ui.separator();
+                        // Status bar: CPU/memory (this process's own,
+                        // matching Task Manager's per-app columns) +
+                        // network quality to the radio (packet loss
+                        // since connecting, from RadioSession::
+                        // rx_packets_total/rx_packets_lost's real
+                        // sequence-gap tracking, plus a best-effort ping
+                        // RTT) + audio underrun count (see AudioOutput::
+                        // underrun_count's own doc comment -- the
+                        // honest, directly-measured stand-in for
+                        // "latency issues" a real report asked for,
+                        // since this app has no way to measure Windows'
+                        // own DPC latency the way a tool like LatencyMon
+                        // does). Same row regardless of Tune/Two Tone --
+                        // this is the main window's persistent layout,
+                        // not something either of those toggles hides.
+                        let sys = sys_stats.snapshot();
+                        ui.weak(format!("CPU: {:.1}%", sys.cpu_percent));
+                        ui.weak(format!("MEM: {:.0}MB", sys.mem_mb));
+                        let total = connected.session.rx_packets_total.load(Ordering::Relaxed);
+                        let lost = connected.session.rx_packets_lost.load(Ordering::Relaxed);
+                        let loss_pct = if total > 0 { 100.0 * lost as f64 / total as f64 } else { 0.0 };
+                        let net_color = if loss_pct > 1.0 {
+                            egui::Color32::from_rgb(220, 60, 60)
+                        } else if loss_pct > 0.0 {
+                            egui::Color32::from_rgb(230, 150, 50)
+                        } else {
+                            ui.visuals().weak_text_color()
+                        };
+                        ui.colored_label(net_color, format!("Net loss: {loss_pct:.2}%"));
+                        match sys.ping_ms {
+                            Some(ms) => ui.weak(format!("Ping: {ms:.0}ms")),
+                            None => ui.weak("Ping: --"),
+                        };
+                        // See ConnectedState::underrun_rate_per_min's own
+                        // doc comment -- a per-minute RATE, recomputed
+                        // once a second, not the raw lifetime cumulative
+                        // count AudioOutput::underrun_count() itself
+                        // returns (a real report: a growing total with
+                        // no time reference wasn't interpretable at a
+                        // glance).
+                        let underruns =
+                            connected.audio_output.as_ref().map(|a| a.underrun_count()).unwrap_or(0);
+                        let elapsed = connected.underrun_rate_checked_at.elapsed().as_secs_f32();
+                        if elapsed >= 1.0 {
+                            let delta = underruns.saturating_sub(connected.underrun_rate_baseline);
+                            connected.underrun_rate_per_min = delta as f32 * (60.0 / elapsed);
+                            connected.underrun_rate_baseline = underruns;
+                            connected.underrun_rate_checked_at = Instant::now();
+                        }
+                        let audio_color = if connected.underrun_rate_per_min > 0.0 {
+                            egui::Color32::from_rgb(230, 150, 50)
+                        } else {
+                            ui.visuals().weak_text_color()
+                        };
+                        ui.colored_label(
+                            audio_color,
+                            format!("Audio glitches: {:.0}/min", connected.underrun_rate_per_min),
+                        );
                     });
                 });
 
@@ -6519,9 +6625,12 @@ impl eframe::App for HpsdrApp {
                                                     && connected.audio_output_device.is_some()
                                                 {
                                                     connected.audio_output_device = None;
-                                                    connected.audio_output =
-                                                        AudioOutput::start(Arc::clone(&connected.spectrum.audio_out), None)
-                                                            .ok();
+                                                    connected.audio_output = AudioOutput::start(
+                                                        Arc::clone(&connected.spectrum.audio_out),
+                                                        None,
+                                                        Some(Arc::clone(&connected.session.mox)),
+                                                    )
+                                                    .ok();
                                                     settings_changed = true;
                                                 }
                                                 for name in &devices {
@@ -6532,6 +6641,7 @@ impl eframe::App for HpsdrApp {
                                                         connected.audio_output = AudioOutput::start(
                                                             Arc::clone(&connected.spectrum.audio_out),
                                                             Some(name),
+                                                            Some(Arc::clone(&connected.session.mox)),
                                                         )
                                                         .ok();
                                                         settings_changed = true;
@@ -7621,7 +7731,7 @@ impl eframe::App for HpsdrApp {
                                                 // ConnectedState::audio_output_device's doc comment on
                                                 // why this doesn't follow the RX output device
                                                 // selection.
-                                                match AudioOutput::start(Arc::clone(&tx.tx_audio_monitor), None) {
+                                                match AudioOutput::start(Arc::clone(&tx.tx_audio_monitor), None, None) {
                                                     Ok(out) => connected.tx_audio_monitor_output = Some(out),
                                                     Err(e) => eprintln!("tx audio monitor unavailable: {e}"),
                                                 }
@@ -9120,6 +9230,7 @@ impl eframe::App for HpsdrApp {
                 }
             }
             AppState::Error(message) => {
+                sys_stats.set_radio_ip(None);
                 let text = message.clone();
                 let mut retry_clicked = false;
 
@@ -11323,14 +11434,21 @@ fn render_extra_receiver_settings(ui: &mut egui::Ui, rx: &Arc<Mutex<ExtraReceive
                             && rx.audio_output_device.is_some()
                         {
                             rx.audio_output_device = None;
-                            rx.audio_output = AudioOutput::start(Arc::clone(&rx.spectrum.audio_out), None).ok();
+                            rx.audio_output =
+                                AudioOutput::start(Arc::clone(&rx.spectrum.audio_out), None, Some(Arc::clone(&rx.mox)))
+                                    .ok();
                             rx.settings_dirty.store(true, Ordering::Relaxed);
                         }
                         for name in &devices {
                             let selected = rx.audio_output_device.as_deref() == Some(name.as_str());
                             if ui.selectable_label(selected, name).clicked() && !selected {
                                 rx.audio_output_device = Some(name.clone());
-                                rx.audio_output = AudioOutput::start(Arc::clone(&rx.spectrum.audio_out), Some(name)).ok();
+                                rx.audio_output = AudioOutput::start(
+                                    Arc::clone(&rx.spectrum.audio_out),
+                                    Some(name),
+                                    Some(Arc::clone(&rx.mox)),
+                                )
+                                .ok();
                                 rx.settings_dirty.store(true, Ordering::Relaxed);
                             }
                         }
@@ -11581,8 +11699,12 @@ fn spawn_extra_receiver(
     }
 
     let audio_output_device = saved.and_then(|s| s.audio_output_device.clone());
-    let audio_output =
-        AudioOutput::start(Arc::clone(&spectrum.audio_out), audio_output_device.as_deref()).ok();
+    let audio_output = AudioOutput::start(
+        Arc::clone(&spectrum.audio_out),
+        audio_output_device.as_deref(),
+        Some(Arc::clone(&session.mox)),
+    )
+    .ok();
     let initial_frequency_hz = freq_arc.load(Ordering::Relaxed);
     // Restore CTUN -- see Config::ctun's doc comment (same reasoning,
     // per receiver).
@@ -11709,6 +11831,7 @@ fn change_sample_rate(connected: &mut ConnectedState, new_rate: u32) {
     connected.audio_output = match AudioOutput::start(
         Arc::clone(&spectrum.audio_out),
         connected.audio_output_device.as_deref(),
+        Some(Arc::clone(&connected.session.mox)),
     ) {
         Ok(a) => Some(a),
         Err(e) => {
@@ -11865,7 +11988,11 @@ fn change_extra_receiver_sample_rate(rx: &mut ExtraReceiver, new_rate: u32) {
     spectrum.set_anf(agc_params.anf);
     spectrum.set_binaural(agc_params.binaural);
 
-    rx.audio_output = match AudioOutput::start(Arc::clone(&spectrum.audio_out), rx.audio_output_device.as_deref()) {
+    rx.audio_output = match AudioOutput::start(
+        Arc::clone(&spectrum.audio_out),
+        rx.audio_output_device.as_deref(),
+        Some(Arc::clone(&rx.mox)),
+    ) {
         Ok(a) => Some(a),
         Err(e) => {
             eprintln!("audio output unavailable after sample rate change: {e}");

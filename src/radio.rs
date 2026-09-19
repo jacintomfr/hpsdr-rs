@@ -22,7 +22,7 @@ use crate::ozy;
 use std::collections::VecDeque;
 use std::io;
 use std::net::UdpSocket;
-use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, AtomicU64, AtomicU8, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
@@ -1076,6 +1076,22 @@ pub struct RadioSession {
     /// not applicable to other P1 boards.
     pub tx_fifo_underrun: Arc<AtomicBool>,
     pub tx_fifo_overrun: Arc<AtomicBool>,
+    /// Network-quality indicators for the main window's status bar (see
+    /// main.rs's bottom status row) -- how many IQ-data packets the
+    /// radio has sent us in total, and how many of those we can tell
+    /// were actually missing (a gap in the radio's own 4-byte packet
+    /// sequence number, both protocols -- see receiver_loop/
+    /// p2_receiver_loop's own gap-detection comments). `packets_lost /
+    /// packets_total` over a rolling window is what the UI actually
+    /// shows; the raw totals live here so the UI can compute its own
+    /// window rather than this module owning any time-windowing policy.
+    /// A real ask: "quality of network" matters a lot more for a
+    /// Hermes/HermesLite2-class board reached over real Ethernet/Wi-Fi
+    /// than for, say, a USB-connected Ozy, so this needed to be a real
+    /// measurement, not just CPU/memory (which say nothing about the
+    /// actual link to the radio).
+    pub rx_packets_total: Arc<AtomicU64>,
+    pub rx_packets_lost: Arc<AtomicU64>,
     stop_flag: Arc<AtomicBool>,
     sender_thread: Option<JoinHandle<()>>,
     receiver_thread: Option<JoinHandle<()>>,
@@ -1215,6 +1231,8 @@ impl RadioSession {
         let cw_paddle_contacts = Arc::new(AtomicU8::new(0));
         let tx_fifo_underrun = Arc::new(AtomicBool::new(false));
         let tx_fifo_overrun = Arc::new(AtomicBool::new(false));
+        let rx_packets_total = Arc::new(AtomicU64::new(0));
+        let rx_packets_lost = Arc::new(AtomicU64::new(0));
         // Checked ahead of the protocol match below, not instead of it:
         // Ozy still reports protocol 1 (it IS P1 framing, just over USB
         // instead of UDP -- see ozy.rs's module doc comment), so every
@@ -1225,7 +1243,7 @@ impl RadioSession {
                 device, settings, frequency_hz, tx_frequency_hz, rx_frequency_hz, requested_frequency_hz, sample_rate, adc, rx_antenna, tx_antenna, rx_attenuation,
                 ps_tx_attenuation, mox, tx_iq, tci_tx_audio, tci_tx_gain, tx_power_watts, cw_keyer, cw_mode_active, pa_gain_db,
                 tx_forward_power, tx_reverse_power, adc0_overload, cw_ptt_active, cw_paddle_contacts, adc1_overload,
-                tx_fifo_underrun, tx_fifo_overrun, ps_rx_feedback_iq, ps_tx_feedback_iq,
+                tx_fifo_underrun, tx_fifo_overrun, rx_packets_total, rx_packets_lost, ps_rx_feedback_iq, ps_tx_feedback_iq,
                 rx_audio_to_radio, send_rx_audio_to_radio, hl2_ak4951_codec, new_pa_board, radio_mic_audio, tx_audio_source,
                 tci_wants_mic, mic_ptt_enabled, mic_bias_enabled, mic_ptt_on_tip,
                 diversity_enabled, diversity_gain_db, diversity_phase_deg, diversity_main_raw_iq,
@@ -1237,7 +1255,7 @@ impl RadioSession {
                 device, settings, frequency_hz, tx_frequency_hz, rx_frequency_hz, requested_frequency_hz, sample_rate, adc, rx_antenna, tx_antenna, rx_attenuation,
                 ps_tx_attenuation, mox, tx_iq, tci_tx_audio, tci_tx_gain, tx_power_watts, cw_keyer, cw_mode_active, pa_gain_db,
                 tx_forward_power, tx_reverse_power, adc0_overload, cw_ptt_active, cw_paddle_contacts, adc1_overload,
-                tx_fifo_underrun, tx_fifo_overrun, ps_rx_feedback_iq, ps_tx_feedback_iq,
+                tx_fifo_underrun, tx_fifo_overrun, rx_packets_total, rx_packets_lost, ps_rx_feedback_iq, ps_tx_feedback_iq,
                 rx_audio_to_radio, send_rx_audio_to_radio, hl2_ak4951_codec, new_pa_board, radio_mic_audio, tx_audio_source,
                 tci_wants_mic, mic_ptt_enabled, mic_bias_enabled, mic_ptt_on_tip,
                 diversity_enabled, diversity_gain_db, diversity_phase_deg, diversity_main_raw_iq,
@@ -1247,7 +1265,7 @@ impl RadioSession {
                 device, settings, frequency_hz, tx_frequency_hz, rx_frequency_hz, requested_frequency_hz, sample_rate, adc, rx_antenna, tx_antenna, rx_attenuation,
                 ps_tx_attenuation, mox, tx_iq, tci_tx_audio, tci_tx_gain, tx_power_watts, cw_keyer, cw_mode_active, pa_gain_db,
                 tx_forward_power, tx_reverse_power, adc0_overload, cw_ptt_active, cw_paddle_contacts, adc1_overload,
-                tx_fifo_underrun, tx_fifo_overrun, ps_rx_feedback_iq, ps_tx_feedback_iq,
+                tx_fifo_underrun, tx_fifo_overrun, rx_packets_total, rx_packets_lost, ps_rx_feedback_iq, ps_tx_feedback_iq,
                 rx_audio_to_radio, send_rx_audio_to_radio, hl2_ak4951_codec, new_pa_board, radio_mic_audio, tx_audio_source,
                 tci_wants_mic, mic_ptt_enabled, mic_bias_enabled, mic_ptt_on_tip,
                 diversity_enabled, diversity_gain_db, diversity_phase_deg, diversity_main_raw_iq,
@@ -1483,6 +1501,8 @@ fn start_protocol1(
     adc1_overload: Arc<AtomicBool>,
     tx_fifo_underrun: Arc<AtomicBool>,
     tx_fifo_overrun: Arc<AtomicBool>,
+    rx_packets_total: Arc<AtomicU64>,
+    rx_packets_lost: Arc<AtomicU64>,
     ps_rx_feedback_iq: Arc<Mutex<VecDeque<IqSample>>>,
     ps_tx_feedback_iq: Arc<Mutex<VecDeque<IqSample>>>,
     rx_audio_to_radio: Arc<Mutex<VecDeque<f32>>>,
@@ -1750,6 +1770,8 @@ fn start_protocol1(
     // Live -- see RadioSession::diversity_enabled's doc comment.
     let receiver_diversity_enabled = Arc::clone(&diversity_enabled);
     let receiver_diversity_main_raw_iq = Arc::clone(&diversity_main_raw_iq);
+    let receiver_rx_packets_total = Arc::clone(&rx_packets_total);
+    let receiver_rx_packets_lost = Arc::clone(&rx_packets_lost);
     let receiver_thread = thread::spawn(move || {
         receiver_loop(
             receiver_socket,
@@ -1769,6 +1791,8 @@ fn start_protocol1(
             receiver_radio_mic_audio,
             receiver_diversity_enabled,
             receiver_diversity_main_raw_iq,
+            receiver_rx_packets_total,
+            receiver_rx_packets_lost,
             receiver_stop,
         );
     });
@@ -1836,6 +1860,8 @@ fn start_protocol1(
         cw_paddle_contacts,
         tx_fifo_underrun,
         tx_fifo_overrun,
+        rx_packets_total,
+        rx_packets_lost,
         stop_flag,
         sender_thread: Some(sender_thread),
         receiver_thread: Some(receiver_thread),
@@ -1907,6 +1933,8 @@ fn start_protocol1_ozy_usb(
     adc1_overload: Arc<AtomicBool>,
     tx_fifo_underrun: Arc<AtomicBool>,
     tx_fifo_overrun: Arc<AtomicBool>,
+    rx_packets_total: Arc<AtomicU64>,
+    rx_packets_lost: Arc<AtomicU64>,
     ps_rx_feedback_iq: Arc<Mutex<VecDeque<IqSample>>>,
     ps_tx_feedback_iq: Arc<Mutex<VecDeque<IqSample>>>,
     rx_audio_to_radio: Arc<Mutex<VecDeque<f32>>>,
@@ -2141,6 +2169,8 @@ fn start_protocol1_ozy_usb(
         cw_paddle_contacts,
         tx_fifo_underrun,
         tx_fifo_overrun,
+        rx_packets_total,
+        rx_packets_lost,
         stop_flag,
         sender_thread: Some(sender_thread),
         receiver_thread: Some(receiver_thread),
@@ -3959,6 +3989,8 @@ fn receiver_loop(
     // read fresh each packet, same as active_receiver_count just above.
     diversity_enabled: Arc<AtomicBool>,
     diversity_main_raw_iq: Arc<Mutex<VecDeque<IqSample>>>,
+    rx_packets_total: Arc<AtomicU64>,
+    rx_packets_lost: Arc<AtomicU64>,
     stop: Arc<AtomicBool>,
 ) {
     let mut buf = [0u8; PACKET_SIZE + 64]; // a little slack in case of larger packets
@@ -3976,10 +4008,38 @@ fn receiver_loop(
     // SWR 1.1-1.9 while an external wattmeter read a steady 5.0W).
     let mut fwd_acc: u32 = 0;
     let mut rev_acc: u32 = 0;
+    // Network-quality tracking for the status bar (see RadioSession::
+    // rx_packets_total/rx_packets_lost's own doc comment) -- the 4-byte
+    // sequence number every Metis/P1 IQ-data packet header already
+    // carries (HEADER_SIZE's own doc comment: "<4-byte seq>"), parsed
+    // here for the first time; nothing previously read it.
+    let mut last_seq: Option<u32> = None;
     while !stop.load(Ordering::Relaxed) {
         match socket.recv(&mut buf) {
             Ok(n) if n == PACKET_SIZE => {
                 if buf[0] == 0xEF && buf[1] == 0xFE && buf[2] == 0x01 && buf[3] == EP_IQ_DATA {
+                    // Network-quality tracking -- see RadioSession::
+                    // rx_packets_total/rx_packets_lost's own doc comment.
+                    // Only counts forward gaps (seq jumped ahead of
+                    // expected) as loss; a seq that goes backwards is an
+                    // out-of-order/duplicate delivery, not a dropped
+                    // packet, so it's left uncounted rather than double-
+                    // counting or under-counting real loss.
+                    let seq = u32::from_be_bytes([buf[4], buf[5], buf[6], buf[7]]);
+                    rx_packets_total.fetch_add(1, Ordering::Relaxed);
+                    if let Some(expected) = last_seq.map(|s| s.wrapping_add(1)) {
+                        if seq != expected {
+                            let gap = seq.wrapping_sub(expected);
+                            // A huge "gap" (e.g. billions) really means
+                            // seq < expected -- an out-of-order packet,
+                            // not a legitimate multi-billion-packet loss.
+                            if gap < 1_000_000 {
+                                rx_packets_lost.fetch_add(u64::from(gap), Ordering::Relaxed);
+                            }
+                        }
+                    }
+                    last_seq = Some(seq);
+
                     let capacity = iq_buffer_capacity_for_rate(sample_rate.load(Ordering::Relaxed));
                     // Read live (not a fixed value captured at session
                     // start) so the interleaving stride matches
@@ -4709,6 +4769,8 @@ fn start_protocol2(
     adc1_overload: Arc<AtomicBool>,
     tx_fifo_underrun: Arc<AtomicBool>,
     tx_fifo_overrun: Arc<AtomicBool>,
+    rx_packets_total: Arc<AtomicU64>,
+    rx_packets_lost: Arc<AtomicU64>,
     ps_rx_feedback_iq: Arc<Mutex<VecDeque<IqSample>>>,
     ps_tx_feedback_iq: Arc<Mutex<VecDeque<IqSample>>>,
     rx_audio_to_radio: Arc<Mutex<VecDeque<f32>>>,
@@ -4949,6 +5011,8 @@ fn start_protocol2(
     let receiver_cw_paddle_contacts = Arc::clone(&cw_paddle_contacts);
     let receiver_tx_fifo_underrun = Arc::clone(&tx_fifo_underrun);
     let receiver_tx_fifo_overrun = Arc::clone(&tx_fifo_overrun);
+    let receiver_rx_packets_total = Arc::clone(&rx_packets_total);
+    let receiver_rx_packets_lost = Arc::clone(&rx_packets_lost);
     let receiver_ps_rx_feedback_iq = Arc::clone(&ps_rx_feedback_iq);
     let receiver_ps_tx_feedback_iq = Arc::clone(&ps_tx_feedback_iq);
     let receiver_radio_mic_audio = Arc::clone(&radio_mic_audio);
@@ -4971,6 +5035,8 @@ fn start_protocol2(
             receiver_adc1_overload,
             receiver_tx_fifo_underrun,
             receiver_tx_fifo_overrun,
+            receiver_rx_packets_total,
+            receiver_rx_packets_lost,
             receiver_puresignal_enabled,
             receiver_ps_rx_feedback_iq,
             receiver_ps_tx_feedback_iq,
@@ -5044,6 +5110,8 @@ fn start_protocol2(
         cw_paddle_contacts,
         tx_fifo_underrun,
         tx_fifo_overrun,
+        rx_packets_total,
+        rx_packets_lost,
         stop_flag,
         sender_thread: Some(sender_thread),
         receiver_thread: Some(receiver_thread),
@@ -6095,6 +6163,8 @@ fn p2_receiver_loop(
     adc1_overload: Arc<AtomicBool>,
     tx_fifo_underrun: Arc<AtomicBool>,
     tx_fifo_overrun: Arc<AtomicBool>,
+    rx_packets_total: Arc<AtomicU64>,
+    rx_packets_lost: Arc<AtomicU64>,
     // PureSignal -- see p2_sender_loop's matching doc comment. DDC0/
     // DDC1's wire positions are permanently reserved on P2 (ddc_reserved
     // below is unconditionally 2), so this live flag no longer affects
@@ -6152,6 +6222,14 @@ fn p2_receiver_loop(
     // even heavier UI-side smoothing.
     let mut fwd_acc: u32 = 0;
     let mut rev_acc: u32 = 0;
+    // Network-quality tracking for the status bar (see RadioSession::
+    // rx_packets_total/rx_packets_lost's own doc comment) -- only the
+    // MAIN receiver's own DDC stream (ddc == ddc_reserved), not every
+    // DDC summed together: each DDC port carries its own independent
+    // sequence number, and what the status bar cares about is the
+    // quality of the link behind what's actually being heard, not an
+    // aggregate across receivers that may not even be running.
+    let mut last_seq: Option<u32> = None;
     while !stop.load(Ordering::Relaxed) {
         match socket.recv_from(&mut buf) {
             Ok((n, src)) => {
@@ -6165,6 +6243,28 @@ fn p2_receiver_loop(
                         eprintln!("radio: first IQ packet received for DDC{ddc} (port {port})");
                     }
                     if n == P2_PACKET_SIZE {
+                        if ddc == ddc_reserved && n >= 4 {
+                            // Same 4-byte big-endian sequence convention
+                            // as every outgoing P2 packet this project
+                            // builds (p2_sender_loop/p2_high_priority_
+                            // packet's own seq.to_be_bytes()) -- confirmed
+                            // against p2_parse_ddc_iq_packet's own header
+                            // layout (seq occupies bytes 0-3, payload
+                            // starts at byte 16). Same forward-gap-only
+                            // counting reasoning as receiver_loop's P1
+                            // twin -- see its own doc comment.
+                            let seq = u32::from_be_bytes([buf[0], buf[1], buf[2], buf[3]]);
+                            rx_packets_total.fetch_add(1, Ordering::Relaxed);
+                            if let Some(expected) = last_seq.map(|s| s.wrapping_add(1)) {
+                                if seq != expected {
+                                    let gap = seq.wrapping_sub(expected);
+                                    if gap < 1_000_000 {
+                                        rx_packets_lost.fetch_add(u64::from(gap), Ordering::Relaxed);
+                                    }
+                                }
+                            }
+                            last_seq = Some(seq);
+                        }
                         let capacity = iq_buffer_capacity_for_rate(sample_rate.load(Ordering::Relaxed));
                         if puresignal_enabled.load(Ordering::Relaxed) && ddc == 0 {
                             // See p2_parse_ps_feedback_packet's doc comment --

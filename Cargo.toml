@@ -77,6 +77,14 @@ nusb = "0.2"
 # are likewise OS-native, same as cpal's own per-platform backends -- no
 # new system dependency on any platform.
 midir = "0.11"
+# App-level CPU/memory readout for the status bar's CPU/MEM indicators --
+# cross-platform (Windows/Linux/macOS), so no per-target dependency
+# needed the way e.g. windows-sys below is. Only the "system"/process
+# feature set is used (no need for disks/networks/components), but
+# sysinfo doesn't expose feature-gating that fine-grained -- default
+# features are fine here, this is a small, infrequently-polled query
+# (see main.rs's status bar refresh), not a hot path.
+sysinfo = "0.33"
 
 [target.'cfg(windows)'.dependencies]
 # SetStdHandle, used by main.rs's redirect_stdio_to_log_file() to send
@@ -86,7 +94,7 @@ midir = "0.11"
 # top of main.rs) so Windows stops auto-allocating a console window
 # when launched from Explorer/the Start Menu shortcut, which otherwise
 # silently swallows that same output with nowhere to show it.
-windows-sys = { version = "0.59", features = ["Win32_Foundation", "Win32_System_Console"] }
+windows-sys = { version = "0.59", features = ["Win32_Foundation", "Win32_System_Console", "Win32_System_Threading"] }
 
 # NOTE: I could not compile-check this in the sandbox this was written in
 # (no Rust toolchain available), so treat these version numbers as a
