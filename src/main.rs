@@ -527,7 +527,6 @@ fn dispatch_midi_event(connected: &mut ConnectedState, ev: RawMidiEvent, freq_hz
     }
 
     let current_mode = connected.spectrum.mode();
-    let cw_mode = matches!(current_mode, spectrum::Mode::Cwl | spectrum::Mode::Cwu);
     let dial_freq_hz = if connected.ctun { connected.ctun_frequency_hz } else { freq_hz };
 
     match binding.action {
@@ -662,7 +661,7 @@ fn dispatch_midi_event(connected: &mut ConnectedState, ev: RawMidiEvent, freq_hz
             connected.width_memory.insert(current_mode.label().to_string(), width);
         }
         MidiAction::VfoStepUp | MidiAction::VfoStepDown => {
-            let step = scroll_tune_step_hz(cw_mode, false);
+            let step = scroll_tune_step_hz(connected.tune_step_hz, false);
             let signed_step = if binding.action == MidiAction::VfoStepUp { step } else { -step };
             let new_freq = (dial_freq_hz as i64 + signed_step).max(0) as u32;
             let (effective_freq, retune) = resolve_tune(connected.ctun, freq_hz, sample_rate, passband, new_freq);
@@ -1322,6 +1321,15 @@ struct ConnectedState {
     /// Only meaningful while ctun is true; kept in sync with
     /// session.frequency_hz otherwise (see resolve_tune).
     ctun_frequency_hz: u32,
+    /// Plain (no-modifier) scroll-wheel/click-drag tuning step, in Hz --
+    /// chosen via the "Step" button next to CTUN. A real ask: the
+    /// original only offered a fixed 1kHz step (100Hz in CW mode), with
+    /// no way to change it short of holding Shift for a fixed /10 --
+    /// piHPSDR's own Step popup was the explicit reference asked for.
+    /// Shift (always a fixed 100Hz) and Ctrl (always a fixed 10kHz, the
+    /// existing zoom-notch repurposed as a coarse-tune alias) are
+    /// unaffected by this -- see scroll_tune_step_hz's own doc comment.
+    tune_step_hz: i64,
     /// The last value of session.requested_frequency_hz this app has
     /// already handled -- see that field's doc comment. Compared against
     /// its live value once per frame; a mismatch means a network client
@@ -2277,6 +2285,7 @@ fn connect_to_device(device: Device, cfg: &Config) -> Result<ConnectedState, Str
             let ctun = cfg.ctun.unwrap_or(false);
             let ctun_frequency_hz =
                 if ctun { cfg.ctun_frequency_hz.unwrap_or(initial_frequency_hz) } else { initial_frequency_hz };
+            let tune_step_hz = cfg.tune_step_hz.unwrap_or(1_000);
             // VFO B / Split -- see ConnectedState's own doc comments.
             // VFO B falls back to A's frequency (matches a real rig's
             // typical power-on state, and this project's own convention
@@ -2371,6 +2380,7 @@ fn connect_to_device(device: Device, cfg: &Config) -> Result<ConnectedState, Str
                 width_memory: cfg.width_memory.clone(),
                 ctun,
                 ctun_frequency_hz,
+                tune_step_hz,
                 last_requested_frequency_hz: initial_frequency_hz,
                 vfo_b_frequency_hz,
                 vfo_b_scroll_accum: 0.0,
@@ -3435,6 +3445,42 @@ impl eframe::App for HpsdrApp {
                                         connected.ctun = !connected.ctun;
                                         settings_changed = true;
                                     }
+                                    // Plain (no-modifier) scroll/drag
+                                    // tuning step -- see ConnectedState::
+                                    // tune_step_hz's own doc comment. A
+                                    // real ask, explicitly modeled on
+                                    // piHPSDR's own Step popup: the
+                                    // original had no way to change this
+                                    // short of holding Shift for a fixed
+                                    // /10, and no UI at all for picking a
+                                    // step size directly.
+                                    // Plain ui.label uses this theme's
+                                    // "noninteractive" text color, which
+                                    // reads as a visibly different gray
+                                    // than the CTUN/Split buttons right
+                                    // next to it (Button::selectable's
+                                    // own inactive-state color) -- a real
+                                    // report. Pulling that exact color
+                                    // explicitly keeps this row visually
+                                    // consistent.
+                                    ui.colored_label(ui.visuals().widgets.inactive.fg_stroke.color, "Step:");
+                                    egui::ComboBox::from_id_salt("tune_step_hz")
+                                        .width(60.0)
+                                        .selected_text(tune_step_label(connected.tune_step_hz))
+                                        .show_ui(ui, |ui| {
+                                            for hz in ALL_TUNE_STEPS_HZ {
+                                                if ui
+                                                    .selectable_label(
+                                                        connected.tune_step_hz == hz,
+                                                        tune_step_label(hz),
+                                                    )
+                                                    .clicked()
+                                                {
+                                                    connected.tune_step_hz = hz;
+                                                    settings_changed = true;
+                                                }
+                                            }
+                                        });
                                     // Only shown while actually in CW
                                     // mode -- see cw_panel_visible's own
                                     // doc comment further down. Also
@@ -4717,12 +4763,16 @@ impl eframe::App for HpsdrApp {
                         // grab and slide when CTUN is on.
                         let drag_sign = if connected.ctun { 1.0 } else { -1.0 };
                         connected.drag_tune_accum_hz += drag_sign * spectrum_resp.drag_delta().x as f64 * hz_per_px;
-                        const STEP_HZ: i64 = 1_000;
+                        // See ConnectedState::tune_step_hz's own doc
+                        // comment -- drag-tuning now respects the same
+                        // user-chosen step as scroll-tuning, instead of
+                        // a fixed 1kHz no setting could change.
+                        let step_hz = connected.tune_step_hz;
                         let mut new_freq = dial_freq_hz as i64;
-                        while connected.drag_tune_accum_hz.abs() >= STEP_HZ as f64 {
+                        while connected.drag_tune_accum_hz.abs() >= step_hz as f64 {
                             let sign = connected.drag_tune_accum_hz.signum();
-                            connected.drag_tune_accum_hz -= sign * STEP_HZ as f64;
-                            new_freq += STEP_HZ * sign as i64;
+                            connected.drag_tune_accum_hz -= sign * step_hz as f64;
+                            new_freq += step_hz * sign as i64;
                         }
                         new_freq = new_freq.max(0);
                         if new_freq as u32 != dial_freq_hz {
@@ -4775,7 +4825,7 @@ impl eframe::App for HpsdrApp {
                             const NOTCH: f32 = 100.0;
 
                             let shift = ui.input(|i| i.modifiers.shift);
-                            let step: i64 = scroll_tune_step_hz(cw_mode, shift);
+                            let step: i64 = scroll_tune_step_hz(connected.tune_step_hz, shift);
 
                             let mut new_freq = dial_freq_hz as i64;
                             while connected.scroll_accum.abs() >= NOTCH {
@@ -5127,12 +5177,12 @@ impl eframe::App for HpsdrApp {
                             let hz_per_px = (2.0 * visible_half_span_hz) / rect.width().max(1.0) as f64;
                             let drag_sign = if connected.ctun { 1.0 } else { -1.0 };
                             connected.drag_tune_accum_hz += drag_sign * waterfall_click_resp.drag_delta().x as f64 * hz_per_px;
-                            const STEP_HZ: i64 = 1_000;
+                            let step_hz = connected.tune_step_hz;
                             let mut new_freq = dial_freq_hz as i64;
-                            while connected.drag_tune_accum_hz.abs() >= STEP_HZ as f64 {
+                            while connected.drag_tune_accum_hz.abs() >= step_hz as f64 {
                                 let sign = connected.drag_tune_accum_hz.signum();
-                                connected.drag_tune_accum_hz -= sign * STEP_HZ as f64;
-                                new_freq += STEP_HZ * sign as i64;
+                                connected.drag_tune_accum_hz -= sign * step_hz as f64;
+                                new_freq += step_hz * sign as i64;
                             }
                             new_freq = new_freq.max(0);
                             if new_freq as u32 != dial_freq_hz {
@@ -5168,7 +5218,7 @@ impl eframe::App for HpsdrApp {
                                 connected.scroll_accum += delta;
                                 const NOTCH: f32 = 100.0;
                                 let shift = ui.input(|i| i.modifiers.shift);
-                                let step: i64 = scroll_tune_step_hz(cw_mode, shift);
+                                let step: i64 = scroll_tune_step_hz(connected.tune_step_hz, shift);
 
                                 let mut new_freq = dial_freq_hz as i64;
                                 while connected.scroll_accum.abs() >= NOTCH {
@@ -9132,6 +9182,7 @@ impl eframe::App for HpsdrApp {
                         window_geometry: self.main_window_geometry,
                         ctun: Some(connected.ctun),
                         ctun_frequency_hz: Some(connected.ctun_frequency_hz),
+                        tune_step_hz: Some(connected.tune_step_hz),
                         vfo_b_frequency_hz: Some(connected.vfo_b_frequency_hz),
                         split: Some(connected.split),
                         cw_decode_enabled: Some(connected.cw_decode_enabled),
@@ -10904,7 +10955,11 @@ fn render_extra_receiver_ui(ui: &mut egui::Ui, rx: &Arc<Mutex<ExtraReceiver>>) {
             // See the main receiver's own scroll-to-tune NOTCH comment.
             const NOTCH: f32 = 100.0;
             let shift = ui.input(|i| i.modifiers.shift);
-            let step: i64 = scroll_tune_step_hz(cw_mode, shift);
+            // Extra receiver windows don't have their own Step button
+            // yet (see ConnectedState::tune_step_hz's own doc comment --
+            // this project's main window only, for now) -- 1kHz matches
+            // this project's original, previously-only default.
+            let step: i64 = scroll_tune_step_hz(1_000, shift);
             let mut new_freq = dial_freq_hz as i64;
             while rx.scroll_accum.abs() >= NOTCH {
                 let sign = rx.scroll_accum.signum();
@@ -11095,7 +11150,11 @@ fn render_extra_receiver_ui(ui: &mut egui::Ui, rx: &Arc<Mutex<ExtraReceiver>>) {
                 rx.scroll_accum += delta;
                 const NOTCH: f32 = 100.0;
                 let shift = ui.input(|i| i.modifiers.shift);
-                let step: i64 = scroll_tune_step_hz(cw_mode, shift);
+                // Extra receiver windows don't have their own Step button
+            // yet (see ConnectedState::tune_step_hz's own doc comment --
+            // this project's main window only, for now) -- 1kHz matches
+            // this project's original, previously-only default.
+            let step: i64 = scroll_tune_step_hz(1_000, shift);
                 let mut new_freq = dial_freq_hz as i64;
                 while rx.scroll_accum.abs() >= NOTCH {
                     let sign = rx.scroll_accum.signum();
@@ -11543,17 +11602,32 @@ fn render_extra_receiver_settings(ui: &mut egui::Ui, rx: &Arc<Mutex<ExtraReceive
     }
 }
 
-/// Scroll-to-tune step size over the spectrum/waterfall panes -- finer
-/// in CW mode (100Hz normally, 10Hz with Shift) than every other mode
-/// (1kHz normally, 100Hz with Shift), since zero-beating a CW signal
-/// is commonly done within tens of Hz, far tighter than SSB/AM/FM
-/// listening ever needs.
-fn scroll_tune_step_hz(cw_mode: bool, shift: bool) -> i64 {
-    match (cw_mode, shift) {
-        (true, true) => 10,
-        (true, false) => 100,
-        (false, true) => 100,
-        (false, false) => 1_000,
+/// Scroll-to-tune step size over the spectrum/waterfall panes.
+/// `base_step_hz`: the plain (no-modifier) scroll step -- user-chosen via
+/// the "Step" button next to CTUN (see ConnectedState::tune_step_hz's own
+/// doc comment), replacing what used to be a fixed 1kHz (100Hz in CW
+/// mode) with no way to change it short of a different keyboard modifier.
+/// Shift is a fixed 100Hz alias regardless of `base_step_hz` -- a real
+/// ask: "un método rápido para um passo fino sem abrir o popup", holding
+/// Shift while scrolling should always mean the same thing. Ctrl+scroll
+/// (a real 10kHz alias) is handled entirely separately, at its own call
+/// site -- see that site's own doc comment.
+fn scroll_tune_step_hz(base_step_hz: i64, shift: bool) -> i64 {
+    if shift { 100 } else { base_step_hz }
+}
+
+/// Presets offered by the "Step" popup next to CTUN -- same 1Hz..1MHz
+/// decade spread piHPSDR's own Step menu offers (the explicit reference
+/// this was modeled on).
+const ALL_TUNE_STEPS_HZ: [i64; 7] = [1, 10, 100, 1_000, 10_000, 100_000, 1_000_000];
+
+fn tune_step_label(hz: i64) -> String {
+    if hz >= 1_000_000 {
+        format!("{} MHz", hz / 1_000_000)
+    } else if hz >= 1_000 {
+        format!("{} kHz", hz / 1_000)
+    } else {
+        format!("{hz} Hz")
     }
 }
 

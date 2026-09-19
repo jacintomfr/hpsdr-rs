@@ -407,6 +407,11 @@ pub struct Config {
     pub ctun: Option<bool>,
     #[serde(default)]
     pub ctun_frequency_hz: Option<u32>,
+    /// See ConnectedState::tune_step_hz's own doc comment. Missing (a
+    /// config saved before this existed) falls back to 1000 (1kHz),
+    /// this project's original hardcoded default.
+    #[serde(default)]
+    pub tune_step_hz: Option<i64>,
     /// VFO B / Split -- see ConnectedState::vfo_b_frequency_hz/split's
     /// doc comments (main.rs). `None`/missing falls back to A's
     /// frequency and Split off, respectively -- same "never leave a

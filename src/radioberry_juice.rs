@@ -110,8 +110,50 @@ impl JuiceHandle {
     /// meaningful sense -- from then on there IS a real `Child`, and a
     /// live console works normally too.
     pub fn adopt(exe_path: &Path) -> Self {
+        // BUG FIX for a real report: the console used to start (and, for
+        // an adopted handle, permanently stay) completely empty with no
+        // explanation at all -- confusing on its own, especially since
+        // this is the NORMAL case whenever hpsdr-rs itself was closed
+        // and reopened (X button, not Stop juice) while juice kept
+        // running underneath, so it's not some rare edge case. There's
+        // no way to retroactively attach to an already-running process's
+        // stdout on Windows (the pipe has to be set up at spawn time,
+        // by whichever process actually launched it -- an earlier
+        // hpsdr-rs session in this scenario, long gone by now), so
+        // genuinely live output still can't be recovered here. What CAN
+        // be recovered: that earlier session's own log_path_for file,
+        // still sitting on disk with everything juice printed up to
+        // this point -- seeding the console with its content (capped to
+        // the same MAX_CONSOLE_LINES a live session uses) turns "blank,
+        // unexplained" into "the real history, frozen as of now" plus a
+        // note about why it won't keep updating on its own.
+        let mut lines = VecDeque::with_capacity(MAX_CONSOLE_LINES);
+        let log_path = log_path_for(exe_path);
+        match std::fs::read_to_string(&log_path) {
+            Ok(contents) => {
+                let all_lines: Vec<&str> = contents.lines().collect();
+                let start = all_lines.len().saturating_sub(MAX_CONSOLE_LINES - 1);
+                for line in &all_lines[start..] {
+                    lines.push_back((*line).to_string());
+                }
+                lines.push_back(format!(
+                    "--- adopted an already-running juice (from an earlier session) -- the lines \
+                     above are its log file ({}) as of just now, not live; new output won't appear \
+                     here unless you Restart it ---",
+                    log_path.display()
+                ));
+            }
+            Err(_) => {
+                lines.push_back(
+                    "--- adopted an already-running juice (from an earlier session) -- no log \
+                     file found, and live output isn't available for a process this session \
+                     didn't launch itself; Restart it to get a live console again ---"
+                        .to_string(),
+                );
+            }
+        }
         Self {
-            lines: Arc::new(Mutex::new(VecDeque::new())),
+            lines: Arc::new(Mutex::new(lines)),
             process: Arc::new(Mutex::new(None)),
             exe_path: exe_path.to_path_buf(),
         }

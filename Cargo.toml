@@ -7,6 +7,17 @@ authors = ["John Melton <john.d.melton@googlemail.com>"]
 description = "Desktop client for openHPSDR Protocol 1/2 SDR radios"
 repository = "https://github.com/g0orx/hpsdr-rs"
 
+# A `[profile.release] strip = true / lto = true / codegen-units = 1`
+# block here roughly halves the release .exe (confirmed: ~43MB -> ~20MB)
+# -- worth it for a real distribution build, but `lto = true` alone
+# makes every release build (including ones during ordinary iteration/
+# testing, not just a final one) take about twice as long. Deliberately
+# NOT enabled here for that reason -- only add it back (and only for
+# the one build that actually needs to be small) when a release build
+# is explicitly meant to be the final/distributed one, not a test
+# build. Debug builds (`cargo build`, no `--release`) are unaffected by
+# this either way.
+
 [dependencies]
 # default-features disabled specifically to drop "accesskit" (Linux
 # screen-reader/AT-SPI support via egui-winit -> accesskit_unix ->
