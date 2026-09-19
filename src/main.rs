@@ -881,6 +881,7 @@ enum SettingsTab {
     Antenna,
     Firmware,
     Midi,
+    Meter,
     About,
 }
 
@@ -1246,6 +1247,9 @@ struct ConnectedState {
     tx_waterfall_db_low: f32,
     tx_waterfall_db_high: f32,
     waterfall_palette: Palette,
+    /// S-meter style (Settings -> Meter) -- see MeterStyle's own doc
+    /// comment.
+    meter_style: MeterStyle,
     /// Spectrum's share (0.0-1.0) of the combined spectrum+waterfall
     /// height, adjustable via the drag handle between them -- see
     /// Config::spectrum_waterfall_ratio's doc comment.
@@ -2361,6 +2365,7 @@ fn connect_to_device(device: Device, cfg: &Config) -> Result<ConnectedState, Str
                     .tx_waterfall_db_high
                     .unwrap_or(cfg.waterfall_db_high.unwrap_or(-60.0) + 60.0),
                 waterfall_palette: cfg.waterfall_palette.unwrap_or(Palette::Ocean),
+                meter_style: cfg.meter_style.unwrap_or(MeterStyle::Analog),
                 spectrum_waterfall_ratio: cfg
                     .spectrum_waterfall_ratio
                     .unwrap_or(150.0 / 350.0),
@@ -5558,7 +5563,10 @@ impl eframe::App for HpsdrApp {
                             // at.
                             connected.smoothed_fwd_power = 0.0;
                             connected.smoothed_rev_power = 0.0;
-                            draw_s_meter(ui, meter_rect, meter_db);
+                            match connected.meter_style {
+                                MeterStyle::Analog => draw_s_meter(ui, meter_rect, meter_db),
+                                MeterStyle::Digital => draw_digital_s_meter(ui, meter_rect, meter_db),
+                            }
                         }
 
                         // ADC front-end overload -- see
@@ -5881,6 +5889,7 @@ impl eframe::App for HpsdrApp {
                                     (SettingsTab::Diversity, "Diversity"),
                                     (SettingsTab::Equalizer, "Equalizer"),
                                     (SettingsTab::Firmware, "Firmware"),
+                                    (SettingsTab::Meter, "Meter"),
                                     (SettingsTab::Midi, "MIDI"),
                                     (SettingsTab::Network, "Network"),
                                     (SettingsTab::OpenCollector, "Open Collector"),
@@ -7496,6 +7505,26 @@ impl eframe::App for HpsdrApp {
                                     });
                                 }
 
+                                SettingsTab::Meter => {
+                                    ui.horizontal(|ui| {
+                                        ui.label("S-meter style:");
+                                        for style in ALL_METER_STYLES {
+                                            let selected = style == connected.meter_style;
+                                            if ui
+                                                .add(egui::Button::selectable(selected, style.label()))
+                                                .clicked()
+                                            {
+                                                connected.meter_style = style;
+                                                settings_changed = true;
+                                            }
+                                        }
+                                    });
+                                    ui.weak(
+                                        "Only affects the main receiver's RX S-meter -- the TX \
+                                         power/SWR gauge is unchanged either way.",
+                                    );
+                                }
+
                                 SettingsTab::Tx => {
                                     ui.colored_label(
                                         egui::Color32::from_rgb(230, 150, 50),
@@ -7506,6 +7535,24 @@ impl eframe::App for HpsdrApp {
                                          using a real antenna. See radio.rs/tx.rs for exactly which \
                                          parts are confirmed vs. best-effort guesses.",
                                     );
+                                    {
+                                        let mut logging = connected.session.tx_packet_debug_log.is_enabled();
+                                        if ui
+                                            .checkbox(&mut logging, "Log TX packets (tx_packet_log.txt)")
+                                            .on_hover_text(
+                                                "Protocol 1 only. Logs the raw hex of every outgoing TX \
+                                                 packet (~380/sec while enabled, including the MOX bit and \
+                                                 the TX IQ payload -- see fill_tx_payload's own doc comment) \
+                                                 -- for comparing byte-for-byte against a known-working \
+                                                 reference client's own capture. Meant for a short, \
+                                                 deliberate capture (enable, key PTT briefly, disable), not \
+                                                 left running -- the file grows fast.",
+                                            )
+                                            .changed()
+                                        {
+                                            connected.session.tx_packet_debug_log.set_enabled(logging);
+                                        }
+                                    }
                                     ui.add_space(8.0);
 
                                     ui.horizontal(|ui| {
@@ -9108,6 +9155,7 @@ impl eframe::App for HpsdrApp {
                         tx_waterfall_db_low: Some(connected.tx_waterfall_db_low),
                         tx_waterfall_db_high: Some(connected.tx_waterfall_db_high),
                         waterfall_palette: Some(connected.waterfall_palette),
+                        meter_style: Some(connected.meter_style),
                         spectrum_waterfall_ratio: Some(connected.spectrum_waterfall_ratio),
                         waterfall_enabled: Some(connected.waterfall_enabled),
                         spectrum_zoom: Some(connected.spectrum_zoom),
@@ -10159,6 +10207,141 @@ fn power_watts_and_swr(raw_forward: u32, raw_reverse: u32, board: Boards) -> (f3
     }
 
     (forward, reverse, swr)
+}
+
+/// Ported directly from piHPSDR's own meter.c (`meter_zone_rgb`,
+/// github.com/dl1ycf/pihpsdr) -- three RGB zones (green -> yellow-green,
+/// yellow-green -> amber, amber -> red) as `f` sweeps 0.0..1.0 across
+/// the bar's own width. Values/thresholds kept exactly as that source
+/// has them (not re-derived), since this is meant to reproduce that
+/// specific reference gradient, not just any green-to-red ramp.
+fn meter_zone_rgb(f: f32) -> egui::Color32 {
+    let (r, g, b) = if f < 0.40 {
+        let t = f / 0.40;
+        (0.22 + t * (0.55 - 0.22), 0.83 - t * (0.83 - 0.80), 0.33 - t * 0.33)
+    } else if f < 0.647 {
+        let t = (f - 0.40) / 0.247;
+        (0.55 + t * (0.941 - 0.55), 0.80 - t * (0.80 - 0.647), 0.0)
+    } else {
+        let t = (f - 0.647) / 0.353;
+        (0.941 + t * 0.032, 0.647 - t * (0.647 - 0.318), t * 0.286)
+    };
+    egui::Color32::from_rgb((r * 255.0) as u8, (g * 255.0) as u8, (b * 255.0) as u8)
+}
+
+/// Digital dual-scale S-meter -- the Settings -> Meter "Digital"
+/// alternative to draw_s_meter's analog arc/needle gauge below, modeled
+/// on piHPSDR's own "dualscale" meter style (a horizontal bar with an
+/// S-unit tick row underneath, rather than an arc). Same rect-in,
+/// painter-out shape as draw_s_meter/draw_power_meter so it drops into
+/// the same "s_meter_area" call site unchanged either way.
+fn draw_digital_s_meter(ui: &mut egui::Ui, rect: egui::Rect, db: f64) {
+    let painter = ui.painter();
+    painter.rect_filled(rect, 4.0, egui::Color32::from_gray(20));
+
+    // Same S9 reference/DB_MIN/DB_MAX convention as draw_s_meter's own
+    // (S0 at DB_MIN, S9+60 at DB_MAX), kept as a local const here rather
+    // than shared since these two meters are otherwise independent
+    // draws with nothing else in common to justify coupling them.
+    const S9: f64 = -73.0;
+    const DB_MIN: f64 = S9 - 54.0;
+    const DB_MAX: f64 = S9 + 60.0;
+    const MARGIN: f32 = 6.0;
+    const GREEN: egui::Color32 = egui::Color32::from_rgb(46, 160, 67);
+    const RED: egui::Color32 = egui::Color32::from_rgb(163, 45, 45);
+
+    let s_label = s_meter_label(db, S9);
+    let (s_part, dbm_part) = s_label.split_once(' ').unwrap_or((s_label.as_str(), ""));
+    let text_y = rect.top() + MARGIN + 7.0;
+    painter.text(
+        egui::pos2(rect.left() + MARGIN, text_y),
+        egui::Align2::LEFT_CENTER,
+        s_part,
+        egui::FontId::monospace(16.0),
+        egui::Color32::WHITE,
+    );
+    painter.text(
+        egui::pos2(rect.right() - MARGIN, text_y),
+        egui::Align2::RIGHT_CENTER,
+        dbm_part,
+        egui::FontId::monospace(16.0),
+        egui::Color32::from_rgb(230, 150, 50),
+    );
+
+    let bar = egui::Rect::from_min_max(
+        egui::pos2(rect.left() + MARGIN, rect.top() + MARGIN + 30.0),
+        egui::pos2(rect.right() - MARGIN, rect.top() + MARGIN + 40.0),
+    );
+    painter.rect_filled(bar, 2.0, egui::Color32::from_gray(45));
+    let t = ((db - DB_MIN) / (DB_MAX - DB_MIN)).clamp(0.0, 1.0) as f32;
+    // Green-to-red gradient fill, ported directly from piHPSDR's own
+    // meter.c (meter_zone_rgb + rxmeter_dualscale's 96-segment fill
+    // loop, github.com/dl1ycf/pihpsdr) rather than a flat green bar --
+    // a real request: "não é sempre verde, é gradient". Each segment's
+    // color depends on ITS OWN position along the full bar (0.0 at the
+    // left edge, 1.0 at the right), not on the current reading -- so
+    // the visible fill is green near the low end and shades toward red
+    // as it extends rightward, same as the reference.
+    const N_STEPS: i32 = 96;
+    for i in 0..N_STEPS {
+        let f = i as f32 / N_STEPS as f32;
+        if f > t {
+            break;
+        }
+        let seg = egui::Rect::from_min_max(
+            egui::pos2(bar.left() + f * bar.width(), bar.top()),
+            egui::pos2(bar.left() + f * bar.width() + bar.width() / N_STEPS as f32 + 0.6, bar.bottom()),
+        );
+        painter.rect_filled(seg, 0.0, meter_zone_rgb(f));
+    }
+
+    // Tick labels -- 1/3/5/7/9 (green, S-units) then +20/+40/+60 (red,
+    // over-S9), spaced evenly across the bar's own width (NOT at their
+    // true linear-dB position -- see the dBm row's own comment just
+    // below for why that matters), matching the piHPSDR reference this
+    // was modeled on.
+    let tick_x = |i: usize| bar.left() + bar.width() * (i as f32 / 7.0);
+    let ticks: [(&str, egui::Color32); 8] =
+        [("1", GREEN), ("3", GREEN), ("5", GREEN), ("7", GREEN), ("9", GREEN), ("+20", RED), ("+40", RED), ("+60", RED)];
+    let tick_y = bar.bottom() + 10.0;
+    for (i, (label, color)) in ticks.iter().enumerate() {
+        painter.text(egui::pos2(tick_x(i), tick_y), egui::Align2::CENTER_CENTER, *label, egui::FontId::monospace(10.0), *color);
+    }
+
+    // dBm scale row, directly ABOVE the bar -- REAL BUG FIX: an earlier
+    // version placed 3 dBm labels at even PIXEL thirds of the whole bar
+    // (a plain linear DB_MIN..DB_MAX split), which doesn't line up with
+    // the S-unit ticks below at all -- a real comparison showed -73dBm
+    // (S9's own dB value) landing roughly under "5", not "9". The
+    // S-unit ticks above aren't at their true linear-dB position either
+    // (6dB apart for each of S1/S3/S5/S7/S9, but 20dB apart for each of
+    // +20/+40/+60 -- yet all 8 are drawn at even pixel spacing, matching
+    // the piHPSDR reference this was modeled on, which does the same
+    // simplification) -- so "align with the true dB axis" and "align
+    // with the tick row" are two different things, and correctness here
+    // means the latter: reusing tick_x directly at the S1/S5/S9 indices
+    // (0, 2, 4) with THEIR real dB values (S9 = the S9 const itself;
+    // S1/S5 48 and 24 dB below it, matching the 6dB-per-S-unit
+    // convention s_meter_label's own S computation uses (S1 is 8
+    // S-units below S9, S5 is 4 below), so
+    // whatever dBm value is printed sits exactly above the S-tick it
+    // actually corresponds to.
+    let dbm_scale_y = bar.top() - 8.0;
+    for (i, offset_from_s9) in [(0usize, -48.0), (2, -24.0), (4, 0.0)] {
+        let v = S9 + offset_from_s9;
+        let align = match i {
+            0 => egui::Align2::LEFT_CENTER,
+            4 => egui::Align2::RIGHT_CENTER,
+            _ => egui::Align2::CENTER_CENTER,
+        };
+        painter.text(
+            egui::pos2(tick_x(i), dbm_scale_y),
+            align,
+            format!("{v:.0}"),
+            egui::FontId::monospace(9.0),
+            egui::Color32::from_gray(150),
+        );
+    }
 }
 
 fn draw_s_meter(ui: &mut egui::Ui, rect: egui::Rect, db: f64) {
@@ -11304,6 +11487,12 @@ fn render_extra_receiver_settings(ui: &mut egui::Ui, rx: &Arc<Mutex<ExtraReceive
         // -- fall back to AGC if this is ever somehow selected.
         SettingsTab::Network => rx.settings_tab = SettingsTab::Agc,
 
+        // Meter (Settings -> Meter, main receiver only -- see
+        // MeterStyle's own doc comment) -- no equivalent tab for extra
+        // receivers, same redirect-if-somehow-selected pattern as
+        // Network above.
+        SettingsTab::Meter => rx.settings_tab = SettingsTab::Agc,
+
         // No standalone Audio tab for extra receivers -- this receiver's
         // own Output device picker lives inline at the bottom of its RX
         // tab below (and it has no mic/TX concept at all) -- redirect
@@ -12152,6 +12341,29 @@ fn build_waterfall_image(
 
     Some(image)
 }
+
+/// S-meter style (Settings -> Meter) -- Analog is draw_s_meter's
+/// existing arc/needle gauge (unchanged, this project's default since
+/// before this choice existed); Digital is draw_digital_s_meter's
+/// piHPSDR-style dual-scale bar. Only affects the main receiver's RX
+/// S-meter -- the TX power/SWR gauge (draw_power_meter) and extra
+/// receiver windows are untouched.
+#[derive(Copy, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum MeterStyle {
+    Analog,
+    Digital,
+}
+
+impl MeterStyle {
+    fn label(self) -> &'static str {
+        match self {
+            MeterStyle::Analog => "Analog",
+            MeterStyle::Digital => "Digital",
+        }
+    }
+}
+
+const ALL_METER_STYLES: [MeterStyle; 2] = [MeterStyle::Analog, MeterStyle::Digital];
 
 #[derive(Copy, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum Palette {

@@ -17,6 +17,7 @@
     at reduced drive before ever keying into an antenna.
 */
 
+use crate::debug_log::{self, DebugLog};
 use crate::discovery::{Boards, Device};
 use crate::ozy;
 use std::collections::VecDeque;
@@ -1092,6 +1093,23 @@ pub struct RadioSession {
     /// actual link to the radio).
     pub rx_packets_total: Arc<AtomicU64>,
     pub rx_packets_lost: Arc<AtomicU64>,
+    /// Raw-hex dump of every outgoing Protocol 1 TX packet (P1 only for
+    /// now -- see sender_loop's own logging call), toggled from Settings
+    /// -> Tx. Off by default, same "truncate fresh on enable, never grow
+    /// silently" convention as the rigctl/TCI/CAT debug logs (debug_log.
+    /// rs) this reuses directly. Exists specifically to let this
+    /// project's own outgoing packets be diffed byte-for-byte against a
+    /// known-working reference client's (e.g. piHPSDR, captured
+    /// separately with the same test) for the two parts of the TX path
+    /// the source itself flags as unverified/inferred rather than
+    /// confirmed against the official protocol spec: fill_tx_payload's
+    /// I/Q-vs-raw-audio framing guess, and the MOX/PTT bit's exact
+    /// position. Logs every packet while enabled (not gated to only
+    /// while transmitting) so a PTT press/release is visible as a
+    /// transition in the log, not just steady-state TX traffic -- meant
+    /// for short, deliberate capture sessions (turn on, key PTT briefly,
+    /// turn off), not left running.
+    pub tx_packet_debug_log: DebugLog,
     stop_flag: Arc<AtomicBool>,
     sender_thread: Option<JoinHandle<()>>,
     receiver_thread: Option<JoinHandle<()>>,
@@ -1233,6 +1251,9 @@ impl RadioSession {
         let tx_fifo_overrun = Arc::new(AtomicBool::new(false));
         let rx_packets_total = Arc::new(AtomicU64::new(0));
         let rx_packets_lost = Arc::new(AtomicU64::new(0));
+        let tx_packet_debug_log = DebugLog::new(
+            debug_log::log_path("tx_packet_log.txt").unwrap_or_else(|| "tx_packet_log.txt".into()),
+        );
         // Checked ahead of the protocol match below, not instead of it:
         // Ozy still reports protocol 1 (it IS P1 framing, just over USB
         // instead of UDP -- see ozy.rs's module doc comment), so every
@@ -1243,7 +1264,7 @@ impl RadioSession {
                 device, settings, frequency_hz, tx_frequency_hz, rx_frequency_hz, requested_frequency_hz, sample_rate, adc, rx_antenna, tx_antenna, rx_attenuation,
                 ps_tx_attenuation, mox, tx_iq, tci_tx_audio, tci_tx_gain, tx_power_watts, cw_keyer, cw_mode_active, pa_gain_db,
                 tx_forward_power, tx_reverse_power, adc0_overload, cw_ptt_active, cw_paddle_contacts, adc1_overload,
-                tx_fifo_underrun, tx_fifo_overrun, rx_packets_total, rx_packets_lost, ps_rx_feedback_iq, ps_tx_feedback_iq,
+                tx_fifo_underrun, tx_fifo_overrun, rx_packets_total, rx_packets_lost, tx_packet_debug_log, ps_rx_feedback_iq, ps_tx_feedback_iq,
                 rx_audio_to_radio, send_rx_audio_to_radio, hl2_ak4951_codec, new_pa_board, radio_mic_audio, tx_audio_source,
                 tci_wants_mic, mic_ptt_enabled, mic_bias_enabled, mic_ptt_on_tip,
                 diversity_enabled, diversity_gain_db, diversity_phase_deg, diversity_main_raw_iq,
@@ -1255,7 +1276,7 @@ impl RadioSession {
                 device, settings, frequency_hz, tx_frequency_hz, rx_frequency_hz, requested_frequency_hz, sample_rate, adc, rx_antenna, tx_antenna, rx_attenuation,
                 ps_tx_attenuation, mox, tx_iq, tci_tx_audio, tci_tx_gain, tx_power_watts, cw_keyer, cw_mode_active, pa_gain_db,
                 tx_forward_power, tx_reverse_power, adc0_overload, cw_ptt_active, cw_paddle_contacts, adc1_overload,
-                tx_fifo_underrun, tx_fifo_overrun, rx_packets_total, rx_packets_lost, ps_rx_feedback_iq, ps_tx_feedback_iq,
+                tx_fifo_underrun, tx_fifo_overrun, rx_packets_total, rx_packets_lost, tx_packet_debug_log, ps_rx_feedback_iq, ps_tx_feedback_iq,
                 rx_audio_to_radio, send_rx_audio_to_radio, hl2_ak4951_codec, new_pa_board, radio_mic_audio, tx_audio_source,
                 tci_wants_mic, mic_ptt_enabled, mic_bias_enabled, mic_ptt_on_tip,
                 diversity_enabled, diversity_gain_db, diversity_phase_deg, diversity_main_raw_iq,
@@ -1265,7 +1286,7 @@ impl RadioSession {
                 device, settings, frequency_hz, tx_frequency_hz, rx_frequency_hz, requested_frequency_hz, sample_rate, adc, rx_antenna, tx_antenna, rx_attenuation,
                 ps_tx_attenuation, mox, tx_iq, tci_tx_audio, tci_tx_gain, tx_power_watts, cw_keyer, cw_mode_active, pa_gain_db,
                 tx_forward_power, tx_reverse_power, adc0_overload, cw_ptt_active, cw_paddle_contacts, adc1_overload,
-                tx_fifo_underrun, tx_fifo_overrun, rx_packets_total, rx_packets_lost, ps_rx_feedback_iq, ps_tx_feedback_iq,
+                tx_fifo_underrun, tx_fifo_overrun, rx_packets_total, rx_packets_lost, tx_packet_debug_log, ps_rx_feedback_iq, ps_tx_feedback_iq,
                 rx_audio_to_radio, send_rx_audio_to_radio, hl2_ak4951_codec, new_pa_board, radio_mic_audio, tx_audio_source,
                 tci_wants_mic, mic_ptt_enabled, mic_bias_enabled, mic_ptt_on_tip,
                 diversity_enabled, diversity_gain_db, diversity_phase_deg, diversity_main_raw_iq,
@@ -1503,6 +1524,7 @@ fn start_protocol1(
     tx_fifo_overrun: Arc<AtomicBool>,
     rx_packets_total: Arc<AtomicU64>,
     rx_packets_lost: Arc<AtomicU64>,
+    tx_packet_debug_log: DebugLog,
     ps_rx_feedback_iq: Arc<Mutex<VecDeque<IqSample>>>,
     ps_tx_feedback_iq: Arc<Mutex<VecDeque<IqSample>>>,
     rx_audio_to_radio: Arc<Mutex<VecDeque<f32>>>,
@@ -1712,6 +1734,7 @@ fn start_protocol1(
     // Live -- see RadioSession::puresignal_enabled's doc comment.
     // sender_loop watches this itself for changes, same as diversity.
     let sender_puresignal_enabled = Arc::clone(&puresignal_enabled);
+    let sender_tx_packet_debug_log = tx_packet_debug_log.clone();
     let sender_thread = thread::spawn(move || {
         sender_loop(
             sender_socket,
@@ -1749,6 +1772,7 @@ fn start_protocol1(
             sender_mic_ptt_enabled,
             sender_mic_bias_enabled,
             sender_mic_ptt_on_tip,
+            sender_tx_packet_debug_log,
             sender_stop,
         );
     });
@@ -1862,6 +1886,7 @@ fn start_protocol1(
         tx_fifo_overrun,
         rx_packets_total,
         rx_packets_lost,
+        tx_packet_debug_log,
         stop_flag,
         sender_thread: Some(sender_thread),
         receiver_thread: Some(receiver_thread),
@@ -1935,6 +1960,7 @@ fn start_protocol1_ozy_usb(
     tx_fifo_overrun: Arc<AtomicBool>,
     rx_packets_total: Arc<AtomicU64>,
     rx_packets_lost: Arc<AtomicU64>,
+    tx_packet_debug_log: DebugLog,
     ps_rx_feedback_iq: Arc<Mutex<VecDeque<IqSample>>>,
     ps_tx_feedback_iq: Arc<Mutex<VecDeque<IqSample>>>,
     rx_audio_to_radio: Arc<Mutex<VecDeque<f32>>>,
@@ -2171,6 +2197,7 @@ fn start_protocol1_ozy_usb(
         tx_fifo_overrun,
         rx_packets_total,
         rx_packets_lost,
+        tx_packet_debug_log,
         stop_flag,
         sender_thread: Some(sender_thread),
         receiver_thread: Some(receiver_thread),
@@ -3524,6 +3551,8 @@ fn sender_loop(
     mic_ptt_enabled: Arc<AtomicBool>,
     mic_bias_enabled: Arc<AtomicBool>,
     mic_ptt_on_tip: Arc<AtomicBool>,
+    // See RadioSession::tx_packet_debug_log's own doc comment.
+    tx_packet_debug_log: DebugLog,
     stop: Arc<AtomicBool>,
 ) {
     let mut seq: u32 = 0;
@@ -3764,6 +3793,19 @@ fn sender_loop(
             mic_bias_enabled.load(Ordering::Relaxed),
             mic_ptt_on_tip.load(Ordering::Relaxed),
         );
+
+        // See RadioSession::tx_packet_debug_log's own doc comment --
+        // is_enabled() is a single relaxed atomic load, cheap enough to
+        // check unconditionally every packet (~380/sec) rather than
+        // caching the flag, so toggling the Settings -> Tx checkbox
+        // takes effect on the very next packet.
+        if tx_packet_debug_log.is_enabled() {
+            let mut hex = String::with_capacity(packet.len() * 2);
+            for b in packet.iter() {
+                hex.push_str(&format!("{b:02x}"));
+            }
+            tx_packet_debug_log.log(&format!("seq={seq} mox={mox_on} {hex}"));
+        }
 
         if socket.send(&packet).is_err() {
             break; // socket closed or radio gone; let the thread exit
@@ -4771,6 +4813,7 @@ fn start_protocol2(
     tx_fifo_overrun: Arc<AtomicBool>,
     rx_packets_total: Arc<AtomicU64>,
     rx_packets_lost: Arc<AtomicU64>,
+    tx_packet_debug_log: DebugLog,
     ps_rx_feedback_iq: Arc<Mutex<VecDeque<IqSample>>>,
     ps_tx_feedback_iq: Arc<Mutex<VecDeque<IqSample>>>,
     rx_audio_to_radio: Arc<Mutex<VecDeque<f32>>>,
@@ -5112,6 +5155,7 @@ fn start_protocol2(
         tx_fifo_overrun,
         rx_packets_total,
         rx_packets_lost,
+        tx_packet_debug_log,
         stop_flag,
         sender_thread: Some(sender_thread),
         receiver_thread: Some(receiver_thread),

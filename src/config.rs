@@ -9,7 +9,7 @@
 */
 
 use crate::spectrum::{Agc, EqualizerParams, Mode, NoiseBlanker, NoiseReduction};
-use crate::{BandSettings, Palette};
+use crate::{BandSettings, MeterStyle, Palette};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
@@ -66,6 +66,11 @@ pub struct Config {
     /// without them opting in.
     pub waterfall_db_low_auto: Option<bool>,
     pub waterfall_palette: Option<Palette>,
+    /// See ConnectedState::meter_style's own doc comment (main.rs).
+    /// Missing (a config saved before this existed) falls back to
+    /// Analog, this project's original S-meter style.
+    #[serde(default)]
+    pub meter_style: Option<MeterStyle>,
     /// Spectrum's share (0.0-1.0) of the combined spectrum+waterfall
     /// height -- draggable via the divider between them. Missing falls
     /// back to their old fixed 150/350 proportions.
