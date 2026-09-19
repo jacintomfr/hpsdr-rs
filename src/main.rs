@@ -10250,9 +10250,20 @@ fn draw_digital_s_meter(ui: &mut egui::Ui, rect: egui::Rect, db: f64) {
     const GREEN: egui::Color32 = egui::Color32::from_rgb(46, 160, 67);
     const RED: egui::Color32 = egui::Color32::from_rgb(163, 45, 45);
 
+    // REAL BUG FIX: a real report -- the header/scale/bar/ticks below
+    // are laid out at fixed offsets from rect.top() totaling
+    // CONTENT_HEIGHT, which left the leftover height at the CALL
+    // SITE's actual rect (85px tall, ~23px more than this needs) sitting
+    // entirely below the tick row as dead space, with the header jammed
+    // right at the top edge. Splitting that leftover evenly (half above,
+    // half below, same fix as draw_s_meter's own analog gauge) centers
+    // the whole block in the rect instead.
+    const CONTENT_HEIGHT: f32 = 62.0;
+    let top = rect.top() + ((rect.height() - CONTENT_HEIGHT) / 2.0).max(0.0);
+
     let s_label = s_meter_label(db, S9);
     let (s_part, dbm_part) = s_label.split_once(' ').unwrap_or((s_label.as_str(), ""));
-    let text_y = rect.top() + MARGIN + 7.0;
+    let text_y = top + MARGIN + 7.0;
     painter.text(
         egui::pos2(rect.left() + MARGIN, text_y),
         egui::Align2::LEFT_CENTER,
@@ -10269,8 +10280,8 @@ fn draw_digital_s_meter(ui: &mut egui::Ui, rect: egui::Rect, db: f64) {
     );
 
     let bar = egui::Rect::from_min_max(
-        egui::pos2(rect.left() + MARGIN, rect.top() + MARGIN + 30.0),
-        egui::pos2(rect.right() - MARGIN, rect.top() + MARGIN + 40.0),
+        egui::pos2(rect.left() + MARGIN, top + MARGIN + 30.0),
+        egui::pos2(rect.right() - MARGIN, top + MARGIN + 40.0),
     );
     painter.rect_filled(bar, 2.0, egui::Color32::from_gray(45));
     let t = ((db - DB_MIN) / (DB_MAX - DB_MIN)).clamp(0.0, 1.0) as f32;
@@ -10480,7 +10491,10 @@ fn draw_s_meter(ui: &mut egui::Ui, rect: egui::Rect, db: f64) {
         egui::Align2::RIGHT_TOP,
         format!("{db:.0} dBm"),
         egui::FontId::proportional(15.0),
-        egui::Color32::WHITE,
+        // Same orange as draw_digital_s_meter's own dBm readout -- a
+        // real request to match the two meters' dBm color now that
+        // both exist as alternatives (Settings -> Meter).
+        egui::Color32::from_rgb(230, 150, 50),
     );
 }
 
