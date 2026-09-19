@@ -26,6 +26,7 @@ mod ozy;
 mod radio;
 mod radioberry_juice;
 mod rigctl;
+mod rx888;
 mod spectrum;
 mod sysstats;
 mod tci;
@@ -1589,6 +1590,12 @@ struct ConnectedState {
     /// RadioSettings before RadioSession::start is called.
     ozy_firmware_path: Option<String>,
     ozy_fpga_path: Option<String>,
+    /// RX-888 Mk2 only -- see Config::rx888_firmware_path and
+    /// radio::RadioSettings::rx888_firmware_path. Set via the Discover
+    /// window's "RX-888 USB setup" file picker (not post-connect
+    /// Settings -- needed just to complete the very first connect); kept
+    /// here only so it round-trips back into Config unchanged on save.
+    rx888_firmware_path: Option<String>,
     /// Whether the Tune button is currently engaged -- transient, not
     /// persisted. See the main-panel Tune button handler for the full
     /// mechanism (WDSP PostGen tone + a temporary TX Power override).
@@ -1852,6 +1859,16 @@ fn connect_to_device(device: Device, cfg: &Config) -> Result<ConnectedState, Str
     if let Some(sr) = cfg.sample_rate {
         settings.sample_rate = sr;
     }
+    // RX-888: fixed, non-user-configurable DDC output rate (see
+    // rx888.rs's own doc comment) -- overrides any saved
+    // cfg.sample_rate rather than letting a stale value from some other
+    // board's config linger. Applied here (before RadioSession::start
+    // AND before this same settings.sample_rate is read again below for
+    // SpectrumHandle::start) so both stay consistent with what the DDC
+    // actually produces.
+    if device.board == Boards::Rx888 {
+        settings.sample_rate = rx888::OUTPUT_SAMPLE_RATE_HZ;
+    }
     // Pre-size for multiple receivers, per whatever the
     // radio's own discovery reply reported supporting --
     // both protocols now genuinely support independent
@@ -1887,6 +1904,7 @@ fn connect_to_device(device: Device, cfg: &Config) -> Result<ConnectedState, Str
     settings.xit_offset_hz = xit_offset_hz.round().clamp(-9_999.0, 9_999.0) as i32;
     settings.ozy_firmware_path = cfg.ozy_firmware_path.clone();
     settings.ozy_fpga_path = cfg.ozy_fpga_path.clone();
+    settings.rx888_firmware_path = cfg.rx888_firmware_path.clone();
     match RadioSession::start(&device, settings.clone()) {
         Ok(session) => {
             // Override RadioSession::start's hardcoded
@@ -2271,6 +2289,15 @@ fn connect_to_device(device: Device, cfg: &Config) -> Result<ConnectedState, Str
                     (false, None, None)
                 }
             };
+            // RX-888: receive-only hardware, no TX capability at all --
+            // `tx_enabled` above only reflects whether a local mic
+            // device happened to open successfully, with no board-
+            // capability check, so without this override the MOX/TUNE/
+            // TWO TONE/CW/RIT/XIT row would show up fully clickable
+            // (harmless -- there's no sender thread for this board to
+            // act on any of it, see start_rx888_usb's doc comment -- but
+            // confusing UI for hardware that can never transmit).
+            let tx_enabled = tx_enabled && device.board != Boards::Rx888;
 
             println!(
                 "Started {:?} at {} (protocol {}, {} ADC(s), reports supporting {} receiver(s))",
@@ -2478,6 +2505,7 @@ fn connect_to_device(device: Device, cfg: &Config) -> Result<ConnectedState, Str
                 max_swr: cfg.max_swr.unwrap_or(3.0),
                 ozy_firmware_path: cfg.ozy_firmware_path.clone(),
                 ozy_fpga_path: cfg.ozy_fpga_path.clone(),
+                rx888_firmware_path: cfg.rx888_firmware_path.clone(),
                 tune_active: false,
                 pre_tune_power_watts: None,
                 two_tone_active: false,
@@ -6566,16 +6594,16 @@ impl eframe::App for HpsdrApp {
                                         ));
                                         ui.end_row();
 
-                                        let is_ozy = connected.device.board == Boards::Ozy;
+                                        let is_usb_board = matches!(connected.device.board, Boards::Ozy | Boards::Rx888);
                                         ui.label("IP Address:");
-                                        ui.label(if is_ozy {
+                                        ui.label(if is_usb_board {
                                             "USB".to_string()
                                         } else {
                                             format!("{}", connected.device.address.ip())
                                         });
                                         ui.end_row();
 
-                                        if !is_ozy {
+                                        if !is_usb_board {
                                             ui.label("MAC Address:");
                                             let mac = connected.device.mac;
                                             ui.label(format!(
@@ -6586,7 +6614,7 @@ impl eframe::App for HpsdrApp {
                                         }
 
                                         ui.label("Interface:");
-                                        ui.label(if is_ozy {
+                                        ui.label(if is_usb_board {
                                             "USB".to_string()
                                         } else {
                                             connected.interface_name.clone().unwrap_or_else(|| "unknown".to_string())
@@ -6950,6 +6978,25 @@ impl eframe::App for HpsdrApp {
 
                                 SettingsTab::Agc => {
                                     ui.label("Sample Rate:");
+                                    // RX-888: NOT a hardware-negotiable setting the way it is
+                                    // for a real P1/P2 radio -- this board's own DDC output
+                                    // rate (rx888::OUTPUT_SAMPLE_RATE_HZ) is fixed by its CIC
+                                    // decimation design, and there's no sender thread at all
+                                    // (see start_rx888_usb's doc comment) to tell real
+                                    // hardware to change it. Selecting one of the P1/P2 rate
+                                    // buttons below would only rebuild the WDSP channel to
+                                    // EXPECT a different input rate, while the actual data
+                                    // arriving from rx888_receiver_loop kept coming in at the
+                                    // real fixed rate regardless -- a real report: this
+                                    // mismatch crashed (WDSP's internal buffer/decimation
+                                    // state has no defense against the input rate it was
+                                    // opened with not matching what's actually arriving).
+                                    if connected.device.board == Boards::Rx888 {
+                                        ui.label(format!(
+                                            "{:.3} kHz (fixed -- RX-888's own DDC output rate)",
+                                            connected.sample_rate as f64 / 1000.0
+                                        ));
+                                    } else {
                                     ui.horizontal_wrapped(|ui| {
                                         // Protocol 2 boards support 768/1536ksps too (encoded as
                                         // a raw ksps value in p2_ddc_specific_packet, not the
@@ -6979,6 +7026,7 @@ impl eframe::App for HpsdrApp {
                                     ui.weak(
                                         "Changing this briefly interrupts audio/spectrum while the demod chain restarts.",
                                     );
+                                    }
                                     ui.separator();
 
                                     // BUG FIX: this used to be gated on
@@ -7631,6 +7679,12 @@ impl eframe::App for HpsdrApp {
                                         ui.add_space(8.0);
                                     }
 
+                                    // RX-888: receive-only hardware, no TX capability at
+                                    // all -- don't let this checkbox re-enable the MOX/
+                                    // TUNE/etc. row the connect-time override above hides.
+                                    if connected.device.board == Boards::Rx888 {
+                                        ui.weak("Enable Transmit (receive-only hardware)");
+                                    } else {
                                     let mut tx_enabled = connected.tx_enabled;
                                     if ui.checkbox(&mut tx_enabled, "Enable Transmit").changed() {
                                         if tx_enabled {
@@ -7740,6 +7794,7 @@ impl eframe::App for HpsdrApp {
                                             connected.two_tone_active = false;
                                         }
                                         settings_changed = true;
+                                    }
                                     }
 
                                     // TX audio source selection -- see
@@ -9145,6 +9200,7 @@ impl eframe::App for HpsdrApp {
                         max_swr: Some(connected.max_swr),
                         ozy_firmware_path: connected.ozy_firmware_path.clone(),
                         ozy_fpga_path: connected.ozy_fpga_path.clone(),
+                        rx888_firmware_path: connected.rx888_firmware_path.clone(),
                         rigctl_addr: Some(connected.rigctl_addr.clone()),
                         tci_addr: Some(connected.tci_addr.clone()),
                         cat_addr: Some(connected.cat_addr.clone()),
@@ -9814,16 +9870,19 @@ fn tci_status_hover(status: Option<bool>, addr: &str, server: Option<&TciServer>
 }
 
 fn format_frequency(hz: u32) -> String {
+    // "." as the thousands separator, no "Hz" suffix -- matches piHPSDR's
+    // own VFO display convention (real request), rather than this
+    // project's earlier ","-separated "... Hz" format.
     let digits = hz.to_string();
     let bytes = digits.as_bytes();
     let mut out = String::new();
     for (i, b) in bytes.iter().enumerate() {
         if i > 0 && (bytes.len() - i) % 3 == 0 {
-            out.push(',');
+            out.push('.');
         }
         out.push(*b as char);
     }
-    format!("{out} Hz")
+    out
 }
 
 /// Track width for stable_db_slider/stable_i32_slider/stable_f64_slider
@@ -10233,6 +10292,10 @@ fn default_max_tx_power_watts(board: Boards) -> u32 {
         Boards::Ozy => 5,
         Boards::Metis | Boards::Hermes | Boards::Hermes2 | Boards::Angelia => 10,
         Boards::Orion | Boards::Orion2 | Boards::Saturn => 100,
+        // Receive-only hardware -- 0W makes the TX Power slider/control
+        // meaningless rather than picking an arbitrary non-zero default
+        // it can never actually reach. See radio.rs's start_rx888_usb.
+        Boards::Rx888 => 0,
         Boards::Unknown => 100,
     }
 }
@@ -10299,6 +10362,11 @@ fn power_watts_and_swr(raw_forward: u32, raw_reverse: u32, board: Boards) -> (f3
         // available to compare an indicated value against a real power
         // meter.
         Boards::Ozy => (3.3, 0.09),
+        // Receive-only hardware, no forward/reverse power detector at
+        // all -- never actually displayed (max_tx_power_watts is 0, see
+        // default_max_tx_power_watts), placeholder purely so this match
+        // stays exhaustive.
+        Boards::Rx888 => (3.3, 0.09),
         Boards::Unknown => (3.3, 0.09),
     };
 

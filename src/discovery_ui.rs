@@ -106,6 +106,12 @@ pub struct DiscoveryWindow {
     /// remember to click Refresh themselves. `None` the rest of the
     /// time -- a manual Refresh is unaffected either way.
     juice_refresh_at: Option<Instant>,
+    /// RX-888 Mk2's own user-supplied FX3 RAM image path -- same
+    /// "set here, not post-connect Settings" reasoning as the Ozy paths
+    /// above (needed just to complete the very first connect). See
+    /// `discovery::RX888_SENTINEL_MAC`'s doc comment for why this uses a
+    /// different sentinel MAC than Ozy's.
+    rx888_firmware_path: Option<String>,
 }
 
 /// How long to wait after launching juice before automatically
@@ -146,6 +152,7 @@ impl DiscoveryWindow {
             .map(std::path::Path::new)
             .filter(|path| crate::radioberry_juice::is_named_process_running(path))
             .map(crate::radioberry_juice::JuiceHandle::adopt);
+        let rx888_cfg = Config::load(crate::discovery::RX888_SENTINEL_MAC);
         let window = Self {
             open: true,
             devices: Arc::new(Mutex::new(Vec::new())),
@@ -163,6 +170,7 @@ impl DiscoveryWindow {
             juice_launch_error: None,
             juice_refresh_at: None,
             juice_console,
+            rx888_firmware_path: rx888_cfg.rx888_firmware_path,
         };
         window.spawn_discovery(ctx.clone());
         window
@@ -180,6 +188,12 @@ impl DiscoveryWindow {
         cfg.radioberry_juice_path = self.radioberry_juice_path.clone();
         cfg.radioberry_juice_fpga = self.radioberry_juice_fpga;
         cfg.save(RADIOBERRY_JUICE_CONFIG_MAC);
+    }
+
+    fn save_rx888_path(&self) {
+        let mut cfg = Config::load(crate::discovery::RX888_SENTINEL_MAC);
+        cfg.rx888_firmware_path = self.rx888_firmware_path.clone();
+        cfg.save(crate::discovery::RX888_SENTINEL_MAC);
     }
 
     fn spawn_discovery(&self, ctx: egui::Context) {
@@ -359,7 +373,7 @@ impl DiscoveryWindow {
                             // sentinels for it (see discover_ozy_usb's doc
                             // comment), so show "USB" instead of formatting
                             // them like a real IP/interface.
-                            let interface_cell = if dev.board == Boards::Ozy {
+                            let interface_cell = if matches!(dev.board, Boards::Ozy | Boards::Rx888) {
                                 "USB".to_string()
                             } else {
                                 match interface_names.get(&dev.my_address.ip()) {
@@ -375,7 +389,7 @@ impl DiscoveryWindow {
                             );
                             row_clicked |= resp.clicked();
                             row_double_clicked |= resp.double_clicked();
-                            let ip_cell = if dev.board == Boards::Ozy {
+                            let ip_cell = if matches!(dev.board, Boards::Ozy | Boards::Rx888) {
                                 "USB".to_string()
                             } else {
                                 dev.address.ip().to_string()
@@ -752,6 +766,30 @@ impl DiscoveryWindow {
                         // cheap enough for a console view like this.
                         ui.ctx().request_repaint_after(Duration::from_millis(300));
                     }
+                });
+
+                egui::CollapsingHeader::new("RX-888 USB setup").show(ui, |ui| {
+                    ui.label(
+                        "RX-888 Mk2 needs its own Cypress FX3 RAM image \
+                         (SDDC_FX3.img) to connect. Not bundled with hpsdr-rs \
+                         (different, unverified upstream from Ozy's own \
+                         firmware) -- point this at your own copy.",
+                    );
+                    ui.horizontal(|ui| {
+                        ui.label("FX3 firmware (.img):");
+                        ui.label(match &self.rx888_firmware_path {
+                            Some(p) => p.clone(),
+                            None => "(not set -- use Choose... below)".to_string(),
+                        });
+                        if ui.button("Choose...").clicked() {
+                            if let Some(path) =
+                                rfd::FileDialog::new().add_filter("RX-888 FX3 firmware", &["img"]).pick_file()
+                            {
+                                self.rx888_firmware_path = Some(path.display().to_string());
+                                self.save_rx888_path();
+                            }
+                        }
+                    });
                 });
                 });
             },
