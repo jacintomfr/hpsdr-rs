@@ -516,9 +516,18 @@ pub fn force_kill_all(exe_path: &Path) -> bool {
     }
     #[cfg(not(windows))]
     {
-        let found = Command::new("pgrep").args(["-x", name]).output().map(|o| !o.stdout.is_empty()).unwrap_or(false);
+        // `-x` matches against the kernel's `comm` field, truncated to
+        // 15 characters (TASK_COMM_LEN) -- "radioberry-juice" itself is
+        // 16, so `-x` silently finds (and kills) nothing here, always,
+        // on Linux, regardless of whether juice was actually running.
+        // `-f` matches the full command line instead, which has no
+        // such limit -- see is_named_process_running's own doc comment
+        // for the same fix and why `$name$` (not `-x`) is also right
+        // for the exact-match intent here.
+        let pattern = format!("{name}$");
+        let found = Command::new("pgrep").args(["-f", &pattern]).output().map(|o| !o.stdout.is_empty()).unwrap_or(false);
         if found {
-            let _ = Command::new("pkill").args(["-9", "-x", name]).status();
+            let _ = Command::new("pkill").args(["-9", "-f", &pattern]).status();
         }
         found
     }
@@ -547,7 +556,19 @@ pub fn is_named_process_running(exe_path: &Path) -> bool {
     let Some(name) = exe_path.file_name().and_then(|n| n.to_str()) else {
         return false;
     };
-    Command::new("pgrep").args(["-x", name]).output().map(|o| !o.stdout.is_empty()).unwrap_or(false)
+    // BUG FIX (real report): `pgrep -x` matches against the kernel's
+    // `comm` field, truncated to 15 characters (TASK_COMM_LEN) --
+    // "radioberry-juice" itself is 16, so `-x` refuses to even search
+    // (prints a warning, matches nothing) and this always read as "not
+    // running" on Linux, no matter what. That broke re-adopting a
+    // still-running juice after a plain Stop (session end, see
+    // DiscoveryWindow::new's own adoption check) -- Status/Stop/
+    // Restart/Reset USB all silently disappeared even though juice was
+    // still up. `-f` matches the full command line instead, which has
+    // no such length limit, and as a bonus correctly excludes a zombie
+    // (exited but not yet reaped) process, whose cmdline is already
+    // empty by the time it's a zombie -- `-x` matched those too.
+    Command::new("pgrep").args(["-f", &format!("{name}$")]).output().map(|o| !o.stdout.is_empty()).unwrap_or(false)
 }
 
 /// Whether hpsdr-rs itself is currently running with Administrator
