@@ -224,6 +224,8 @@ If the project directory is under your home directory (the normal case), `apt` w
 
 Rebuilding and reinstalling repeatedly (e.g. while testing local changes) with the crate's own `version` unchanged produces the exact same package version every time — `dpkg`/`apt` treat that as nothing to do, requiring `sudo dpkg -r hpsdr-rs` before the new one will install. `./scripts/build-deb.sh` avoids this: it's a thin wrapper around `cargo deb --deb-revision <n>` that auto-increments a local counter (`.deb-revision`, gitignored) on every run, so each build gets a genuinely newer Debian revision and installs over the previous one cleanly. Use it exactly like `cargo deb` — extra arguments are passed through, e.g. `./scripts/build-deb.sh --no-build`.
 
+If the app panics on startup with `Library libxkbcommon-x11.so could not be loaded` (confirmed on a minimal Ubuntu, e.g. a fresh WSL2 install), install `libxkbcommon-x11-0` manually: `sudo apt install libxkbcommon-x11-0`. `egui`/`winit` load this X11 keyboard library at runtime via `dlopen` rather than linking it directly, so `cargo-deb`'s automatic dependency detection (which scans the binary's linked libraries) never sees it and can't add it to the package's own `Depends:` list.
+
 ## Packaging (Windows)
 
 An `.msi` installer can be built with [`cargo-wix`](https://crates.io/crates/cargo-wix), from a normal PowerShell prompt on a Windows machine already set up for the [MSVC build](#windows-via-msvc) above — this only packages an existing working build, it doesn't set one up:
