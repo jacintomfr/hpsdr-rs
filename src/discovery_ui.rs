@@ -585,8 +585,21 @@ impl DiscoveryWindow {
                                 .unwrap_or("(not set -- use Choose... below)"),
                         );
                         if ui.button("Choose...").clicked() {
-                            let mut dialog = rfd::FileDialog::new()
-                                .add_filter("Radioberry Juice", &[if cfg!(windows) { "exe" } else { "" }]);
+                            // Windows Juice builds are always named
+                            // *.exe, so filtering to that extension is a
+                            // real help there. Linux/macOS executables
+                            // have no fixed extension (e.g. the plain
+                            // `radioberry-juice` built by
+                            // scripts/build-juice-linux.sh) -- an empty
+                            // string isn't "any extension" to rfd, it's
+                            // a literal (unmatchable) one, which made the
+                            // binary itself unselectable in the dialog.
+                            // Leaving the filter off there just shows
+                            // every file, same as the dialog's default.
+                            let mut dialog = rfd::FileDialog::new();
+                            if cfg!(windows) {
+                                dialog = dialog.add_filter("Radioberry Juice", &["exe"]);
+                            }
                             if let Some(existing) = &self.radioberry_juice_path {
                                 if let Some(dir) = std::path::Path::new(existing).parent() {
                                     dialog = dialog.set_directory(dir);
