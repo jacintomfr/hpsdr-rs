@@ -12,11 +12,22 @@
 # NOTE ON THE BUNDLED FTDI D2XX LIBRARY: juice's own source tree already
 # bundles FTDI's proprietary libftd2xx.so (see
 # ftdi/linux/1.4.35/<arch>/lib/ in the juice source), which this .deb
-# ends up redistributing as-is. No separate FTDI EULA/redistribution
-# terms were found bundled alongside it (FTDI-LINUX-README.md and the
-# library's own README.pdf are install/API instructions, not a license
-# grant) -- this was a known, explicitly-accepted decision, not an
-# oversight; revisit if that ever needs re-checking.
+# ends up redistributing as-is. FTDI's own license terms (the notice at
+# the top of ftd2xx.h, also published at
+# https://ftdichip.com/driver-licence-terms/) permit this under two
+# conditions this script deliberately satisfies:
+#   1. "FTDI DRIVERS MAY BE DISTRIBUTED IN ANY FORM AS LONG AS LICENSE
+#      INFORMATION IS NOT MODIFIED" -- ftd2xx.h/README.pdf/release-notes.txt/
+#      SOURCE.txt (which together carry that notice) are bundled
+#      unmodified below, per install-linux.sh's own required-files list,
+#      and the notice is additionally copied verbatim into
+#      usr/share/doc/radioberry-juice/copyright, the standard place a
+#      .deb documents third-party license terms.
+#   2. "FTDI DRIVERS MAY BE USED ONLY IN CONJUNCTION WITH PRODUCTS BASED
+#      ON FTDI PARTS" -- the Radioberry's own FT2232H is a genuine FTDI
+#      part (this is what juice talks to; there is no other use for this
+#      library here), and the package Description below says so
+#      explicitly.
 set -euo pipefail
 
 JUICE_SRC="${1:-$HOME/Documents/juice/firmware-extended}"
@@ -69,7 +80,30 @@ Description: USB-to-network bridge for the Radioberry SDR board
  rule that grants USB access to members of the 'radioberry' group and
  automatically releases the device from the kernel's ftdi_sio serial
  driver so this program can use it instead.
+ .
+ The bundled FTDI D2XX library is for use with the Radioberry's own
+ genuine FTDI FT2232H USB interface chip only, per FTDI's own driver
+ license terms (see /usr/share/doc/radioberry-juice/copyright).
 EOF
+
+# See this script's own top-of-file comment for why this exists and
+# what it has to contain: FTDI's license permits redistribution only
+# with its license notice kept intact, so that notice (extracted
+# verbatim, not retyped) is republished here at the standard Debian
+# path for a package's third-party license terms.
+FTDI_HEADER="$JUICE_SRC/dist/linux-$arch/ftdi/ftd2xx.h"
+mkdir -p "$PKG_ROOT/usr/share/doc/radioberry-juice"
+{
+    echo "This package is not affiliated with or endorsed by Future Technology"
+    echo "Devices International (FTDI). It bundles FTDI's unmodified libftd2xx.so"
+    echo "(D2XX) runtime library and header, redistributed under FTDI's own"
+    echo "driver license terms, reproduced verbatim below from ftd2xx.h"
+    echo "(also published at https://ftdichip.com/driver-licence-terms/)."
+    echo "This library is for use with the Radioberry's genuine FTDI FT2232H"
+    echo "USB interface chip only."
+    echo
+    awk '/^Copyright \(c\)/{p=1} p{print} /^Module Name:/{exit}' "$FTDI_HEADER"
+} > "$PKG_ROOT/usr/share/doc/radioberry-juice/copyright"
 
 # The staged install-linux.sh run above only lays out files at their
 # real system paths -- it deliberately skips the group/udev-reload steps
