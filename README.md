@@ -226,6 +226,13 @@ Rebuilding and reinstalling repeatedly (e.g. while testing local changes) with t
 
 If the app panics on startup with `Library libxkbcommon-x11.so could not be loaded` (confirmed on a minimal Ubuntu, e.g. a fresh WSL2 install), install `libxkbcommon-x11-0` manually: `sudo apt install libxkbcommon-x11-0`. `egui`/`winit` load this X11 keyboard library at runtime via `dlopen` rather than linking it directly, so `cargo-deb`'s automatic dependency detection (which scans the binary's linked libraries) never sees it and can't add it to the package's own `Depends:` list.
 
+### Testing the .deb on WSL2 (no separate Linux box needed)
+
+A recent `wsl --install -d Ubuntu` (the Microsoft Store-backed WSL, not the legacy Windows optional feature) bundles **WSLg** even on Windows 10 -- check with `wsl --version`, look for a `WSLg version` line. WSLg gives the WSL distro its own X11 socket, Wayland socket, and PulseAudio server automatically (`/mnt/wslg/`, `$DISPLAY`, `$WAYLAND_DISPLAY`, `$PULSE_SERVER` are already set in every shell), so the full GUI -- including audio in/out -- runs with no extra display server to install. Only two things are needed beyond `libxkbcommon-x11-0` above:
+
+- `sudo apt install libasound2-plugins pulseaudio-utils` -- the ALSA-to-PulseAudio bridge `cpal` (this project's audio crate) needs to reach WSLg's PulseAudio server; without it, mic input and audio output both fail to open (visible as ALSA `cannot find card '0'` errors in the log), which in turn hides the MOX/TUNE/CW/RIT/XIT row entirely (`tx_enabled` requires a working mic, see `main.rs`'s `tx_enabled` doc comment).
+- For real hardware over USB (Ozy, RX-888, or a Juice-bridged Radioberry running *inside* WSL2 too) rather than a network-attached radio: [usbipd-win](https://github.com/dorssel/usbipd-win) passes a USB device through to WSL2. From an **elevated** Windows PowerShell: `usbipd list` to find the device's `BUSID`, then `usbipd bind --busid <id> --force` (`--force` is needed if a packet-capture filter like USBPcap is installed) and `usbipd attach --wsl --busid <id>`. This has to be repeated after every physical reconnect/reboot; there's no WSL-side persistence.
+
 ## Packaging (Windows)
 
 An `.msi` installer can be built with [`cargo-wix`](https://crates.io/crates/cargo-wix), from a normal PowerShell prompt on a Windows machine already set up for the [MSVC build](#windows-via-msvc) above — this only packages an existing working build, it doesn't set one up:
