@@ -2292,6 +2292,9 @@ fn connect_to_device(device: Device, cfg: &Config) -> Result<ConnectedState, Str
                     if let Some(v) = cfg.tx_compressor_gain_db {
                         tx_handle.set_compressor_gain_db(v);
                     }
+                    if let Some(v) = cfg.tx_cfc_enabled {
+                        tx_handle.set_cfc_enabled(v);
+                    }
                     // Apply a previously-saved correction table
                     // immediately, if PS is enabled and one exists for
                     // this radio -- see TxHandle::restore_ps_corr's doc
@@ -7751,6 +7754,25 @@ impl eframe::App for HpsdrApp {
                                                 ui.label("dB");
                                             });
                                         }
+
+                                        let mut cfc = tx.cfc_enabled();
+                                        if ui
+                                            .checkbox(&mut cfc, "CFC (multiband punch)")
+                                            .on_hover_text(
+                                                "Continuous Frequency Compressor -- the real \"punch\" \
+                                                 processor, matching deskHPSDR: compresses each \
+                                                 frequency band independently (bass through treble) \
+                                                 instead of squashing the whole signal at once, so it \
+                                                 doesn't sound as flattened/distorted as the simple \
+                                                 Compressor above when pushed hard. Uses deskHPSDR's own \
+                                                 default 12-band profile -- not yet editable per-band \
+                                                 here.",
+                                            )
+                                            .changed()
+                                        {
+                                            tx.set_cfc_enabled(cfc);
+                                            settings_changed = true;
+                                        }
                                     }
                                     ui.add_space(8.0);
 
@@ -9338,6 +9360,7 @@ impl eframe::App for HpsdrApp {
                         tx_leveler_decay_ms: connected.tx_handle.as_ref().map(|t| t.leveler_decay_ms()),
                         tx_compressor_enabled: connected.tx_handle.as_ref().map(|t| t.compressor_enabled()),
                         tx_compressor_gain_db: connected.tx_handle.as_ref().map(|t| t.compressor_gain_db()),
+                        tx_cfc_enabled: connected.tx_handle.as_ref().map(|t| t.cfc_enabled()),
                         tci_tx_gain: Some(connected.tci_tx_gain),
                         tx_power_watts: Some(connected.session.tx_power_watts.load(Ordering::Relaxed)),
                         cw_keyer_mode: Some(connected.session.cw_keyer.mode.load(Ordering::Relaxed)),

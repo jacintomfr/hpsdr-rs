@@ -793,6 +793,47 @@ unsafe extern "C" {
     // See SetRXAGrphEQ10's doc comment -- same reasoning, TXA side.
     pub fn SetTXAGrphEQ10(channel: ::std::os::raw::c_int, txeq: *mut ::std::os::raw::c_int);
 }
+
+// CFC (Continuous Frequency Compressor + post-EQ) -- confirmed present
+// in vendor/wdsp/wdsp.h (WDSP_API declarations) and vendor/wdsp/cfcomp.h
+// (auto-created unconditionally as part of TXA channel setup, TXA.c's
+// OpenChannel -- same pattern as EQ/PS, no separate create call needed
+// here). Never previously bound in this project -- deskHPSDR's own
+// multiband TX speech processor, the piece this project's TX chain was
+// missing for real "punch" beyond the single-band Compressor above.
+unsafe extern "C" {
+    pub fn SetTXACFCOMPprofile(
+        channel: ::std::os::raw::c_int,
+        nfreqs: ::std::os::raw::c_int,
+        f: *mut f64,
+        g: *mut f64,
+        e: *mut f64,
+    );
+}
+unsafe extern "C" {
+    pub fn SetTXACFCOMPCompCurve(channel: ::std::os::raw::c_int, deg: ::std::os::raw::c_int, r: ::std::os::raw::c_int, umethod: ::std::os::raw::c_int);
+}
+unsafe extern "C" {
+    pub fn SetTXACFCOMPCompWeights(channel: ::std::os::raw::c_int, nfreq: ::std::os::raw::c_int, weights: *mut f64);
+}
+unsafe extern "C" {
+    pub fn SetTXACFCOMPPeqCurve(channel: ::std::os::raw::c_int, deg: ::std::os::raw::c_int, r: ::std::os::raw::c_int, umethod: ::std::os::raw::c_int);
+}
+unsafe extern "C" {
+    pub fn SetTXACFCOMPPeqWeights(channel: ::std::os::raw::c_int, nfreq: ::std::os::raw::c_int, weights: *mut f64);
+}
+unsafe extern "C" {
+    pub fn SetTXACFCOMPPrecomp(channel: ::std::os::raw::c_int, precomp: f64);
+}
+unsafe extern "C" {
+    pub fn SetTXACFCOMPPrePeq(channel: ::std::os::raw::c_int, prepeq: f64);
+}
+unsafe extern "C" {
+    pub fn SetTXACFCOMPRun(channel: ::std::os::raw::c_int, run: ::std::os::raw::c_int);
+}
+unsafe extern "C" {
+    pub fn SetTXACFCOMPPeqRun(channel: ::std::os::raw::c_int, run: ::std::os::raw::c_int);
+}
 unsafe extern "C" {
     pub fn SetTXAFMDeviation(channel: ::std::os::raw::c_int, deviation: f64);
 }

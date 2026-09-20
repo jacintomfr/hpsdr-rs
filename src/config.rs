@@ -179,6 +179,8 @@ pub struct Config {
     pub tx_compressor_enabled: Option<bool>,
     #[serde(default)]
     pub tx_compressor_gain_db: Option<f32>,
+    #[serde(default)]
+    pub tx_cfc_enabled: Option<bool>,
     /// Gain applied specifically to TX audio received from a TCI
     /// client (WSJT-X, TCI Remote, etc.), independent of mic_gain
     /// above -- see radio::RadioSession::tci_tx_gain's doc comment for

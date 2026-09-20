@@ -467,7 +467,30 @@ pub struct TxParams {
     /// average power" control on its own.
     pub compressor_enabled: bool,
     pub compressor_gain_db: f32,
+    /// WDSP's CFC (Continuous Frequency Compressor + post-EQ,
+    /// SetTXACFCOMP*) -- the multiband speech processor deskHPSDR's own
+    /// transmitter.c uses for real TX "punch", distinct from the simple
+    /// single-band Compressor above. Both the pre-compressor and
+    /// post-EQ stages are toggled together here (deskHPSDR exposes them
+    /// as two separate "Use Pre-CFC"/"Use Post-CFC" checkboxes with a
+    /// full 12-band editor for each; this is a fixed-profile MVP using
+    /// deskHPSDR's own confirmed default band frequencies/levels --
+    /// CFC_FREQ_HZ/CFC_DEFAULT_LVL_DB/CFC_DEFAULT_POST_DB below -- not a
+    /// user-editable curve yet).
+    pub cfc_enabled: bool,
 }
+
+/// deskHPSDR transmitter.c's own default CFC band table (tx->cfc_freq[1..12]) --
+/// 12 fixed frequency corners, Hz.
+pub const CFC_FREQ_HZ: [f64; 12] = [50.0, 150.0, 300.0, 500.0, 750.0, 1250.0, 1750.0, 2300.0, 2800.0, 3100.0, 6000.0, 8000.0];
+/// deskHPSDR's default per-band pre-compression level (tx->cfc_lvl[1..12]), dB.
+pub const CFC_DEFAULT_LVL_DB: [f64; 12] = [0.0, 0.0, 3.0, 3.0, 3.0, 6.0, 6.0, 6.0, 9.0, 9.0, 0.0, 0.0];
+/// deskHPSDR's default per-band post-EQ gain (tx->cfc_post[1..12]), dB -- all flat.
+pub const CFC_DEFAULT_POST_DB: [f64; 12] = [0.0; 12];
+/// deskHPSDR's tx->cfc_lvl[0] ("Pre Compression", frequency-independent part), dB.
+pub const CFC_DEFAULT_PRECOMP_DB: f64 = 3.0;
+/// deskHPSDR's tx->cfc_post[0] ("Post Gain", frequency-independent part), dB.
+pub const CFC_DEFAULT_PREPEQ_DB: f64 = -9.0;
 
 impl Default for TxParams {
     fn default() -> Self {
@@ -507,6 +530,7 @@ impl Default for TxParams {
             // WDSP's create_compressor default/deskHPSDR's own typical
             // starting point; harmless while compressor_enabled is false.
             compressor_gain_db: 10.0,
+            cfc_enabled: false,
         }
     }
 }
@@ -527,6 +551,8 @@ struct TxProcessor {
     last_leveler: Option<(bool, f32, i32)>,
     /// See TxParams::compressor_enabled/compressor_gain_db's doc comment.
     last_compressor: Option<(bool, f32)>,
+    /// See TxParams::cfc_enabled's doc comment.
+    last_cfc: Option<bool>,
     /// (tune, two_tone) as last applied to WDSP's PostGen -- see
     /// process()'s PostGen update for why these are tracked together.
     last_post_gen: Option<(bool, bool)>,
@@ -844,6 +870,27 @@ impl TxProcessor {
             wdsp::SetTXACompressorGain(channel, 0.0);
             wdsp::SetTXACompressorRun(channel, 0);
 
+            // CFC one-time profile setup -- see TxParams::cfc_enabled's
+            // doc comment. Coefficients only, Run stays off here (live-
+            // toggled in process()); deskHPSDR's own defaults throughout
+            // (curve degree/r/umethod = 0 = linear/off, weights = 1.0 --
+            // confirmed via its transmitter.c init block).
+            {
+                let mut freq = CFC_FREQ_HZ;
+                let mut lvl = CFC_DEFAULT_LVL_DB;
+                let mut post = CFC_DEFAULT_POST_DB;
+                let mut weights = [1.0f64; 12];
+                wdsp::SetTXACFCOMPprofile(channel, 12, freq.as_mut_ptr(), lvl.as_mut_ptr(), post.as_mut_ptr());
+                wdsp::SetTXACFCOMPCompCurve(channel, 0, 0, 0);
+                wdsp::SetTXACFCOMPCompWeights(channel, 12, weights.as_mut_ptr());
+                wdsp::SetTXACFCOMPPeqCurve(channel, 0, 0, 0);
+                wdsp::SetTXACFCOMPPeqWeights(channel, 12, weights.as_mut_ptr());
+                wdsp::SetTXACFCOMPPrecomp(channel, CFC_DEFAULT_PRECOMP_DB);
+                wdsp::SetTXACFCOMPPrePeq(channel, CFC_DEFAULT_PREPEQ_DB);
+                wdsp::SetTXACFCOMPRun(channel, 0);
+                wdsp::SetTXACFCOMPPeqRun(channel, 0);
+            }
+
             // TX bandpass passband -- ROOT CAUSE FIX: this was
             // hardcoded to 300-2700Hz regardless of mode/width, which
             // is what actually caused a reported TX power/ALC
@@ -913,6 +960,7 @@ impl TxProcessor {
             last_eq: None,
             last_leveler: None,
             last_compressor: None,
+            last_cfc: None,
             last_post_gen: None,
             last_ps_mox: None,
             ps_ratio_baseline: None,
@@ -963,6 +1011,7 @@ impl TxProcessor {
         leveler_decay_ms: i32,
         compressor_enabled: bool,
         compressor_gain_db: f32,
+        cfc_enabled: bool,
     ) -> (Vec<f32>, c_int) {
         debug_assert_eq!(mic_samples.len(), TX_BUFFER_SIZE);
 
@@ -1150,8 +1199,37 @@ impl TxProcessor {
             unsafe {
                 wdsp::SetTXACompressorGain(self.channel, compressor_gain_db as f64);
                 wdsp::SetTXACompressorRun(self.channel, compressor_enabled as c_int);
+                // CESSB (controlled-envelope overshoot control) -- matches
+                // deskHPSDR's transmitter.c exactly (its own `cessb_enable`
+                // defaults to on and isn't exposed as a separate toggle
+                // here, so this reduces to deskHPSDR's condition minus
+                // that always-true term and minus low_latency, a TX-DSP
+                // mode this project doesn't have):
+                //   if (compressor && cessb_enable && compressor_level > 0
+                //       && !low_latency) SetTXAosctrlRun(id, compressor);
+                //   else SetTXAosctrlRun(id, 0);
+                // Only meaningful alongside the Compressor -- lets it be
+                // pushed harder without the overshoot that would
+                // otherwise cause, more average TX power for the same
+                // peak envelope.
+                let cessb_on = compressor_enabled && compressor_gain_db > 0.0;
+                wdsp::SetTXAosctrlRun(self.channel, cessb_on as c_int);
             }
             self.last_compressor = Some((compressor_enabled, compressor_gain_db));
+        }
+
+        // CFC (multiband Continuous Frequency Compressor + post-EQ) --
+        // see TxParams::cfc_enabled's doc comment. Profile itself
+        // (frequencies/levels/curve/weights) is deskHPSDR's own fixed
+        // default -- only Run toggles live here; the coefficient calls
+        // only need to happen once, at open() (see there), not per
+        // chunk.
+        if self.last_cfc != Some(cfc_enabled) {
+            unsafe {
+                wdsp::SetTXACFCOMPRun(self.channel, cfc_enabled as c_int);
+                wdsp::SetTXACFCOMPPeqRun(self.channel, cfc_enabled as c_int);
+            }
+            self.last_cfc = Some(cfc_enabled);
         }
 
         // Confirmed against the reference: real mono mic sample in the
@@ -2340,6 +2418,7 @@ fn run(
             p.leveler_decay_ms,
             p.compressor_enabled,
             p.compressor_gain_db,
+            p.cfc_enabled,
         );
 
         if exch_error != 0 {
@@ -2714,6 +2793,14 @@ impl TxHandle {
     }
     pub fn set_compressor_gain_db(&self, gain_db: f32) {
         self.params.lock().unwrap().compressor_gain_db = gain_db.clamp(0.0, 20.0);
+    }
+
+    /// See TxParams::cfc_enabled's doc comment.
+    pub fn cfc_enabled(&self) -> bool {
+        self.params.lock().unwrap().cfc_enabled
+    }
+    pub fn set_cfc_enabled(&self, enabled: bool) {
+        self.params.lock().unwrap().cfc_enabled = enabled;
     }
 
     pub fn set_ps_enabled(&self, enabled: bool) {
