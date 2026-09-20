@@ -301,6 +301,10 @@ pub struct Config {
     /// rarely touched. Missing (not yet set) falls back to 0, same as
     /// piHPSDR's own uncalibrated default.
     pub rx_gain_calibration_db: Option<i32>,
+    /// HermesLite/HermesLite2-only -- see radio::RadioSession::lna_tx_db's
+    /// doc comment.
+    #[serde(default)]
+    pub lna_tx_db: Option<i32>,
     /// RX-888 Mk2 only (see radio.rs's start_rx888_usb) -- path to the
     /// user-supplied Cypress FX3 RAM image (`SDDC_FX3.img`), set via the
     /// Discover window's "RX-888 USB setup" file picker. Deliberately

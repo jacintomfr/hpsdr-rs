@@ -178,6 +178,9 @@ pub struct RadioSettings {
     /// this from Config, falling back to this struct's own default
     /// for a never-saved config.
     pub rx_attenuation: u32,
+    /// Initial value for RadioSession::lna_tx_db -- see that field's own
+    /// doc comment (HermesLite/HermesLite2 P1 boards only).
+    pub lna_tx_db: i32,
     /// Initial value for RadioSession::ps_tx_attenuation -- see that
     /// field's doc comment (standard boards only, both protocols; not a
     /// PureSignal-only concept despite the name).
@@ -229,6 +232,10 @@ impl Default for RadioSettings {
             // Non-zero rather than 0dB -- see RadioSession::rx_attenuation's
             // doc comment for why 0dB caused real front-end overload.
             rx_attenuation: 12,
+            // Minimum (most attenuation/most conservative) rather than
+            // 0dB -- same reasoning as rx_attenuation just above, and
+            // matches Quisk's own hermes_TxLNA_dB default.
+            lna_tx_db: -12,
             // Non-zero rather than 0dB, same "real front-end overload"
             // reasoning as rx_attenuation just above -- this protects
             // ADC0 from the radio's OWN TX leakage while transmitting
@@ -587,6 +594,21 @@ pub struct RadioSession {
     /// piHPSDR exposes a live, user-adjustable slider for this exact
     /// value (`sliders.c`'s "RX GAIN - ADC-%d (dB)" dialog).
     pub rx_attenuation: Arc<AtomicU32>,
+    /// HermesLite/HermesLite2-only: hardware-managed LNA gain applied
+    /// specifically while transmitting, dB, range -12..48 -- separate
+    /// from rx_attenuation (the RX-time gain), and matters most for
+    /// PureSignal's TX feedback sampling, which reuses the RX ADC to
+    /// capture a strong local TX-derived signal that would otherwise
+    /// clip at a normal RX-time gain setting. Confirmed against Quisk's
+    /// own hermes/quisk_hardware.py (`ChangeTxLNA`, a working, shipped
+    /// reference implementation): C&C address 0x0E, C3 byte =
+    /// `((db+12) & 0x3F) | 0xC0` (0xC0 = enable hardware-managed TX LNA
+    /// + a second always-set flag Quisk itself never clears). Not
+    /// implemented in this project before -- see p1_build_packet's
+    /// command-11 match arm for the actual byte construction, and
+    /// Settings -> RX's own "LNA during TX" slider for where a user
+    /// sets this.
+    pub lna_tx_db: Arc<AtomicI32>,
     /// TX-time step attenuator (0-31 dB) applied to ADC0's input while
     /// transmitting, on both protocols. Standard (non-HermesLite) boards
     /// only. Despite the name (kept for now to avoid a config-schema
@@ -1102,6 +1124,17 @@ pub struct RadioSession {
     /// actual link to the radio).
     pub rx_packets_total: Arc<AtomicU64>,
     pub rx_packets_lost: Arc<AtomicU64>,
+    /// Largest real gap (microseconds) between two consecutive incoming
+    /// RX packets in the last full 1-second measurement window -- the
+    /// RX-side counterpart to audio.rs's MicJitterStats, for the same
+    /// "jitter meter" status-bar reading. MVP scope: only
+    /// `receiver_loop` (protocol 1 over UDP -- what this session's real-
+    /// hardware Radioberry/HermesLite2 testing actually used) populates
+    /// this; protocol 2, Ozy USB, and RX-888 construct a RadioSession
+    /// with this left at a fresh, never-updated 0 rather than wiring
+    /// (and risking getting wrong, unverified) a measurement for paths
+    /// not actually tested tonight.
+    pub rx_max_gap_us: Arc<AtomicU64>,
     /// Raw-hex dump of every outgoing Protocol 1 TX packet (P1 only for
     /// now -- see sender_loop's own logging call), toggled from Settings
     /// -> Tx. Off by default, same "truncate fresh on enable, never grow
@@ -1222,6 +1255,8 @@ impl RadioSession {
         // real-hardware testing confirmed causes front-end overload on
         // an ordinary HF antenna.
         let rx_attenuation = Arc::new(AtomicU32::new(settings.rx_attenuation));
+        // See RadioSession::lna_tx_db's doc comment.
+        let lna_tx_db = Arc::new(AtomicI32::new(settings.lna_tx_db));
         // See RadioSession::ps_tx_attenuation's doc comment.
         let ps_tx_attenuation = Arc::new(AtomicU32::new(settings.ps_tx_attenuation));
         let mox = Arc::new(AtomicBool::new(false));
@@ -1305,6 +1340,7 @@ impl RadioSession {
             match device.protocol {
             1 => start_protocol1(
                 device, settings, frequency_hz, tx_frequency_hz, rx_frequency_hz, requested_frequency_hz, sample_rate, adc, rx_antenna, tx_antenna, rx_attenuation,
+                lna_tx_db,
                 ps_tx_attenuation, mox, tx_iq, tci_tx_audio, tci_tx_gain, tx_power_watts, cw_keyer, cw_mode_active, pa_gain_db,
                 tx_forward_power, tx_reverse_power, adc0_overload, cw_ptt_active, cw_paddle_contacts, adc1_overload,
                 tx_fifo_underrun, tx_fifo_overrun, rx_packets_total, rx_packets_lost, tx_packet_debug_log, ps_rx_feedback_iq, ps_tx_feedback_iq,
@@ -1539,6 +1575,7 @@ fn start_protocol1(
     rx_antenna: Arc<AtomicU32>,
     tx_antenna: Arc<AtomicU32>,
     rx_attenuation: Arc<AtomicU32>,
+    lna_tx_db: Arc<AtomicI32>,
     ps_tx_attenuation: Arc<AtomicU32>,
     mox: Arc<AtomicBool>,
     tx_iq: Arc<Mutex<VecDeque<f32>>>,
@@ -1689,6 +1726,7 @@ fn start_protocol1(
         settings.sample_rate,
         matches!(device.board, Boards::HermesLite | Boards::HermesLite2),
         rx_attenuation.load(Ordering::Relaxed) as u8,
+        lna_tx_db.load(Ordering::Relaxed),
         ps_tx_attenuation.load(Ordering::Relaxed) as u8,
         device.adcs,
         settings.diversity_enabled,
@@ -1747,6 +1785,7 @@ fn start_protocol1(
     let sender_cw_mode_active = Arc::clone(&cw_mode_active);
     let sender_pa_gain_db = Arc::clone(&pa_gain_db);
     let sender_rx_attenuation = Arc::clone(&rx_attenuation);
+    let sender_lna_tx_db = Arc::clone(&lna_tx_db);
     let sender_ps_tx_attenuation = Arc::clone(&ps_tx_attenuation);
     let sender_is_hermes_lite = matches!(device.board, Boards::HermesLite | Boards::HermesLite2);
     let sender_disable_pa = Arc::clone(&disable_pa);
@@ -1788,6 +1827,7 @@ fn start_protocol1(
             sender_cw_mode_active,
             sender_pa_gain_db,
             sender_rx_attenuation,
+            sender_lna_tx_db,
             sender_ps_tx_attenuation,
             sender_is_hermes_lite,
             sender_disable_pa,
@@ -1830,6 +1870,8 @@ fn start_protocol1(
     let receiver_diversity_main_raw_iq = Arc::clone(&diversity_main_raw_iq);
     let receiver_rx_packets_total = Arc::clone(&rx_packets_total);
     let receiver_rx_packets_lost = Arc::clone(&rx_packets_lost);
+    let rx_max_gap_us = Arc::new(AtomicU64::new(0));
+    let receiver_rx_max_gap_us = Arc::clone(&rx_max_gap_us);
     let receiver_thread = thread::spawn(move || {
         receiver_loop(
             receiver_socket,
@@ -1851,6 +1893,7 @@ fn start_protocol1(
             receiver_diversity_main_raw_iq,
             receiver_rx_packets_total,
             receiver_rx_packets_lost,
+            receiver_rx_max_gap_us,
             receiver_stop,
         );
     });
@@ -1920,6 +1963,8 @@ fn start_protocol1(
         tx_fifo_overrun,
         rx_packets_total,
         rx_packets_lost,
+        rx_max_gap_us,
+        lna_tx_db,
         tx_packet_debug_log,
         stop_flag,
         sender_thread: Some(sender_thread),
@@ -2233,6 +2278,8 @@ fn start_protocol1_ozy_usb(
         tx_fifo_overrun,
         rx_packets_total,
         rx_packets_lost,
+        rx_max_gap_us: Arc::new(AtomicU64::new(0)),
+        lna_tx_db: Arc::new(AtomicI32::new(-12)),
         tx_packet_debug_log,
         stop_flag,
         sender_thread: Some(sender_thread),
@@ -2393,6 +2440,8 @@ fn start_rx888_usb(
         active_receiver_count,
         rx_packets_total,
         rx_packets_lost,
+        rx_max_gap_us: Arc::new(AtomicU64::new(0)),
+        lna_tx_db: Arc::new(AtomicI32::new(-12)),
         tx_packet_debug_log,
         ps_rx_feedback_iq,
         ps_tx_feedback_iq,
@@ -2982,6 +3031,8 @@ fn p1_send_preconfig_and_start(
     sample_rate: u32,
     is_hermes_lite: bool,
     rx_attenuation: u8,
+    // See RadioSession::lna_tx_db's doc comment.
+    lna_tx_db: i32,
     ps_tx_attenuation: u8,
     num_adcs: u8,
     // BUG FIX: this used to be hardcoded `false` in this function's own
@@ -3038,6 +3089,7 @@ fn p1_send_preconfig_and_start(
             0, // oc_rx: nothing to key yet this early -- sender_loop's live value takes over immediately after
             0, // oc_tx: not transmitting during startup config (mox false above), so never actually used
             rx_attenuation,
+            lna_tx_db,
             ps_tx_attenuation,
             num_adcs,
             &[], // no extra receivers active yet this early -- falls back to the main frequency
@@ -3158,6 +3210,9 @@ fn p1_build_packet(
     oc_rx: u8,
     oc_tx: u8,
     rx_attenuation: u8,
+    // See RadioSession::lna_tx_db's doc comment -- consumed by command
+    // 11's match arm below.
+    lna_tx_db: i32,
     ps_tx_attenuation: u8,
     num_adcs: u8,
     extra_frequencies_hz: &[Arc<AtomicU32>],
@@ -3793,10 +3848,34 @@ fn p1_build_packet(
             }
             (0x24, c1, c2, 0x00, 0x00)
         }
+        11 => {
+            // HermesLite/HermesLite2-only: hardware-managed LNA gain
+            // during TX -- see RadioSession::lna_tx_db's own doc
+            // comment for the full story (real-hardware-verified
+            // register, ported byte-for-byte from Quisk's own
+            // hermes/quisk_hardware.py ChangeTxLNA, a working shipped
+            // reference implementation). Sent unconditionally (not
+            // gated on mox_on) -- Quisk's own reference does the same
+            // (a fixed C3 byte, no mox branch), and the wiki's own
+            // description ("hardware quickly changes the LNA to this
+            // value during transmit") implies the radio's firmware
+            // itself, not the host, decides when to actually apply it.
+            // Inert on non-HermesLite boards (this project has no
+            // equivalent per-chip LNA register for them -- those boards
+            // use discrete ALEX preamp/attenuator relays instead,
+            // already covered by commands 4/9 above).
+            if is_hermes_lite {
+                let clamped = lna_tx_db.clamp(-12, 48);
+                let c3 = (((clamped + 12) as u8) & 0x3F) | 0xC0;
+                (0x1C, 0x00, 0x00, c3, 0x00)
+            } else {
+                (0x2E, 0x00, 0x00, 0x04, 0x15) // same as the default catch-all below
+            }
+        }
         _ => (0x2E, 0x00, 0x00, 0x04, 0x15),
     };
     if *current_receiver == 0 {
-        *ozy_command = if *ozy_command >= 11 { 1 } else { *ozy_command + 1 };
+        *ozy_command = if *ozy_command >= 12 { 1 } else { *ozy_command + 1 };
     }
     let mut frame1 = build_usb_frame(c0b | mox_bit, c1b, c2b, c3b, c4b);
 
@@ -3852,6 +3931,7 @@ fn sender_loop(
     cw_mode_active: Arc<AtomicBool>,
     pa_gain_db: Arc<AtomicU32>,
     rx_attenuation: Arc<AtomicU32>,
+    lna_tx_db: Arc<AtomicI32>,
     ps_tx_attenuation: Arc<AtomicU32>,
     is_hermes_lite: bool,
     disable_pa: Arc<std::sync::atomic::AtomicBool>,
@@ -3961,6 +4041,7 @@ fn sender_loop(
                 sample_rate.load(Ordering::Relaxed),
                 is_hermes_lite,
                 rx_attenuation.load(Ordering::Relaxed) as u8,
+                lna_tx_db.load(Ordering::Relaxed),
                 ps_tx_attenuation.load(Ordering::Relaxed) as u8,
                 num_adcs,
                 now_diversity_enabled,
@@ -4001,6 +4082,7 @@ fn sender_loop(
                 sample_rate.load(Ordering::Relaxed),
                 is_hermes_lite,
                 rx_attenuation.load(Ordering::Relaxed) as u8,
+                lna_tx_db.load(Ordering::Relaxed),
                 ps_tx_attenuation.load(Ordering::Relaxed) as u8,
                 num_adcs,
                 diversity_enabled.load(Ordering::Relaxed),
@@ -4120,6 +4202,7 @@ fn sender_loop(
             oc_rx.load(Ordering::Relaxed),
             oc_tx.load(Ordering::Relaxed),
             rx_attenuation.load(Ordering::Relaxed) as u8,
+            lna_tx_db.load(Ordering::Relaxed),
             ps_tx_attenuation.load(Ordering::Relaxed) as u8,
             num_adcs,
             &extra_frequencies_hz,
@@ -4377,9 +4460,17 @@ fn receiver_loop(
     diversity_main_raw_iq: Arc<Mutex<VecDeque<IqSample>>>,
     rx_packets_total: Arc<AtomicU64>,
     rx_packets_lost: Arc<AtomicU64>,
+    rx_max_gap_us: Arc<AtomicU64>,
     stop: Arc<AtomicBool>,
 ) {
     let mut buf = [0u8; PACKET_SIZE + 64]; // a little slack in case of larger packets
+    // RX-side jitter measurement -- see RadioSession::rx_max_gap_us's own
+    // doc comment. Same approach as audio.rs's mic-capture instrumentation:
+    // track the real gap between consecutive packet arrivals, store the
+    // largest one seen in each 1-second window.
+    let mut gap_window_start = Instant::now();
+    let mut gap_last: Option<Instant> = None;
+    let mut gap_max = Duration::ZERO;
     // Persistent byte-stream parse state for parse_iq_stream -- see its
     // doc comment. Owned here (not per-packet) because a "frame" can
     // straddle two packets once the discovered sync phase isn't a
@@ -4403,6 +4494,19 @@ fn receiver_loop(
     while !stop.load(Ordering::Relaxed) {
         match socket.recv(&mut buf) {
             Ok(n) if n == PACKET_SIZE => {
+                let recv_now = Instant::now();
+                if let Some(last) = gap_last {
+                    let gap = recv_now.duration_since(last);
+                    if gap > gap_max {
+                        gap_max = gap;
+                    }
+                }
+                gap_last = Some(recv_now);
+                if recv_now.duration_since(gap_window_start) >= Duration::from_secs(1) {
+                    rx_max_gap_us.store(gap_max.as_micros() as u64, Ordering::Relaxed);
+                    gap_window_start = recv_now;
+                    gap_max = Duration::ZERO;
+                }
                 if buf[0] == 0xEF && buf[1] == 0xFE && buf[2] == 0x01 && buf[3] == EP_IQ_DATA {
                     // Network-quality tracking -- see RadioSession::
                     // rx_packets_total/rx_packets_lost's own doc comment.
@@ -4572,6 +4676,7 @@ fn ozy_sender_loop(
             oc_rx.load(Ordering::Relaxed),
             oc_tx.load(Ordering::Relaxed),
             rx_attenuation.load(Ordering::Relaxed) as u8,
+            0, // lna_tx_db -- inert, is_hermes_lite is false above; Ozy has no such register
             ps_tx_attenuation.load(Ordering::Relaxed) as u8,
             num_adcs,
             &extra_frequencies_hz,
@@ -5499,6 +5604,8 @@ fn start_protocol2(
         tx_fifo_overrun,
         rx_packets_total,
         rx_packets_lost,
+        rx_max_gap_us: Arc::new(AtomicU64::new(0)),
+        lna_tx_db: Arc::new(AtomicI32::new(-12)),
         tx_packet_debug_log,
         stop_flag,
         sender_thread: Some(sender_thread),

@@ -1893,6 +1893,9 @@ fn connect_to_device(device: Device, cfg: &Config) -> Result<ConnectedState, Str
     if let Some(atten) = cfg.rx_attenuation {
         settings.rx_attenuation = atten;
     }
+    if let Some(db) = cfg.lna_tx_db {
+        settings.lna_tx_db = db;
+    }
     if let Some(atten) = cfg.ps_tx_attenuation {
         settings.ps_tx_attenuation = atten;
     }
@@ -2191,7 +2194,7 @@ fn connect_to_device(device: Device, cfg: &Config) -> Result<ConnectedState, Str
             // one's PsParams's fallback for a session that
             // skips Config loading entirely).
             let ps_enabled = true;
-            let ps_hw_peak = cfg.ps_hw_peak.unwrap_or_else(|| default_ps_hw_peak(device.protocol));
+            let ps_hw_peak = cfg.ps_hw_peak.unwrap_or_else(|| default_ps_hw_peak(device.protocol, device.board));
             let ps_mox_delay = cfg.ps_mox_delay.unwrap_or(0.2);
             let ps_loop_delay = cfg.ps_loop_delay.unwrap_or(0.0);
             let ps_tx_delay_ns = cfg.ps_tx_delay_ns.unwrap_or(150.0);
@@ -4022,6 +4025,16 @@ impl eframe::App for HpsdrApp {
                                 } else {
                                     ui.weak("PROC");
                                 }
+                                ui.add_space(8.0);
+                                // CFC has no single scalar gain to show
+                                // (12-band fixed profile) -- just on/off,
+                                // same dim/highlighted convention as
+                                // LEV/PROC above.
+                                if tx.cfc_enabled() {
+                                    ui.colored_label(egui::Color32::from_rgb(230, 150, 50), "CFC");
+                                } else {
+                                    ui.weak("CFC");
+                                }
                             });
                         }
                     }
@@ -5511,9 +5524,18 @@ impl eframe::App for HpsdrApp {
                         let total = connected.session.rx_packets_total.load(Ordering::Relaxed);
                         let lost = connected.session.rx_packets_lost.load(Ordering::Relaxed);
                         let loss_pct = if total > 0 { 100.0 * lost as f64 / total as f64 } else { 0.0 };
+                        // BUG FIX (real report): this used to color orange
+                        // on any loss_pct > 0.0, including a genuine but
+                        // tiny loss (e.g. 1 packet out of tens of
+                        // thousands) that rounds DOWN to "0.00%" at the
+                        // {:.2} precision actually displayed below --
+                        // showing an alarming color next to text that
+                        // reads zero. 0.005 is half the 0.01 rounding
+                        // step, i.e. "only warn if the displayed number
+                        // itself would actually read as nonzero."
                         let net_color = if loss_pct > 1.0 {
                             egui::Color32::from_rgb(220, 60, 60)
-                        } else if loss_pct > 0.0 {
+                        } else if loss_pct >= 0.005 {
                             egui::Color32::from_rgb(230, 150, 50)
                         } else {
                             ui.visuals().weak_text_color()
@@ -5548,6 +5570,43 @@ impl eframe::App for HpsdrApp {
                             audio_color,
                             format!("Audio glitches: {:.0}/min", connected.underrun_rate_per_min),
                         );
+
+                        // Jitter meter (Thetis-style), TX + RX -- the
+                        // largest real gap seen between consecutive
+                        // deliveries in the last 1s window, on each
+                        // side: TX = audio.rs's mic capture callback
+                        // (MicJitterStats, direct-capture path only);
+                        // RX = radio.rs's receiver_loop packet arrivals
+                        // (RadioSession::rx_max_gap_us, protocol 1 UDP
+                        // only for now -- see that field's own doc
+                        // comment for why P2/Ozy/RX-888 aren't covered
+                        // yet). A real report: seeing the actual number
+                        // (not just a derived glitch COUNT) is what let
+                        // this session's mic-underrun bug get root-
+                        // caused at all -- surfacing it here instead of
+                        // only in hpsdr-rs.log.
+                        if let Some(mic) = &connected.mic_input {
+                            let j = mic.jitter();
+                            let tx_color = if j.max_gap_ms > 15.0 {
+                                egui::Color32::from_rgb(230, 150, 50)
+                            } else {
+                                ui.visuals().weak_text_color()
+                            };
+                            ui.colored_label(tx_color, format!("TX jitter: {:.1}ms", j.max_gap_ms))
+                                .on_hover_text(format!(
+                                    "Largest gap between mic driver callbacks in the last 1s window. \
+                                     Drift-compensator correction: {:+.2}% vs nominal 48000Hz.",
+                                    j.rate_deviation_pct
+                                ));
+                        }
+                        let rx_gap_us = connected.session.rx_max_gap_us.load(Ordering::Relaxed);
+                        let rx_gap_ms = rx_gap_us as f64 / 1000.0;
+                        let rx_color = if rx_gap_ms > 15.0 {
+                            egui::Color32::from_rgb(230, 150, 50)
+                        } else {
+                            ui.visuals().weak_text_color()
+                        };
+                        ui.colored_label(rx_color, format!("RX jitter: {rx_gap_ms:.1}ms"));
                     });
                 });
 
@@ -5622,7 +5681,7 @@ impl eframe::App for HpsdrApp {
                                 connected.smoothed_rev_power
                                     + SMOOTHING_ALPHA * (raw_rev as f32 - connected.smoothed_rev_power)
                             };
-                            let (watts, _reverse_watts, swr) = power_watts_and_swr(
+                            let (watts, reverse_watts, swr) = power_watts_and_swr(
                                 connected.smoothed_fwd_power as u32,
                                 connected.smoothed_rev_power as u32,
                                 connected.device.board,
@@ -5643,14 +5702,25 @@ impl eframe::App for HpsdrApp {
                             if swr >= connected.max_swr && watts > 35.0 {
                                 connected.session.tx_power_watts.store(10, std::sync::atomic::Ordering::Relaxed);
                             }
-                            draw_power_meter(
-                                ui,
-                                meter_rect,
-                                watts,
-                                swr,
-                                connected.max_tx_power_watts as f32,
-                                connected.max_swr,
-                            );
+                            match connected.meter_style {
+                                MeterStyle::Analog => draw_power_meter(
+                                    ui,
+                                    meter_rect,
+                                    watts,
+                                    swr,
+                                    connected.max_tx_power_watts as f32,
+                                    connected.max_swr,
+                                ),
+                                MeterStyle::Digital => draw_digital_power_meter(
+                                    ui,
+                                    meter_rect,
+                                    watts,
+                                    reverse_watts,
+                                    swr,
+                                    connected.max_tx_power_watts as f32,
+                                    connected.max_swr,
+                                ),
+                            }
                         } else {
                             // Reset so the next key-up's meter ramps from
                             // zero (like a real wattmeter's needle
@@ -7205,6 +7275,40 @@ impl eframe::App for HpsdrApp {
                                              actually receives. Leave at 0 unless you've measured a \
                                              real offset (piHPSDR calls this same value \"RX Gain \
                                              Calibr.\" in its Radio settings).",
+                                        );
+                                        ui.separator();
+                                    }
+
+                                    // HermesLite/HermesLite2-only: hardware-managed
+                                    // LNA gain applied specifically while
+                                    // transmitting -- see RadioSession::lna_tx_db's
+                                    // doc comment. Confirmed against Quisk's own
+                                    // hermes/quisk_hardware.py (ChangeTxLNA) and its
+                                    // UI's own help text: "The LNA gain is -12 to 48
+                                    // dB. Use -12 for Pure Signal."
+                                    if matches!(connected.device.board, Boards::HermesLite | Boards::HermesLite2) {
+                                        let mut db = connected.session.lna_tx_db.load(Ordering::Relaxed);
+                                        ui.horizontal(|ui| {
+                                            ui.label("LNA during TX:");
+                                            if scroll_slider_i32(
+                                                ui,
+                                                &mut connected.slider_scroll_accum,
+                                                &mut db,
+                                                -12..=48,
+                                                1,
+                                                " dB",
+                                            ) {
+                                                connected.session.lna_tx_db.store(db.clamp(-12, 48), Ordering::Relaxed);
+                                                settings_changed = true;
+                                            }
+                                        });
+                                        ui.weak(
+                                            "The RX LNA's gain while transmitting -- separate from the \
+                                             RX Gain slider above, which only applies while receiving. \
+                                             Matters most for PureSignal's TX feedback (which reuses the \
+                                             RX ADC to sample a strong local TX signal that would \
+                                             otherwise clip at a normal RX-time gain). Use -12 for \
+                                             PureSignal, same as Quisk's own recommendation.",
                                         );
                                         ui.separator();
                                     }
@@ -9431,6 +9535,9 @@ impl eframe::App for HpsdrApp {
                         rx_attenuation: Some(
                             connected.session.rx_attenuation.load(std::sync::atomic::Ordering::Relaxed),
                         ),
+                        lna_tx_db: Some(
+                            connected.session.lna_tx_db.load(std::sync::atomic::Ordering::Relaxed),
+                        ),
                         ps_tx_attenuation: Some(
                             connected.session.ps_tx_attenuation.load(std::sync::atomic::Ordering::Relaxed),
                         ),
@@ -10475,9 +10582,26 @@ fn render_equalizer_panel(ui: &mut egui::Ui, scroll_accum: &mut f32, side_label:
 /// scaling/reference-point error, not a genuinely-too-strong signal --
 /// a real overload would track drive level, not sit pinned at a
 /// constant). Confirmed Thetis defaults: P1/USB 0.4072, P2 0.2899.
-fn default_ps_hw_peak(protocol: u8) -> f64 {
+fn default_ps_hw_peak(protocol: u8, board: Boards) -> f64 {
+    // BUG FIX (real report): this only branched on protocol, giving
+    // HermesLite2 the generic P1 value (0.4067/0.4072) -- confirmed
+    // wrong via deskHPSDR's own transmitter.c board-specific switch,
+    // which uses a real MEASURED value for HermesLite2 specifically:
+    // "measured value: 0.2386" for HL2, rounded up slightly to 0.2400
+    // (that file's own comment: "if the pk value is slightly too
+    // small, very strange things can happen" -- a deliberate small
+    // safety margin, not a rounding accident). Only HermesLite2 gets
+    // this special case (confirmed via deskHPSDR's own switch: classic
+    // HermesLite v1 isn't separately cased there, so it falls through
+    // to the same generic P1 default as Hermes/Angelia/Orion/Orion2) --
+    // HL2's different ADC/feedback scaling from the rest of that board
+    // family is exactly why this needs a board-specific case at all.
     if protocol == 1 {
-        0.4072
+        if board == Boards::HermesLite2 {
+            0.2400
+        } else {
+            0.4072
+        }
     } else {
         0.2899
     }
@@ -10894,6 +11018,118 @@ fn draw_s_meter(ui: &mut egui::Ui, rect: egui::Rect, db: f64) {
 /// match sight-unseen, so it no longer looks like "the same gauge
 /// family" the two used to. Restyle this one too if/when there's a
 /// reference for it.
+/// Digital TX power meter -- the "Digital" MeterStyle's counterpart to
+/// draw_power_meter's analog gauge, mirroring draw_digital_s_meter's own
+/// look (dark panel, header row, gradient bar, tick labels) rather than
+/// a second unrelated style. Layout, per a real request: REF (reflected
+/// power) on the left of the header, SWR on the right, and a bar
+/// showing PWR (forward power) against max_watts -- same header-plus-
+/// bar shape as the S-meter's S-unit/dBm header plus its own bar, just
+/// with TX's own three numbers (REF/SWR/PWR) instead of RX's two
+/// (S-unit/dBm).
+fn draw_digital_power_meter(
+    ui: &mut egui::Ui,
+    rect: egui::Rect,
+    watts: f32,
+    reverse_watts: f32,
+    swr: f32,
+    max_watts: f32,
+    max_swr: f32,
+) {
+    let painter = ui.painter();
+    painter.rect_filled(rect, 4.0, egui::Color32::from_gray(20));
+
+    const MARGIN: f32 = 6.0;
+    // Same "center the fixed-height content block in whatever rect the
+    // caller actually gave us" fix as draw_digital_s_meter's own
+    // CONTENT_HEIGHT/top -- see that function's doc comment for the
+    // real report this addresses.
+    const CONTENT_HEIGHT: f32 = 62.0;
+    let top = rect.top() + ((rect.height() - CONTENT_HEIGHT) / 2.0).max(0.0);
+
+    let max_watts = max_watts.max(1.0);
+    let bad_swr = swr > max_swr;
+    let alarm_color = egui::Color32::from_rgb(220, 60, 60);
+    let ok_color = egui::Color32::from_rgb(255, 150, 70);
+    let swr_color = if bad_swr { alarm_color } else { ok_color };
+
+    // Header row: REF (reflected power) on the left, SWR on the right --
+    // same left/right split as draw_digital_s_meter's S-unit/dBm header.
+    let text_y = top + MARGIN + 7.0;
+    painter.text(
+        egui::pos2(rect.left() + MARGIN, text_y),
+        egui::Align2::LEFT_CENTER,
+        format!("REF {reverse_watts:.0}W"),
+        egui::FontId::monospace(14.0),
+        egui::Color32::WHITE,
+    );
+    painter.text(
+        egui::pos2(rect.right() - MARGIN, text_y),
+        egui::Align2::RIGHT_CENTER,
+        format!("SWR {swr:.1}"),
+        egui::FontId::monospace(14.0),
+        swr_color,
+    );
+
+    // PWR value, centered directly above the bar -- same slot
+    // draw_digital_s_meter's dBm scale row occupies, just one big
+    // number here instead of three small ones (TX has no S-unit-style
+    // bucketed scale to align against).
+    painter.text(
+        egui::pos2(rect.center().x, top + MARGIN + 22.0),
+        egui::Align2::CENTER_CENTER,
+        format!("PWR {watts:.0}W"),
+        egui::FontId::monospace(15.0),
+        egui::Color32::from_rgb(230, 150, 50),
+    );
+
+    let bar = egui::Rect::from_min_max(
+        egui::pos2(rect.left() + MARGIN, top + MARGIN + 30.0),
+        egui::pos2(rect.right() - MARGIN, top + MARGIN + 40.0),
+    );
+    painter.rect_filled(bar, 2.0, egui::Color32::from_gray(45));
+    let t = (watts / max_watts).clamp(0.0, 1.0);
+    // Same piHPSDR-ported 96-segment gradient fill as
+    // draw_digital_s_meter's own bar -- green at low power, shading
+    // toward red as it approaches full scale, so a glance at fill color
+    // alone hints at drive level the same way it hints at signal
+    // strength on the S-meter. SWR alarm state is already covered by
+    // the header's own red REF/SWR text, so this bar doesn't need a
+    // second, redundant alarm color of its own.
+    const N_STEPS: i32 = 96;
+    for i in 0..N_STEPS {
+        let f = i as f32 / N_STEPS as f32;
+        if f > t {
+            break;
+        }
+        let seg = egui::Rect::from_min_max(
+            egui::pos2(bar.left() + f * bar.width(), bar.top()),
+            egui::pos2(bar.left() + f * bar.width() + bar.width() / N_STEPS as f32 + 0.6, bar.bottom()),
+        );
+        painter.rect_filled(seg, 0.0, meter_zone_rgb(f));
+    }
+
+    // Tick labels -- same "nice" round-watt-boundary fix as the analog
+    // gauge's own ticks (see draw_power_meter's BUG FIX comment for the
+    // real report behind it: a plain 0/25/50/75% split lands on
+    // ugly/misleading fractional-watt boundaries for a non-round
+    // max_watts).
+    let step = nice_tick_step(max_watts as f64, 4.0) as f32;
+    let tick_y = bar.bottom() + 10.0;
+    let mut w = 0.0f32;
+    while w <= max_watts + step * 0.001 {
+        let x = bar.left() + (w / max_watts) * bar.width();
+        painter.text(
+            egui::pos2(x, tick_y),
+            egui::Align2::CENTER_CENTER,
+            format!("{w:.0}"),
+            egui::FontId::monospace(10.0),
+            egui::Color32::from_gray(150),
+        );
+        w += step;
+    }
+}
+
 fn draw_power_meter(ui: &mut egui::Ui, rect: egui::Rect, watts: f32, swr: f32, max_watts: f32, max_swr: f32) {
     let painter = ui.painter();
     painter.rect_filled(rect, 4.0, egui::Color32::from_gray(20));

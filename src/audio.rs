@@ -1050,9 +1050,26 @@ mod tests {
     }
 }
 
+/// Live snapshot of the mic capture callback's own delivery timing --
+/// same data that was already going into hpsdr-rs.log once a second
+/// (see MicInput::start's direct-config callback), now also kept here
+/// so the UI can show it directly instead of requiring a log read. See
+/// ConnectedState's own "Jitter" status-bar reading.
+#[derive(Clone, Copy, Default)]
+pub struct MicJitterStats {
+    /// Largest real gap between two consecutive driver callbacks in the
+    /// last full 1-second measurement window, ms.
+    pub max_gap_ms: f64,
+    /// How far the drift compensator's smoothed measured rate currently
+    /// sits from nominal INPUT_SAMPLE_RATE, as a percentage (signed --
+    /// negative means the device is delivering slower than nominal).
+    pub rate_deviation_pct: f64,
+}
+
 pub struct MicInput {
     _stream: cpal::Stream,
     buffer: Arc<Mutex<VecDeque<f32>>>,
+    jitter: Arc<Mutex<MicJitterStats>>,
 }
 
 impl MicInput {
@@ -1136,6 +1153,8 @@ impl MicInput {
             buffer_size: cpal::BufferSize::Fixed(480),
         };
         let direct_buffer = Arc::clone(&buffer);
+        let jitter = Arc::new(Mutex::new(MicJitterStats::default()));
+        let callback_jitter = Arc::clone(&jitter);
         // Diagnostic instrumentation for a real, still-unexplained report
         // (continuous `tx: mic buffer underrun` in tx.rs, on a powerful,
         // idle-CPU Xeon workstation, surviving both a timer-resolution
@@ -1205,6 +1224,11 @@ impl MicInput {
                     };
                     measured_rate_ema = Some(smoothed);
                     drift.set_ratio(smoothed, INPUT_SAMPLE_RATE as f64);
+                    *callback_jitter.lock().unwrap() = MicJitterStats {
+                        max_gap_ms: cb_max_gap.as_secs_f64() * 1000.0,
+                        rate_deviation_pct: (smoothed - INPUT_SAMPLE_RATE as f64) / INPUT_SAMPLE_RATE as f64
+                            * 100.0,
+                    };
 
                     // log_async (tx.rs), not eprintln! directly -- this
                     // callback IS the real-time WASAPI audio thread
@@ -1311,7 +1335,15 @@ impl MicInput {
             .play()
             .map_err(|e| format!("failed to start audio capture: {e}"))?;
 
-        Ok(Self { _stream: stream, buffer })
+        Ok(Self { _stream: stream, buffer, jitter })
+    }
+
+    /// See MicJitterStats's own doc comment. Only populated by the
+    /// direct (no-resampling) capture path -- the fallback native-rate+
+    /// resample path doesn't yet feed this, so it reads as all-zero
+    /// there rather than lying with stale/default numbers.
+    pub fn jitter(&self) -> MicJitterStats {
+        *self.jitter.lock().unwrap()
     }
 
     /// The ring buffer this capture writes into -- lets a caller (e.g.
