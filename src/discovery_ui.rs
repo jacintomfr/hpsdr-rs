@@ -713,13 +713,19 @@ impl DiscoveryWindow {
                             }
                             if ui
                                 .button("Reset USB & Restart")
-                                .on_hover_text(
+                                .on_hover_text(if cfg!(windows) {
                                     "For when a plain Restart doesn't unstick it. Disables and \
                                      re-enables the Radioberry's USB device in Windows -- the \
                                      same effect as unplugging and replugging the cable, without \
                                      touching it -- then relaunches juice. Requires running \
-                                     hpsdr-rs as Administrator.",
-                                )
+                                     hpsdr-rs as Administrator."
+                                } else {
+                                    "For when a plain Restart doesn't unstick it. Issues a USB \
+                                     port reset to the Radioberry -- the same effect as \
+                                     unplugging and replugging the cable, without touching it -- \
+                                     then relaunches juice. Uses the same USB device permissions \
+                                     juice itself already needs, no extra privileges required."
+                                })
                                 .clicked()
                             {
                                 if let Err(e) = handle.reset_usb_and_restart() {
@@ -730,25 +736,35 @@ impl DiscoveryWindow {
                                     ui.ctx().request_repaint_after(JUICE_REFRESH_DELAY);
                                 }
                             }
-                            // Quiet, always-available option rather than an alarmist banner --
-                            // the graceful shutdown path above needs no special privileges at
-                            // all (a process closing itself never does), so most people will
-                            // never actually need this. It only matters for the rare fallback
-                            // case (a stuck juice that has to be force-killed, or Reset USB),
-                            // where Windows can silently refuse without it -- the console
-                            // already says so, reactively, exactly if/when that happens.
-                            if ui
-                                .button("Run as Administrator")
-                                .on_hover_text(
-                                    "Only needed if Stop/Reset USB ever fails with a permissions \
-                                     error -- most people never hit this.",
-                                )
-                                .clicked()
-                            {
-                                if let Err(e) = crate::radioberry_juice::relaunch_elevated() {
-                                    self.juice_launch_error = Some(format!("Couldn't relaunch elevated: {e}"));
-                                } else {
-                                    std::process::exit(0);
+                            // Windows-only: elevation (UAC/"Run as
+                            // Administrator") is a Windows-specific
+                            // concept -- relaunch_elevated/is_elevated
+                            // are both no-ops elsewhere (see their own
+                            // doc comments), and Reset USB above needs
+                            // no special privileges on Linux/macOS in
+                            // the first place, so there's nothing this
+                            // button could ever fix on those platforms.
+                            if cfg!(windows) {
+                                // Quiet, always-available option rather than an alarmist banner --
+                                // the graceful shutdown path above needs no special privileges at
+                                // all (a process closing itself never does), so most people will
+                                // never actually need this. It only matters for the rare fallback
+                                // case (a stuck juice that has to be force-killed, or Reset USB),
+                                // where Windows can silently refuse without it -- the console
+                                // already says so, reactively, exactly if/when that happens.
+                                if ui
+                                    .button("Run as Administrator")
+                                    .on_hover_text(
+                                        "Only needed if Stop/Reset USB ever fails with a permissions \
+                                         error -- most people never hit this.",
+                                    )
+                                    .clicked()
+                                {
+                                    if let Err(e) = crate::radioberry_juice::relaunch_elevated() {
+                                        self.juice_launch_error = Some(format!("Couldn't relaunch elevated: {e}"));
+                                    } else {
+                                        std::process::exit(0);
+                                    }
                                 }
                             }
                         });

@@ -9319,6 +9319,9 @@ impl eframe::App for HpsdrApp {
                                             {
                                                 let _ = console.restart();
                                             }
+                                            // Windows-only: elevation is a Windows-specific
+                                            // concept, see discovery_ui.rs's matching comment.
+                                            //
                                             // Quiet, always-available option rather than an
                                             // alarmist banner -- the graceful shutdown path
                                             // needs no elevation at all (a process closing
@@ -9327,14 +9330,15 @@ impl eframe::App for HpsdrApp {
                                             // force-kill fallback, where Windows can silently
                                             // refuse without it -- the console already says so,
                                             // reactively, exactly if/when that happens.
-                                            if ui
-                                                .button("Run as Administrator")
-                                                .on_hover_text(
-                                                    "Only needed if Stop ever fails with a \
-                                                     permissions error -- most people never hit \
-                                                     this.",
-                                                )
-                                                .clicked()
+                                            if cfg!(windows)
+                                                && ui
+                                                    .button("Run as Administrator")
+                                                    .on_hover_text(
+                                                        "Only needed if Stop ever fails with a \
+                                                         permissions error -- most people never hit \
+                                                         this.",
+                                                    )
+                                                    .clicked()
                                                 && crate::radioberry_juice::relaunch_elevated().is_ok()
                                             {
                                                 std::process::exit(0);

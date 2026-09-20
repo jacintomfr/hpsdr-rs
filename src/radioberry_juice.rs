@@ -22,6 +22,8 @@
     on disk; it doesn't build or install one.
 */
 
+#[cfg(not(windows))]
+use nusb::MaybeFuture;
 use std::collections::VecDeque;
 use std::io;
 use std::io::{BufRead, BufReader, Write};
@@ -268,10 +270,10 @@ impl JuiceHandle {
 
     /// The heavier recovery option, for when a plain Restart isn't
     /// enough and the board would otherwise need the USB cable
-    /// physically unplugged and replugged: stops juice, asks Windows to
-    /// disable then re-enable the Radioberry's own USB device (its
-    /// FT2232H, VID 0403 / PID 6010 -- see reset_usb_device's own doc
-    /// comment), then launches juice again. This is a real USB-level
+    /// physically unplugged and replugged: stops juice, resets the
+    /// Radioberry's own USB device (its FT2232H, VID 0403 / PID 6010 --
+    /// see reset_usb_device's own doc comment for the platform-specific
+    /// mechanism), then launches juice again. This is a real USB-level
     /// reset (same effect as a physical unplug/replug) rather than
     /// anything aimed at juice itself -- it doesn't depend on juice
     /// handling any particular signal gracefully, since this module has
@@ -698,9 +700,39 @@ fn reset_usb_device() -> io::Result<()> {
         )))
     }
 }
+/// Linux/macOS equivalent of the Windows pnputil dance above: rather
+/// than disabling/re-enabling the device at the OS device-manager level
+/// (a Windows-specific concept with no real analogue here), this issues
+/// a USB port reset directly through the OS's own USB stack (usbfs on
+/// Linux, IOKit on macOS -- both via `nusb`, already a dependency for
+/// the RX-888's own USB access). This needs no elevated privileges
+/// beyond whatever access the device node already grants the current
+/// user -- on Linux that's the `radioberry` group + udev rule described
+/// in FTDI-LINUX-README.md, the same permissions juice's own D2XX calls
+/// already rely on, so anyone who can run juice at all can also use
+/// this. Matches by VID 0403 / PID 6010 (the Radioberry's FT2232H, same
+/// as the Windows path above) -- the first matching device found is
+/// reset; if more than one FT2232H with this exact VID/PID is attached,
+/// there's no more specific identifier available here to disambiguate
+/// them, same caveat as Windows.
 #[cfg(not(windows))]
 fn reset_usb_device() -> io::Result<()> {
-    Err(io::Error::new(io::ErrorKind::Unsupported, "USB device reset is only implemented on Windows"))
+    const VENDOR_ID: u16 = 0x0403;
+    const PRODUCT_ID: u16 = 0x6010;
+    let device_info = nusb::list_devices()
+        .wait()
+        .map_err(|e| io::Error::other(format!("couldn't enumerate USB devices: {e}")))?
+        .find(|d| d.vendor_id() == VENDOR_ID && d.product_id() == PRODUCT_ID)
+        .ok_or_else(|| {
+            io::Error::other(format!(
+                "no matching USB device found (VID {VENDOR_ID:04x}:PID {PRODUCT_ID:04x})"
+            ))
+        })?;
+    let device = device_info
+        .open()
+        .wait()
+        .map_err(|e| io::Error::other(format!("couldn't open the Radioberry's USB device: {e}")))?;
+    device.reset().wait().map_err(|e| io::Error::other(format!("USB device reset failed: {e}")))
 }
 
 /// Opens (truncating) the log file for a launch, falling back to a
