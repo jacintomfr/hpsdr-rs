@@ -26,6 +26,7 @@ mod ozy;
 mod radio;
 mod radioberry_juice;
 mod rigctl;
+mod rx200;
 mod rx888;
 mod spectrum;
 mod sysstats;
@@ -1136,6 +1137,12 @@ struct ConnectedState {
     /// diagnostic -- see that function's own doc comment. `None` until
     /// the first unmatched event; UI-only/transient, never persisted.
     midi_unmatched_last_logged: Option<Instant>,
+    /// Background listener for an optional external DL1BZ-style "RX200"
+    /// SWR/power meter -- see rx200.rs's module doc comment. Always
+    /// running while connected (a UDP listener with nothing broadcasting
+    /// to it costs nothing) rather than gated by a setting; its overlay
+    /// only appears once a reading actually arrives.
+    rx200: rx200::Rx200Monitor,
     /// Result summary of the last "Import Thetis Midi2Cat XML..." click
     /// (see midi_import.rs) -- shown right under that button rather than
     /// via ConnectedState::status_message, since that's rendered on the
@@ -2270,6 +2277,21 @@ fn connect_to_device(device: Device, cfg: &Config) -> Result<ConnectedState, Str
                     if let Some(v) = cfg.tx_eq {
                         tx_handle.set_eq(v);
                     }
+                    if let Some(v) = cfg.tx_leveler_enabled {
+                        tx_handle.set_leveler_enabled(v);
+                    }
+                    if let Some(v) = cfg.tx_leveler_gain_db {
+                        tx_handle.set_leveler_gain_db(v);
+                    }
+                    if let Some(v) = cfg.tx_leveler_decay_ms {
+                        tx_handle.set_leveler_decay_ms(v);
+                    }
+                    if let Some(v) = cfg.tx_compressor_enabled {
+                        tx_handle.set_compressor_enabled(v);
+                    }
+                    if let Some(v) = cfg.tx_compressor_gain_db {
+                        tx_handle.set_compressor_gain_db(v);
+                    }
                     // Apply a previously-saved correction table
                     // immediately, if PS is enabled and one exists for
                     // this radio -- see TxHandle::restore_ps_corr's doc
@@ -2358,6 +2380,7 @@ fn connect_to_device(device: Device, cfg: &Config) -> Result<ConnectedState, Str
                 midi_bindings,
                 midi_learn: MidiLearnState::default(),
                 midi_unmatched_last_logged: None,
+                rx200: rx200::Rx200Monitor::start(),
                 midi_import_message: None,
                 midi_wheel_last_step: std::collections::HashMap::new(),
                 audio_output,
@@ -3969,7 +3992,34 @@ impl eframe::App for HpsdrApp {
                     if connected.tx_enabled {
                         if let Some(tx) = &connected.tx_handle {
                             let disp = *tx.display.lock().unwrap();
-                            ui.weak(format!("Mic level: {:.3}    ALC: {:.1}", disp.mic_pk, disp.alc_av));
+                            ui.horizontal(|ui| {
+                                ui.weak(format!("Mic level: {:.3}    ALC: {:.1}", disp.mic_pk, disp.alc_av));
+
+                                // Leveler/Compressor status -- same idea as
+                                // deskHPSDR's top-bar "LEV +N"/"PROC +N"
+                                // (vfo.c): dim label when off, the
+                                // configured gain value highlighted when
+                                // on, so it's visible without opening
+                                // Settings -> TX.
+                                ui.add_space(12.0);
+                                if tx.leveler_enabled() {
+                                    ui.colored_label(
+                                        egui::Color32::from_rgb(230, 150, 50),
+                                        format!("LEV +{:.0}", tx.leveler_gain_db()),
+                                    );
+                                } else {
+                                    ui.weak("LEV");
+                                }
+                                ui.add_space(8.0);
+                                if tx.compressor_enabled() {
+                                    ui.colored_label(
+                                        egui::Color32::from_rgb(230, 150, 50),
+                                        format!("PROC +{:.0}", tx.compressor_gain_db()),
+                                    );
+                                } else {
+                                    ui.weak("PROC");
+                                }
+                            });
                         }
                     }
 
@@ -5083,6 +5133,50 @@ impl eframe::App for HpsdrApp {
                             points,
                             egui::Stroke::new(1.5, egui::Color32::LIGHT_GREEN),
                         ));
+                    }
+
+                    // External DL1BZ-style "RX200" SWR/power meter overlay
+                    // -- see rx200.rs's module doc comment. Drawn AFTER the
+                    // dB gridlines/trace above (not before, as an earlier
+                    // version of this had it) so it sits on top of them
+                    // instead of a gridline visibly cutting through the
+                    // text -- a real report. Deliberately on the LEFT
+                    // (offset past the dB gridline labels at
+                    // rect.left()+2), not the right like deskHPSDR's own
+                    // placement -- this app's spectrum area already uses
+                    // its top-right corner for the audio waveform preview
+                    // (draw_audio_waveform).
+                    if let Some(reading) = connected.rx200.latest() {
+                        let x = rect.left() + 55.0;
+                        let font = egui::FontId::monospace(13.0);
+                        let colour = if reading.swr > 3.0 {
+                            egui::Color32::from_rgb(255, 60, 60)
+                        } else {
+                            egui::Color32::from_rgb(230, 150, 50)
+                        };
+                        ui.painter().text(
+                            egui::pos2(x, rect.top() + 4.0),
+                            egui::Align2::LEFT_TOP,
+                            format!("Fwd {:.0}W", reading.fwd_watts),
+                            font.clone(),
+                            colour,
+                        );
+                        ui.painter().text(
+                            egui::pos2(x, rect.top() + 20.0),
+                            egui::Align2::LEFT_TOP,
+                            format!("Ref {:.0}W  SWR {:.1}", reading.ref_watts, reading.swr),
+                            font,
+                            colour,
+                        );
+                        if !reading.device_time.is_empty() {
+                            ui.painter().text(
+                                egui::pos2(x, rect.top() + 36.0),
+                                egui::Align2::LEFT_TOP,
+                                reading.device_time,
+                                egui::FontId::monospace(10.0),
+                                egui::Color32::GRAY,
+                            );
+                        }
                     }
 
                     // See draw_band_edge_markers's own doc comment for
@@ -7574,6 +7668,92 @@ impl eframe::App for HpsdrApp {
                                     }
                                     ui.add_space(8.0);
 
+                                    // Leveler and Compressor ("PROC") -- WDSP stages
+                                    // this project previously left permanently off
+                                    // (see tx.rs's open()), now user-toggleable. See
+                                    // TxParams::leveler_enabled/compressor_enabled's
+                                    // doc comments for what each one actually does.
+                                    if let Some(tx) = &connected.tx_handle {
+                                        let mut leveler = tx.leveler_enabled();
+                                        if ui
+                                            .checkbox(&mut leveler, "Leveler")
+                                            .on_hover_text(
+                                                "Slower average-level normalizer, separate from the \
+                                                 ALC's fast peak limiting -- evens out a speaker who \
+                                                 trails off quieter at the end of a sentence, without \
+                                                 the punchier/crunchier effect of the Compressor below.",
+                                            )
+                                            .changed()
+                                        {
+                                            tx.set_leveler_enabled(leveler);
+                                            settings_changed = true;
+                                        }
+                                        if leveler {
+                                            ui.horizontal(|ui| {
+                                                ui.label("Leveler gain:");
+                                                let mut gain_db = tx.leveler_gain_db();
+                                                if scroll_slider_f32(
+                                                    ui,
+                                                    &mut connected.slider_scroll_accum,
+                                                    &mut gain_db,
+                                                    0.0..=15.0,
+                                                    1.0,
+                                                ) {
+                                                    tx.set_leveler_gain_db(gain_db);
+                                                    settings_changed = true;
+                                                }
+                                                ui.label("dB");
+                                                ui.add_space(12.0);
+                                                ui.label("Decay:");
+                                                let mut decay_ms = tx.leveler_decay_ms();
+                                                if scroll_slider_i32(
+                                                    ui,
+                                                    &mut connected.slider_scroll_accum,
+                                                    &mut decay_ms,
+                                                    0..=500,
+                                                    10,
+                                                    "ms",
+                                                ) {
+                                                    tx.set_leveler_decay_ms(decay_ms);
+                                                    settings_changed = true;
+                                                }
+                                            });
+                                        }
+
+                                        let mut compressor = tx.compressor_enabled();
+                                        if ui
+                                            .checkbox(&mut compressor, "Compressor (PROC)")
+                                            .on_hover_text(
+                                                "Simple single-band speech compressor -- raises average \
+                                                 TX power for a more 'in your face' SSB sound. Cruder \
+                                                 than a real multiband processor: pushed too hard, it \
+                                                 flattens dynamics and can sound compressed/distorted.",
+                                            )
+                                            .changed()
+                                        {
+                                            tx.set_compressor_enabled(compressor);
+                                            settings_changed = true;
+                                        }
+                                        if compressor {
+                                            ui.horizontal(|ui| {
+                                                ui.label("Compressor gain:");
+                                                let mut gain_db = tx.compressor_gain_db();
+                                                if scroll_slider_f32(
+                                                    ui,
+                                                    &mut connected.slider_scroll_accum,
+                                                    &mut gain_db,
+                                                    0.0..=20.0,
+                                                    1.0,
+                                                ) {
+                                                    tx.set_compressor_gain_db(gain_db);
+                                                    settings_changed = true;
+                                                }
+                                                ui.label("dB");
+                                            });
+                                        }
+                                    }
+                                    ui.add_space(8.0);
+
                                     ui.horizontal(|ui| {
                                         ui.label(format!("Max TX Power ({}):", connected.device.board_label()));
                                         let mut max_watts = connected.max_tx_power_watts as i32;
@@ -9153,6 +9333,11 @@ impl eframe::App for HpsdrApp {
                         rx_eq: Some(agc_params_now.eq),
                         mic_gain: Some(connected.mic_gain),
                         tx_eq: connected.tx_handle.as_ref().map(|t| t.eq()),
+                        tx_leveler_enabled: connected.tx_handle.as_ref().map(|t| t.leveler_enabled()),
+                        tx_leveler_gain_db: connected.tx_handle.as_ref().map(|t| t.leveler_gain_db()),
+                        tx_leveler_decay_ms: connected.tx_handle.as_ref().map(|t| t.leveler_decay_ms()),
+                        tx_compressor_enabled: connected.tx_handle.as_ref().map(|t| t.compressor_enabled()),
+                        tx_compressor_gain_db: connected.tx_handle.as_ref().map(|t| t.compressor_gain_db()),
                         tci_tx_gain: Some(connected.tci_tx_gain),
                         tx_power_watts: Some(connected.session.tx_power_watts.load(Ordering::Relaxed)),
                         cw_keyer_mode: Some(connected.session.cw_keyer.mode.load(Ordering::Relaxed)),
@@ -12310,72 +12495,29 @@ fn change_sample_rate(connected: &mut ConnectedState, new_rate: u32) {
     connected.spectrum = spectrum;
     connected.sample_rate = new_rate;
 
-    // P1 has one shared RX/TX clock (no separate DUC rate the way P2
-    // has a fixed 192ksps regardless of RX rate) -- if TX is armed,
-    // tx.rs's TXA channel was opened expecting the *old* sample rate
-    // and needs rebuilding against the new one, or TX audio would come
-    // out at the wrong pitch/speed. Mic capture itself (audio.rs's
-    // MicInput) is unaffected -- only the TXA channel's output rate
-    // needs to change, so only tx_handle is torn down and recreated
-    // here, not mic_input.
-    if connected.tx_enabled && connected.device.protocol == 1 {
-        if let Some(old_tx) = connected.tx_handle.take() {
-            let mic_gain = connected.mic_gain;
-            drop(old_tx); // stop the old TXA thread before opening a new one on the same WDSP TX channel
-            // Same reasoning as the RX SpectrumHandle rebuild above --
-            // tear down before creating a replacement on the same channel.
-            connected.tx_spectrum.stop();
-            let tx_spectrum_iq: Arc<Mutex<VecDeque<IqSample>>> = Arc::new(Mutex::new(VecDeque::new()));
-            connected.tx_spectrum = SpectrumHandle::start(
-                connected.session.iq_buffers.len() as i32 + 1,
-                Arc::clone(&tx_spectrum_iq),
-                new_rate as i32,
-                None,
-                Arc::clone(&connected.session.mox),
-                Arc::clone(&connected.session.mute_local_audio_for_tci),
-            );
-            if let Some(mic) = &connected.mic_input {
-                let tx_handle = TxHandle::start(
-                    Arc::clone(mic.buffer()),
-                    Arc::clone(&connected.session.tci_tx_audio),
-                    Arc::clone(&connected.session.radio_mic_audio),
-                    Arc::clone(&connected.session.tx_audio_source),
-                    Arc::clone(&connected.session.tci_wants_mic),
-                    Arc::clone(&connected.session.tx_iq),
-                    Arc::clone(&tx_spectrum_iq),
-                    Arc::clone(&connected.session.mox),
-                    connected.session.iq_buffers.len() as i32,
-                    connected.device.protocol,
-                    48_000,
-                    new_rate as i32,
-                    connected.puresignal_enabled,
-                    Arc::clone(&connected.session.ps_rx_feedback_iq),
-                    Arc::clone(&connected.session.ps_tx_feedback_iq),
-                    ps_corr_path(connected.device.mac),
-                    Arc::clone(&connected.session.cw_keyer),
-                );
-                tx_handle.set_mic_gain(mic_gain);
-                tx_handle.set_mode(connected.spectrum.mode());
-                tx_handle.set_width_hz(connected.spectrum.width_hz());
-                tx_handle.set_ps_enabled(connected.ps_enabled);
-                tx_handle.set_ps_hw_peak(connected.ps_hw_peak);
-                tx_handle.set_ps_mox_delay(connected.ps_mox_delay);
-                tx_handle.set_ps_loop_delay(connected.ps_loop_delay);
-                tx_handle.set_ps_tx_delay_ns(connected.ps_tx_delay_ns);
-                // See connect_to_device's identical restore -- this
-                // rebuild also opens a fresh WDSP channel with no
-                // calibration history of its own.
-                if connected.puresignal_enabled {
-                    if let Some(path) = ps_corr_path(connected.device.mac) {
-                        if path.exists() {
-                            tx_handle.restore_ps_corr();
-                        }
-                    }
-                }
-                connected.tx_handle = Some(tx_handle);
-            }
-        }
-    }
+    // BUG FIX (real report): this function used to also tear down and
+    // rebuild tx_handle/tx_spectrum here for protocol 1, on the theory
+    // that P1 has "one shared RX/TX clock" and TX needed rebuilding
+    // against the new RX rate or TX audio would come out at the wrong
+    // pitch/speed. That premise is false and already confirmed wrong
+    // TWICE elsewhere in this codebase: P1's TX IQ rate is a fixed
+    // 48000 regardless of the RX DDC rate (see this file's own
+    // `duc_rate` comment at tx_spectrum's initial construction, and
+    // radio.rs's fill_tx_payload doc comment, which fixed the exact
+    // same "bad TX spectrum at a non-48k P1 RX rate" bug class once
+    // already, just in the outgoing-packet path rather than this
+    // display path). Rebuilding tx_spectrum at `new_rate` here left the
+    // main panel's TX spectrum axis-scale code (which correctly assumes
+    // a fixed 48000 span for P1, see the `transmitting` block above)
+    // mismatched against the analyzer's real span -- a live RX rate
+    // change while connected (not a fresh connect, which already opens
+    // tx_spectrum at the correct fixed 48000) visibly squeezed/
+    // mislabeled the TX trace, confirmed via a real Radioberry test.
+    // Removing this block entirely both fixes that and stops needlessly
+    // dropping the TX WDSP channel (losing PureSignal calibration, see
+    // the restore logic this used to redo) on every RX rate change --
+    // nothing about TX actually needs touching when only the RX rate
+    // changes for P1.
 
     // P1 has one shared clock for every receiver, unlike P2 where each
     // DDC can run its own independent rate -- keep every currently-open

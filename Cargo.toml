@@ -105,7 +105,13 @@ sysinfo = "0.33"
 # top of main.rs) so Windows stops auto-allocating a console window
 # when launched from Explorer/the Start Menu shortcut, which otherwise
 # silently swallows that same output with nowhere to show it.
-windows-sys = { version = "0.59", features = ["Win32_Foundation", "Win32_System_Console", "Win32_System_Threading"] }
+#
+# Win32_Media: timeBeginPeriod/timeEndPeriod, used by tx.rs's run() to
+# raise the system timer resolution for its own lifetime -- see that call
+# site's doc comment for the real-hardware mic-buffer-underrun report
+# this is a hypothesis for (Windows' default ~15.6ms Sleep() granularity,
+# coarser than the ~10.67ms TX chunk pacing interval needs).
+windows-sys = { version = "0.59", features = ["Win32_Foundation", "Win32_Media", "Win32_System_Console", "Win32_System_Threading"] }
 
 # NOTE: I could not compile-check this in the sandbox this was written in
 # (no Rust toolchain available), so treat these version numbers as a

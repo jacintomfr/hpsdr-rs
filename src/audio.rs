@@ -750,6 +750,20 @@ impl RateConverter {
         Self { ratio: in_rate.max(1) as f64 / out_rate.max(1) as f64, pos: 0.0, prev: 0.0 }
     }
 
+    /// Live-adjusts the conversion ratio without resetting `pos`/`prev` --
+    /// see MicInput::start's direct-config callback for why this exists
+    /// (a small, continuously-updated correction for real hardware clock
+    /// drift measured from actual callback delivery, as opposed to
+    /// `new`'s one-time nominal-vs-native rate setup). Clamped
+    /// to a narrow band so a bad single measurement can't swing this into
+    /// audibly-wrong pitch territory -- real crystal drift is a fraction
+    /// of a percent; anything requesting far more than that is noise in
+    /// the measurement, not a real correction to make.
+    fn set_ratio(&mut self, in_rate: f64, out_rate: f64) {
+        let requested = in_rate.max(1.0) / out_rate.max(1.0);
+        self.ratio = requested.clamp(0.98, 1.02);
+    }
+
     /// Appends the resampled equivalent of `input` (mono, at in_rate)
     /// to `out` (mono, at out_rate).
     ///
@@ -1100,17 +1114,121 @@ impl MicInput {
             .map(|d| d.name().to_string())
             .unwrap_or_else(|_| "<unknown>".to_string());
 
+        // Fixed, small buffer period -- UNVERIFIED HYPOTHESIS for a real
+        // report of continuous `tx: mic buffer underrun` on Windows
+        // (tx.rs's run() loop drains this buffer in ~10.67ms/512-sample
+        // steps at 48kHz). `BufferSize::Default` lets the OS/driver pick
+        // its own delivery period, which on WASAPI can be considerably
+        // longer than that -- audio would then arrive in occasional
+        // larger bursts rather than a roughly steady trickle, so this
+        // loop's frequent small reads would often find the buffer
+        // genuinely empty between bursts even though the mic itself is
+        // working fine (confirmed not to be the mic/driver/Windows in
+        // general: a different SDR app using the same mic on the same
+        // machine doesn't reproduce this). 480 frames = 10ms @ 48kHz, a
+        // WASAPI-common period close to this app's own consumption rate.
+        // If a device can't honor this exact size, build_input_stream
+        // below fails and the existing native-config fallback path takes
+        // over, same as any other unsupported direct_config today.
         let direct_config = cpal::StreamConfig {
             channels: INPUT_CHANNELS,
             sample_rate: INPUT_SAMPLE_RATE,
-            buffer_size: cpal::BufferSize::Default,
+            buffer_size: cpal::BufferSize::Fixed(480),
         };
         let direct_buffer = Arc::clone(&buffer);
+        // Diagnostic instrumentation for a real, still-unexplained report
+        // (continuous `tx: mic buffer underrun` in tx.rs, on a powerful,
+        // idle-CPU Xeon workstation, surviving both a timer-resolution
+        // fix and a fixed-buffer-size fix) -- logs, once per second, the
+        // REAL gaps between this callback's own invocations (is the
+        // DRIVER delivering audio on a steady ~10ms cadence, or does it
+        // occasionally stall?) rather than continuing to guess at the
+        // mechanism blind. See the matching consumer-side instrumentation
+        // in tx.rs's run() for the other half of this same picture.
+        let mut cb_window_start = Instant::now();
+        let mut cb_count: u32 = 0;
+        let mut cb_samples: usize = 0;
+        let mut cb_last: Option<Instant> = None;
+        let mut cb_max_gap = Duration::ZERO;
+        // Drift-compensating resampler -- ROOT CAUSE FIX (attempt) for a
+        // real report: even on the exact-match "no resampling" path
+        // (device accepted a direct 48000Hz/Fixed(480) request), a real
+        // hpsdr-rs.log showed the device's TRUE delivery rate, measured
+        // against this machine's own wall clock, running a small but
+        // persistent ~0.1-0.6% below/above nominal 48000/sec across many
+        // separate real-hardware tests -- ordinary crystal-tolerance
+        // drift between the mic's own clock and the PC's, not something
+        // any fixed buffer/cushion size can fix (a cushion only delays
+        // when an ONGOING deficit finally empties it, it can't undo a
+        // rate that's genuinely, continuously too slow). Starts as an
+        // exact 1:1 passthrough (`new(48000, 48000)`) and is
+        // continuously RE-TARGETED below from this same callback's own
+        // per-second delivery measurement, so it tracks whatever this
+        // specific device's real clock is doing right now rather than a
+        // single fixed guess -- same idea as any audio-clock drift
+        // compensator (e.g. a receiver locking to a transmitter's
+        // slightly-off sample clock in networked audio).
+        let mut drift = RateConverter::new(INPUT_SAMPLE_RATE, INPUT_SAMPLE_RATE);
+        let mut measured_rate_ema: Option<f64> = None;
+        let mut resampled_scratch: Vec<f32> = Vec::new();
         let direct_result = device.build_input_stream(
             &direct_config,
             move |data: &[f32], _: &cpal::InputCallbackInfo| {
+                let now = Instant::now();
+                if let Some(last) = cb_last {
+                    let gap = now.duration_since(last);
+                    if gap > cb_max_gap {
+                        cb_max_gap = gap;
+                    }
+                }
+                cb_last = Some(now);
+                cb_count += 1;
+                cb_samples += data.len();
+                let window_elapsed = now.duration_since(cb_window_start);
+                if window_elapsed >= Duration::from_secs(1) {
+                    // Real elapsed seconds, not an assumed 1.0 -- this
+                    // check only fires once elapsed already passed 1s,
+                    // by however much, and that overshoot would otherwise
+                    // bias the rate estimate low every single window.
+                    let measured_rate = cb_samples as f64 / window_elapsed.as_secs_f64();
+                    // EMA-smoothed, not applied raw -- a single window's
+                    // measurement is noisy (see the max-gap diagnostic:
+                    // real delivery is bursty, not perfectly even), and
+                    // an unsmoothed ratio update every second would
+                    // itself introduce audible micro-pitch jitter. alpha
+                    //=0.3 settles over a handful of seconds, fast enough
+                    // to track real drift, slow enough to reject one-off
+                    // noise.
+                    let smoothed = match measured_rate_ema {
+                        Some(prev) => prev + 0.3 * (measured_rate - prev),
+                        None => measured_rate,
+                    };
+                    measured_rate_ema = Some(smoothed);
+                    drift.set_ratio(smoothed, INPUT_SAMPLE_RATE as f64);
+
+                    // log_async (tx.rs), not eprintln! directly -- this
+                    // callback IS the real-time WASAPI audio thread
+                    // itself; a synchronous disk-I/O stall right here
+                    // (see that function's doc comment) would be an even
+                    // more direct way for this diagnostic to cause the
+                    // exact kind of driver-side glitch it exists to
+                    // investigate.
+                    crate::tx::log_async(format!(
+                        "mic capture: {cb_count} callbacks, {cb_samples} samples, max gap \
+                         {:.1}ms, measured rate {measured_rate:.0}/s (smoothed {smoothed:.0}/s) \
+                         in the last second",
+                        cb_max_gap.as_secs_f64() * 1000.0
+                    ));
+                    cb_window_start = now;
+                    cb_count = 0;
+                    cb_samples = 0;
+                    cb_max_gap = Duration::ZERO;
+                }
+
+                resampled_scratch.clear();
+                drift.process(data, &mut resampled_scratch);
                 let mut buf = direct_buffer.lock().unwrap();
-                for &sample in data {
+                for &sample in &resampled_scratch {
                     if buf.len() >= MIC_BUFFER_CAPACITY {
                         buf.pop_front();
                     }
@@ -1125,9 +1243,16 @@ impl MicInput {
 
         let stream = match direct_result {
             Ok(stream) => {
-                println!(
+                // eprintln, not println -- see this project's own
+                // hpsdr-rs.log from a real debugging session: every
+                // println here (this one included) was silently
+                // missing from the log despite the code definitely
+                // having run, while eprintln output (e.g. tx.rs's own
+                // underrun diagnostic) always showed up reliably.
+                eprintln!(
                     "mic input: using \"{device_name}\" at {INPUT_SAMPLE_RATE}Hz/{INPUT_CHANNELS}ch \
-                     directly -- no resampling"
+                     directly, {:?} buffer -- no resampling",
+                    direct_config.buffer_size
                 );
                 stream
             }
@@ -1138,7 +1263,9 @@ impl MicInput {
                         failed ({e}), and querying a fallback native config also failed: {e2}"))?;
                 let native_rate = default_cfg.sample_rate();
                 let native_channels = default_cfg.channels();
-                println!(
+                // eprintln, not println -- see the sibling Ok(stream)
+                // arm's comment above.
+                eprintln!(
                     "mic input: \"{device_name}\" doesn't support {INPUT_SAMPLE_RATE}Hz/{INPUT_CHANNELS}ch \
                      directly ({e}) -- falling back to its native {native_rate}Hz/{native_channels}ch, \
                      downmixed and resampled to {INPUT_SAMPLE_RATE}Hz/{INPUT_CHANNELS}ch in software"

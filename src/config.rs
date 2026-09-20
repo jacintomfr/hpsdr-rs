@@ -167,6 +167,18 @@ pub struct Config {
     pub mic_gain: Option<f32>,
     /// TX graphic EQ -- see spectrum::EqualizerParams's doc comment.
     pub tx_eq: Option<EqualizerParams>,
+    /// WDSP Leveler/Compressor ("PROC") on-off and gain -- see
+    /// tx::TxParams::leveler_enabled/compressor_enabled's doc comments.
+    #[serde(default)]
+    pub tx_leveler_enabled: Option<bool>,
+    #[serde(default)]
+    pub tx_leveler_gain_db: Option<f32>,
+    #[serde(default)]
+    pub tx_leveler_decay_ms: Option<i32>,
+    #[serde(default)]
+    pub tx_compressor_enabled: Option<bool>,
+    #[serde(default)]
+    pub tx_compressor_gain_db: Option<f32>,
     /// Gain applied specifically to TX audio received from a TCI
     /// client (WSJT-X, TCI Remote, etc.), independent of mic_gain
     /// above -- see radio::RadioSession::tci_tx_gain's doc comment for

@@ -113,6 +113,44 @@ use std::time::{Duration, Instant};
 const TX_BUFFER_SIZE: usize = 512;
 const TX_FFT_SIZE: i32 = 2048;
 
+/// Sends a diagnostic line to a dedicated background thread instead of
+/// calling `eprintln!` directly on this hot pacing loop. ROOT CAUSE FIX
+/// for a real report: a paired diagnostic log showed the CONSUMER side
+/// of this loop (not the mic driver) occasionally stalling for whole
+/// SECONDS (1.4s, 16.2s, 5.5s observed) -- far beyond anything explained
+/// by audio jitter. Prime suspect: `eprintln!` on Windows release builds
+/// writes through a handle `main.rs`'s `redirect_stdio_to_log_file`
+/// pointed at a real log FILE (see that function's doc comment) -- an
+/// antivirus scan, cloud-sync (OneDrive etc.) touching that same file,
+/// or ordinary disk contention can make a single synchronous write
+/// block for an arbitrarily long time, and this loop's own per-second
+/// diagnostic eprintln! calls sat directly in the timing-critical path
+/// being measured, right between one mic_buffer read and the next.
+/// Moving the actual write to its own thread (a bounded channel, oldest
+/// line dropped rather than blocking the sender if the writer thread
+/// itself is ever the one stuck) means a slow disk can only delay log
+/// output, never the TX audio pacing loop that happens to be reporting
+/// it.
+pub(crate) fn log_async(line: String) {
+    use std::sync::mpsc::{sync_channel, SyncSender};
+    use std::sync::OnceLock;
+    static SENDER: OnceLock<SyncSender<String>> = OnceLock::new();
+    let sender = SENDER.get_or_init(|| {
+        let (tx, rx) = sync_channel::<String>(64);
+        thread::spawn(move || {
+            for line in rx {
+                eprintln!("{line}");
+            }
+        });
+        tx
+    });
+    // try_send, not send -- never block the caller even if the writer
+    // thread itself is the one currently stuck on a slow disk; a
+    // dropped diagnostic line is a fine trade for never re-introducing
+    // the exact stall this exists to get rid of.
+    let _ = sender.try_send(line);
+}
+
 // ~0.25s of TX IQ at a typical 192ksps DUC rate -- same "small ring
 // buffer, drop oldest on overflow" reasoning as every other buffer in
 // this project (see radio.rs's IQ_BUFFER_CAPACITY comment): a backlog
@@ -408,6 +446,27 @@ pub struct TxParams {
     pub two_tone: bool,
     /// See spectrum::EqualizerParams's doc comment -- same type, TXA side.
     pub eq: EqualizerParams,
+    /// WDSP's Leveler stage (SetTXALevelerSt) -- a slower average-level
+    /// normalizer, separate from the ALC's fast peak limiting (see
+    /// open()'s own Leveler setup comment for why it was previously left
+    /// off entirely).
+    pub leveler_enabled: bool,
+    /// SetTXALevelerTop -- deskHPSDR's own "Leveler Gain" (tx->lev_gain,
+    /// 0..15 dB, default 5.0): how far the Leveler's gain floor is
+    /// allowed to rise during quiet gaps. Confirmed against
+    /// transmitter.c's tx_menu.c UI (same range/default).
+    pub leveler_gain_db: f32,
+    /// SetTXALevelerDecay -- deskHPSDR's "Leveler Decay" (tx->lev_decay,
+    /// 0..500 ms, default 500).
+    pub leveler_decay_ms: i32,
+    /// WDSP's simple single-band Compressor stage ("PROC" in deskHPSDR's
+    /// UI, SetTXACompressorRun) -- gain in dB (SetTXACompressorGain),
+    /// same unit/spin-button convention as deskHPSDR's own
+    /// tx->compressor_level. Simpler and cruder than the multiband CFC
+    /// this project doesn't have yet, but a real, immediate "more
+    /// average power" control on its own.
+    pub compressor_enabled: bool,
+    pub compressor_gain_db: f32,
 }
 
 impl Default for TxParams {
@@ -433,6 +492,21 @@ impl Default for TxParams {
             tune: false,
             two_tone: false,
             eq: EqualizerParams::default(),
+            // Off by default -- matches this project's and piHPSDR's own
+            // prior behavior exactly (open()'s SetTXALevelerSt(channel, 0)
+            // at channel creation); an explicit opt-in via Settings -> TX.
+            leveler_enabled: false,
+            // deskHPSDR's own defaults (tx->lev_gain/lev_decay) -- also
+            // exactly what this project's open() used to hardcode before
+            // these became live-adjustable.
+            leveler_gain_db: 5.0,
+            leveler_decay_ms: 500,
+            // Same reasoning as leveler_enabled -- off by default,
+            // matches open()'s SetTXACompressorRun(channel, 0).
+            compressor_enabled: false,
+            // WDSP's create_compressor default/deskHPSDR's own typical
+            // starting point; harmless while compressor_enabled is false.
+            compressor_gain_db: 10.0,
         }
     }
 }
@@ -449,6 +523,10 @@ struct TxProcessor {
     last_gain: Option<f32>,
     last_passband: Option<(f64, f64)>,
     last_eq: Option<EqualizerParams>,
+    /// See TxParams::leveler_enabled's doc comment.
+    last_leveler: Option<(bool, f32, i32)>,
+    /// See TxParams::compressor_enabled/compressor_gain_db's doc comment.
+    last_compressor: Option<(bool, f32)>,
     /// (tune, two_tone) as last applied to WDSP's PostGen -- see
     /// process()'s PostGen update for why these are tracked together.
     last_post_gen: Option<(bool, bool)>,
@@ -833,6 +911,8 @@ impl TxProcessor {
             last_gain: None,
             last_passband: Some(default_passband),
             last_eq: None,
+            last_leveler: None,
+            last_compressor: None,
             last_post_gen: None,
             last_ps_mox: None,
             ps_ratio_baseline: None,
@@ -878,6 +958,11 @@ impl TxProcessor {
         tune: bool,
         two_tone: bool,
         eq: EqualizerParams,
+        leveler_enabled: bool,
+        leveler_gain_db: f32,
+        leveler_decay_ms: i32,
+        compressor_enabled: bool,
+        compressor_gain_db: f32,
     ) -> (Vec<f32>, c_int) {
         debug_assert_eq!(mic_samples.len(), TX_BUFFER_SIZE);
 
@@ -1042,6 +1127,31 @@ impl TxProcessor {
                 wdsp::SetTXAEQRun(self.channel, eq.enabled as c_int);
             }
             self.last_eq = Some(eq);
+        }
+
+        // Leveler -- see TxParams::leveler_enabled/leveler_gain_db/
+        // leveler_decay_ms's doc comments. Top/Decay set before St, same
+        // order as deskHPSDR's own transmitter.c. Attack stays at open()'s
+        // fixed 1ms (deskHPSDR doesn't expose a Leveler attack control
+        // either -- see its tx_menu.c ProAudio grid).
+        if self.last_leveler != Some((leveler_enabled, leveler_gain_db, leveler_decay_ms)) {
+            unsafe {
+                wdsp::SetTXALevelerTop(self.channel, leveler_gain_db as f64);
+                wdsp::SetTXALevelerDecay(self.channel, leveler_decay_ms as c_int);
+                wdsp::SetTXALevelerSt(self.channel, leveler_enabled as c_int);
+            }
+            self.last_leveler = Some((leveler_enabled, leveler_gain_db, leveler_decay_ms));
+        }
+
+        // Simple Compressor ("PROC") -- see TxParams::compressor_enabled's
+        // doc comment. Gain set before Run, same order as deskHPSDR's own
+        // tx_menu.c/transmitter.c.
+        if self.last_compressor != Some((compressor_enabled, compressor_gain_db)) {
+            unsafe {
+                wdsp::SetTXACompressorGain(self.channel, compressor_gain_db as f64);
+                wdsp::SetTXACompressorRun(self.channel, compressor_enabled as c_int);
+            }
+            self.last_compressor = Some((compressor_enabled, compressor_gain_db));
         }
 
         // Confirmed against the reference: real mono mic sample in the
@@ -1796,6 +1906,9 @@ fn run(
     // which could be ~90/s and flood stderr) so it's cheap to leave in.
     let mut starve_window_start = Instant::now();
     let mut starved_chunks_this_window: u32 = 0;
+    // See the read_now/last_read_at instrumentation below.
+    let mut last_read_at: Option<Instant> = None;
+    let mut read_max_gap = Duration::ZERO;
     let mut chunks_this_window: u32 = 0;
 
     // Second diagnostic, added after the mic-buffer one above didn't
@@ -1830,10 +1943,41 @@ fn run(
     // which starves that downstream queue exactly like drifting sender
     // pacing was already confirmed to spur the RF output on the
     // consumer side.
+    // Windows only: raise the system timer resolution from its default
+    // (commonly ~15.6ms) to 1ms for as long as this thread runs.
+    // UNVERIFIED HYPOTHESIS, not a confirmed fix -- flagged as such
+    // rather than asserted, since the exact mechanism hasn't been
+    // isolated yet. Prompted by a real report: continuous `tx: mic
+    // buffer underrun` in hpsdr-rs.log (up to ~30/94 chunks in a given
+    // second) throughout a real voice transmission, reproducing with
+    // Leveler/Compressor both OFF and with the monitoring receiver on
+    // USB instead of LAN -- which does rule out both the new Leveler/
+    // Compressor work and a network-side cause, but stops short of
+    // pinning down which stage in THIS process is actually dropping
+    // samples: cpal's WASAPI capture and this loop's own pacing both sit
+    // on the Windows scheduler, whose default coarse timer tick is a
+    // plausible contributor to jitter either could suffer from, but
+    // "plausible" isn't "confirmed" -- this needs a real-hardware retest
+    // to know if it actually helps. `timeBeginPeriod`'s effect is
+    // process-wide, not thread-local, but scoping the begin/end calls to
+    // this thread's own lifetime (tied to TxHandle, i.e. exactly "while
+    // connected") is the standard pattern for a short-lived low-latency
+    // audio/timing thread -- see e.g. Chromium's base::PlatformThread,
+    // which does the same. Cheap and harmless if it turns out not to be
+    // the (whole) answer.
+    #[cfg(windows)]
+    unsafe {
+        windows_sys::Win32::Media::timeBeginPeriod(1);
+    }
+
     let mut next_chunk = Instant::now();
     // PureSignal: when MOX went active most recently -- None while
     // idle. See below for why this matters.
     let mut mox_active_since: Option<Instant> = None;
+    // See the priming wait below (right before mic_buffer's per-source
+    // reads) for what this gates -- set back to true every time MOX
+    // drops, alongside the idle-branch's own mic_buffer.clear().
+    let mut needs_mic_prime = true;
     // piHPSDR's transmitter.c documents a real ordering requirement
     // that isn't optional: "enabling should restart feedback streams
     // first, wait ~100ms, then turn PS on" -- ROOT CAUSE FIX for
@@ -1896,6 +2040,22 @@ fn run(
                 cw_text_busy.store(false, Ordering::Relaxed);
             }
             mox_active_since = None;
+            needs_mic_prime = true;
+            // BUG FIX: this idle branch `continue`s below, skipping the
+            // read_now/last_read_at gap-tracking code further down --
+            // which meant last_read_at just sat stale at whatever it was
+            // from the last ACTIVE read, for the whole idle period. The
+            // next PTT's first gap computation then measured "time since
+            // the previous transmission's last chunk" (i.e. however long
+            // the mic was simply idle between transmissions) as if it
+            // were a stall in this loop's own pacing -- a real report:
+            // "consumer read max gap 16190.6ms" was just ~16 seconds of
+            // normal silence between two PTT presses, not a freeze.
+            // Resetting here means the gap after the NEXT active read
+            // starts counting from that read itself, not from whenever
+            // MOX last dropped.
+            last_read_at = None;
+            read_max_gap = Duration::ZERO;
             thread::sleep(Duration::from_millis(20));
             // Resync so the first chunk after PTT is produced against a
             // fresh schedule, not delayed by however long MOX was off --
@@ -1968,6 +2128,63 @@ fn run(
                 processor.apply_ps_params(&ps_params.lock().unwrap());
             }
         }
+
+        // Jitter-buffer priming, once per PTT press (mic_buffer only --
+        // the Local Mic/Auto-fallback source; radio_mic_audio and
+        // tci_tx_audio haven't shown this problem and have different
+        // producers, no reason to delay those too). ROOT CAUSE FIX for a
+        // real report, confirmed via paired diagnostic logging on both
+        // sides of this queue (see audio.rs's MicInput callback
+        // instrumentation): this loop's own consumption pacing is solid
+        // (~11.5ms actual vs ~10.7ms nominal), but cpal's WASAPI capture
+        // callback on the affected machine delivers audio in bursts with
+        // real ~20-30ms gaps between them. That alone wouldn't matter if
+        // mic_buffer carried some standing slack -- but the idle branch
+        // above clears mic_buffer on EVERY iteration while MOX is off
+        // (by design, so the next PTT doesn't replay stale backlog
+        // audio), which means an earlier attempt at priming this once at
+        // thread startup was silently undone within ~10ms by that same
+        // clear, every single time, well before any real PTT press could
+        // ever benefit from it -- the buffer was always starting from
+        // genuinely empty at the exact moment MOX went active. Priming
+        // HERE, gated on the idle->active edge (needs_mic_prime), is the
+        // earliest point where blocking briefly can't be undone by that
+        // clear. Capped at 1 second so a genuinely absent/broken mic
+        // input doesn't hang TX startup.
+        if needs_mic_prime {
+            needs_mic_prime = false;
+            // Raised from 100ms after a real test: several seconds'
+            // worth of driver samples-delivered totals came in genuinely
+            // BELOW 48000/sec (not just intra-second burst redistribution
+            // -- a real per-second shortfall), consistent with deficits
+            // sometimes stacking across consecutive seconds and draining
+            // a 100ms cushion faster than it can refill. 250ms is still
+            // a small slice of MIC_BUFFER_CAPACITY's 500ms ceiling and a
+            // one-time PTT-to-audio delay nobody will consciously notice
+            // on voice.
+            let cushion_samples = (mic_rate as f64 * 0.25) as usize; // 250ms
+            let deadline = Instant::now() + Duration::from_secs(1);
+            while mic_buffer.lock().unwrap().len() < cushion_samples && Instant::now() < deadline {
+                thread::sleep(Duration::from_millis(5));
+            }
+        }
+
+        // Diagnostic instrumentation, paired with MicInput's own callback-
+        // side version in audio.rs -- see that call site's doc comment
+        // for why this exists. Tracks the REAL gap between consecutive
+        // mic_buffer reads on THIS (consumer) side, to compare against
+        // the driver's own callback-to-callback gaps: if this side's
+        // gaps are the ones spiking, the pacing loop itself (still, even
+        // after timeBeginPeriod) is the culprit; if the driver's gaps
+        // spike instead, it's cpal/WASAPI/the device, not this loop.
+        let read_now = Instant::now();
+        if let Some(last) = last_read_at {
+            let gap = read_now.duration_since(last);
+            if gap > read_max_gap {
+                read_max_gap = gap;
+            }
+        }
+        last_read_at = Some(read_now);
 
         let selected_source = tx_audio_source.load(Ordering::Relaxed);
         if selected_source == TX_AUDIO_SOURCE_RADIO_MIC {
@@ -2092,31 +2309,49 @@ fn run(
         chunks_this_window += 1;
         if starve_window_start.elapsed() >= Duration::from_secs(1) {
             if starved_chunks_this_window > 0 {
-                eprintln!(
+                log_async(format!(
                     "tx: mic buffer underrun on {starved_chunks_this_window}/{chunks_this_window} \
                      chunks in the last second -- real silence (0W on SSB) went out during those; \
                      see audio.rs's MicInput doc comment if this is frequent"
-                );
+                ));
             }
+            log_async(format!(
+                "tx: consumer read max gap {:.1}ms in the last second (nominal {:.1}ms)",
+                read_max_gap.as_secs_f64() * 1000.0,
+                chunk_interval.as_secs_f64() * 1000.0
+            ));
             starve_window_start = Instant::now();
             starved_chunks_this_window = 0;
             chunks_this_window = 0;
+            read_max_gap = Duration::ZERO;
         }
 
         let p = *params.lock().unwrap();
-        let (iq, exch_error) =
-            processor.process(&chunk, p.mode, p.mic_gain, p.width_hz, p.tune, p.two_tone, p.eq);
+        let (iq, exch_error) = processor.process(
+            &chunk,
+            p.mode,
+            p.mic_gain,
+            p.width_hz,
+            p.tune,
+            p.two_tone,
+            p.eq,
+            p.leveler_enabled,
+            p.leveler_gain_db,
+            p.leveler_decay_ms,
+            p.compressor_enabled,
+            p.compressor_gain_db,
+        );
 
         if exch_error != 0 {
             exch_errors_this_window += 1;
         }
         if exch_error_window_start.elapsed() >= Duration::from_secs(1) {
             if exch_errors_this_window > 0 {
-                eprintln!(
+                log_async(format!(
                     "tx: fexchange0 returned a nonzero error on {exch_errors_this_window} chunks \
                      in the last second -- WDSP's own internal TXA worker thread fell behind and \
                      substituted real silence into the TX IQ output (see tx.rs's run() comment)"
-                );
+                ));
             }
             exch_error_window_start = Instant::now();
             exch_errors_this_window = 0;
@@ -2181,6 +2416,11 @@ fn run(
             // reasoning as p2_tx_iq_loop's own fallback.
             next_chunk = now;
         }
+    }
+
+    #[cfg(windows)]
+    unsafe {
+        windows_sys::Win32::Media::timeEndPeriod(1);
     }
 }
 
@@ -2440,6 +2680,40 @@ impl TxHandle {
     }
     pub fn set_eq(&self, eq: EqualizerParams) {
         self.params.lock().unwrap().eq = eq;
+    }
+
+    /// See TxParams::leveler_enabled's doc comment.
+    pub fn leveler_enabled(&self) -> bool {
+        self.params.lock().unwrap().leveler_enabled
+    }
+    pub fn set_leveler_enabled(&self, enabled: bool) {
+        self.params.lock().unwrap().leveler_enabled = enabled;
+    }
+    pub fn leveler_gain_db(&self) -> f32 {
+        self.params.lock().unwrap().leveler_gain_db
+    }
+    pub fn set_leveler_gain_db(&self, gain_db: f32) {
+        self.params.lock().unwrap().leveler_gain_db = gain_db.clamp(0.0, 15.0);
+    }
+    pub fn leveler_decay_ms(&self) -> i32 {
+        self.params.lock().unwrap().leveler_decay_ms
+    }
+    pub fn set_leveler_decay_ms(&self, decay_ms: i32) {
+        self.params.lock().unwrap().leveler_decay_ms = decay_ms.clamp(0, 500);
+    }
+
+    /// See TxParams::compressor_enabled/compressor_gain_db's doc comment.
+    pub fn compressor_enabled(&self) -> bool {
+        self.params.lock().unwrap().compressor_enabled
+    }
+    pub fn set_compressor_enabled(&self, enabled: bool) {
+        self.params.lock().unwrap().compressor_enabled = enabled;
+    }
+    pub fn compressor_gain_db(&self) -> f32 {
+        self.params.lock().unwrap().compressor_gain_db
+    }
+    pub fn set_compressor_gain_db(&self, gain_db: f32) {
+        self.params.lock().unwrap().compressor_gain_db = gain_db.clamp(0.0, 20.0);
     }
 
     pub fn set_ps_enabled(&self, enabled: bool) {
