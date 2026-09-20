@@ -40,6 +40,8 @@ Also, separately: the original Ozy/Mercury/Penny hardware (Protocol 1 over USB r
 
 And separately again: the receive-only [RX-888 Mk2](#rx-888-mk2-receive-only-direct-sampling-sdr) direct-sampling SDR — see that section below. **v1, unconfirmed against real hardware.**
 
+The [Radioberry 2.x](https://github.com/jacintomfr/Radioberry-2.x) also works, via its own separate "Juice" USB-to-network bridge program (not part of this repo) — Juice talks to the board over USB and exposes it as a HermesLite2 over the normal openHPSDR discovery/UDP protocol, so once it's running the Radioberry shows up in the Discover window like any other network radio. The Discover window's **Radioberry Juice setup** section can launch Juice directly (Choose its executable, pick the FPGA variant, Launch) instead of needing a separate terminal. Prebuilt Juice installers (Windows MSI and Linux `.deb`, both tested end-to-end) are on that repo's [releases page](https://github.com/jacintomfr/Radioberry-2.x/releases).
+
 ## Building
 
 Developed and tested primarily on Linux. A Windows build (via MSVC + vcpkg)
@@ -231,7 +233,7 @@ If the app panics on startup with `Library libxkbcommon-x11.so could not be load
 A recent `wsl --install -d Ubuntu` (the Microsoft Store-backed WSL, not the legacy Windows optional feature) bundles **WSLg** even on Windows 10 -- check with `wsl --version`, look for a `WSLg version` line. WSLg gives the WSL distro its own X11 socket, Wayland socket, and PulseAudio server automatically (`/mnt/wslg/`, `$DISPLAY`, `$WAYLAND_DISPLAY`, `$PULSE_SERVER` are already set in every shell), so the full GUI -- including audio in/out -- runs with no extra display server to install. Only two things are needed beyond `libxkbcommon-x11-0` above:
 
 - `sudo apt install libasound2-plugins pulseaudio-utils` -- the ALSA-to-PulseAudio bridge `cpal` (this project's audio crate) needs to reach WSLg's PulseAudio server; without it, mic input and audio output both fail to open (visible as ALSA `cannot find card '0'` errors in the log), which in turn hides the MOX/TUNE/CW/RIT/XIT row entirely (`tx_enabled` requires a working mic, see `main.rs`'s `tx_enabled` doc comment).
-- For real hardware over USB (Ozy, RX-888, or a Juice-bridged Radioberry running *inside* WSL2 too) rather than a network-attached radio: [usbipd-win](https://github.com/dorssel/usbipd-win) passes a USB device through to WSL2. From an **elevated** Windows PowerShell: `usbipd list` to find the device's `BUSID`, then `usbipd bind --busid <id> --force` (`--force` is needed if a packet-capture filter like USBPcap is installed) and `usbipd attach --wsl --busid <id>`. This has to be repeated after every physical reconnect/reboot; there's no WSL-side persistence.
+- For real hardware over USB (Ozy, RX-888, or a [Juice](https://github.com/jacintomfr/Radioberry-2.x)-bridged Radioberry running *inside* WSL2 too) rather than a network-attached radio: [usbipd-win](https://github.com/dorssel/usbipd-win) passes a USB device through to WSL2. From an **elevated** Windows PowerShell: `usbipd list` to find the device's `BUSID`, then `usbipd bind --busid <id> --force` (`--force` is needed if a packet-capture filter like USBPcap is installed) and `usbipd attach --wsl --busid <id>`. This has to be repeated after every physical reconnect/reboot; there's no WSL-side persistence.
 
 ## Packaging (Windows)
 
