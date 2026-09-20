@@ -782,6 +782,17 @@ pub const DEFAULT_EXE_NAME: &str = "radioberry-juice-x64.exe";
 #[cfg(not(windows))]
 pub const DEFAULT_EXE_NAME: &str = "radioberry-juice";
 
+/// Where `scripts/build-juice-deb.sh`'s package (and juice's own
+/// install-linux.sh, run directly) put the launcher -- see either
+/// script's own comments. Windows has no equivalent standard install
+/// location (the MSI/manual build doesn't install juice at all, it's a
+/// separate download the user places wherever they like), so this is
+/// Linux/macOS-only: used to spare a fresh install from needing the
+/// Choose... file dialog at all for the common case of "I just `apt
+/// install`ed radioberry-juice".
+#[cfg(not(windows))]
+pub const DEFAULT_INSTALLED_PATH: &str = "/usr/local/bin/radioberry-juice";
+
 /// juice reads `radioberry.props` from its own working directory (see
 /// BUILD-README.md's "Configuration" section) -- i.e. right next to
 /// the executable in the normal `dist/...` layout the build produces.

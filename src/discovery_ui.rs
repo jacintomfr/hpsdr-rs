@@ -35,6 +35,24 @@ fn effective_path_label(explicit: &Option<String>, default: fn() -> Option<std::
     }
 }
 
+/// Checks for a juice install at the well-known path
+/// `scripts/build-juice-deb.sh`'s package (and install-linux.sh directly)
+/// use -- see `DEFAULT_INSTALLED_PATH`'s own doc comment. Windows has no
+/// such standard location, so this always returns `None` there.
+#[cfg(windows)]
+fn detect_default_juice() -> Option<(String, Option<crate::radioberry_juice::Fpga>)> {
+    None
+}
+#[cfg(not(windows))]
+fn detect_default_juice() -> Option<(String, Option<crate::radioberry_juice::Fpga>)> {
+    let path = std::path::Path::new(crate::radioberry_juice::DEFAULT_INSTALLED_PATH);
+    if !path.is_file() {
+        return None;
+    }
+    let fpga = crate::radioberry_juice::read_fpga(&crate::radioberry_juice::props_path_for(path));
+    Some((path.display().to_string(), fpga))
+}
+
 /// What the caller should do after this frame's `show()` call.
 pub enum DiscoveryAction {
     None,
@@ -153,6 +171,21 @@ impl DiscoveryWindow {
             .filter(|path| crate::radioberry_juice::is_named_process_running(path))
             .map(crate::radioberry_juice::JuiceHandle::adopt);
         let rx888_cfg = Config::load(crate::discovery::RX888_SENTINEL_MAC);
+        // Nothing configured yet (first run, or a fresh profile) -- on
+        // Linux/macOS, check the well-known path scripts/build-juice-deb.sh's
+        // package (and install-linux.sh directly) installs to, so
+        // `apt install radioberry-juice` alone is enough to make this
+        // panel usable without ever touching the Choose... file dialog.
+        // Windows has no equivalent standard location (see
+        // DEFAULT_INSTALLED_PATH's own doc comment), so this is a no-op
+        // there.
+        let (radioberry_juice_path, radioberry_juice_fpga) = match juice_cfg.radioberry_juice_path {
+            Some(path) => (Some(path), juice_cfg.radioberry_juice_fpga),
+            None => match detect_default_juice() {
+                Some((path, fpga)) => (Some(path), fpga),
+                None => (None, None),
+            },
+        };
         let window = Self {
             open: true,
             devices: Arc::new(Mutex::new(Vec::new())),
@@ -165,13 +198,17 @@ impl DiscoveryWindow {
             firmware_update: None,
             ozy_firmware_path: ozy_cfg.ozy_firmware_path,
             ozy_fpga_path: ozy_cfg.ozy_fpga_path,
-            radioberry_juice_path: juice_cfg.radioberry_juice_path,
-            radioberry_juice_fpga: juice_cfg.radioberry_juice_fpga,
+            radioberry_juice_path,
+            radioberry_juice_fpga,
             juice_launch_error: None,
             juice_refresh_at: None,
             juice_console,
             rx888_firmware_path: rx888_cfg.rx888_firmware_path,
         };
+        // Persist an auto-detected path (see above) so it survives even
+        // if the user never touches this panel at all this session --
+        // a no-op write when nothing changed from what was already saved.
+        window.save_radioberry_juice_config();
         window.spawn_discovery(ctx.clone());
         window
     }
