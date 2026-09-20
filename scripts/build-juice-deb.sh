@@ -102,7 +102,7 @@ mkdir -p "$PKG_ROOT/usr/share/doc/radioberry-juice"
     echo "This library is for use with the Radioberry's genuine FTDI FT2232H"
     echo "USB interface chip only."
     echo
-    awk '/^Copyright \(c\)/{p=1} p{print} /^Module Name:/{exit}' "$FTDI_HEADER"
+    awk '/^Module Name:/{exit} /^Copyright \(c\)/{p=1} p{print}' "$FTDI_HEADER"
 } > "$PKG_ROOT/usr/share/doc/radioberry-juice/copyright"
 
 # The staged install-linux.sh run above only lays out files at their
