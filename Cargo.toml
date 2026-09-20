@@ -1,6 +1,6 @@
 [package]
 name = "hpsdr-rs"
-version = "0.6.0"
+version = "0.7.0"
 edition = "2021"
 license = "GPL-2.0-or-later"
 authors = ["John Melton <john.d.melton@googlemail.com>"]
@@ -168,7 +168,7 @@ priority = "optional"
 # treats a new package as an upgrade if ITS version string (crate
 # version + this revision) actually differs from what's installed, so
 # reusing the same version+revision needs a manual `dpkg -r` first.
-revision = "2"
+revision = "1"
 assets = [
     ["target/release/hpsdr-rs", "usr/bin/", "755"],
     ["README.md", "usr/share/doc/hpsdr-rs/README.md", "644"],
