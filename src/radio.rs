@@ -1743,21 +1743,31 @@ fn start_protocol1(
     // reconnect -- see RadioSession::puresignal_enabled's doc comment for
     // the "Add Receiver" capacity cost this trades for that.
     //
-    // NOT forced to a minimum of 1 real receiver -- on Metis/HermesLite
-    // (max_real=0), real receiver indices would otherwise collide with
-    // the feedback indices themselves (rx_feedback_idx=0 there), a
-    // genuine wire-level correctness bug, not just a UI nicety. This
-    // does mean `iq_buffers` can legitimately end up empty on those
-    // smallest boards now (regardless of whether PS starts on) -- main.rs's
-    // connect flow (which assumes iq_buffers[0] always exists for the main
-    // SpectrumHandle) doesn't handle that yet; not a concern for the
-    // 2-ADC Angelia/Orion/Orion2-class hardware this was built against,
-    // but flagged rather than silently papered over for anyone with
-    // one of the smaller boards.
+    // BUG FIX, confirmed via a real crash report on genuine Metis
+    // hardware: the cap below used to apply unconditionally whenever
+    // `max_real` was `Some(_)`, with no floor -- fine for the 2-ADC
+    // Angelia/Orion/Orion2-class hardware this was built against (where
+    // `max_real` is always >= 1), but on Metis/HermesLite specifically
+    // `max_real` is `Some(0)` (their single ADC is entirely claimed by
+    // the PS feedback reservation), so `real_receivers` came out 0 --
+    // unconditionally, regardless of whether PS was even enabled. That
+    // left `iq_buffers` empty, and main.rs's connect flow unconditionally
+    // indexes `iq_buffers[0]` for the main SpectrumHandle -- an
+    // `index out of bounds` panic on every single connect attempt.
+    // `max_real == 0` genuinely means "this board has no real-RX
+    // capacity left to spare for PS at all" -- there's no valid non-zero
+    // value to floor it to that would also honor the reservation, so the
+    // fix is to skip the cap entirely for these boards (same as the
+    // `None` arm) rather than pick an arbitrary floor. This does
+    // reintroduce the wire-index collision the cap was protecting
+    // against, but only if a user actually enables PS on one of these
+    // boards -- a real RX signal on every connect beats a correctness
+    // edge case in an already-experimental (Phase 1) feature nobody can
+    // reach without normal RX working first.
     let ps_config = ps_feedback_config(1, device.board);
     let mut real_receivers = match ps_config {
-        Some((_, _, Some(max_real))) => settings.receivers.max(1).min(max_real),
-        Some((_, _, None)) | None => settings.receivers.max(1),
+        Some((_, _, Some(max_real))) if max_real > 0 => settings.receivers.max(1).min(max_real),
+        Some((_, _, Some(_) | None)) | None => settings.receivers.max(1),
     };
     // Diversity: forces at least 2 wire slots (wire 0 = ADC0/main, wire 1
     // = the reserved ADC1 aux feed) -- see RadioSession::diversity_enabled's
