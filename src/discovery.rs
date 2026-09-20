@@ -10,6 +10,7 @@
     (at your option) any later version.
 */
 
+use crate::config::Config;
 use crate::ozy;
 use crate::rx888;
 use network_interface::{Addr, NetworkInterface, NetworkInterfaceConfig};
@@ -116,6 +117,18 @@ pub struct Device {
     /// actually consulted for behavior (plus `Device::board_label` for
     /// display, so the UI doesn't just say "HermesLite2").
     pub is_radioberry: bool,
+    /// A short, human-readable reason this device's own USB link looks
+    /// too slow to sustain its data rate -- `None` for every board
+    /// except a too-slow RX-888. Shown in the Discover window's Status
+    /// column AND gates that row's availability there (see
+    /// discovery_ui.rs's own device_available) -- safe to gate on since
+    /// discover_rx888_usb now brings the device up to its real streaming
+    /// firmware before rx888::link_speed_warning reads this (see that
+    /// function's own doc comment), the same firmware/PID
+    /// rx888::initialise itself connects to, not a guess off the
+    /// bootloader. Not meaningful for network-discovered boards, which
+    /// have no USB link of their own to warn about.
+    pub usb_link_speed_warning: Option<&'static str>,
 }
 
 impl Device {
@@ -161,6 +174,7 @@ impl Device {
             frequency_min,
             frequency_max,
             is_radioberry,
+            usb_link_speed_warning: None,
         })
     }
 
@@ -193,6 +207,7 @@ impl Device {
             frequency_min,
             frequency_max,
             is_radioberry,
+            usb_link_speed_warning: None,
         })
     }
 }
@@ -406,6 +421,7 @@ fn discover_ozy_usb(devices: &Arc<Mutex<Vec<Device>>>) {
         frequency_min: 0,
         frequency_max: 61_440_000,
         is_radioberry: false,
+        usb_link_speed_warning: None,
     });
 }
 
@@ -424,6 +440,16 @@ fn discover_rx888_usb(devices: &Arc<Mutex<Vec<Device>>>) {
     if !rx888::discover() {
         return;
     }
+    // Best-effort: brings the device up to the streaming PID (if a
+    // firmware path is already configured from a prior run) BEFORE the
+    // link-speed hint below reads it, so that hint reflects the real
+    // firmware's own negotiated speed rather than the bootloader's --
+    // see rx888::link_speed_warning's own doc comment for the real
+    // report (a warning that never fired) this fixes.
+    let firmware_path = Config::load(RX888_SENTINEL_MAC)
+        .rx888_firmware_path
+        .map(std::path::PathBuf::from)
+        .or_else(rx888::default_firmware_path);
     let sentinel = SocketAddr::new(IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED), 0);
     devices.lock().unwrap().push(Device {
         address: sentinel,
@@ -434,12 +460,30 @@ fn discover_rx888_usb(devices: &Arc<Mutex<Vec<Device>>>) {
         version: 0,
         status: 2, // available
         mac: RX888_SENTINEL_MAC,
-        supported_receivers: 1, // v1 scope: single receiver only, see start_rx888_usb
+        // ADDED (2026-09-20, real request: "can we have more than 1 DDC
+        // for the RX888") -- up from v1's single-receiver-only scope.
+        // RAISED from an initial cap of 3 to 8 after real-hardware
+        // confirmation ("CPU usage with 3 running is no problem on this
+        // PC") once each DDC got its own worker thread (see
+        // rx888_receiver_loop's own doc comment) rather than all
+        // running sequentially on one -- with that change, this cap is
+        // no longer really about single-core CPU budget at all so much
+        // as "how many receivers is anyone plausibly going to want on
+        // one wideband capture" -- still NOT a hardware limit (unlike a
+        // real P1/P2 board's own reported count) -- see start_rx888_usb's
+        // own doc comment on the real_receivers sizing it drives.
+        supported_receivers: 8,
         supported_transmitters: 0, // receive-only hardware
         adcs: 1,
         frequency_min: 0,
         frequency_max: (rx888::DEFAULT_SAMPLE_RATE_HZ / 2) as u64,
         is_radioberry: false,
+        // See rx888::link_speed_warning's own doc comment -- lets the
+        // Discover window's Status column warn about a too-slow USB
+        // link/cable before the user ever tries to connect, not just
+        // fail clearly once they do (radio.rs's start_rx888_usb hits
+        // the same check again at connect time, via rx888::initialise).
+        usb_link_speed_warning: rx888::link_speed_warning(firmware_path.as_deref()),
     });
 }
 

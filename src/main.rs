@@ -90,6 +90,61 @@ fn band_for_frequency(freq_hz: u32) -> Option<&'static Band> {
     BANDS.iter().find(|b| freq_hz >= b.low_hz && freq_hz <= b.high_hz)
 }
 
+/// "General coverage" -- not a real ham band, but a real request: a
+/// band-button-like way to jump anywhere across the whole radio's own
+/// tunable range, for listening outside the ham allocations (broadcast,
+/// utility, WWV, etc.). Deliberately NOT a `BANDS` entry: that array is
+/// a fixed-size `const` indexed by literal position elsewhere (MIDI's
+/// Band160m..Band6m actions) and its entries participate in PA
+/// calibration/drive-linearization lookups (band_for_frequency, used
+/// for TX gain tables) where a catch-all spanning the ENTIRE range would
+/// incorrectly shadow every real band if it matched first, or need
+/// special-casing to avoid it. A `Band` value built fresh per call
+/// instead, using the CONNECTED device's own real frequency_min/max
+/// (which a `const` array entry couldn't hold anyway, since it's
+/// different per board) -- reuses the exact same Band/apply_band/
+/// band_memory machinery every real band already has (recall last
+/// frequency/mode on this "band", etc.) for free.
+fn gen_band(frequency_min: u64, frequency_max: u64) -> Band {
+    let lo = frequency_min as u32;
+    let hi = frequency_max as u32;
+    Band {
+        name: "Gen",
+        low_hz: lo,
+        high_hz: hi,
+        // 10.000.000 Hz -- WWV/WWVH, a globally-recognized reference
+        // signal and a reasonable first stop for general coverage
+        // listening; clamped into range for a board with a narrower
+        // tunable span than that.
+        default_hz: 10_000_000u32.clamp(lo, hi),
+        default_mode: spectrum::Mode::Am,
+    }
+}
+
+/// Whether TX is allowed to key at `freq_hz` -- real request, a safety
+/// default against accidentally transmitting outside the ham bands
+/// (e.g. while parked on "Gen"/general coverage -- see gen_band's own
+/// doc comment). `allow_out_of_band` is the explicit TX Settings
+/// opt-out (ConnectedState::allow_out_of_band_tx) for MARS/CAP/other
+/// authorized out-of-band operation.
+///
+/// Checked at every place `mox`/PTT gets turned ON (main.rs's own
+/// button/MIDI handlers, plus cat.rs/rigctl.rs/tci.rs's raw-protocol
+/// PTT commands, which is why this is `pub(crate)`), NOT inside
+/// radio.rs's P1/P2/Ozy sender loops or their packet builders --
+/// `mox: Arc<AtomicBool>` is the one flag every sender loop already
+/// reads to build the real over-the-wire key bit, so refusing to ever
+/// SET it true from a disallowed request is a complete interlock
+/// without needing to thread a new parameter through that already
+/// huge, safety-critical, hand-tuned protocol code at all. The one
+/// real exception is CW break-in via a physical key/paddle wired
+/// directly into the radio's own hardware -- see main.rs's CW
+/// break-in handling (search "radio_keyed") for why that specific
+/// path can't be gated by software at all, by design.
+pub(crate) fn tx_frequency_allowed(freq_hz: u32, allow_out_of_band: bool) -> bool {
+    allow_out_of_band || band_for_frequency(freq_hz).is_some()
+}
+
 /// Looks up the current band's calibrated PA gain (dB), falling back to
 /// radio::DEFAULT_PA_GAIN_DB for a band with no calibration entry yet
 /// (or a frequency outside every defined band). See ConnectedState's
@@ -323,19 +378,27 @@ fn remember_band_settings(
     waterfall_db_high: f32,
     mode: spectrum::Mode,
 ) {
-    if let Some(band) = band_for_frequency(freq_hz) {
-        band_memory.insert(
-            band.name.to_string(),
-            BandSettings {
-                frequency_hz: freq_hz,
-                db_low,
-                db_high,
-                waterfall_db_low,
-                waterfall_db_high,
-                mode: Some(mode),
-            },
-        );
-    }
+    // ROOT CAUSE FIX for a real report ("the Gen band does not remember
+    // its last settings"): this used to silently no-op (`if let Some`)
+    // for any frequency outside every real ham band -- i.e. every
+    // single time this ran while tuned to "Gen", including the very
+    // first save right after switching TO it (apply_band's own initial
+    // remember_band_settings call, immediately after computing Gen's
+    // own default_hz, which also isn't in a real band). Same "Gen"
+    // fallback as gen_band/current_band elsewhere (main.rs) -- see
+    // gen_band's own doc comment.
+    let name = band_for_frequency(freq_hz).map(|b| b.name).unwrap_or("Gen");
+    band_memory.insert(
+        name.to_string(),
+        BandSettings {
+            frequency_hz: freq_hz,
+            db_low,
+            db_high,
+            waterfall_db_low,
+            waterfall_db_high,
+            mode: Some(mode),
+        },
+    );
 }
 
 /// Last filter width the user set while in `mode`, if any -- falls back
@@ -356,7 +419,7 @@ fn width_for_mode(width_memory: &std::collections::HashMap<String, f64>, mode: s
 /// extracted (unlike most of this file's inline UI-handler logic) because
 /// it touches enough fields (active_xvtr, band_memory, mode, width, the TX
 /// mirror) that duplicating it risks the two call sites drifting apart.
-fn apply_band(connected: &mut ConnectedState, band: &'static Band) {
+fn apply_band(connected: &mut ConnectedState, band: &Band) {
     connected.active_xvtr = None;
     let saved = connected.band_memory.get(band.name).copied();
     let target = saved.map(|s| s.frequency_hz).unwrap_or(band.default_hz);
@@ -385,6 +448,37 @@ fn apply_band(connected: &mut ConnectedState, band: &'static Band) {
         tx.set_mode(resolved_mode);
         tx.set_width_hz(resolved_width_hz);
     }
+}
+
+/// Same as `apply_band` above, but for an `ExtraReceiver` -- no XVTR/TX
+/// concept there, and its frequency is a plain atomic store rather than
+/// going through RadioSession::set_frequency. Factored out (2026-09-20)
+/// from what used to be inline-only logic in its own band-button row, so
+/// the "Gen" button (gen_band) can share it too instead of a second copy.
+fn apply_band_extra(rx: &mut ExtraReceiver, band: &Band) {
+    let saved = rx.band_memory.get(band.name).copied();
+    let target = saved.map(|s| s.frequency_hz).unwrap_or(band.default_hz);
+    rx.frequency_hz.store(target, Ordering::Relaxed);
+    rx.ctun_frequency_hz = target;
+    if let Some(s) = saved {
+        rx.db_low = s.db_low;
+        rx.db_high = s.db_high;
+        rx.waterfall_db_low = s.waterfall_db_low;
+        rx.waterfall_db_high = s.waterfall_db_high;
+    }
+    let resolved_mode = saved.and_then(|s| s.mode).unwrap_or(band.default_mode);
+    remember_band_settings(
+        &mut rx.band_memory,
+        target,
+        rx.db_low,
+        rx.db_high,
+        rx.waterfall_db_low,
+        rx.waterfall_db_high,
+        resolved_mode,
+    );
+    rx.spectrum.set_mode(resolved_mode);
+    rx.spectrum.set_width_hz(width_for_mode(&rx.width_memory, resolved_mode));
+    rx.settings_dirty.store(true, Ordering::Relaxed);
 }
 
 /// Switches to `mode` at the current dial frequency. Shared by the
@@ -533,10 +627,17 @@ fn dispatch_midi_event(connected: &mut ConnectedState, ev: RawMidiEvent, freq_hz
 
     match binding.action {
         MidiAction::Mox => {
-            if binding.momentary {
-                connected.session.set_mox(!ev.off);
-            } else {
-                connected.session.set_mox(!connected.session.mox_active());
+            // Real request -- see tx_frequency_allowed's own doc
+            // comment. Only gates the transition TO keyed; unkeying
+            // (ev.off / already-on -> off) always goes through.
+            let want_on = if binding.momentary { !ev.off } else { !connected.session.mox_active() };
+            if !want_on
+                || tx_frequency_allowed(
+                    connected.session.tx_frequency_hz.load(Ordering::Relaxed),
+                    connected.allow_out_of_band_tx.load(Ordering::Relaxed),
+                )
+            {
+                connected.session.set_mox(want_on);
             }
         }
         // Mirrors the TUNE button handler -- see its own comments for why
@@ -555,7 +656,11 @@ fn dispatch_midi_event(connected: &mut ConnectedState, ev: RawMidiEvent, freq_hz
             } else {
                 let tune_may_start = !connected.session.mox_active()
                     && !connected.two_tone_active
-                    && !connected.cw_text_sending;
+                    && !connected.cw_text_sending
+                    && tx_frequency_allowed(
+                        connected.session.tx_frequency_hz.load(Ordering::Relaxed),
+                        connected.allow_out_of_band_tx.load(Ordering::Relaxed),
+                    );
                 if tune_may_start {
                     let current_watts = connected.session.tx_power_watts.load(Ordering::Relaxed);
                     connected.pre_tune_power_watts = Some(current_watts);
@@ -663,7 +768,8 @@ fn dispatch_midi_event(connected: &mut ConnectedState, ev: RawMidiEvent, freq_hz
             connected.width_memory.insert(current_mode.label().to_string(), width);
         }
         MidiAction::VfoStepUp | MidiAction::VfoStepDown => {
-            let step = scroll_tune_step_hz(connected.tune_step_hz, false);
+            let cw_mode = matches!(current_mode, spectrum::Mode::Cwl | spectrum::Mode::Cwu);
+            let step = scroll_tune_step_hz(connected.tune_step_hz, cw_mode, false, false);
             let signed_step = if binding.action == MidiAction::VfoStepUp { step } else { -step };
             let new_freq = (dial_freq_hz as i64 + signed_step).max(0) as u32;
             let (effective_freq, retune) = resolve_tune(connected.ctun, freq_hz, sample_rate, passband, new_freq);
@@ -904,6 +1010,18 @@ struct ExtraReceiver {
     /// this receiver's own sample-rate control when it can't actually
     /// be honored independently (see render_extra_receiver_settings).
     protocol: u8,
+    /// ADDED (2026-09-20, real report: an RX-888 extra receiver's own
+    /// Settings->RX showed the full generic P1 rate list (48-1536kHz),
+    /// most of which this board doesn't actually support -- see
+    /// rx888::ddc_params_for_output_rate's own doc comment for why only
+    /// 96/192/384 are real options). RX-888's `protocol` field is the
+    /// same dummy value 1 real P1 hardware uses (see Boards::Rx888's own
+    /// doc comment), so `protocol` alone can't tell the two apart --
+    /// this field can. Used only to pick the right rate BUTTON LIST in
+    /// render_extra_receiver_settings; the "follows the main receiver,
+    /// not independently adjustable" behavior itself is unchanged and
+    /// still driven by `protocol == 1` for both.
+    board: Boards,
     /// See discovery::Device::frequency_min/frequency_max's doc comment
     /// -- same radio, same limits, copied in once at spawn time (the
     /// connected device can't change mid-session). Used by this
@@ -1090,6 +1208,17 @@ impl Default for MidiLearnState {
             edit_index: None,
         }
     }
+}
+
+/// Right-click VFO -> keypad frequency-entry popup state -- real
+/// request. See ConnectedState::frequency_entry's own doc comment.
+struct FrequencyEntry {
+    vfo_b: bool,
+    /// ASCII '0'-'9' only, most-significant digit first, whole Hz --
+    /// e.g. "14074000" displays as "14.074.000" (format_frequency).
+    /// Empty until the user presses a digit key, same as a phone
+    /// dialer starting blank rather than pre-filled.
+    digits: String,
 }
 
 struct ConnectedState {
@@ -1291,6 +1420,23 @@ struct ConnectedState {
     spectrum_pan: f32,
     slider_scroll_accum: f32,
     show_settings_window: bool,
+    /// Right-click VFO-A or VFO-B -> keypad frequency-entry popup, real
+    /// request. `None` = not open, same toggle idiom as
+    /// show_settings_window above. `vfo_b: true` targets VFO B instead
+    /// of VFO A/the dial; `digits` is what's been typed so far (ASCII
+    /// '0'-'9', most-significant first, interpreted as whole Hz) --
+    /// starts empty (not pre-filled with the current frequency) so
+    /// typing always starts a fresh number, same as a phone dialer.
+    frequency_entry: Option<FrequencyEntry>,
+    /// Real request: a safety default against accidentally transmitting
+    /// outside the ham bands (e.g. while parked on "Gen"/general
+    /// coverage) -- off means tx_frequency_allowed's ham-band check
+    /// actually blocks TX; the operator can explicitly opt in via a TX
+    /// Settings checkbox for MARS/CAP/other authorized out-of-band use.
+    /// An `Arc` (not a plain `bool`) so cat.rs/rigctl.rs/tci.rs's own
+    /// PTT-handling threads can read the live value too -- same idiom
+    /// as `mox` itself.
+    allow_out_of_band_tx: Arc<std::sync::atomic::AtomicBool>,
     settings_tab: SettingsTab,
     /// P2 in-application firmware update against THIS connected radio --
     /// see bootloader_ui::FirmwareUpdateWindow/bootloader.rs's own doc
@@ -1866,14 +2012,16 @@ fn connect_to_device(device: Device, cfg: &Config) -> Result<ConnectedState, Str
     if let Some(sr) = cfg.sample_rate {
         settings.sample_rate = sr;
     }
-    // RX-888: fixed, non-user-configurable DDC output rate (see
-    // rx888.rs's own doc comment) -- overrides any saved
-    // cfg.sample_rate rather than letting a stale value from some other
-    // board's config linger. Applied here (before RadioSession::start
-    // AND before this same settings.sample_rate is read again below for
-    // SpectrumHandle::start) so both stay consistent with what the DDC
-    // actually produces.
-    if device.board == Boards::Rx888 {
+    // RX-888: a saved rate only sticks if it's actually one of
+    // rx888::ddc_params_for_output_rate's supported presets -- otherwise
+    // (no prior RX-888 session, or a stale value carried over from some
+    // other board's config) falls back to this module's own default.
+    // Applied here (before RadioSession::start AND before this same
+    // settings.sample_rate is read again below for SpectrumHandle::start)
+    // so both stay consistent with what the DDC actually produces;
+    // start_rx888_usb resolves this exact same way and corrects
+    // settings.sample_rate's own atomic if it still somehow disagrees.
+    if device.board == Boards::Rx888 && rx888::ddc_params_for_output_rate(settings.sample_rate).is_none() {
         settings.sample_rate = rx888::OUTPUT_SAMPLE_RATE_HZ;
     }
     // Pre-size for multiple receivers, per whatever the
@@ -2025,6 +2173,13 @@ fn connect_to_device(device: Device, cfg: &Config) -> Result<ConnectedState, Str
             let cw_remote_pending: Arc<Mutex<VecDeque<String>>> = Arc::new(Mutex::new(VecDeque::new()));
             let cw_remote_stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
             let cw_remote_busy = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            // Created once here (not separately inside ConnectedState's
+            // own construction below) so rigctl/CAT/TCI's own PTT paths
+            // and the TX Settings checkbox both read/write the SAME
+            // atomic -- see ConnectedState::allow_out_of_band_tx's doc
+            // comment.
+            let allow_out_of_band_tx =
+                Arc::new(std::sync::atomic::AtomicBool::new(cfg.allow_out_of_band_tx.unwrap_or(false)));
 
             // rigctl/TCI are started/stopped manually from the Network
             // settings tab rather than always-on, but their run state
@@ -2042,6 +2197,8 @@ fn connect_to_device(device: Device, cfg: &Config) -> Result<ConnectedState, Str
                     spectrum.demod_params_handle(),
                     Arc::clone(&spectrum.display),
                     Arc::clone(&session.mox),
+                    Arc::clone(&session.tx_frequency_hz),
+                    Arc::clone(&allow_out_of_band_tx),
                     Arc::clone(&session.rit_enabled),
                     Arc::clone(&session.rit_offset_hz),
                     Arc::clone(&session.xit_enabled),
@@ -2070,6 +2227,8 @@ fn connect_to_device(device: Device, cfg: &Config) -> Result<ConnectedState, Str
                     Arc::clone(&session.sample_rate),
                     spectrum.demod_params_handle(),
                     Arc::clone(&session.mox),
+                    Arc::clone(&session.tx_frequency_hz),
+                    Arc::clone(&allow_out_of_band_tx),
                     Arc::clone(&spectrum.tci_audio_out),
                     Arc::clone(&spectrum.iq_out),
                     Arc::clone(&session.tci_tx_audio),
@@ -2101,6 +2260,8 @@ fn connect_to_device(device: Device, cfg: &Config) -> Result<ConnectedState, Str
                     spectrum.demod_params_handle(),
                     Arc::clone(&spectrum.display),
                     Arc::clone(&session.mox),
+                    Arc::clone(&session.tx_frequency_hz),
+                    Arc::clone(&allow_out_of_band_tx),
                     Arc::clone(&session.rit_enabled),
                     Arc::clone(&session.rit_offset_hz),
                     Arc::clone(&session.xit_enabled),
@@ -2152,6 +2313,9 @@ fn connect_to_device(device: Device, cfg: &Config) -> Result<ConnectedState, Str
             }
             if let Some(v) = cfg.agc_slope_db {
                 spectrum.set_agc_slope_db(v);
+            }
+            if let Some(v) = cfg.meter_calibration_db {
+                spectrum.set_meter_calibration_db(v);
             }
             if let Some(v) = cfg.noise_blanker {
                 spectrum.set_noise_blanker(v);
@@ -2206,6 +2370,7 @@ fn connect_to_device(device: Device, cfg: &Config) -> Result<ConnectedState, Str
                     &session,
                     device.adcs,
                     device.protocol,
+                    device.board,
                     device.frequency_min,
                     device.frequency_max,
                     Arc::clone(&settings_dirty),
@@ -2430,6 +2595,8 @@ fn connect_to_device(device: Device, cfg: &Config) -> Result<ConnectedState, Str
                 spectrum_pan: cfg.spectrum_pan.unwrap_or(0.0),
                 slider_scroll_accum: 0.0,
                 show_settings_window: false,
+                frequency_entry: None,
+                allow_out_of_band_tx,
                 settings_tab: SettingsTab::Agc,
                 firmware_update: None,
                 juice_console: None,
@@ -2813,6 +2980,20 @@ impl eframe::App for HpsdrApp {
                 // (on-screen MOX button, spacebar, Tune, Two-Tone,
                 // rigctl/TCI/CAT PTT). See ConnectedState::
                 // cw_break_in_active's doc comment for the full design.
+                // Deliberately NOT gated by tx_frequency_allowed, unlike
+                // every other set_mox(true) call site in this file: by
+                // the time this runs, `radio_keyed` already reflects the
+                // radio's OWN FPGA having physically keyed the
+                // transmitter (a real paddle/key wired directly into the
+                // radio's hardware KEY jack, break-in keying entirely
+                // independent of any host software) -- the RF is already
+                // on the air regardless of what this app does. This is
+                // pure UI/state mirroring after the fact, not a PTT
+                // decision this software makes, so there is nothing here
+                // for a software out-of-band lockout to actually
+                // prevent. A physical key/paddle bypasses this app's own
+                // TX-frequency safety check entirely -- see
+                // tx_frequency_allowed's own doc comment.
                 if cw_mode_now {
                     if radio_keyed {
                         if !connected.session.mox_active() {
@@ -3041,9 +3222,23 @@ impl eframe::App for HpsdrApp {
                 // the real hardware LO's own band -- freq_hz, not
                 // dial_freq_hz, matching pa_gain_db's identical
                 // real-RF-path reasoning just above in this same frame).
+                // ROOT CAUSE FIX for a real report ("we should be able to
+                // bypass the filters" while on Gen): this used to fall
+                // back to "" (no legitimate band is ever named that),
+                // which silently forced OC-outputs-all-off/antenna-ANT1
+                // whenever tuned to Gen, with no way to configure it --
+                // oc_settings.get("")/antenna_settings.get("") could
+                // never hit, `unwrap_or_default()` always won. "Gen" is
+                // the same fallback the band-button row and the per-band
+                // OC/Antenna settings table itself already use (see
+                // gen_band's own doc comment) -- matching it here makes
+                // "Gen" a normal, configurable band name in
+                // oc_settings/antenna_settings too, so an operator can
+                // set up its own OC/antenna routing (e.g. a wideband/
+                // bypass port) exactly like any real band.
                 let current_band_name: &str = match active_xvtr_name.as_deref() {
                     Some(name) => name,
-                    None => band_for_frequency(freq_hz).map(|b| b.name).unwrap_or(""),
+                    None => band_for_frequency(freq_hz).map(|b| b.name).unwrap_or("Gen"),
                 };
                 let oc = connected.oc_settings.get(current_band_name).copied().unwrap_or_default();
                 let oc_tx_resolved = if connected.tune_active { oc.tx | connected.oc_tune } else { oc.tx };
@@ -3393,19 +3588,56 @@ impl eframe::App for HpsdrApp {
                                 .group(|ui| {
                                     ui.vertical(|ui| {
                                         ui.label("VFO-A");
-                                        ui.add(
-                                            egui::Label::new(
-                                                egui::RichText::new(format_frequency(displayed_freq_hz))
-                                                    .monospace()
-                                                    .size(28.0)
-                                                    .strong()
-                                                    .color(freq_a_color),
+                                        let resp = ui
+                                            .add(
+                                                egui::Label::new(
+                                                    egui::RichText::new(format_frequency(displayed_freq_hz))
+                                                        .monospace()
+                                                        .size(28.0)
+                                                        .strong()
+                                                        .color(freq_a_color),
+                                                )
+                                                // CLICK (not just hover) --
+                                                // needed for
+                                                // secondary_clicked() below;
+                                                // still senses hover fine
+                                                // (Sense::click() includes
+                                                // it) so the existing
+                                                // scroll-to-tune hover check
+                                                // further down is unaffected.
+                                                .sense(egui::Sense::click()),
                                             )
-                                            .sense(egui::Sense::hover()),
-                                        )
-                                        .on_hover_text(
-                                            "Scroll to tune -- Shift: 100 Hz, Ctrl: 10 kHz, none: 1 kHz",
-                                        )
+                                            .on_hover_text(if matches!(current_mode, spectrum::Mode::Cwl | spectrum::Mode::Cwu) {
+                                                // ROOT CAUSE FIX for a real
+                                                // report: this hovering
+                                                // over VFO-A shares the
+                                                // SAME scroll handler as
+                                                // the spectrum/waterfall
+                                                // (see the "if
+                                                // freq_label.hovered() ||
+                                                // spectrum_resp.hovered()"
+                                                // check further down) --
+                                                // its real step sizes were
+                                                // already CW-aware
+                                                // (scroll_tune_step_hz/
+                                                // ctrl_scroll_tune_step_hz),
+                                                // but this tooltip text
+                                                // was a plain static
+                                                // string that never
+                                                // reflected that, always
+                                                // showing the non-CW
+                                                // values even in CW mode.
+                                                "Scroll to tune -- Shift: 10 Hz, Ctrl: 1 Hz, none: 100 Hz -- right-click to type a frequency"
+                                            } else {
+                                                "Scroll to tune -- Shift: 100 Hz, Ctrl: 10 kHz, none: 1 kHz -- right-click to type a frequency"
+                                            });
+                                        // Right-click -> keypad frequency
+                                        // entry popup, real request.
+                                        if resp.secondary_clicked() {
+                                            connected.frequency_entry =
+                                                Some(FrequencyEntry { vfo_b: false, digits: String::new() });
+                                        }
+                                        resp
                                     })
                                     .inner
                                 })
@@ -3574,21 +3806,27 @@ impl eframe::App for HpsdrApp {
                                 .group(|ui| {
                                     ui.vertical(|ui| {
                                         ui.label("VFO-B");
-                                        ui.add(
-                                            egui::Label::new(
-                                                egui::RichText::new(format_frequency(
-                                                    connected.vfo_b_frequency_hz,
-                                                ))
-                                                .monospace()
-                                                .size(28.0)
-                                                .strong()
-                                                .color(freq_b_color),
+                                        let resp = ui
+                                            .add(
+                                                egui::Label::new(
+                                                    egui::RichText::new(format_frequency(
+                                                        connected.vfo_b_frequency_hz,
+                                                    ))
+                                                    .monospace()
+                                                    .size(28.0)
+                                                    .strong()
+                                                    .color(freq_b_color),
+                                                )
+                                                .sense(egui::Sense::click()),
                                             )
-                                            .sense(egui::Sense::hover()),
-                                        )
-                                        .on_hover_text(
-                                            "Scroll to tune -- Shift: 100 Hz, none: 1 kHz",
-                                        )
+                                            .on_hover_text(
+                                                "Scroll to tune -- Shift: 100 Hz, none: 1 kHz -- right-click to type a frequency",
+                                            );
+                                        if resp.secondary_clicked() {
+                                            connected.frequency_entry =
+                                                Some(FrequencyEntry { vfo_b: true, digits: String::new() });
+                                        }
+                                        resp
                                     })
                                     .inner
                                 })
@@ -3623,6 +3861,7 @@ impl eframe::App for HpsdrApp {
                                             &connected.session,
                                             connected.device.adcs,
                                             connected.device.protocol,
+                                            connected.device.board,
                                             connected.device.frequency_min,
                                             connected.device.frequency_max,
                                             Arc::clone(&connected.settings_dirty),
@@ -3667,8 +3906,13 @@ impl eframe::App for HpsdrApp {
                         // sits at 28MHz) would light up together, which
                         // reads as "I'm on two bands at once". Only one
                         // button should ever appear selected.
+                        // Falls back to "Gen" (see gen_band's own doc
+                        // comment) whenever the dial isn't in any real
+                        // ham band -- so the Gen button lights up as the
+                        // active "band" for general-coverage listening,
+                        // same as any other band would for its own range.
                         let current_band = if active_xvtr_name.is_none() {
-                            band_for_frequency(dial_freq_hz).map(|b| b.name)
+                            Some(band_for_frequency(dial_freq_hz).map(|b| b.name).unwrap_or("Gen"))
                         } else {
                             None
                         };
@@ -3693,6 +3937,18 @@ impl eframe::App for HpsdrApp {
                                 // job -- shared with MIDI's BandUp/
                                 // BandDown.
                                 apply_band(connected, band);
+                                settings_changed = true;
+                            }
+                        }
+                        // "Gen" (general coverage, the radio's full own
+                        // range) -- real request. See gen_band's own doc
+                        // comment for why this isn't just another BANDS
+                        // entry.
+                        {
+                            let gen = gen_band(connected.device.frequency_min, connected.device.frequency_max);
+                            let selected = current_band == Some("Gen");
+                            if ui.add(egui::Button::selectable(selected, "Gen")).clicked() && !selected {
+                                apply_band(connected, &gen);
                                 settings_changed = true;
                             }
                         }
@@ -3741,6 +3997,164 @@ impl eframe::App for HpsdrApp {
                             }
                         }
                     });
+
+                    // Right-click VFO -> keypad frequency-entry popup --
+                    // real request. Opened by freq_label/vfo_b_label's
+                    // own secondary_clicked() handling above.
+                    if connected.frequency_entry.is_some() {
+                        let mut close_now = false;
+                        ui.ctx().show_viewport_immediate(
+                            egui::ViewportId::from_hash_of("frequency_entry_window"),
+                            egui::ViewportBuilder::default()
+                                .with_title("Enter Frequency")
+                                .with_inner_size([260.0, 360.0])
+                                .with_resizable(false)
+                                .with_active(true),
+                            |ui, _class| {
+                                if ui.input(|i| i.viewport().close_requested()) {
+                                    close_now = true;
+                                    return;
+                                }
+                                egui::CentralPanel::default().show(ui, |ui| {
+                                    // Pulled out as plain locals rather
+                                    // than held as a live borrow of
+                                    // connected.frequency_entry for the
+                                    // rest of this closure -- Enter below
+                                    // also needs to mutate OTHER
+                                    // connected fields (session,
+                                    // vfo_b_frequency_hz) to actually
+                                    // apply the result, which a held
+                                    // borrow of this one field would
+                                    // otherwise conflict with.
+                                    let (vfo_b, mut digits) = match &connected.frequency_entry {
+                                        Some(e) => (e.vfo_b, e.digits.clone()),
+                                        None => return,
+                                    };
+                                    let mut apply = false;
+
+                                    // Keyboard input -- digits, Backspace,
+                                    // Enter, Escape -- same actions as the
+                                    // on-screen buttons below, for anyone
+                                    // who'd rather type than click.
+                                    ui.input(|i| {
+                                        for ev in &i.events {
+                                            match ev {
+                                                egui::Event::Key { key: egui::Key::Backspace, pressed: true, .. } => {
+                                                    digits.pop();
+                                                }
+                                                egui::Event::Key { key: egui::Key::Enter, pressed: true, .. } => {
+                                                    apply = true;
+                                                }
+                                                egui::Event::Key { key: egui::Key::Escape, pressed: true, .. } => {
+                                                    close_now = true;
+                                                }
+                                                egui::Event::Text(t) => {
+                                                    for c in t.chars() {
+                                                        if c.is_ascii_digit() && digits.len() < 9 {
+                                                            digits.push(c);
+                                                        }
+                                                    }
+                                                }
+                                                _ => {}
+                                            }
+                                        }
+                                    });
+
+                                    ui.add_space(8.0);
+                                    ui.vertical_centered(|ui| {
+                                        ui.label(egui::RichText::new(if vfo_b { "VFO-B" } else { "VFO-A" }).weak());
+                                        // 0 while empty (nothing typed
+                                        // yet) rather than blank -- makes
+                                        // it clear this is a live preview,
+                                        // not a label that's just missing.
+                                        let preview_hz: u32 = digits.parse().unwrap_or(0);
+                                        ui.label(
+                                            egui::RichText::new(format_frequency(preview_hz))
+                                                .monospace()
+                                                .size(26.0)
+                                                .strong(),
+                                        );
+                                    });
+                                    ui.add_space(8.0);
+
+                                    let button_size = [64.0, 42.0];
+                                    egui::Grid::new("frequency_entry_keypad").spacing([6.0, 6.0]).show(ui, |ui| {
+                                        for row in [['7', '8', '9'], ['4', '5', '6'], ['1', '2', '3']] {
+                                            for d in row {
+                                                if ui.add_sized(button_size, egui::Button::new(d.to_string())).clicked()
+                                                    && digits.len() < 9
+                                                {
+                                                    digits.push(d);
+                                                }
+                                            }
+                                            ui.end_row();
+                                        }
+                                        if ui.add_sized(button_size, egui::Button::new("C")).clicked() {
+                                            digits.clear();
+                                        }
+                                        if ui.add_sized(button_size, egui::Button::new("0")).clicked()
+                                            && digits.len() < 9
+                                        {
+                                            digits.push('0');
+                                        }
+                                        if ui.add_sized(button_size, egui::Button::new("\u{2190}")).clicked() {
+                                            digits.pop();
+                                        }
+                                        ui.end_row();
+                                    });
+
+                                    ui.add_space(10.0);
+                                    ui.horizontal(|ui| {
+                                        if ui.add_sized([123.0, 32.0], egui::Button::new("Cancel")).clicked() {
+                                            close_now = true;
+                                        }
+                                        if ui.add_sized([123.0, 32.0], egui::Button::new("Enter")).clicked() {
+                                            apply = true;
+                                        }
+                                    });
+
+                                    // Write the (possibly just-edited)
+                                    // digits back so they persist to the
+                                    // next frame -- the borrow this takes
+                                    // is brief and doesn't overlap with
+                                    // anything below.
+                                    if let Some(e) = connected.frequency_entry.as_mut() {
+                                        e.digits = digits.clone();
+                                    }
+
+                                    if apply {
+                                        if !digits.is_empty() {
+                                            if let Ok(freq) = digits.parse::<u32>() {
+                                                let clamped = freq.clamp(
+                                                    connected.device.frequency_min as u32,
+                                                    connected.device.frequency_max as u32,
+                                                );
+                                                if vfo_b {
+                                                    connected.vfo_b_frequency_hz = clamped;
+                                                } else {
+                                                    // Unconditional retune, CTUN
+                                                    // or not -- typing an exact
+                                                    // frequency is an explicit
+                                                    // "go here" request, same as
+                                                    // apply_band's own band-switch
+                                                    // handling, not a small nudge
+                                                    // resolve_tune's CTUN-window
+                                                    // clamping is meant for.
+                                                    connected.session.set_frequency(clamped);
+                                                    connected.ctun_frequency_hz = clamped;
+                                                }
+                                                settings_changed = true;
+                                            }
+                                        }
+                                        close_now = true;
+                                    }
+                                });
+                            },
+                        );
+                        if close_now {
+                            connected.frequency_entry = None;
+                        }
+                    }
 
                     ui.horizontal_wrapped(|ui| {
                         for mode in ALL_MODES {
@@ -3828,11 +4242,28 @@ impl eframe::App for HpsdrApp {
                         // spectrum.rs's run()), so there's no correctness
                         // reason to cap it as low as 1.5 -- just headroom.
                         // Displayed/dragged in dB (see scroll_slider_f32_db's
-                        // doc comment) -- +18dB ceiling matches the old
-                        // 8.0 linear max; -100dB floor is effectively
+                        // doc comment); -100dB floor is effectively
                         // silent (0.00001 linear) while still being a
                         // finite, draggable slider position.
-                        if stable_db_slider(ui, &mut connected.slider_scroll_accum, &mut gain, -100.0, 18.0, 1.0) {
+                        //
+                        // RAISED AGAIN, 18dB -> 30dB (2026-09-20, real
+                        // RX-888 report: audio still too quiet with AGC
+                        // OFF even at the old 18dB ceiling AND
+                        // pavucontrol maxed). Deliberately NOT fixed by
+                        // raising rx888::Ddc's own HEADROOM_FACTOR
+                        // instead (which would affect every RX-888 user,
+                        // not just this AGC-off case) -- that constant's
+                        // own doc comment traces the ORIGINAL clipping
+                        // bug it fixed to WDSP's AM envelope detector/
+                        // limiter, which (unlike the separate RX AGC
+                        // toggle this report turned off) runs whenever
+                        // AM mode itself is active regardless of that
+                        // toggle -- raising it back up risks silently
+                        // reintroducing that same hard-clipping bug for
+                        // AM users who leave AGC on. Widening THIS
+                        // user-controlled slider instead only affects
+                        // whoever actually drags it up.
+                        if stable_db_slider(ui, &mut connected.slider_scroll_accum, &mut gain, -100.0, 30.0, 1.0) {
                             connected.spectrum.set_gain(gain);
                             settings_changed = true;
                         }
@@ -4246,6 +4677,21 @@ impl eframe::App for HpsdrApp {
                             } else {
                                 egui::Color32::from_gray(60)
                             };
+                            // Real request: a safety default against
+                            // accidentally transmitting outside the ham
+                            // bands -- see tx_frequency_allowed's own doc
+                            // comment. `mox_now ||` so the button stays
+                            // enabled to turn OFF an out-of-band
+                            // transmission that's somehow already running
+                            // (e.g. the setting was just disabled mid-TX),
+                            // same "always enabled to stop, only
+                            // conditionally enabled to start" pattern the
+                            // Tune/Two-Tone buttons below already use.
+                            let mox_tx_allowed = mox_now
+                                || tx_frequency_allowed(
+                                    connected.session.tx_frequency_hz.load(Ordering::Relaxed),
+                                    connected.allow_out_of_band_tx.load(Ordering::Relaxed),
+                                );
                             // Click-to-toggle rather than hold-to-talk:
                             // most CAT-driven operation (WSJT-X etc.)
                             // and typical ham software convention key
@@ -4256,14 +4702,20 @@ impl eframe::App for HpsdrApp {
                             // that run many seconds (holding a mouse
                             // button that long is impractical).
                             let mox_resp = ui
-                                .add_sized(
-                                    [90.0, 32.0],
+                                .add_enabled(
+                                    mox_tx_allowed,
                                     egui::Button::new(
                                         egui::RichText::new(mox_label).strong().color(egui::Color32::WHITE),
                                     )
-                                    .fill(mox_color),
+                                    .fill(mox_color)
+                                    .min_size(egui::vec2(90.0, 32.0)),
                                 )
-                                .on_hover_text("Click to toggle transmit on/off");
+                                .on_hover_text(if mox_tx_allowed {
+                                    "Click to toggle transmit on/off"
+                                } else {
+                                    "Blocked: outside every ham band -- enable \"Allow TX outside ham \
+                                     bands\" in Settings -> TX to override"
+                                });
                             if mox_resp.clicked() {
                                 connected.session.set_mox(!mox_now);
                             }
@@ -4284,7 +4736,18 @@ impl eframe::App for HpsdrApp {
                             // keying.
                             let tune_may_start = (!mox_now || connected.tune_active)
                                 && !connected.two_tone_active
-                                && !connected.cw_text_sending;
+                                && !connected.cw_text_sending
+                                // Real request: only actually gates the
+                                // "start" transition -- if Tune is what's
+                                // already running, clicking to STOP it
+                                // must always work regardless of
+                                // frequency. See tx_frequency_allowed's
+                                // own doc comment.
+                                && (connected.tune_active
+                                    || tx_frequency_allowed(
+                                        connected.session.tx_frequency_hz.load(Ordering::Relaxed),
+                                        connected.allow_out_of_band_tx.load(Ordering::Relaxed),
+                                    ));
                             let tune_label = if connected.tune_active { "TUNE ON" } else { "TUNE" };
                             let tune_color = if connected.tune_active {
                                 egui::Color32::from_rgb(230, 140, 20)
@@ -4362,7 +4825,14 @@ impl eframe::App for HpsdrApp {
                             // excludes two_tone_active; mirrored here).
                             let two_tone_may_start = (!mox_now || connected.two_tone_active)
                                 && !connected.tune_active
-                                && !connected.cw_text_sending;
+                                && !connected.cw_text_sending
+                                // Real request -- see tune_may_start's
+                                // own identical clause just above.
+                                && (connected.two_tone_active
+                                    || tx_frequency_allowed(
+                                        connected.session.tx_frequency_hz.load(Ordering::Relaxed),
+                                        connected.allow_out_of_band_tx.load(Ordering::Relaxed),
+                                    ));
                             let two_tone_label =
                                 if connected.two_tone_active { "TWO TONE ON" } else { "TWO TONE" };
                             let two_tone_color = if connected.two_tone_active {
@@ -4436,11 +4906,20 @@ impl eframe::App for HpsdrApp {
                             // -- only the conditions for STARTING a new
                             // send require CW mode/nothing else already
                             // using mox.
+                            // Real request -- also covers the remote
+                            // CAT "KY"/rigctl "send_morse" CW-text path
+                            // further below, which reuses this SAME gate
+                            // (see its own comment). See
+                            // tx_frequency_allowed's own doc comment.
                             let cw_text_may_start = connected.cw_text_sending
                                 || (cw_text_mode_selected
                                     && !mox_now
                                     && !connected.tune_active
-                                    && !connected.two_tone_active);
+                                    && !connected.two_tone_active
+                                    && tx_frequency_allowed(
+                                        connected.session.tx_frequency_hz.load(Ordering::Relaxed),
+                                        connected.allow_out_of_band_tx.load(Ordering::Relaxed),
+                                    ));
                             egui::ComboBox::from_id_salt("cw_text_message_select")
                                 .selected_text(format!("{}", connected.cw_text_selected + 1))
                                 .show_ui(ui, |ui| {
@@ -4579,7 +5058,20 @@ impl eframe::App for HpsdrApp {
                             // not a general PTT-conflict resolver.
                             let editing_text = ui.ctx().memory(|m| m.focused().is_some());
                             let space_down = !editing_text && ui.input(|i| i.key_down(egui::Key::Space));
-                            if space_down && !connected.ptt_held {
+                            // Real request -- see tx_frequency_allowed's
+                            // own doc comment. No on-screen feedback
+                            // possible for a held key the same way a
+                            // disabled button shows one -- silently
+                            // refusing to key is the best this control
+                            // can do, same as a real radio's own
+                            // TX-inhibit firmware would.
+                            if space_down
+                                && !connected.ptt_held
+                                && tx_frequency_allowed(
+                                    connected.session.tx_frequency_hz.load(Ordering::Relaxed),
+                                    connected.allow_out_of_band_tx.load(Ordering::Relaxed),
+                                )
+                            {
                                 connected.ptt_held = true;
                                 connected.session.set_mox(true);
                             } else if !space_down && connected.ptt_held {
@@ -4886,7 +5378,8 @@ impl eframe::App for HpsdrApp {
                             const NOTCH: f32 = 100.0;
 
                             let shift = ui.input(|i| i.modifiers.shift);
-                            let step: i64 = scroll_tune_step_hz(connected.tune_step_hz, shift);
+                            let ctrl = ui.input(|i| i.modifiers.ctrl);
+                            let step: i64 = scroll_tune_step_hz(connected.tune_step_hz, cw_mode, shift, ctrl);
 
                             let mut new_freq = dial_freq_hz as i64;
                             while connected.scroll_accum.abs() >= NOTCH {
@@ -4913,6 +5406,9 @@ impl eframe::App for HpsdrApp {
                         // and reports it via zoom_delta() (1.0 = no
                         // change) rather than smooth_scroll_delta, so it
                         // needs its own accumulate-and-threshold path.
+                        // See ctrl_scroll_tune_step_hz's own doc comment
+                        // for why the step size is computed there, not
+                        // hardcoded here.
                         let zoom = ui.input(|i| i.zoom_delta());
                         if zoom != 1.0 {
                             connected.zoom_accum += zoom - 1.0;
@@ -4920,12 +5416,13 @@ impl eframe::App for HpsdrApp {
                             // Unverified threshold, same caveat as NOTCH
                             // above -- tune if 10kHz steps feel off.
                             const ZOOM_NOTCH: f32 = 0.05;
+                            let ctrl_step = ctrl_scroll_tune_step_hz(cw_mode);
 
                             let mut new_freq = dial_freq_hz as i64;
                             while connected.zoom_accum.abs() >= ZOOM_NOTCH {
                                 let sign = connected.zoom_accum.signum();
                                 connected.zoom_accum -= sign * ZOOM_NOTCH;
-                                new_freq += 10_000 * sign as i64;
+                                new_freq += ctrl_step * sign as i64;
                             }
                             new_freq = new_freq.max(0);
 
@@ -5229,7 +5726,7 @@ impl eframe::App for HpsdrApp {
                     }
 
                     if let Some(pos) = spectrum_resp.hover_pos() {
-                        let hover_freq = freq_at_x(pos.x, rect, freq_hz, sample_rate, connected.spectrum_zoom, pan_offset_hz);
+                        let hover_freq = round_to_step_hz(freq_at_x(pos.x, rect, freq_hz, sample_rate, connected.spectrum_zoom, pan_offset_hz), main_hover_scroll_step_hz(connected.tune_step_hz, cw_mode, ui.input(|i| i.modifiers.shift), ui.input(|i| i.modifiers.ctrl)));
                         // Shown in RF space when a transverter is active --
                         // see xvtr_rf_offset_hz's doc comment -- matching
                         // the frequency-axis tick labels, which get the
@@ -5323,7 +5820,8 @@ impl eframe::App for HpsdrApp {
                                 connected.scroll_accum += delta;
                                 const NOTCH: f32 = 100.0;
                                 let shift = ui.input(|i| i.modifiers.shift);
-                                let step: i64 = scroll_tune_step_hz(connected.tune_step_hz, shift);
+                                let ctrl = ui.input(|i| i.modifiers.ctrl);
+                                let step: i64 = scroll_tune_step_hz(connected.tune_step_hz, cw_mode, shift, ctrl);
 
                                 let mut new_freq = dial_freq_hz as i64;
                                 while connected.scroll_accum.abs() >= NOTCH {
@@ -5346,16 +5844,20 @@ impl eframe::App for HpsdrApp {
                                 }
                             }
 
+                            // See ctrl_scroll_tune_step_hz's own doc
+                            // comment for why the step size is computed
+                            // there, not hardcoded here.
                             let zoom = ui.input(|i| i.zoom_delta());
                             if zoom != 1.0 {
                                 connected.zoom_accum += zoom - 1.0;
                                 const ZOOM_NOTCH: f32 = 0.05;
+                                let ctrl_step = ctrl_scroll_tune_step_hz(cw_mode);
 
                                 let mut new_freq = dial_freq_hz as i64;
                                 while connected.zoom_accum.abs() >= ZOOM_NOTCH {
                                     let sign = connected.zoom_accum.signum();
                                     connected.zoom_accum -= sign * ZOOM_NOTCH;
-                                    new_freq += 10_000 * sign as i64;
+                                    new_freq += ctrl_step * sign as i64;
                                 }
                                 new_freq = new_freq.max(0);
 
@@ -5406,7 +5908,7 @@ impl eframe::App for HpsdrApp {
                             );
                         }
                         if let Some(pos) = waterfall_click_resp.hover_pos() {
-                            let hover_freq = freq_at_x(pos.x, rect, freq_hz, sample_rate, connected.spectrum_zoom, pan_offset_hz);
+                            let hover_freq = round_to_step_hz(freq_at_x(pos.x, rect, freq_hz, sample_rate, connected.spectrum_zoom, pan_offset_hz), main_hover_scroll_step_hz(connected.tune_step_hz, cw_mode, ui.input(|i| i.modifiers.shift), ui.input(|i| i.modifiers.ctrl)));
                             // See the spectrum pane's identical treatment above.
                             let hover_freq_shown = (hover_freq as i64 + xvtr_rf_offset_hz).clamp(0, u32::MAX as i64) as u32;
                             draw_freq_hover_tooltip(ui.painter(), pos, hover_freq_shown);
@@ -6108,6 +6610,8 @@ impl eframe::App for HpsdrApp {
                                                 connected.spectrum.demod_params_handle(),
                                                 Arc::clone(&connected.spectrum.display),
                                                 Arc::clone(&connected.session.mox),
+                                                Arc::clone(&connected.session.tx_frequency_hz),
+                                                Arc::clone(&connected.allow_out_of_band_tx),
                                                 Arc::clone(&connected.session.rit_enabled),
                                                 Arc::clone(&connected.session.rit_offset_hz),
                                                 Arc::clone(&connected.session.xit_enabled),
@@ -6176,6 +6680,8 @@ impl eframe::App for HpsdrApp {
                                                 Arc::clone(&connected.session.sample_rate),
                                                 connected.spectrum.demod_params_handle(),
                                                 Arc::clone(&connected.session.mox),
+                                                Arc::clone(&connected.session.tx_frequency_hz),
+                                                Arc::clone(&connected.allow_out_of_band_tx),
                                                 Arc::clone(&connected.spectrum.tci_audio_out),
                                                 Arc::clone(&connected.spectrum.iq_out),
                                                 Arc::clone(&connected.session.tci_tx_audio),
@@ -6270,6 +6776,8 @@ impl eframe::App for HpsdrApp {
                                                 connected.spectrum.demod_params_handle(),
                                                 Arc::clone(&connected.spectrum.display),
                                                 Arc::clone(&connected.session.mox),
+                                                Arc::clone(&connected.session.tx_frequency_hz),
+                                                Arc::clone(&connected.allow_out_of_band_tx),
                                                 Arc::clone(&connected.session.rit_enabled),
                                                 Arc::clone(&connected.session.rit_offset_hz),
                                                 Arc::clone(&connected.session.xit_enabled),
@@ -7145,33 +7653,27 @@ impl eframe::App for HpsdrApp {
 
                                 SettingsTab::Agc => {
                                     ui.label("Sample Rate:");
-                                    // RX-888: NOT a hardware-negotiable setting the way it is
-                                    // for a real P1/P2 radio -- this board's own DDC output
-                                    // rate (rx888::OUTPUT_SAMPLE_RATE_HZ) is fixed by its CIC
-                                    // decimation design, and there's no sender thread at all
-                                    // (see start_rx888_usb's doc comment) to tell real
-                                    // hardware to change it. Selecting one of the P1/P2 rate
-                                    // buttons below would only rebuild the WDSP channel to
-                                    // EXPECT a different input rate, while the actual data
-                                    // arriving from rx888_receiver_loop kept coming in at the
-                                    // real fixed rate regardless -- a real report: this
-                                    // mismatch crashed (WDSP's internal buffer/decimation
-                                    // state has no defense against the input rate it was
-                                    // opened with not matching what's actually arriving).
-                                    if connected.device.board == Boards::Rx888 {
-                                        ui.label(format!(
-                                            "{:.3} kHz (fixed -- RX-888's own DDC output rate)",
-                                            connected.sample_rate as f64 / 1000.0
-                                        ));
-                                    } else {
                                     ui.horizontal_wrapped(|ui| {
+                                        // RX-888: its own NCO+CIC software DDC (rx888.rs) can
+                                        // only land exactly on WDSP-recognized rates it has a
+                                        // real (ADC rate, decimation) pair for -- see
+                                        // rx888::ddc_params_for_output_rate's own doc comment
+                                        // for why that's just 96/192/384 (not the full P1/P2
+                                        // list) -- a real earlier report: offering a rate this
+                                        // DDC can't actually hit crashed WDSP outright (its
+                                        // decimation state has no defense against the input
+                                        // rate it was opened with not matching what's actually
+                                        // arriving).
+                                        //
                                         // Protocol 2 boards support 768/1536ksps too (encoded as
                                         // a raw ksps value in p2_ddc_specific_packet, not the
                                         // fixed 2-bit code P1 uses -- see sample_rate_code, which
                                         // only has entries up to 384000 and would silently fall
                                         // through to 48kHz for anything higher, so these extra
                                         // rates are P2-only).
-                                        let rates: &[u32] = if connected.device.protocol == 2 {
+                                        let rates: &[u32] = if connected.device.board == Boards::Rx888 {
+                                            &[96_000, 192_000, 384_000]
+                                        } else if connected.device.protocol == 2 {
                                             &[48_000, 96_000, 192_000, 384_000, 768_000, 1_536_000]
                                         } else {
                                             &[48_000, 96_000, 192_000, 384_000]
@@ -7190,9 +7692,16 @@ impl eframe::App for HpsdrApp {
                                         }
                                         ui.weak("kHz");
                                     });
-                                    ui.weak(
-                                        "Changing this briefly interrupts audio/spectrum while the demod chain restarts.",
-                                    );
+                                    if connected.device.board == Boards::Rx888 {
+                                        ui.weak(
+                                            "Changing this stops streaming, reprograms the RX-888's own ADC clock, \
+                                             and restarts it -- a bigger interruption than a real P1/P2 radio's \
+                                             live rate change, but still brief.",
+                                        );
+                                    } else {
+                                        ui.weak(
+                                            "Changing this briefly interrupts audio/spectrum while the demod chain restarts.",
+                                        );
                                     }
                                     ui.separator();
 
@@ -7459,6 +7968,38 @@ impl eframe::App for HpsdrApp {
                                             " dB",
                                         ) {
                                             connected.spectrum.set_agc_slope_db(slope);
+                                            settings_changed = true;
+                                        }
+                                    });
+
+                                    // Real request: a controlled real-
+                                    // hardware test (Elecraft XG2 signal
+                                    // generator, known 50uV/-73dBm/S9
+                                    // reference) found the S-meter
+                                    // reading consistently off on a real
+                                    // ANAN-8000DLE. See
+                                    // DemodParams::meter_calibration_db's
+                                    // own doc comment for why this is a
+                                    // real, persisted control rather than
+                                    // a guessed per-board default.
+                                    ui.horizontal_wrapped(|ui| {
+                                        let mut meter_cal = agc_params.meter_calibration_db;
+                                        ui.label("S-Meter Cal:").on_hover_text(
+                                            "Added directly to the displayed/reported S-meter reading, \
+                                             AND to the spectrum/waterfall trace's own dB scale. Key a \
+                                             known reference signal (e.g. a signal generator at a \
+                                             documented dBm level) and adjust until the reading matches \
+                                             -- 0dB (default) applies no correction.",
+                                        );
+                                        if scroll_slider_f64(
+                                            ui,
+                                            &mut connected.slider_scroll_accum,
+                                            &mut meter_cal,
+                                            -20.0..=20.0,
+                                            0.5,
+                                            " dB",
+                                        ) {
+                                            connected.spectrum.set_meter_calibration_db(meter_cal);
                                             settings_changed = true;
                                         }
                                     });
@@ -7937,6 +8478,34 @@ impl eframe::App for HpsdrApp {
                                         }
                                         ui.label(":1");
                                     });
+                                    ui.add_space(8.0);
+
+                                    // Real request: a safety default
+                                    // against accidentally transmitting
+                                    // outside the ham bands (e.g. while
+                                    // parked on "Gen"/general coverage --
+                                    // see gen_band's own doc comment) --
+                                    // off by default, checked by every
+                                    // PTT path (tx_frequency_allowed's own
+                                    // doc comment has the full list).
+                                    {
+                                        let mut allow_oob =
+                                            connected.allow_out_of_band_tx.load(Ordering::Relaxed);
+                                        if ui
+                                            .checkbox(&mut allow_oob, "Allow TX outside ham bands")
+                                            .on_hover_text(
+                                                "Off (default): TX is blocked outside the defined ham \
+                                                 band allocations, e.g. on \"Gen\". Enable only for \
+                                                 MARS/CAP or other explicitly authorized out-of-band \
+                                                 operation -- this does not check any regulatory \
+                                                 database, it only removes this app's own safety check.",
+                                            )
+                                            .changed()
+                                        {
+                                            connected.allow_out_of_band_tx.store(allow_oob, Ordering::Relaxed);
+                                            settings_changed = true;
+                                        }
+                                    }
                                     ui.add_space(8.0);
 
                                     // Standard (non-HermesLite) boards only -- see
@@ -8467,10 +9036,16 @@ impl eframe::App for HpsdrApp {
                                         }
                                         ui.end_row();
 
-                                        // Reachable BANDS, then configured
-                                        // XVTRs -- same combined row list
-                                        // as PA Calibration + XVTR's own
-                                        // tabs, matching piHPSDR's fused
+                                        // Reachable BANDS, then "Gen" (see
+                                        // gen_band's own doc comment --
+                                        // NOT a BANDS entry, so it needs
+                                        // adding explicitly here, same as
+                                        // the band-button row's own
+                                        // separate Gen button), then
+                                        // configured XVTRs -- same
+                                        // combined row list as PA
+                                        // Calibration + XVTR's own tabs,
+                                        // matching piHPSDR's fused
                                         // oc_menu.c loop.
                                         let names: Vec<&str> = BANDS
                                             .iter()
@@ -8479,6 +9054,7 @@ impl eframe::App for HpsdrApp {
                                                     && (band.high_hz as u64) <= connected.device.frequency_max
                                             })
                                             .map(|band| band.name)
+                                            .chain(std::iter::once("Gen"))
                                             .chain(
                                                 connected
                                                     .xvtrs
@@ -8589,9 +9165,12 @@ impl eframe::App for HpsdrApp {
                                         ui.label("TX Antenna");
                                         ui.end_row();
 
-                                        // Reachable BANDS, then configured
-                                        // XVTRs -- same combined row list as
-                                        // Open Collector just above.
+                                        // Reachable BANDS, then "Gen", then
+                                        // configured XVTRs -- same combined
+                                        // row list as Open Collector just
+                                        // above (see its own comment for
+                                        // why "Gen" needs adding
+                                        // explicitly here).
                                         let names: Vec<&str> = BANDS
                                             .iter()
                                             .filter(|band| {
@@ -8599,6 +9178,7 @@ impl eframe::App for HpsdrApp {
                                                     && (band.high_hz as u64) <= connected.device.frequency_max
                                             })
                                             .map(|band| band.name)
+                                            .chain(std::iter::once("Gen"))
                                             .chain(
                                                 connected
                                                     .xvtrs
@@ -9400,6 +9980,7 @@ impl eframe::App for HpsdrApp {
                                 agc_hang_ms: agc_params.agc_hang_ms,
                                 agc_top_db: agc_params.agc_top_db,
                                 agc_slope_db: agc_params.agc_slope_db,
+                                meter_calibration_db: agc_params.meter_calibration_db,
                                 noise_blanker: agc_params.noise_blanker,
                                 nb_threshold: agc_params.nb_threshold,
                                 noise_reduction: agc_params.noise_reduction,
@@ -9452,6 +10033,7 @@ impl eframe::App for HpsdrApp {
                         agc_hang_ms: Some(agc_params_now.agc_hang_ms),
                         agc_top_db: Some(agc_params_now.agc_top_db),
                         agc_slope_db: Some(agc_params_now.agc_slope_db),
+                        meter_calibration_db: Some(agc_params_now.meter_calibration_db),
                         noise_blanker: Some(agc_params_now.noise_blanker),
                         nb_threshold: Some(agc_params_now.nb_threshold),
                         noise_reduction: Some(agc_params_now.noise_reduction),
@@ -9528,6 +10110,9 @@ impl eframe::App for HpsdrApp {
                         tci_logging_enabled: Some(connected.tci_debug_log.is_enabled()),
                         cat_logging_enabled: Some(connected.cat_debug_log.is_enabled()),
                         extra_receivers,
+                        allow_out_of_band_tx: Some(
+                            connected.allow_out_of_band_tx.load(std::sync::atomic::Ordering::Relaxed),
+                        ),
                         puresignal_enabled: Some(connected.puresignal_enabled),
                         diversity_enabled: Some(connected.diversity_enabled),
                         diversity_gain_db: Some(f32::from_bits(
@@ -11359,7 +11944,16 @@ fn render_extra_receiver_ui(ui: &mut egui::Ui, rx: &Arc<Mutex<ExtraReceiver>>) {
                     )
                     .sense(egui::Sense::hover()),
                 )
-                .on_hover_text("Scroll to tune -- Shift: 100 Hz, none: 1 kHz. Click spectrum/waterfall to jump.")
+                .on_hover_text(if cw_mode {
+                    // Same real report/fix as the main window's
+                    // identical tooltip (main.rs) -- this label shares
+                    // its own spectrum/waterfall scroll handler
+                    // (scroll_tune_step_hz), already CW-aware, but this
+                    // text never reflected that.
+                    "Scroll to tune -- Shift: 10 Hz, none: 100 Hz. Click spectrum/waterfall to jump."
+                } else {
+                    "Scroll to tune -- Shift: 100 Hz, none: 1 kHz. Click spectrum/waterfall to jump."
+                })
             });
         });
 
@@ -11504,7 +12098,9 @@ fn render_extra_receiver_ui(ui: &mut egui::Ui, rx: &Arc<Mutex<ExtraReceiver>>) {
     });
 
     ui.horizontal_wrapped(|ui| {
-        let current_band = band_for_frequency(dial_freq_hz).map(|b| b.name);
+        // Falls back to "Gen" the same way the main receiver's own
+        // band row does -- see that block's doc comment.
+        let current_band = Some(band_for_frequency(dial_freq_hz).map(|b| b.name).unwrap_or("Gen"));
         for band in &BANDS {
             // Same reachable-band filter as the main receiver's own
             // band-button row -- see its doc comment for why.
@@ -11513,35 +12109,14 @@ fn render_extra_receiver_ui(ui: &mut egui::Ui, rx: &Arc<Mutex<ExtraReceiver>>) {
             }
             let selected = Some(band.name) == current_band;
             if ui.add(egui::Button::selectable(selected, band.name)).clicked() && !selected {
-                let saved = rx.band_memory.get(band.name).copied();
-                let target = saved.map(|s| s.frequency_hz).unwrap_or(band.default_hz);
-                rx.frequency_hz.store(target, Ordering::Relaxed);
-                rx.ctun_frequency_hz = target;
-                if let Some(s) = saved {
-                    rx.db_low = s.db_low;
-                    rx.db_high = s.db_high;
-                    rx.waterfall_db_low = s.waterfall_db_low;
-                    rx.waterfall_db_high = s.waterfall_db_high;
-                }
-                let (new_db_low, new_db_high, new_wf_low, new_wf_high) =
-                    (rx.db_low, rx.db_high, rx.waterfall_db_low, rx.waterfall_db_high);
-                // Restore whatever mode was last used on this band, if
-                // any -- see the main receiver's own band-click handler
-                // for the full reasoning.
-                let resolved_mode = saved.and_then(|s| s.mode).unwrap_or(band.default_mode);
-                remember_band_settings(
-                    &mut rx.band_memory,
-                    target,
-                    new_db_low,
-                    new_db_high,
-                    new_wf_low,
-                    new_wf_high,
-                    resolved_mode,
-                );
-                rx.spectrum.set_mode(resolved_mode);
-                rx.spectrum.set_width_hz(width_for_mode(&rx.width_memory, resolved_mode));
-                rx.settings_dirty.store(true, Ordering::Relaxed);
+                apply_band_extra(&mut rx, band);
             }
+        }
+        // "Gen" -- see gen_band's own doc comment.
+        let gen = gen_band(rx.frequency_min, rx.frequency_max);
+        let selected = current_band == Some("Gen");
+        if ui.add(egui::Button::selectable(selected, "Gen")).clicked() && !selected {
+            apply_band_extra(&mut rx, &gen);
         }
     });
 
@@ -11579,9 +12154,12 @@ fn render_extra_receiver_ui(ui: &mut egui::Ui, rx: &Arc<Mutex<ExtraReceiver>>) {
     ui.horizontal(|ui| {
         ui.label("Audio gain:");
         let mut gain = current_gain;
-        // Same dB-displayed treatment as the main window's identical
-        // control -- see scroll_slider_f32_db's doc comment (main.rs).
-        if scroll_slider_f32_db(ui, &mut rx.slider_scroll_accum, &mut gain, -100.0, 18.0, 1.0) {
+        // Same dB-displayed treatment, and same 30dB ceiling, as the main
+        // window's identical control -- see scroll_slider_f32_db's doc
+        // comment (main.rs) and that control's own doc comment for why
+        // 30dB, not rx888::Ddc::HEADROOM_FACTOR, was raised for the real
+        // AGC-off-too-quiet RX-888 report this fixes.
+        if scroll_slider_f32_db(ui, &mut rx.slider_scroll_accum, &mut gain, -100.0, 30.0, 1.0) {
             rx.spectrum.set_gain(gain);
             rx.settings_dirty.store(true, Ordering::Relaxed);
         }
@@ -11786,11 +12364,12 @@ fn render_extra_receiver_ui(ui: &mut egui::Ui, rx: &Arc<Mutex<ExtraReceiver>>) {
             // See the main receiver's own scroll-to-tune NOTCH comment.
             const NOTCH: f32 = 100.0;
             let shift = ui.input(|i| i.modifiers.shift);
+            let ctrl = ui.input(|i| i.modifiers.ctrl);
             // Extra receiver windows don't have their own Step button
             // yet (see ConnectedState::tune_step_hz's own doc comment --
             // this project's main window only, for now) -- 1kHz matches
             // this project's original, previously-only default.
-            let step: i64 = scroll_tune_step_hz(1_000, shift);
+            let step: i64 = scroll_tune_step_hz(1_000, cw_mode, shift, ctrl);
             let mut new_freq = dial_freq_hz as i64;
             while rx.scroll_accum.abs() >= NOTCH {
                 let sign = rx.scroll_accum.signum();
@@ -11909,7 +12488,7 @@ fn render_extra_receiver_ui(ui: &mut egui::Ui, rx: &Arc<Mutex<ExtraReceiver>>) {
     draw_audio_waveform(ui.painter(), rect, &waveform_samples);
 
     if let Some(pos) = spectrum_resp.hover_pos() {
-        let hover_freq = freq_at_x(pos.x, rect, freq_hz, sample_rate, rx.spectrum_zoom, pan_offset_hz);
+        let hover_freq = round_to_step_hz(freq_at_x(pos.x, rect, freq_hz, sample_rate, rx.spectrum_zoom, pan_offset_hz), scroll_tune_step_hz(1_000, cw_mode, ui.input(|i| i.modifiers.shift), ui.input(|i| i.modifiers.ctrl)));
         draw_freq_hover_tooltip(ui.painter(), pos, hover_freq);
     }
 
@@ -11981,11 +12560,12 @@ fn render_extra_receiver_ui(ui: &mut egui::Ui, rx: &Arc<Mutex<ExtraReceiver>>) {
                 rx.scroll_accum += delta;
                 const NOTCH: f32 = 100.0;
                 let shift = ui.input(|i| i.modifiers.shift);
+                let ctrl = ui.input(|i| i.modifiers.ctrl);
                 // Extra receiver windows don't have their own Step button
-            // yet (see ConnectedState::tune_step_hz's own doc comment --
-            // this project's main window only, for now) -- 1kHz matches
-            // this project's original, previously-only default.
-            let step: i64 = scroll_tune_step_hz(1_000, shift);
+                // yet (see ConnectedState::tune_step_hz's own doc comment --
+                // this project's main window only, for now) -- 1kHz matches
+                // this project's original, previously-only default.
+                let step: i64 = scroll_tune_step_hz(1_000, cw_mode, shift, ctrl);
                 let mut new_freq = dial_freq_hz as i64;
                 while rx.scroll_accum.abs() >= NOTCH {
                     let sign = rx.scroll_accum.signum();
@@ -12053,7 +12633,7 @@ fn render_extra_receiver_ui(ui: &mut egui::Ui, rx: &Arc<Mutex<ExtraReceiver>>) {
             );
         }
         if let Some(pos) = wf_resp.hover_pos() {
-            let hover_freq = freq_at_x(pos.x, wf_rect, freq_hz, sample_rate, rx.spectrum_zoom, pan_offset_hz);
+            let hover_freq = round_to_step_hz(freq_at_x(pos.x, wf_rect, freq_hz, sample_rate, rx.spectrum_zoom, pan_offset_hz), scroll_tune_step_hz(1_000, cw_mode, ui.input(|i| i.modifiers.shift), ui.input(|i| i.modifiers.ctrl)));
             draw_freq_hover_tooltip(ui.painter(), pos, hover_freq);
         }
 
@@ -12194,9 +12774,23 @@ fn render_extra_receiver_settings(ui: &mut egui::Ui, rx: &Arc<Mutex<ExtraReceive
             // (see change_sample_rate's P1 branch) rather than exposed
             // as independently adjustable, which the hardware has no
             // way to actually honor.
+            // ROOT CAUSE FIX for a real report ("show all the sample
+            // rates but grayed out" -- an RX-888 extra receiver showed
+            // the full generic P1 list, most of which this board never
+            // actually supports, unlike real P1 hardware where every
+            // one of these genuinely is a valid shared-clock rate). Same
+            // rate list as the main receiver's own Sample Rate buttons
+            // (main.rs's SettingsTab::Agc block) -- see
+            // rx888::ddc_params_for_output_rate's own doc comment for
+            // why RX-888 is limited to just these three.
+            let rates: &[u32] = if rx.board == Boards::Rx888 {
+                &[96_000, 192_000, 384_000]
+            } else {
+                &[48_000, 96_000, 192_000, 384_000, 768_000, 1_536_000]
+            };
             ui.add_enabled_ui(rx.protocol != 1, |ui| {
                 ui.horizontal_wrapped(|ui| {
-                    for rate in [48_000u32, 96_000, 192_000, 384_000, 768_000, 1_536_000] {
+                    for &rate in rates {
                         let selected = rate == current_rate;
                         let label = format!("{}", rate / 1000);
                         if ui.add(egui::Button::selectable(selected, label)).clicked() && !selected {
@@ -12273,6 +12867,21 @@ fn render_extra_receiver_settings(ui: &mut egui::Ui, rx: &Arc<Mutex<ExtraReceive
                 ui.label("Slope:");
                 if scroll_slider_i32(ui, &mut rx.slider_scroll_accum, &mut slope, 0..=100, 2, " dB") {
                     rx.spectrum.set_agc_slope_db(slope);
+                    rx.settings_dirty.store(true, Ordering::Relaxed);
+                }
+            });
+
+            // See the main window's identical control (main.rs) for the
+            // real report this fixes.
+            ui.horizontal_wrapped(|ui| {
+                let mut meter_cal = agc_params.meter_calibration_db;
+                ui.label("S-Meter Cal:").on_hover_text(
+                    "Added directly to the displayed/reported S-meter reading, AND to the \
+                     spectrum/waterfall trace's own dB scale. Key a known reference signal and \
+                     adjust until the reading matches -- 0dB (default) applies no correction.",
+                );
+                if scroll_slider_f64(ui, &mut rx.slider_scroll_accum, &mut meter_cal, -20.0..=20.0, 0.5, " dB") {
+                    rx.spectrum.set_meter_calibration_db(meter_cal);
                     rx.settings_dirty.store(true, Ordering::Relaxed);
                 }
             });
@@ -12440,17 +13049,35 @@ fn render_extra_receiver_settings(ui: &mut egui::Ui, rx: &Arc<Mutex<ExtraReceive
 }
 
 /// Scroll-to-tune step size over the spectrum/waterfall panes.
-/// `base_step_hz`: the plain (no-modifier) scroll step -- user-chosen via
-/// the "Step" button next to CTUN (see ConnectedState::tune_step_hz's own
-/// doc comment), replacing what used to be a fixed 1kHz (100Hz in CW
-/// mode) with no way to change it short of a different keyboard modifier.
-/// Shift is a fixed 100Hz alias regardless of `base_step_hz` -- a real
-/// ask: "un método rápido para um passo fino sem abrir o popup", holding
-/// Shift while scrolling should always mean the same thing. Ctrl+scroll
-/// (a real 10kHz alias) is handled entirely separately, at its own call
-/// site -- see that site's own doc comment.
-fn scroll_tune_step_hz(base_step_hz: i64, shift: bool) -> i64 {
-    if shift { 100 } else { base_step_hz }
+/// `base_step_hz`: the plain (no-modifier), non-CW scroll step -- user-
+/// chosen via the "Step" button next to CTUN (see ConnectedState::
+/// tune_step_hz's own doc comment), replacing what used to be a fixed
+/// 1kHz with no way to change it short of a different keyboard
+/// modifier. In CW mode `base_step_hz` is overridden by a fixed, finer
+/// progression instead (100Hz normally, 10Hz with Shift, 1Hz with Ctrl
+/// -- real request), since zero-beating a CW signal is commonly done
+/// within single-digit Hz, far tighter than SSB/AM/FM listening ever
+/// needs -- the user's chosen base step doesn't apply there. Outside
+/// CW, Shift is a fixed 100Hz alias regardless of `base_step_hz` -- a
+/// real ask: "un método rápido para um passo fino sem abrir o popup",
+/// holding Shift while scrolling should always mean the same thing;
+/// Ctrl has no meaning there and is ignored, same as before CW-aware
+/// stepping was added. Ctrl+scroll's own separate 10kHz-jump gesture
+/// (intercepted by egui as zoom, not a plain scroll -- see
+/// ctrl_scroll_tune_step_hz) is handled entirely separately, at its
+/// own call site.
+fn scroll_tune_step_hz(base_step_hz: i64, cw_mode: bool, shift: bool, ctrl: bool) -> i64 {
+    if cw_mode {
+        match (ctrl, shift) {
+            (true, _) => 1,
+            (false, true) => 10,
+            (false, false) => 100,
+        }
+    } else if shift {
+        100
+    } else {
+        base_step_hz
+    }
 }
 
 /// Presets offered by the "Step" popup next to CTUN -- same 1Hz..1MHz
@@ -12468,6 +13095,53 @@ fn tune_step_label(hz: i64) -> String {
     }
 }
 
+/// The REAL step a Ctrl+scroll gesture over the spectrum/waterfall uses
+/// right now -- ROOT CAUSE FIX for a real report ("Ctrl + scroll should
+/// be 1Hz not 10kHz" in CW mode): egui intercepts Ctrl+scroll BEFORE it
+/// ever reaches smooth_scroll_delta, reporting it instead as a "zoom"
+/// gesture via zoom_delta() -- a genuinely separate code path (see the
+/// spectrum click-and-drag handler's own "Ctrl+scroll: egui treats this
+/// as a zoom gesture" comment) with its own historical hardcoded 10kHz
+/// step that predates CW-aware stepping entirely. scroll_tune_step_hz's
+/// own `ctrl` parameter, passed at the PLAIN-scroll call sites, can
+/// therefore never actually see ctrl=true in practice -- delta is
+/// always 0.0 there whenever Ctrl is held, since egui already diverted
+/// it. This is the function that actually needs to know about Ctrl:
+/// used both where the zoom-gesture path itself decides its step, and
+/// by the hover tooltip (so its preview matches what scrolling would
+/// really do). CW drops all the way to 1Hz on this gesture too, since
+/// zero-beating needs that precision regardless of which gesture got
+/// you there; every other mode keeps this path's own original 10kHz
+/// jump unchanged (not tied to scroll_tune_step_hz's own non-CW
+/// values, which were never what this "big jump" gesture used).
+fn ctrl_scroll_tune_step_hz(cw_mode: bool) -> i64 {
+    if cw_mode {
+        1
+    } else {
+        10_000
+    }
+}
+
+/// Accurate hover-tooltip preview for the MAIN receiver's spectrum/
+/// waterfall -- accounts for ctrl_scroll_tune_step_hz's own doc
+/// comment: Ctrl+scroll is a genuinely separate gesture/code path from
+/// a plain scroll, with its own distinct step, so the preview needs to
+/// branch the same way the real handlers do rather than just calling
+/// scroll_tune_step_hz (which can never actually see ctrl=true from a
+/// real scroll, only from this tooltip's own direct modifier check).
+/// NOT used for extra receivers, which have no Ctrl+scroll zoom-gesture
+/// handler of their own at all yet -- their hover tooltip keeps its
+/// existing (less precise, but harmless) scroll_tune_step_hz-only
+/// preview rather than implying a gesture that doesn't actually do
+/// anything there.
+fn main_hover_scroll_step_hz(base_step_hz: i64, cw_mode: bool, shift: bool, ctrl: bool) -> i64 {
+    if ctrl {
+        ctrl_scroll_tune_step_hz(cw_mode)
+    } else {
+        scroll_tune_step_hz(base_step_hz, cw_mode, shift, false)
+    }
+}
+
 /// A click on the spectrum/waterfall to select a signal in CW mode
 /// should land that signal centered in the (narrow) CW filter -- at
 /// the pitch offset from the dial (Settings -> CW -> CW Pitch, see
@@ -12479,18 +13153,56 @@ fn tune_step_label(hz: i64) -> String {
 /// centered ±pitch off the dial, never on it). Only used at the four
 /// actual click handlers (not drag/scroll/zoom, which are relative
 /// adjustments rather than "select this exact signal").
+///
+/// Also where rounding is decided (real request): every OTHER mode's
+/// click-to-tune snaps to the nearest 1kHz (round_to_step_hz, matching
+/// freq_at_x's own former behavior, still applied here for them) --
+/// fine for voice modes, but CW operators need to land exactly on a
+/// signal's real frequency (often not anywhere near a 1kHz boundary),
+/// so CW's own two arms use `clicked_freq_hz` (now the EXACT frequency
+/// under the cursor -- see freq_at_x's own doc comment) directly,
+/// un-rounded, before applying the pitch offset.
 fn cw_center_click_freq(mode: spectrum::Mode, clicked_freq_hz: u32) -> u32 {
     let pitch = spectrum::cw_pitch_hz() as i64;
     match mode {
         spectrum::Mode::Cwl => (clicked_freq_hz as i64 + pitch).max(0) as u32,
         spectrum::Mode::Cwu => (clicked_freq_hz as i64 - pitch).max(0) as u32,
-        _ => clicked_freq_hz,
+        _ => round_to_step_hz(clicked_freq_hz, 1_000),
     }
+}
+
+/// Rounds to the nearest multiple of `step_hz` -- factored out of
+/// freq_at_x (real request: CW click-to-tune needed the EXACT
+/// frequency instead, see cw_center_click_freq's own doc comment) so
+/// hover-tooltip display call sites can still round for a clean
+/// readout without forcing every caller of freq_at_x to.
+///
+/// `step_hz` is a real parameter, not hardcoded to 1kHz (REVISED, real
+/// report): the hover tooltip rounding to a fixed 1kHz didn't match CW
+/// mode's own actual scroll-to-tune step (100Hz, 10Hz with Shift, 1Hz
+/// with Ctrl -- see scroll_tune_step_hz), so the preview shown while
+/// hovering disagreed with where a scroll would actually land.
+/// Hover-tooltip call sites now pass `scroll_tune_step_hz(cw_mode,
+/// <live Shift state>, <live Ctrl state>)`, the exact same step the
+/// scroll handler itself would use at that instant; cw_center_click_freq's
+/// own non-CW arm above still hardcodes 1000, since click-to-tune
+/// (unlike hover/scroll) never varies by modifier keys.
+fn round_to_step_hz(freq_hz: u32, step_hz: i64) -> u32 {
+    let step = step_hz.max(1) as f64;
+    ((freq_hz as f64 / step).round() * step).max(0.0) as u32
 }
 
 /// `zoom`/`pan_offset_hz` describe the currently visible window the same
 /// way the spectrum-drawing code's own visible_half_span_hz/
 /// pan_offset_hz do -- pass 1.0/0.0 for the old (full-span) behavior.
+///
+/// Returns the EXACT frequency under the cursor -- REVISED (real
+/// request) from an earlier version that rounded to the nearest 1kHz
+/// internally, which defeated precise CW click-to-tune (a CW signal is
+/// essentially never sitting exactly on a 1kHz boundary). Callers that
+/// want a rounded value instead (the hover tooltip; cw_center_click_freq,
+/// the actual click-to-tune path, for every non-CW mode) apply
+/// round_to_step_hz themselves.
 fn freq_at_x(
     x: f32,
     rect: egui::Rect,
@@ -12504,8 +13216,7 @@ fn freq_at_x(
     let visible_half_span_hz = half_span_hz / zoom as f64;
     let freq =
         center_freq_hz as f64 + pan_offset_hz - visible_half_span_hz + frac * (2.0 * visible_half_span_hz);
-    let rounded = (freq / 1000.0).round() * 1000.0;
-    rounded.max(0.0) as u32
+    freq.max(0.0) as u32
 }
 
 /// Decides what a tuning request (from a spectrum/waterfall click,
@@ -12557,10 +13268,12 @@ fn resolve_tune(
 /// applying saved settings (used both by the "Add Receiver" button --
 /// saved=None, defaults -- and by auto-restoring from config on
 /// connect -- saved=Some(...)).
+#[allow(clippy::too_many_arguments)]
 fn spawn_extra_receiver(
     session: &RadioSession,
     num_adcs: u8,
     protocol: u8,
+    board: Boards,
     frequency_min: u64,
     frequency_max: u64,
     settings_dirty: Arc<std::sync::atomic::AtomicBool>,
@@ -12575,6 +13288,20 @@ fn spawn_extra_receiver(
         freq_arc.store(s.frequency_hz, Ordering::Relaxed);
         rate_arc.store(s.sample_rate_hz, Ordering::Relaxed);
         adc_arc.store(s.adc as u32, Ordering::Relaxed);
+    } else if protocol == 1 {
+        // ROOT CAUSE FIX for a real report (RX-888's own "Add Receiver"
+        // showing a rate that didn't match the main receiver): a fresh
+        // (non-restored) extra receiver's own extra_sample_rates_hz[idx-1]
+        // slot was pre-allocated at CONNECT time (see start_rx888_usb/
+        // start_protocol1's own identical sizing) and never touched
+        // again until this receiver was actually added -- if the user
+        // changed the main Sample Rate in between, this slot went stale,
+        // showing/using the OLD rate instead of what's actually running.
+        // Every shared-clock board (protocol == 1 -- real P1 hardware
+        // AND RX-888, whose own DDCs all share one decimation too, see
+        // ExtraReceiver::board's own doc comment) must start a fresh
+        // receiver already synced to the CURRENT session rate instead.
+        rate_arc.store(session.sample_rate.load(Ordering::Relaxed), Ordering::Relaxed);
     }
     let rate_val = rate_arc.load(Ordering::Relaxed);
 
@@ -12598,6 +13325,7 @@ fn spawn_extra_receiver(
         spectrum.set_agc_hang_ms(s.agc_hang_ms);
         spectrum.set_agc_top_db(s.agc_top_db);
         spectrum.set_agc_slope_db(s.agc_slope_db);
+        spectrum.set_meter_calibration_db(s.meter_calibration_db);
         spectrum.set_noise_blanker(s.noise_blanker);
         spectrum.set_nb_threshold(s.nb_threshold);
         spectrum.set_noise_reduction(s.noise_reduction);
@@ -12639,6 +13367,7 @@ fn spawn_extra_receiver(
         adc: adc_arc,
         num_adcs,
         protocol,
+        board,
         frequency_min,
         frequency_max,
         mox: Arc::clone(&session.mox),
@@ -12694,6 +13423,16 @@ fn change_sample_rate(connected: &mut ConnectedState, new_rate: u32) {
     let agc = connected.spectrum.agc();
     let agc_params = connected.spectrum.agc_params();
 
+    // RX-888: stop the old producer BEFORE the new WDSP channel below is
+    // built, so nothing pushes old-rate samples into iq_buffers[0] while
+    // the new channel expects the new rate -- see
+    // RadioSession::stop_rx888_threads's own doc comment for why this is
+    // split into a stop call here and a restart call at the end of this
+    // function rather than one atomic call. No-op for every other board.
+    if connected.device.board == Boards::Rx888 {
+        connected.session.stop_rx888_threads();
+    }
+
     connected.session.set_sample_rate(new_rate);
 
     // Explicitly tear down everything that depends on the old WDSP
@@ -12730,6 +13469,7 @@ fn change_sample_rate(connected: &mut ConnectedState, new_rate: u32) {
     spectrum.set_agc_hang_ms(agc_params.agc_hang_ms);
     spectrum.set_agc_top_db(agc_params.agc_top_db);
     spectrum.set_agc_slope_db(agc_params.agc_slope_db);
+    spectrum.set_meter_calibration_db(agc_params.meter_calibration_db);
     spectrum.set_noise_blanker(agc_params.noise_blanker);
     spectrum.set_nb_threshold(agc_params.nb_threshold);
     spectrum.set_noise_reduction(agc_params.noise_reduction);
@@ -12794,6 +13534,29 @@ fn change_sample_rate(connected: &mut ConnectedState, new_rate: u32) {
     // nothing about TX actually needs touching when only the RX rate
     // changes for P1.
 
+    // RX-888: restart the producer AFTER the new WDSP channel above
+    // already exists and is listening on iq_buffers[0] -- see this
+    // function's own opening stop_rx888_threads call for the other half
+    // of this ordering. Resolved rate may differ from `new_rate` if it
+    // somehow wasn't one of ddc_params_for_output_rate's supported
+    // presets (shouldn't happen -- the Sample Rate buttons only ever
+    // offer supported presets for this board -- but corrected here
+    // defensively regardless, same as start_rx888_usb's own fallback).
+    if connected.device.board == Boards::Rx888 {
+        let firmware_path =
+            connected.rx888_firmware_path.clone().map(std::path::PathBuf::from).or_else(rx888::default_firmware_path);
+        match firmware_path {
+            Some(path) => match connected.session.restart_rx888_at_rate(&path, new_rate) {
+                Ok(actual_rate) => {
+                    connected.sample_rate = actual_rate;
+                    connected.session.sample_rate.store(actual_rate, Ordering::Relaxed);
+                }
+                Err(e) => eprintln!("RX-888: failed to restart streaming at {new_rate}Hz: {e}"),
+            },
+            None => eprintln!("RX-888: no firmware path available, cannot restart streaming"),
+        }
+    }
+
     // P1 has one shared clock for every receiver, unlike P2 where each
     // DDC can run its own independent rate -- keep every currently-open
     // extra receiver in sync with the new rate rather than letting it
@@ -12847,6 +13610,7 @@ fn change_extra_receiver_sample_rate(rx: &mut ExtraReceiver, new_rate: u32) {
     spectrum.set_agc_hang_ms(agc_params.agc_hang_ms);
     spectrum.set_agc_top_db(agc_params.agc_top_db);
     spectrum.set_agc_slope_db(agc_params.agc_slope_db);
+    spectrum.set_meter_calibration_db(agc_params.meter_calibration_db);
     spectrum.set_noise_blanker(agc_params.noise_blanker);
     spectrum.set_nb_threshold(agc_params.nb_threshold);
     spectrum.set_noise_reduction(agc_params.noise_reduction);
