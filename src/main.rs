@@ -9615,6 +9615,18 @@ impl eframe::App for HpsdrApp {
                     connected.spectrum.recorder.stop();
                     connected.session.stop();
                     connected.spectrum.stop();
+                    // Deliberately NOT stopping connected.juice_console here:
+                    // Stop ends this SDR session and returns to Discover, but
+                    // radioberry-juice is a separate, longer-lived background
+                    // service -- leaving it running means reconnecting to the
+                    // same Radioberry doesn't need another Launch (and
+                    // another ~3s FPGA reload). It's never left untracked
+                    // either: DiscoveryWindow::new() below re-detects a still
+                    // -running juice by name and re-adopts it (see its own
+                    // adoption check), so Status/Stop/Restart still work from
+                    // there. Stopping the process itself is Radioberry
+                    // Juice's own Stop button's job, in the Discover panel or
+                    // the Juice Console window.
                     let ctx = ui.ctx().clone();
                     self.state = AppState::Discovering(DiscoveryWindow::new(&ctx));
                 } else if let Some(device) = restart_after_firmware_update {
