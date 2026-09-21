@@ -177,9 +177,19 @@ impl FirmwareUpdateWindow {
         let light_visuals = egui::Visuals::light();
         let light_style = egui::Style { visuals: light_visuals.clone(), ..Default::default() };
         let mut still_open = self.open;
+        let mut firmware_viewport =
+            egui::ViewportBuilder::default().with_title("Firmware Update").with_inner_size([560.0, 520.0]);
+        if crate::lcd_kiosk_mode() {
+            // Fixed 1024x600 kiosk mode -- see lcd_kiosk_mode's/
+            // kiosk_centered_pos's doc comments in main.rs.
+            firmware_viewport = firmware_viewport
+                .with_position(crate::kiosk_centered_pos([560.0, 520.0]))
+                .with_max_inner_size([560.0, 520.0])
+                .with_resizable(false);
+        }
         ui.ctx().show_viewport_immediate(
             egui::ViewportId::from_hash_of("firmware_update_window"),
-            egui::ViewportBuilder::default().with_title("Firmware Update").with_inner_size([560.0, 520.0]),
+            firmware_viewport,
             |ui, _class| {
                 if ui.input(|i| i.viewport().close_requested()) {
                     still_open = false;

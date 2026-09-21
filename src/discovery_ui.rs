@@ -323,18 +323,29 @@ impl DiscoveryWindow {
         // concern (focus vs. stacking order) that happens to have
         // shared this same window_level gate before.
         let window_level = egui::WindowLevel::AlwaysOnTop;
+        let mut discovery_viewport = egui::ViewportBuilder::default()
+            .with_title("Discover HPSDR Radios")
+            // Widened from 700 -- the Interface column now shows the
+            // interface name alongside its address (e.g. "eth0
+            // (192.168.1.50)"), which combined with the MAC column's
+            // own width was pushing the trailing Status column past
+            // the fixed window edge and clipping it.
+            .with_inner_size([900.0, 500.0])
+            .with_active(true)
+            .with_window_level(window_level);
+        if crate::lcd_kiosk_mode() {
+            // Fixed 1024x600 kiosk mode -- see lcd_kiosk_mode's/
+            // kiosk_centered_pos's doc comments in main.rs. Already
+            // smaller than the main window on both axes, just needs to
+            // stay centered within it and not get dragged/resized past it.
+            discovery_viewport = discovery_viewport
+                .with_position(crate::kiosk_centered_pos([900.0, 500.0]))
+                .with_max_inner_size([900.0, 500.0])
+                .with_resizable(false);
+        }
         ui.ctx().show_viewport_immediate(
             egui::ViewportId::from_hash_of("discovery_window"),
-            egui::ViewportBuilder::default()
-                .with_title("Discover HPSDR Radios")
-                // Widened from 700 -- the Interface column now shows the
-                // interface name alongside its address (e.g. "eth0
-                // (192.168.1.50)"), which combined with the MAC column's
-                // own width was pushing the trailing Status column past
-                // the fixed window edge and clipping it.
-                .with_inner_size([900.0, 500.0])
-                .with_active(true)
-                .with_window_level(window_level),
+            discovery_viewport,
             |ui, _class| {
                 if let Some(deadline) = self.focus_deadline {
                     let focused = ui.input(|i| i.viewport().focused).unwrap_or(false);

@@ -2852,13 +2852,21 @@ impl eframe::App for HpsdrApp {
                     // ViewportBuilder field, a ViewportCommand actually
                     // re-applies every time it's sent, which would fight
                     // the user moving/resizing the window themselves.
-                    if let Some(g) = cfg.window_geometry {
-                        ui.ctx().send_viewport_cmd(egui::ViewportCommand::OuterPosition(
-                            egui::pos2(g.x, g.y),
-                        ));
-                        ui.ctx().send_viewport_cmd(egui::ViewportCommand::InnerSize(egui::vec2(
-                            g.width, g.height,
-                        )));
+                    // Skip restoring per-radio saved geometry in fixed
+                    // 1024x600 kiosk mode (see main()'s HPSDR_LCD_1024X600
+                    // handling) -- applying a saved position/size here
+                    // would immediately move/resize the window away from
+                    // the fullscreen kiosk layout the moment a radio is
+                    // selected.
+                    if !lcd_kiosk_mode() {
+                        if let Some(g) = cfg.window_geometry {
+                            ui.ctx().send_viewport_cmd(egui::ViewportCommand::OuterPosition(
+                                egui::pos2(g.x, g.y),
+                            ));
+                            ui.ctx().send_viewport_cmd(egui::ViewportCommand::InnerSize(
+                                egui::vec2(g.width, g.height),
+                            ));
+                        }
                     }
                     match connect_to_device(device, &cfg) {
                         Ok(mut connected) => {
@@ -4003,13 +4011,19 @@ impl eframe::App for HpsdrApp {
                     // own secondary_clicked() handling above.
                     if connected.frequency_entry.is_some() {
                         let mut close_now = false;
+                        let mut freq_entry_viewport = egui::ViewportBuilder::default()
+                            .with_title("Enter Frequency")
+                            .with_inner_size([260.0, 360.0])
+                            .with_resizable(false)
+                            .with_active(true);
+                        if lcd_kiosk_mode() {
+                            // See kiosk_centered_pos's doc comment.
+                            freq_entry_viewport =
+                                freq_entry_viewport.with_position(kiosk_centered_pos([260.0, 360.0]));
+                        }
                         ui.ctx().show_viewport_immediate(
                             egui::ViewportId::from_hash_of("frequency_entry_window"),
-                            egui::ViewportBuilder::default()
-                                .with_title("Enter Frequency")
-                                .with_inner_size([260.0, 360.0])
-                                .with_resizable(false)
-                                .with_active(true),
+                            freq_entry_viewport,
                             |ui, _class| {
                                 if ui.input(|i| i.viewport().close_requested()) {
                                     close_now = true;
@@ -6374,11 +6388,27 @@ impl eframe::App for HpsdrApp {
                     // live-tracked window_geometry) to avoid fighting the
                     // user dragging/resizing the window themselves.
                     let seed_geometry = rx_for_closure.lock().unwrap().initial_window_geometry;
+                    let kiosk = lcd_kiosk_mode();
                     let mut viewport_builder =
                         egui::ViewportBuilder::default().with_title(title).with_inner_size([1024.0, 500.0]);
-                    if let Some(g) = seed_geometry {
-                        viewport_builder =
-                            viewport_builder.with_position([g.x, g.y]).with_inner_size([g.width, g.height]);
+                    if kiosk {
+                        // Never allowed to exceed (or be dragged past) the
+                        // main window's own fixed 1024x600 kiosk size, and
+                        // always opens centered within it -- see
+                        // lcd_kiosk_mode's/kiosk_centered_pos's doc comments.
+                        viewport_builder = viewport_builder
+                            .with_position(kiosk_centered_pos([1024.0, 500.0]))
+                            .with_max_inner_size([1024.0, 500.0])
+                            .with_resizable(false);
+                    } else if let Some(g) = seed_geometry {
+                        // Skipped in kiosk mode -- this could be larger
+                        // than the main window (e.g. left over from a
+                        // previous normal-desktop run), which would
+                        // defeat the "nothing exceeds the main window's
+                        // own fixed size" rule above.
+                        viewport_builder = viewport_builder
+                            .with_position([g.x, g.y])
+                            .with_inner_size([g.width, g.height]);
                     }
                     ui.ctx().show_viewport_deferred(
                         viewport_id,
@@ -6446,11 +6476,21 @@ impl eframe::App for HpsdrApp {
                                 ));
                                 let rx_for_settings = Arc::clone(&rx_for_closure);
                                 let settings_title = format!("Receiver {} Settings", ddc_index + 1);
+                                let mut rx_settings_viewport = egui::ViewportBuilder::default()
+                                    .with_title(settings_title)
+                                    .with_inner_size([420.0, 500.0]);
+                                if lcd_kiosk_mode() {
+                                    // See kiosk_centered_pos's doc comment --
+                                    // keeps this inside the main window's
+                                    // own fixed 1024x600 kiosk area.
+                                    rx_settings_viewport = rx_settings_viewport
+                                        .with_position(kiosk_centered_pos([420.0, 500.0]))
+                                        .with_max_inner_size([420.0, 500.0])
+                                        .with_resizable(false);
+                                }
                                 ui.ctx().show_viewport_deferred(
                                     settings_viewport_id,
-                                    egui::ViewportBuilder::default()
-                                        .with_title(settings_title)
-                                        .with_inner_size([420.0, 500.0]),
+                                    rx_settings_viewport,
                                     move |ui: &mut egui::Ui, _class: egui::ViewportClass| {
                                         if ui.input(|i| i.viewport().close_requested()) {
                                             rx_for_settings.lock().unwrap().show_settings_window = false;
@@ -6491,10 +6531,28 @@ impl eframe::App for HpsdrApp {
                     // this closure borrows `connected` directly by
                     // reference rather than through an Arc<Mutex<>>).
                     let mut close_requested = false;
+                    // Capped to fit inside the main window's own fixed
+                    // 1024x600 kiosk size -- see lcd_kiosk_mode's doc
+                    // comment -- rather than the normal-desktop 1100x700
+                    // below. The tab row already wraps to a second line
+                    // under its own real width (see that comment), so
+                    // this narrower kiosk size degrades the same way
+                    // instead of clipping.
+                    let kiosk = lcd_kiosk_mode();
+                    let settings_size = if kiosk { [1000.0, 580.0] } else { [1100.0, 700.0] };
+                    let mut settings_viewport = egui::ViewportBuilder::default().with_title("Settings");
+                    if kiosk {
+                        // See kiosk_centered_pos's doc comment -- keeps
+                        // this inside the main window's own fixed
+                        // 1024x600 kiosk area, and not resizable past it.
+                        settings_viewport = settings_viewport
+                            .with_position(kiosk_centered_pos(settings_size))
+                            .with_max_inner_size(settings_size)
+                            .with_resizable(false);
+                    }
                     ui.ctx().show_viewport_immediate(
                         egui::ViewportId::from_hash_of("settings_window"),
-                        egui::ViewportBuilder::default()
-                            .with_title("Settings")
+                        settings_viewport
                             // ROOT CAUSE FIX for a real report: 860 was
                             // wide enough for the tab row back when it
                             // had fewer tabs, but adding MIDI brought
@@ -6509,7 +6567,7 @@ impl eframe::App for HpsdrApp {
                             // user manually shrinking the window (or a
                             // future tab addition) degrades to a second
                             // line instead of reproducing this exact cutoff.
-                            .with_inner_size([1100.0, 700.0])
+                            .with_inner_size(settings_size)
                             // Same "keep the window from getting buried
                             // behind other windows" reasoning as the
                             // discovery window -- see its own doc
@@ -9860,12 +9918,20 @@ impl eframe::App for HpsdrApp {
                         let light_visuals = egui::Visuals::light();
                         let light_style = egui::Style { visuals: light_visuals.clone(), ..Default::default() };
                         let mut close_requested = false;
+                        let mut juice_viewport = egui::ViewportBuilder::default()
+                            .with_title("Radioberry Juice Console")
+                            .with_inner_size([700.0, 420.0])
+                            .with_window_level(egui::WindowLevel::AlwaysOnTop);
+                        if lcd_kiosk_mode() {
+                            // See kiosk_centered_pos's doc comment.
+                            juice_viewport = juice_viewport
+                                .with_position(kiosk_centered_pos([700.0, 420.0]))
+                                .with_max_inner_size([700.0, 420.0])
+                                .with_resizable(false);
+                        }
                         ui.ctx().show_viewport_immediate(
                             egui::ViewportId::from_hash_of("juice_console_window"),
-                            egui::ViewportBuilder::default()
-                                .with_title("Radioberry Juice Console")
-                                .with_inner_size([700.0, 420.0])
-                                .with_window_level(egui::WindowLevel::AlwaysOnTop),
+                            juice_viewport,
                             |ui, _class| {
                                 if ui.input(|i| i.viewport().close_requested()) {
                                     close_requested = true;
@@ -13843,6 +13909,31 @@ fn redirect_stdio_to_log_file() {
     }
 }
 
+/// Fixed 1024x600 fullscreen kiosk mode for a small LCD panel (e.g. a
+/// Raspberry Pi shack touchscreen) -- see main()'s NativeOptions setup
+/// for the main window itself. Checked from several places (the main
+/// window's own setup, skipping saved per-radio window-geometry restores
+/// that would otherwise un-fullscreen/oversize it again, and capping
+/// secondary windows so none of them can exceed the main window's own
+/// fixed size) rather than computed once and threaded through, since
+/// it's a cheap env var read and most call sites don't otherwise share
+/// a convenient common owner to stash a bool on.
+pub(crate) fn lcd_kiosk_mode() -> bool {
+    std::env::var("HPSDR_LCD_1024X600").map(|v| v != "0").unwrap_or(false)
+}
+
+/// Screen-absolute position that centers a `size`d secondary window
+/// inside the main window's fixed 1024x600 kiosk area (which starts at
+/// the screen origin -- it's fullscreen on a panel that IS 1024x600, see
+/// lcd_kiosk_mode's doc comment) rather than wherever the OS/window
+/// manager would otherwise place it, which on a screen this small could
+/// easily land partly off-screen. Every secondary-window call site in
+/// kiosk mode uses this so none of them can open outside the main
+/// window's own visible area.
+pub(crate) fn kiosk_centered_pos(size: [f32; 2]) -> [f32; 2] {
+    [((1024.0 - size[0]) / 2.0).max(0.0), ((600.0 - size[1]) / 2.0).max(0.0)]
+}
+
 fn main() -> eframe::Result<()> {
     // See the crate-level `windows_subsystem` attribute above for why
     // this matters: with no console auto-allocated on Windows release
@@ -13923,11 +14014,35 @@ fn main() -> eframe::Result<()> {
     // now keyed per-radio (see Config::window_geometry's doc comment),
     // so there's nothing to seed until a specific radio is chosen; see
     // the DiscoveryAction::Start handler in ui() for where that happens.
-    let options = eframe::NativeOptions {
-        viewport: egui::ViewportBuilder::default()
+    // Kiosk mode for a fixed 1024x600 LCD panel (e.g. a Raspberry Pi
+    // touchscreen shack display) -- HPSDR_LCD_1024X600=1 locks the
+    // window to exactly that size, disables resizing, drops window
+    // decorations (title bar), and starts fullscreen so the app fills
+    // the panel immediately on launch with no manual resize/positioning
+    // step. Off by default: this is a fixed-size kiosk layout, not a
+    // general "small screen" mode, so it would be actively wrong on a
+    // normal desktop monitor. See also the DiscoveryAction::Start
+    // handler below, which skips restoring per-radio saved window
+    // geometry while this is active (that geometry restore would
+    // otherwise immediately un-fullscreen/resize the window back to
+    // whatever was saved from a previous, non-kiosk run).
+    let viewport = if lcd_kiosk_mode() {
+        egui::ViewportBuilder::default()
+            .with_inner_size([1024.0, 600.0])
+            .with_min_inner_size([1024.0, 600.0])
+            .with_max_inner_size([1024.0, 600.0])
+            .with_resizable(false)
+            .with_decorations(false)
+            .with_fullscreen(true)
+            .with_icon(icon)
+    } else {
+        egui::ViewportBuilder::default()
             .with_inner_size([1200.0, 660.0])
             .with_min_inner_size([900.0, 520.0])
-            .with_icon(icon),
+            .with_icon(icon)
+    };
+    let options = eframe::NativeOptions {
+        viewport,
         wgpu_options: eframe::egui_wgpu::WgpuConfiguration {
             // NOTE: this used to override `surface` to force
             // PresentMode::Fifo (true vsync), added 2026-09-11 on
