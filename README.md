@@ -75,8 +75,11 @@ hardware yet, since CI has no radio to connect to.
 
 **Windows via MSYS2/MinGW-w64:**
 - [MSYS2](https://www.msys2.org/), then from an **MSYS2 MinGW64** shell: `pacman -S mingw-w64-x86_64-toolchain mingw-w64-x86_64-fftw mingw-w64-x86_64-pkg-config`
-- Rust's `x86_64-pc-windows-gnu` target (`rustup target add x86_64-pc-windows-gnu`)
-- Build with `gcc`/`pkg-config` reachable on `PATH` (either build from that same MSYS2 MinGW64 shell, or add `<msys2 install dir>\mingw64\bin` to your own shell's `PATH`) and `--target x86_64-pc-windows-gnu`
+- Rust's `x86_64-pc-windows-gnu` target (`rustup target add x86_64-pc-windows-gnu`) -- and, since build scripts/proc-macros always compile for the *host* triple regardless of `--target`, either switch the default toolchain to it too (`rustup toolchain install stable-x86_64-pc-windows-gnu` then `rustup default stable-x86_64-pc-windows-gnu`, letting a plain `cargo build --release` work with no `--target` flag) or keep a `link.exe`-capable MSVC install around just for those host artifacts -- confirmed by a real build failing with `error: linking with `link.exe` failed` (MSVC's linker missing) the moment `--target x86_64-pc-windows-gnu` was passed while the *default* toolchain was still `-msvc`
+- Build with `gcc`/`pkg-config` reachable on `PATH` (either build from that same MSYS2 MinGW64 shell, or add `<msys2 install dir>\mingw64\bin` to your own shell's `PATH`)
+- The [Firmware update](#firmware-update) feature's Npcap SDK requirement (`NPCAP_SDK_DIR`, `Packet.lib`) applies here too, same as the MSVC bullets below -- `build.rs`'s Npcap discovery isn't MSVC-specific. Confirmed by a real MinGW build failing to link with `cannot find -lPacket` until `NPCAP_SDK_DIR` was set; a MinGW `ld.exe` can link directly against the SDK's MSVC-format `Packet.lib` with no conversion needed.
+- Unlike the MSVC+vcpkg build below, this links fftw3 *dynamically* against MSYS2's `libfftw3-3.dll` rather than statically -- fine for `cargo run`/development (as long as `<msys2 install dir>\mingw64\bin` is on `PATH` at runtime too, not just build time), but anyone distributing just the `.exe` on its own (or [packaging it](#packaging-windows)) needs to bundle that `.dll` alongside it, or it fails to even launch with "libfftw3-3.dll was not found"
+- Confirmed building AND installing/running successfully this way, including against real Radioberry hardware (2026-09-21)
 
 **Windows via MSVC:**
 - Visual Studio Build Tools (C++ workload) — needed for any `x86_64-pc-windows-msvc`-target Rust build regardless of this project
