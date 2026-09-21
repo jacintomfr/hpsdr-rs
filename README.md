@@ -31,6 +31,7 @@ This project started as an experiment: could Claude port the discovery code from
 - Selectable RX output / TX input audio devices (independent of the OS default), for routing through virtual audio cables
 - Per-radio settings persistence (keyed by the radio's MAC address, so multiple physical radios each keep their own saved configuration)
 - FPGA firmware upload and static IP configuration — see [Firmware update](#firmware-update) below
+- MIDI control-surface support, several devices at once — see [MIDI control surface](#midi-control-surface) below
 
 ## Supported hardware
 
@@ -108,6 +109,18 @@ On Windows, a release build no longer pops up a console window alongside the app
 The main window's toolbar has a **Record** button that saves the RX audio you're currently hearing to a WAV file under a `recordings` folder alongside the settings above — useful for capturing a signal to play back later, or to demonstrate a feature (see the [Noise Reduction demo](#noise-reduction-demo) below for an example).
 
 See the **[User Manual](docs/manual/README.md)** for a full walkthrough of the UI -- every settings tab, tuning gestures, extra receivers, and the PureSignal/Diversity/Equalizer features.
+
+## MIDI control surface
+
+Any class-compliant MIDI controller's notes/CCs/pitch-bend can be bound to a radio action from **Settings -> MIDI**:
+
+- **Several devices at once** -- check as many detected ports as you like (e.g. a button box AND a separate jog-wheel controller); every enabled device feeds the same set of bindings, so it doesn't matter which physical controller a given message came from.
+- **Learn mode**: click **Learn**, move a control on your MIDI device, then pick which radio action to bind it to from a searchable list -- mirrors piHPSDR's own MIDI learn workflow. Covers VFO/RIT/XIT tuning, mode/band/filter-width stepping, MOX/Tune/Split, noise blanker/reduction, AF/AGC/mic/RF gain, PureSignal's live Running toggle, Diversity gain/phase, and sending one of Settings -> CW's 5 saved CW messages.
+- **Buttons** (Note On/Off) can be bound "momentary" (act on both press AND release -- e.g. press-to-transmit/release-to-receive for MOX) instead of the default toggle-per-press.
+- **Relative encoders/jog wheels** (Control Change, "Wheel" bindings) have a **Sensitivity** multiplier and a **Rate limit** (debounce) to tame a chatty, no-detent encoder, plus a choice of **Acceleration** style per binding:
+  - **Fixed** (the default) -- every message moves by the same amount regardless of how hard/fast you spun the control; only how many messages arrive per second changes the effective speed. Deliberately magnitude-independent, so landing on an exact frequency stays predictable even on a controller whose relative-CC magnitude is itself erratic.
+  - **Value-based** -- piHPSDR/deskHPSDR's own convention instead: a bigger/faster physical turn (which most encoders report as a larger CC value swing) moves further per message too, not just more messages per second.
+- **Importing from Thetis**: Settings -> MIDI can import a Midi2Cat XML export (Thetis's Settings -> CAT/Midi -> Save As) directly into hpsdr-rs's own bindings, translating each recognized CAT command to its closest hpsdr-rs equivalent and reporting anything it couldn't translate.
 
 ## Firmware update
 
