@@ -109,6 +109,23 @@ The main window's toolbar has a **Record** button that saves the RX audio you're
 
 See the **[User Manual](docs/manual/README.md)** for a full walkthrough of the UI -- every settings tab, tuning gestures, extra receivers, and the PureSignal/Diversity/Equalizer features.
 
+### Fixed-resolution LCD kiosk mode
+
+For running on a small, fixed-resolution panel (e.g. a Windows mini-PC driving a 1024x600 shack LCD) rather than a normal resizable desktop monitor, set `HPSDR_LCD_1024X600=1` before launching:
+
+```powershell
+$env:HPSDR_LCD_1024X600 = "1"
+.\target\release\hpsdr-rs.exe
+```
+
+This locks the main window to exactly 1024x600, starts it fullscreen with no window decorations (no title bar), and disables resizing. Every secondary window (Settings, an extra receiver + its own Settings, the frequency-entry popup, the Radioberry Juice console, Discover, Firmware Update) is capped to stay inside that same 1024x600 area and opens centered within it, instead of their normal (larger) desktop sizes.
+
+Since there's no native title bar to close a secondary window from, each one instead gets an on-screen **Min**/**Close** button pair (bottom-right corner) and responds to **Escape**. The Discover window also gains an **Exit** button (next to Start/Cancel/Firmware Update) to quit the whole app -- deliberately placed there rather than on the main Connected window, since that's also where the Radioberry Juice setup section's own **Stop** button lives, so shutting everything down surfaces both controls together instead of a one-click Exit on the main window silently leaving juice running in the background.
+
+Off by default -- this is a fixed-size kiosk layout for a specific small panel, not a general "small screen" mode, so it would be actively wrong on a normal resizable desktop monitor.
+
+**Known limitation**: a native OS file-picker dialog (e.g. "Choose..." for the Radioberry Juice executable path, or a firmware `.rbf` file) is a real Windows window, not part of this app's own UI -- its size/position is controlled by Windows itself, not by this app, so it can open larger than the 1024x600 panel or need scrolling to reach its own buttons. Windows remembers a common dialog's last-used size per user, so resizing it down once on the actual kiosk PC should make it stay that size on future opens.
+
 ## Firmware update
 
 Two independent, unrelated ways to update a radio's FPGA firmware (`.rbf` file) or change its static IP, matching how the openHPSDR reference tools (Apache Labs' `HPSDRBootloader`/`HPSDRProgrammer`) split this into two separate utilities:
