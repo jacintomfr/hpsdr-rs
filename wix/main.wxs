@@ -122,6 +122,26 @@
                                 KeyPath='yes'/>
                         </Component>
                         <!--
+                          MinGW/GNU builds (see README's "Windows via
+                          MSYS2/MinGW-w64" section) link fftw3
+                          dynamically, unlike the MSVC+vcpkg build this
+                          template was originally authored for (which
+                          links fftw3 statically via the
+                          x64-windows-static-md vcpkg triplet), so the
+                          .exe needs libfftw3-3.dll alongside it or it
+                          fails to launch with "libfftw3-3.dll was not
+                          found". Harmless to include on an MSVC build
+                          too (the extra DLL is just unused there).
+                        -->
+                        <Component Id='fftw3dll' Guid='7C1E2B4A-9D3F-4E6C-BF2A-1A6D5E8C3B7F'>
+                            <File
+                                Id='fftw3dll'
+                                Name='libfftw3-3.dll'
+                                DiskId='1'
+                                Source='C:\msys64\mingw64\bin\libfftw3-3.dll'
+                                KeyPath='yes'/>
+                        </Component>
+                        <!--
                           Ozy USB (legacy Ozy/Mercury/Penny hardware) FX2/FPGA
                           firmware, mirroring the .deb package's bundled copy.
                           See src/ozy.rs's `bundled_path()`, which checks
@@ -188,6 +208,7 @@
             <ComponentRef Id='License'/>
 
             <ComponentRef Id='binary0'/>
+            <ComponentRef Id='fftw3dll'/>
             <ComponentRef Id='OzyFirmware'/>
             <ComponentRef Id='ApplicationShortcut'/>
 

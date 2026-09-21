@@ -237,17 +237,26 @@ A recent `wsl --install -d Ubuntu` (the Microsoft Store-backed WSL, not the lega
 
 ## Packaging (Windows)
 
-An `.msi` installer can be built with [`cargo-wix`](https://crates.io/crates/cargo-wix), from a normal PowerShell prompt on a Windows machine already set up for the [MSVC build](#windows-via-msvc) above — this only packages an existing working build, it doesn't set one up:
+An `.msi` installer can be built with [`cargo-wix`](https://crates.io/crates/cargo-wix), from a normal PowerShell prompt on a Windows machine already set up for a working build (either the [MSVC](#windows-via-msvc) or the [MSYS2/MinGW-w64](#windows-via-msys2mingw-w64) toolchain above) — this only packages an existing working build, it doesn't set one up:
 
 ```powershell
 cargo install cargo-wix   # one-time
-# Also one-time: install the WiX Toolset v3 (https://wixtoolset.org/)
-# so candle.exe/light.exe are reachable (its installer normally adds
-# the WIX env var pointing at them automatically)
+# Also one-time: install the WiX Toolset v3 (https://wixtoolset.org/,
+# or `winget install WiXToolset.WiXToolset`) so candle.exe/light.exe
+# are reachable. Its installer depends on the ".NET Framework 3.5"
+# Windows feature (NetFx3) -- winget/the WiX installer will offer to
+# enable it, but doing so needs an ELEVATED (Run as Administrator)
+# prompt; if `winget install` fails with "This command requires
+# administrator privileges", rerun it from an admin PowerShell. Once
+# installed, if `cargo wix` can't find candle.exe/light.exe on its
+# own, set the WIX env var to the install dir, e.g.:
+#   $env:WIX = "C:\Program Files (x86)\WiX Toolset v3.14"
 .\scripts\build-windows-release.ps1
 ```
 
-This produces `target\wix\hpsdr-rs-<version>-x86_64.msi`, which installs `hpsdr-rs.exe` (icon embedded, via `winresource` in `build.rs`) under `Program Files\hpsdr-rs\bin`, adds that folder to `PATH`, and bundles the `LICENSE` file. The installer/uninstaller icon and WiX packaging config live in `wix/main.wxs` (generated once via `cargo wix init`, then hand-edited — see its own comments for how to further customize the install UI). Unlike the `.deb` case above, there's no local revision counter needed: WiX's `<MajorUpgrade>` element already reinstalls cleanly over an older version, so between releases just bump Cargo.toml's `version` like any other platform. **Not yet confirmed on real Windows hardware** — the MSI itself was authored and generated from Linux (WiX's `candle.exe`/`light.exe` are Windows-only, so the actual `.msi` build has to happen on a real Windows box); report back if `cargo wix` or the resulting installer misbehaves.
+This produces `target\wix\hpsdr-rs-<version>-x86_64.msi`, which installs `hpsdr-rs.exe` (icon embedded, via `winresource` in `build.rs`) under `Program Files\hpsdr-rs\bin`, adds that folder to `PATH`, and bundles the `LICENSE` file. The installer/uninstaller icon and WiX packaging config live in `wix/main.wxs` (generated once via `cargo wix init`, then hand-edited — see its own comments for how to further customize the install UI). Unlike the `.deb` case above, there's no local revision counter needed: WiX's `<MajorUpgrade>` element already reinstalls cleanly over an older version, so between releases just bump Cargo.toml's `version` like any other platform.
+
+**Confirmed building AND installing/running successfully on real Windows hardware (2026-09-21), from a MinGW-w64 build.** One MinGW-specific gotcha found by that real run, now fixed in `wix/main.wxs`: unlike the MSVC+vcpkg build (which links fftw3 *statically* via the `x64-windows-static-md` vcpkg triplet), a MinGW-w64 build links fftw3 *dynamically* — the installed `hpsdr-rs.exe` failed to even launch with "libfftw3-3.dll was not found" until `libfftw3-3.dll` was added as its own bundled `File`/`Component` in `wix/main.wxs`, sourced from `C:\msys64\mingw64\bin\libfftw3-3.dll` (adjust that hardcoded path if your MSYS2 install lives elsewhere). Harmless to leave in for an MSVC-built installer too — the extra DLL is simply unused there. If you hit the same "libfftw3-3.dll was not found" error building this way, that's the fix; the `.dll` needs to already exist on disk (an ordinary MSYS2/MinGW build has already produced it) when `cargo wix` runs, since it doesn't build it itself.
 
 ## PureSignal calibration
 
