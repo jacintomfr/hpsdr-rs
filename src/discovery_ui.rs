@@ -323,20 +323,42 @@ impl DiscoveryWindow {
         // concern (focus vs. stacking order) that happens to have
         // shared this same window_level gate before.
         let kiosk = crate::lcd_kiosk_mode();
-        // NOT AlwaysOnTop in kiosk mode -- a real test found this
-        // window's own AlwaysOnTop pin it above EVERY other window,
-        // including the native "Choose file" dialog its own Radioberry
-        // Juice setup section opens (rfd::FileDialog), which isn't
-        // itself AlwaysOnTop -- the dialog opened genuinely behind this
-        // window with no way to bring it to front, blocking that whole
-        // flow. Kiosk mode is a single-app fullscreen takeover with no
-        // other apps competing for the foreground anyway, so AlwaysOnTop
-        // isn't needed there; keep it for the normal desktop case below,
-        // where it protects against exactly the "buried behind a
-        // terminal/browser" scenario this field's own doc comment
-        // describes.
-        let window_level =
-            if kiosk { egui::WindowLevel::Normal } else { egui::WindowLevel::AlwaysOnTop };
+        // In kiosk mode: AlwaysOnTop ONLY during the same initial
+        // `focus_deadline` grace period used below for the keyboard-
+        // focus grab (a real test confirmed this window still needs
+        // SOME AlwaysOnTop period -- dropping it entirely reintroduced
+        // exactly the original "buried behind the main window itself"
+        // bug this field's own doc comment describes, this time against
+        // the kiosk main window's own fullscreen undecorated viewport
+        // rather than a terminal/browser: main.rs's root viewport is a
+        // separate OS-level window created around the same time as this
+        // one, and without AlwaysOnTop during that initial race, it can
+        // end up on top instead, showing as a plain black window since
+        // the root only ever renders real content once a radio is
+        // connected). Once past that grace period (normally ~1.5s, or
+        // as soon as this window is actually focused -- see
+        // `focus_deadline`'s own doc comment), dropped to Normal so a
+        // native dialog opened later from THIS window (e.g. the
+        // Radioberry Juice setup section's "Choose..." rfd::FileDialog)
+        // can still come to the front above it -- AlwaysOnTop for this
+        // window's whole lifetime was confirmed to permanently block
+        // that instead. Outside kiosk mode, unchanged: AlwaysOnTop for
+        // the window's whole lifetime, which is what actually fixed the
+        // "buried behind other windows (a terminal, a browser)" desktop
+        // report this field's own doc comment above describes -- kiosk
+        // mode's fullscreen main window doesn't have other apps to
+        // compete with the same way, so trading permanent AlwaysOnTop
+        // for a native-dialog-friendly Normal after the initial race is
+        // a better trade there specifically.
+        let window_level = if kiosk {
+            if self.focus_deadline.is_some() {
+                egui::WindowLevel::AlwaysOnTop
+            } else {
+                egui::WindowLevel::Normal
+            }
+        } else {
+            egui::WindowLevel::AlwaysOnTop
+        };
         let mut discovery_viewport = egui::ViewportBuilder::default()
             .with_title("Discover HPSDR Radios")
             // Widened from 700 -- the Interface column now shows the
