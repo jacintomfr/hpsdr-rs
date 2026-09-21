@@ -322,7 +322,21 @@ impl DiscoveryWindow {
         // one-shot keyboard-focus grab just below -- that's a different
         // concern (focus vs. stacking order) that happens to have
         // shared this same window_level gate before.
-        let window_level = egui::WindowLevel::AlwaysOnTop;
+        let kiosk = crate::lcd_kiosk_mode();
+        // NOT AlwaysOnTop in kiosk mode -- a real test found this
+        // window's own AlwaysOnTop pin it above EVERY other window,
+        // including the native "Choose file" dialog its own Radioberry
+        // Juice setup section opens (rfd::FileDialog), which isn't
+        // itself AlwaysOnTop -- the dialog opened genuinely behind this
+        // window with no way to bring it to front, blocking that whole
+        // flow. Kiosk mode is a single-app fullscreen takeover with no
+        // other apps competing for the foreground anyway, so AlwaysOnTop
+        // isn't needed there; keep it for the normal desktop case below,
+        // where it protects against exactly the "buried behind a
+        // terminal/browser" scenario this field's own doc comment
+        // describes.
+        let window_level =
+            if kiosk { egui::WindowLevel::Normal } else { egui::WindowLevel::AlwaysOnTop };
         let mut discovery_viewport = egui::ViewportBuilder::default()
             .with_title("Discover HPSDR Radios")
             // Widened from 700 -- the Interface column now shows the
@@ -333,7 +347,6 @@ impl DiscoveryWindow {
             .with_inner_size([900.0, 500.0])
             .with_active(true)
             .with_window_level(window_level);
-        let kiosk = crate::lcd_kiosk_mode();
         if kiosk {
             // Fixed 1024x600 kiosk mode -- see lcd_kiosk_mode's/
             // kiosk_centered_pos's doc comments in main.rs. Already
@@ -619,6 +632,36 @@ impl DiscoveryWindow {
                          physically switched into bootloader mode and power-cycled.",
                     ).clicked() {
                         self.firmware_update = Some(FirmwareUpdateWindow::new_raw_ethernet());
+                    }
+
+                    // Kiosk mode only -- see lcd_kiosk_mode's doc comment
+                    // in main.rs. On a normal desktop the native title
+                    // bar's own close button already quits the app; in
+                    // kiosk mode there IS no native title bar (see this
+                    // window's own with_decorations(false) above) or
+                    // taskbar-friendly way to reach one, so this is the
+                    // only way to quit at all. Deliberately placed HERE
+                    // (the Discover window) rather than on the main
+                    // Connected window's Stop button: this is also where
+                    // the Radioberry Juice setup section's own Stop
+                    // button lives (just below, when a juice console is
+                    // attached), so someone shutting the whole thing down
+                    // sees both controls together instead of a one-click
+                    // Exit on the main window silently leaving juice
+                    // running in the background.
+                    if kiosk {
+                        ui.separator();
+                        if ui
+                            .button("Exit")
+                            .on_hover_text(
+                                "Quit hpsdr-rs. If a Radioberry Juice process is running (see \
+                                 below), stop it first if you don't want it left running in \
+                                 the background.",
+                            )
+                            .clicked()
+                        {
+                            std::process::exit(0);
+                        }
                     }
                 });
 

@@ -6472,16 +6472,27 @@ impl eframe::App for HpsdrApp {
                             if kiosk {
                                 // No native title bar in kiosk mode (see
                                 // this window's own with_decorations(false)
-                                // comment above) -- an on-screen Close
-                                // replaces it.
+                                // comment above) -- on-screen Minimize/
+                                // Close replace it. Bottom-right (not
+                                // top, like the S-meter just below claims
+                                // top-right, and the tab-row overlap a
+                                // top placement caused on the Settings
+                                // window).
                                 egui::Area::new(egui::Id::new(("kiosk_close_extra_rx", ddc_index)))
-                                    .anchor(egui::Align2::LEFT_TOP, egui::vec2(6.0, 6.0))
+                                    .anchor(egui::Align2::RIGHT_BOTTOM, egui::vec2(-6.0, -6.0))
                                     .show(ui, |ui| {
-                                        if ui.button("\u{2715} Close").clicked() {
-                                            let mut rx = rx_for_closure.lock().unwrap();
-                                            rx.open = false;
-                                            rx.settings_dirty.store(true, Ordering::Relaxed);
-                                        }
+                                        ui.horizontal(|ui| {
+                                            if ui.button("\u{2013} Min").clicked() {
+                                                ui.ctx().send_viewport_cmd(
+                                                    egui::ViewportCommand::Minimized(true),
+                                                );
+                                            }
+                                            if ui.button("\u{2715} Close").clicked() {
+                                                let mut rx = rx_for_closure.lock().unwrap();
+                                                rx.open = false;
+                                                rx.settings_dirty.store(true, Ordering::Relaxed);
+                                            }
+                                        });
                                     });
                             }
 
@@ -6561,11 +6572,19 @@ impl eframe::App for HpsdrApp {
                                                 "kiosk_close_extra_rx_settings",
                                                 ddc_index,
                                             )))
-                                            .anchor(egui::Align2::RIGHT_TOP, egui::vec2(-6.0, 6.0))
+                                            .anchor(egui::Align2::RIGHT_BOTTOM, egui::vec2(-6.0, -6.0))
                                             .show(ui.ctx(), |ui| {
-                                                if ui.button("\u{2715} Close").clicked() {
-                                                    rx_for_settings.lock().unwrap().show_settings_window = false;
-                                                }
+                                                ui.horizontal(|ui| {
+                                                    if ui.button("\u{2013} Min").clicked() {
+                                                        ui.ctx().send_viewport_cmd(
+                                                            egui::ViewportCommand::Minimized(true),
+                                                        );
+                                                    }
+                                                    if ui.button("\u{2715} Close").clicked() {
+                                                        rx_for_settings.lock().unwrap().show_settings_window =
+                                                            false;
+                                                    }
+                                                });
                                             });
                                         }
                                         egui::CentralPanel::default()
@@ -6653,8 +6672,17 @@ impl eframe::App for HpsdrApp {
                             // Same "keep the window from getting buried
                             // behind other windows" reasoning as the
                             // discovery window -- see its own doc
-                            // comment on window_level.
-                            .with_window_level(egui::WindowLevel::AlwaysOnTop),
+                            // comment on window_level. NOT AlwaysOnTop in
+                            // kiosk mode though -- same real bug as that
+                            // window's own fix: this window's MIDI tab
+                            // has a "Choose..." rfd::FileDialog too, which
+                            // would open stuck behind an AlwaysOnTop
+                            // Settings window with no way to reach it.
+                            .with_window_level(if kiosk {
+                                egui::WindowLevel::Normal
+                            } else {
+                                egui::WindowLevel::AlwaysOnTop
+                            }),
                         |ui, _class| {
                             if ui.input(|i| i.viewport().close_requested()) {
                                 close_requested = true;
@@ -6695,12 +6723,22 @@ impl eframe::App for HpsdrApp {
                                         }
                                     }
                                 });
+                                // Bottom-right, not top -- a real test
+                                // found a top-right placement overlapping
+                                // the tab row (About/Antenna/.../XVTR).
                                 egui::Area::new(egui::Id::new("kiosk_close_settings"))
-                                    .anchor(egui::Align2::RIGHT_TOP, egui::vec2(-6.0, 6.0))
+                                    .anchor(egui::Align2::RIGHT_BOTTOM, egui::vec2(-6.0, -6.0))
                                     .show(ui.ctx(), |ui| {
-                                        if ui.button("\u{2715} Close").clicked() {
-                                            close_requested = true;
-                                        }
+                                        ui.horizontal(|ui| {
+                                            if ui.button("\u{2013} Min").clicked() {
+                                                ui.ctx().send_viewport_cmd(
+                                                    egui::ViewportCommand::Minimized(true),
+                                                );
+                                            }
+                                            if ui.button("\u{2715} Close").clicked() {
+                                                close_requested = true;
+                                            }
+                                        });
                                     });
                             }
                             egui::CentralPanel::default()
@@ -10030,7 +10068,15 @@ impl eframe::App for HpsdrApp {
                         let mut juice_viewport = egui::ViewportBuilder::default()
                             .with_title("Radioberry Juice Console")
                             .with_inner_size([700.0, 420.0])
-                            .with_window_level(egui::WindowLevel::AlwaysOnTop);
+                            // NOT AlwaysOnTop in kiosk mode -- same
+                            // "would block a native dialog opened from
+                            // another still-open kiosk window" reasoning
+                            // as the Discover/Settings windows' own fix.
+                            .with_window_level(if juice_kiosk {
+                                egui::WindowLevel::Normal
+                            } else {
+                                egui::WindowLevel::AlwaysOnTop
+                            });
                         if juice_kiosk {
                             // See kiosk_centered_pos's/Settings window's
                             // with_decorations(false) doc comments.
@@ -10063,11 +10109,18 @@ impl eframe::App for HpsdrApp {
                                 }
                                 if juice_kiosk {
                                     egui::Area::new(egui::Id::new("kiosk_close_juice"))
-                                        .anchor(egui::Align2::RIGHT_TOP, egui::vec2(-6.0, 6.0))
+                                        .anchor(egui::Align2::RIGHT_BOTTOM, egui::vec2(-6.0, -6.0))
                                         .show(ui.ctx(), |ui| {
-                                            if ui.button("\u{2715} Close").clicked() {
-                                                close_requested = true;
-                                            }
+                                            ui.horizontal(|ui| {
+                                                if ui.button("\u{2013} Min").clicked() {
+                                                    ui.ctx().send_viewport_cmd(
+                                                        egui::ViewportCommand::Minimized(true),
+                                                    );
+                                                }
+                                                if ui.button("\u{2715} Close").clicked() {
+                                                    close_requested = true;
+                                                }
+                                            });
                                         });
                                 }
                                 egui::CentralPanel::default()
