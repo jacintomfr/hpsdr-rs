@@ -4017,9 +4017,14 @@ impl eframe::App for HpsdrApp {
                             .with_resizable(false)
                             .with_active(true);
                         if lcd_kiosk_mode() {
-                            // See kiosk_centered_pos's doc comment.
-                            freq_entry_viewport =
-                                freq_entry_viewport.with_position(kiosk_centered_pos([260.0, 360.0]));
+                            // See kiosk_centered_pos's/Settings window's
+                            // with_decorations(false) doc comments. This
+                            // window already has an on-screen Cancel
+                            // button and Escape handling below, so no
+                            // native title bar close button is needed.
+                            freq_entry_viewport = freq_entry_viewport
+                                .with_position(kiosk_centered_pos([260.0, 360.0]))
+                                .with_decorations(false);
                         }
                         ui.ctx().show_viewport_immediate(
                             egui::ViewportId::from_hash_of("frequency_entry_window"),
@@ -6395,11 +6400,19 @@ impl eframe::App for HpsdrApp {
                         // Never allowed to exceed (or be dragged past) the
                         // main window's own fixed 1024x600 kiosk size, and
                         // always opens centered within it -- see
-                        // lcd_kiosk_mode's/kiosk_centered_pos's doc comments.
+                        // lcd_kiosk_mode's/kiosk_centered_pos's doc
+                        // comments. Decorations off too -- see the
+                        // Settings window's own with_decorations(false)
+                        // comment for why (native title bar chrome would
+                        // otherwise push this past the main window's own
+                        // size despite the inner size being capped); this
+                        // window's Escape/on-screen-Close handling just
+                        // below replaces the native title bar close button.
                         viewport_builder = viewport_builder
                             .with_position(kiosk_centered_pos([1024.0, 500.0]))
                             .with_max_inner_size([1024.0, 500.0])
-                            .with_resizable(false);
+                            .with_resizable(false)
+                            .with_decorations(false);
                     } else if let Some(g) = seed_geometry {
                         // Skipped in kiosk mode -- this could be larger
                         // than the main window (e.g. left over from a
@@ -6431,7 +6444,20 @@ impl eframe::App for HpsdrApp {
                                 });
                             }
 
-                            if ui.input(|i| i.viewport().close_requested()) {
+                            let escape_pressed = kiosk
+                                && ui.input(|i| {
+                                    i.events.iter().any(|ev| {
+                                        matches!(
+                                            ev,
+                                            egui::Event::Key {
+                                                key: egui::Key::Escape,
+                                                pressed: true,
+                                                ..
+                                            }
+                                        )
+                                    })
+                                });
+                            if ui.input(|i| i.viewport().close_requested()) || escape_pressed {
                                 let mut rx = rx_for_closure.lock().unwrap();
                                 rx.open = false;
                                 // Without this, closing a receiver is
@@ -6441,6 +6467,22 @@ impl eframe::App for HpsdrApp {
                                 // silently bring it back next launch.
                                 rx.settings_dirty.store(true, Ordering::Relaxed);
                                 return;
+                            }
+
+                            if kiosk {
+                                // No native title bar in kiosk mode (see
+                                // this window's own with_decorations(false)
+                                // comment above) -- an on-screen Close
+                                // replaces it.
+                                egui::Area::new(egui::Id::new(("kiosk_close_extra_rx", ddc_index)))
+                                    .anchor(egui::Align2::LEFT_TOP, egui::vec2(6.0, 6.0))
+                                    .show(ui, |ui| {
+                                        if ui.button("\u{2715} Close").clicked() {
+                                            let mut rx = rx_for_closure.lock().unwrap();
+                                            rx.open = false;
+                                            rx.settings_dirty.store(true, Ordering::Relaxed);
+                                        }
+                                    });
                             }
 
                             let meter_db = rx_for_closure.lock().unwrap().spectrum.display.lock().unwrap().meter_db;
@@ -6476,25 +6518,55 @@ impl eframe::App for HpsdrApp {
                                 ));
                                 let rx_for_settings = Arc::clone(&rx_for_closure);
                                 let settings_title = format!("Receiver {} Settings", ddc_index + 1);
+                                let rx_kiosk = lcd_kiosk_mode();
                                 let mut rx_settings_viewport = egui::ViewportBuilder::default()
                                     .with_title(settings_title)
                                     .with_inner_size([420.0, 500.0]);
-                                if lcd_kiosk_mode() {
-                                    // See kiosk_centered_pos's doc comment --
-                                    // keeps this inside the main window's
-                                    // own fixed 1024x600 kiosk area.
+                                if rx_kiosk {
+                                    // See kiosk_centered_pos's/Settings
+                                    // window's with_decorations(false) doc
+                                    // comments -- keeps this inside the
+                                    // main window's own fixed 1024x600
+                                    // kiosk area, with no native title bar
+                                    // chrome pushing it past that.
                                     rx_settings_viewport = rx_settings_viewport
                                         .with_position(kiosk_centered_pos([420.0, 500.0]))
                                         .with_max_inner_size([420.0, 500.0])
-                                        .with_resizable(false);
+                                        .with_resizable(false)
+                                        .with_decorations(false);
                                 }
                                 ui.ctx().show_viewport_deferred(
                                     settings_viewport_id,
                                     rx_settings_viewport,
                                     move |ui: &mut egui::Ui, _class: egui::ViewportClass| {
-                                        if ui.input(|i| i.viewport().close_requested()) {
+                                        let escape_pressed = rx_kiosk
+                                            && ui.input(|i| {
+                                                i.events.iter().any(|ev| {
+                                                    matches!(
+                                                        ev,
+                                                        egui::Event::Key {
+                                                            key: egui::Key::Escape,
+                                                            pressed: true,
+                                                            ..
+                                                        }
+                                                    )
+                                                })
+                                            });
+                                        if ui.input(|i| i.viewport().close_requested()) || escape_pressed {
                                             rx_for_settings.lock().unwrap().show_settings_window = false;
                                             return;
+                                        }
+                                        if rx_kiosk {
+                                            egui::Area::new(egui::Id::new((
+                                                "kiosk_close_extra_rx_settings",
+                                                ddc_index,
+                                            )))
+                                            .anchor(egui::Align2::RIGHT_TOP, egui::vec2(-6.0, 6.0))
+                                            .show(ui.ctx(), |ui| {
+                                                if ui.button("\u{2715} Close").clicked() {
+                                                    rx_for_settings.lock().unwrap().show_settings_window = false;
+                                                }
+                                            });
                                         }
                                         egui::CentralPanel::default()
                                             .frame(egui::Frame::central_panel(&light_style))
@@ -6545,10 +6617,20 @@ impl eframe::App for HpsdrApp {
                         // See kiosk_centered_pos's doc comment -- keeps
                         // this inside the main window's own fixed
                         // 1024x600 kiosk area, and not resizable past it.
+                        // Decorations off too -- a real test found the
+                        // native Windows title bar's own height/border
+                        // chrome is added ON TOP of with_inner_size's
+                        // content size, so a decorated window ended up
+                        // taller than the main window despite the inner
+                        // size itself being capped to fit -- see the
+                        // in-panel "Close" button and Escape handling
+                        // below this window now needs as a result (no
+                        // native title bar left to close it from).
                         settings_viewport = settings_viewport
                             .with_position(kiosk_centered_pos(settings_size))
                             .with_max_inner_size(settings_size)
-                            .with_resizable(false);
+                            .with_resizable(false)
+                            .with_decorations(false);
                     }
                     ui.ctx().show_viewport_immediate(
                         egui::ViewportId::from_hash_of("settings_window"),
@@ -6594,6 +6676,32 @@ impl eframe::App for HpsdrApp {
                             // memory: settings_viewport_minimize_stall.
                             if ui.input(|i| i.viewport().minimized).unwrap_or(false) {
                                 return;
+                            }
+                            // No native title bar in kiosk mode (see this
+                            // viewport's own with_decorations(false)
+                            // comment above), so this is the only way to
+                            // close the window -- an on-screen button
+                            // (more reliable to hit on a small touchscreen
+                            // than a title bar X would have been anyway)
+                            // plus Escape for a keyboard/remote-control setup.
+                            if kiosk {
+                                ui.input(|i| {
+                                    for ev in &i.events {
+                                        if let egui::Event::Key {
+                                            key: egui::Key::Escape, pressed: true, ..
+                                        } = ev
+                                        {
+                                            close_requested = true;
+                                        }
+                                    }
+                                });
+                                egui::Area::new(egui::Id::new("kiosk_close_settings"))
+                                    .anchor(egui::Align2::RIGHT_TOP, egui::vec2(-6.0, 6.0))
+                                    .show(ui.ctx(), |ui| {
+                                        if ui.button("\u{2715} Close").clicked() {
+                                            close_requested = true;
+                                        }
+                                    });
                             }
                             egui::CentralPanel::default()
                                 .frame(egui::Frame::central_panel(&light_style))
@@ -9918,24 +10026,49 @@ impl eframe::App for HpsdrApp {
                         let light_visuals = egui::Visuals::light();
                         let light_style = egui::Style { visuals: light_visuals.clone(), ..Default::default() };
                         let mut close_requested = false;
+                        let juice_kiosk = lcd_kiosk_mode();
                         let mut juice_viewport = egui::ViewportBuilder::default()
                             .with_title("Radioberry Juice Console")
                             .with_inner_size([700.0, 420.0])
                             .with_window_level(egui::WindowLevel::AlwaysOnTop);
-                        if lcd_kiosk_mode() {
-                            // See kiosk_centered_pos's doc comment.
+                        if juice_kiosk {
+                            // See kiosk_centered_pos's/Settings window's
+                            // with_decorations(false) doc comments.
                             juice_viewport = juice_viewport
                                 .with_position(kiosk_centered_pos([700.0, 420.0]))
                                 .with_max_inner_size([700.0, 420.0])
-                                .with_resizable(false);
+                                .with_resizable(false)
+                                .with_decorations(false);
                         }
                         ui.ctx().show_viewport_immediate(
                             egui::ViewportId::from_hash_of("juice_console_window"),
                             juice_viewport,
                             |ui, _class| {
-                                if ui.input(|i| i.viewport().close_requested()) {
+                                let escape_pressed = juice_kiosk
+                                    && ui.input(|i| {
+                                        i.events.iter().any(|ev| {
+                                            matches!(
+                                                ev,
+                                                egui::Event::Key {
+                                                    key: egui::Key::Escape,
+                                                    pressed: true,
+                                                    ..
+                                                }
+                                            )
+                                        })
+                                    });
+                                if ui.input(|i| i.viewport().close_requested()) || escape_pressed {
                                     close_requested = true;
                                     return;
+                                }
+                                if juice_kiosk {
+                                    egui::Area::new(egui::Id::new("kiosk_close_juice"))
+                                        .anchor(egui::Align2::RIGHT_TOP, egui::vec2(-6.0, 6.0))
+                                        .show(ui.ctx(), |ui| {
+                                            if ui.button("\u{2715} Close").clicked() {
+                                                close_requested = true;
+                                            }
+                                        });
                                 }
                                 egui::CentralPanel::default()
                                     .frame(egui::Frame::central_panel(&light_style))

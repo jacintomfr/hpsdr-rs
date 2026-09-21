@@ -333,15 +333,23 @@ impl DiscoveryWindow {
             .with_inner_size([900.0, 500.0])
             .with_active(true)
             .with_window_level(window_level);
-        if crate::lcd_kiosk_mode() {
+        let kiosk = crate::lcd_kiosk_mode();
+        if kiosk {
             // Fixed 1024x600 kiosk mode -- see lcd_kiosk_mode's/
             // kiosk_centered_pos's doc comments in main.rs. Already
             // smaller than the main window on both axes, just needs to
-            // stay centered within it and not get dragged/resized past it.
+            // stay centered within it and not get dragged/resized past
+            // it. Decorations off too -- see the main Settings window's
+            // own with_decorations(false) comment for why (native title
+            // bar chrome would otherwise push it past the main window's
+            // own size); the existing Cancel button below (and Escape,
+            // added below) already covers dismissing this window, so no
+            // separate on-screen Close is needed here.
             discovery_viewport = discovery_viewport
                 .with_position(crate::kiosk_centered_pos([900.0, 500.0]))
                 .with_max_inner_size([900.0, 500.0])
-                .with_resizable(false);
+                .with_resizable(false)
+                .with_decorations(false);
         }
         ui.ctx().show_viewport_immediate(
             egui::ViewportId::from_hash_of("discovery_window"),
@@ -359,6 +367,23 @@ impl DiscoveryWindow {
                 if ui.input(|i| i.viewport().close_requested()) {
                     still_open = false;
                     return;
+                }
+                if kiosk {
+                    // No native title bar in kiosk mode -- Escape maps
+                    // to the same Cancel action as the on-screen button
+                    // below, since there's no OS close button to fall
+                    // back on.
+                    let escape_pressed = ui.input(|i| {
+                        i.events.iter().any(|ev| {
+                            matches!(
+                                ev,
+                                egui::Event::Key { key: egui::Key::Escape, pressed: true, .. }
+                            )
+                        })
+                    });
+                    if escape_pressed {
+                        action = DiscoveryAction::Cancelled;
+                    }
                 }
                 egui::CentralPanel::default().frame(egui::Frame::central_panel(&light_style)).show(
                     ui,

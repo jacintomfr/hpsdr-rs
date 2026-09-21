@@ -177,15 +177,21 @@ impl FirmwareUpdateWindow {
         let light_visuals = egui::Visuals::light();
         let light_style = egui::Style { visuals: light_visuals.clone(), ..Default::default() };
         let mut still_open = self.open;
+        let kiosk = crate::lcd_kiosk_mode();
         let mut firmware_viewport =
             egui::ViewportBuilder::default().with_title("Firmware Update").with_inner_size([560.0, 520.0]);
-        if crate::lcd_kiosk_mode() {
+        if kiosk {
             // Fixed 1024x600 kiosk mode -- see lcd_kiosk_mode's/
-            // kiosk_centered_pos's doc comments in main.rs.
+            // kiosk_centered_pos's doc comments in main.rs. Decorations
+            // off too -- see the main Settings window's own
+            // with_decorations(false) comment for why; the existing
+            // Cancel/Close buttons in show_contents below (and Escape,
+            // added below) already cover dismissing this window.
             firmware_viewport = firmware_viewport
                 .with_position(crate::kiosk_centered_pos([560.0, 520.0]))
                 .with_max_inner_size([560.0, 520.0])
-                .with_resizable(false);
+                .with_resizable(false)
+                .with_decorations(false);
         }
         ui.ctx().show_viewport_immediate(
             egui::ViewportId::from_hash_of("firmware_update_window"),
@@ -194,6 +200,20 @@ impl FirmwareUpdateWindow {
                 if ui.input(|i| i.viewport().close_requested()) {
                     still_open = false;
                     return;
+                }
+                if kiosk {
+                    let escape_pressed = ui.input(|i| {
+                        i.events.iter().any(|ev| {
+                            matches!(
+                                ev,
+                                egui::Event::Key { key: egui::Key::Escape, pressed: true, .. }
+                            )
+                        })
+                    });
+                    if escape_pressed {
+                        still_open = false;
+                        return;
+                    }
                 }
                 egui::CentralPanel::default().frame(egui::Frame::central_panel(&light_style)).show(ui, |ui| {
                     ui.visuals_mut().clone_from(&light_visuals);
