@@ -2303,6 +2303,9 @@ fn connect_to_device(device: Device, cfg: &Config) -> Result<ConnectedState, Str
     if let Some(atten) = cfg.rx_attenuation {
         settings.rx_attenuation = atten;
     }
+    if let Some(atten) = cfg.alex_attenuation {
+        settings.alex_attenuation = atten as u32;
+    }
     if let Some(db) = cfg.lna_tx_db {
         settings.lna_tx_db = db;
     }
@@ -3674,7 +3677,7 @@ impl eframe::App for HpsdrApp {
                 let pan_offset_hz = (zoom_ctun_offset_hz + connected.spectrum_pan as f64 * max_pan_hz)
                     .clamp(-max_pan_hz, max_pan_hz);
 
-                let (spectrum_row, meter_db, waterfall_data_revision) = {
+                let (mut spectrum_row, meter_db, waterfall_data_revision) = {
                     let d = if transmitting {
                         connected.tx_spectrum.display.lock().unwrap()
                     } else {
@@ -3695,19 +3698,40 @@ impl eframe::App for HpsdrApp {
                 // meter_db is tx_spectrum's own (ALC/drive) reading while
                 // transmitting, an unrelated meter this correction has
                 // nothing to say about.
-                let meter_db = if transmitting {
-                    meter_db
+                // rx_attenuation value -- see that field's doc comment --
+                // so which side of the formula applies depends on which
+                // control is actually shown for this board (same
+                // condition as the toolbar slider above). RX only --
+                // meter_db is tx_spectrum's own (ALC/drive) reading while
+                // transmitting, an unrelated meter this correction has
+                // nothing to say about. Applied to spectrum_row and (via
+                // waterfall_correction_db below) the waterfall too, not
+                // just the S-meter -- a real report: without this, ALL
+                // THREE displays drop by the full attenuation amount
+                // instead of showing the true incoming signal strength,
+                // giving an incorrect signal report to anyone the
+                // operator is talking to (confirmed against piHPSDR,
+                // which keeps all three steady across attenuator changes).
+                let rx_display_correction_db: f64 = if transmitting {
+                    0.0
                 } else {
                     let stored_rx_atten = connected.session.rx_attenuation.load(Ordering::Relaxed) as i32;
+                    let alex_atten_db = connected.session.alex_attenuation.load(Ordering::Relaxed) as i32 * 10;
                     let correction_db = if connected.device.protocol == 1
                         && matches!(connected.device.board, Boards::HermesLite | Boards::HermesLite2)
                     {
                         connected.rx_gain_calibration_db - (stored_rx_atten - 12)
                     } else {
-                        connected.rx_gain_calibration_db + stored_rx_atten
+                        connected.rx_gain_calibration_db + stored_rx_atten + alex_atten_db
                     };
-                    meter_db + f64::from(correction_db)
+                    f64::from(correction_db)
                 };
+                let meter_db = meter_db + rx_display_correction_db;
+                if rx_display_correction_db != 0.0 {
+                    for v in &mut spectrum_row {
+                        *v += rx_display_correction_db as f32;
+                    }
+                }
 
                 // "Auto" Low (Settings -> Spectrum) -- see
                 // ConnectedState::db_low_auto's doc comment. RX only:
@@ -3772,6 +3796,16 @@ impl eframe::App for HpsdrApp {
                 } else {
                     (wf_base_high, wf_base_high + 1.0)
                 };
+                // Waterfall color-mapping shift (NOT the stored row
+                // values themselves, which stay untouched -- see
+                // rx_display_correction_db's own doc comment). Shadows
+                // wf_db_low/wf_db_high rather than introducing new names
+                // -- confirmed neither name is read again later in this
+                // function for anything else (e.g. gridline labels),
+                // only by the signature/build_waterfall_image call right
+                // below, so shadowing here is safe.
+                let wf_correction = rx_display_correction_db as f32;
+                let (wf_db_low, wf_db_high) = (wf_db_low - wf_correction, wf_db_high - wf_correction);
 
                 // Texture update needs &egui::Context, so do it before
                 // opening the panel closure (same reasoning as the
@@ -4804,9 +4838,23 @@ impl eframe::App for HpsdrApp {
                         // TX Power alongside it on the right -- keeps the top row to the
                         // "how loud" controls and this row to the "how much signal
                         // in/out" controls.
-                        if connected.device.protocol == 1
-                            && matches!(connected.device.board, Boards::HermesLite | Boards::HermesLite2)
-                        {
+                        let is_hermes_lite_family =
+                            matches!(connected.device.board, Boards::HermesLite | Boards::HermesLite2);
+                        // See radio::RadioSession::alex_attenuation's doc
+                        // comment for the have_alex_att/have_rx_att matrix
+                        // this mirrors (piHPSDR's radio.c): Metis has ONLY
+                        // the ALEX relay (no step attenuator at all);
+                        // Hermes/Hermes2/Angelia/Orion have BOTH; Orion2
+                        // has only the step attenuator. P2 boards don't
+                        // implement the ALEX relay on the wire (P1-only
+                        // register), so always fall through to the plain
+                        // step-attenuator slider there, same as before.
+                        let has_alex_att = connected.device.protocol == 1
+                            && !is_hermes_lite_family
+                            && connected.device.board != Boards::Orion2;
+                        let has_rx_att =
+                            !(connected.device.protocol == 1 && connected.device.board == Boards::Metis);
+                        if is_hermes_lite_family {
                             // The stored wire value is gain_db+12 (0-60) -- see
                             // RadioSession::rx_attenuation's doc comment -- so the
                             // conversion happens at this UI boundary only.
@@ -4821,11 +4869,53 @@ impl eframe::App for HpsdrApp {
                                 settings_changed = true;
                             }
                         } else {
-                            let mut atten = connected.session.rx_attenuation.load(Ordering::Relaxed) as i32;
-                            ui.label("RX Attenuation:");
-                            if stable_i32_slider(ui, &mut connected.slider_scroll_accum, &mut atten, 0..=31, 1, " dB") {
-                                connected.session.rx_attenuation.store(atten as u32, Ordering::Relaxed);
-                                settings_changed = true;
+                            if has_alex_att {
+                                let mut alex_atten =
+                                    connected.session.alex_attenuation.load(Ordering::Relaxed).min(3) as usize;
+                                ui.label("Alex ATT:");
+                                if alex_att_combo(ui, &mut alex_atten) {
+                                    connected.session.alex_attenuation.store(alex_atten as u32, Ordering::Relaxed);
+                                    settings_changed = true;
+                                }
+                            }
+                            if has_rx_att {
+                                // Boards with BOTH controls (Hermes/Hermes2/
+                                // Angelia/Orion, i.e. has_alex_att also
+                                // true here) would otherwise push this row
+                                // to 8 grid cells (3 pairs already budgeted
+                                // + this extra pair) -- egui::Grid silently
+                                // auto-wraps past num_columns(6) without an
+                                // explicit end_row(), a real, already-hit
+                                // bug (see the AGC row's own "ROOT CAUSE
+                                // FIX" comment for the full story) that
+                                // scattered a row's content across the
+                                // grid's other rows. Wrapped in one
+                                // ui.horizontal (a single cell regardless
+                                // of how many widgets are inside) ONLY in
+                                // that dual-control case; Orion2/P2 (RX
+                                // Attenuation alone, has_alex_att false)
+                                // stay as plain unwrapped cells, matching
+                                // this slot's normal 2-cell budget and
+                                // keeping their column width aligned with
+                                // every other row the same way it always was.
+                                if has_alex_att {
+                                    ui.horizontal(|ui| {
+                                        let mut atten =
+                                            connected.session.rx_attenuation.load(Ordering::Relaxed) as i32;
+                                        ui.label("RX Attenuation:");
+                                        if stable_i32_slider(ui, &mut connected.slider_scroll_accum, &mut atten, 0..=31, 1, " dB") {
+                                            connected.session.rx_attenuation.store(atten as u32, Ordering::Relaxed);
+                                            settings_changed = true;
+                                        }
+                                    });
+                                } else {
+                                    let mut atten = connected.session.rx_attenuation.load(Ordering::Relaxed) as i32;
+                                    ui.label("RX Attenuation:");
+                                    if stable_i32_slider(ui, &mut connected.slider_scroll_accum, &mut atten, 0..=31, 1, " dB") {
+                                        connected.session.rx_attenuation.store(atten as u32, Ordering::Relaxed);
+                                        settings_changed = true;
+                                    }
+                                }
                             }
                         }
 
@@ -11087,6 +11177,9 @@ impl eframe::App for HpsdrApp {
                         rx_attenuation: Some(
                             connected.session.rx_attenuation.load(std::sync::atomic::Ordering::Relaxed),
                         ),
+                        alex_attenuation: Some(
+                            connected.session.alex_attenuation.load(std::sync::atomic::Ordering::Relaxed) as u8,
+                        ),
                         lna_tx_db: Some(
                             connected.session.lna_tx_db.load(std::sync::atomic::Ordering::Relaxed),
                         ),
@@ -11942,6 +12035,26 @@ fn format_frequency(hz: u32) -> String {
 /// track width is instead a style setting (Spacing::slider_width),
 /// saved/restored around each call rather than left mutated globally.
 const STABLE_SLIDER_TRACK_WIDTH: f32 = 90.0;
+
+/// The Alex front-end's discrete 0/10/20/30dB attenuator relay -- see
+/// radio::RadioSession::alex_attenuation's doc comment for the board
+/// matrix this control is gated on. Returns whether the value changed,
+/// same convention as start_stop_button-style helpers.
+fn alex_att_combo(ui: &mut egui::Ui, alex_atten: &mut usize) -> bool {
+    const ALEX_ATT_LABELS: [&str; 4] = ["0 dB", "10 dB", "20 dB", "30 dB"];
+    let before = *alex_atten;
+    egui::ComboBox::from_id_salt("alex_attenuation")
+        .width(STABLE_SLIDER_TRACK_WIDTH)
+        .selected_text(ALEX_ATT_LABELS[*alex_atten])
+        .show_ui(ui, |ui| {
+            for (i, label) in ALEX_ATT_LABELS.iter().enumerate() {
+                if ui.selectable_label(*alex_atten == i, *label).clicked() {
+                    *alex_atten = i;
+                }
+            }
+        });
+    *alex_atten != before
+}
 
 /// Rounded gray box behind a slider's value -- replaces the background
 /// egui::Slider's own built-in value box used to draw before

@@ -382,6 +382,13 @@ pub struct Config {
     /// falls back to RadioSession::start's own default rather than the
     /// old hardcoded 0dB.
     pub rx_attenuation: Option<u32>,
+    /// Protocol 1 ALEX front-end attenuator relay (0=0dB, 1=10dB,
+    /// 2=20dB, 3=30dB) -- see radio::RadioSession::alex_attenuation's
+    /// doc comment. A separate physical stage from rx_attenuation
+    /// above, present on different (and sometimes overlapping) boards.
+    /// Missing falls back to RadioSettings::default's own 0dB.
+    #[serde(default)]
+    pub alex_attenuation: Option<u8>,
     /// PureSignal calibration values (Settings -> PureSignal) -- see
     /// tx::PsParams's field docs for what each one means. Missing
     /// (e.g. configs saved before Phase 3 existed) falls back to the

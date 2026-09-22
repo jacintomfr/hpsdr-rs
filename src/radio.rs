@@ -1,4 +1,4 @@
-/*
+﻿/*
     Protocol 1 (Metis/old protocol) and Protocol 2 start-and-stream
     implementation.
 
@@ -179,6 +179,9 @@ pub struct RadioSettings {
     /// this from Config, falling back to this struct's own default
     /// for a never-saved config.
     pub rx_attenuation: u32,
+    /// Initial value for RadioSession::alex_attenuation -- see that
+    /// field's own doc comment.
+    pub alex_attenuation: u32,
     /// Initial value for RadioSession::lna_tx_db -- see that field's own
     /// doc comment (HermesLite/HermesLite2 P1 boards only).
     pub lna_tx_db: i32,
@@ -233,6 +236,10 @@ impl Default for RadioSettings {
             // Non-zero rather than 0dB -- see RadioSession::rx_attenuation's
             // doc comment for why 0dB caused real front-end overload.
             rx_attenuation: 12,
+            // 0dB, matching piHPSDR's own default (radio.c:
+            // `adc[0].alex_attenuation = 0`) -- see
+            // RadioSession::alex_attenuation's doc comment.
+            alex_attenuation: 0,
             // Minimum (most attenuation/most conservative) rather than
             // 0dB -- same reasoning as rx_attenuation just above, and
             // matches Quisk's own hermes_TxLNA_dB default.
@@ -595,6 +602,32 @@ pub struct RadioSession {
     /// piHPSDR exposes a live, user-adjustable slider for this exact
     /// value (`sliders.c`'s "RX GAIN - ADC-%d (dB)" dialog).
     pub rx_attenuation: Arc<AtomicU32>,
+    /// P1-only: the RF front-end's own switched ALEX attenuator relay
+    /// bank -- a SEPARATE physical stage from `rx_attenuation` above
+    /// (that's an ADC-level step attenuator/gain register; this is a
+    /// discrete 0/10/20/30dB relay bank on the Alex filter board
+    /// itself). Confirmed against piHPSDR's source (`have_alex_att`
+    /// matrix in radio.c, `adc[0].alex_attenuation` in sliders.c/
+    /// rx_menu.c, wire encoding `buffer[C3] = adc[0].alex_attenuation
+    /// & 0x03` in old_protocol.c's C&C register 0 case): Metis (Ozy/
+    /// Atlas too, though those connect over USB not this P1/network
+    /// path) has ALEX att but NO step attenuator at all; Hermes/
+    /// Hermes2/Angelia/Orion have BOTH simultaneously (two independent
+    /// controls); Orion2 has step attenuator only (no separate ALEX
+    /// relay); HermesLite/HermesLite2 have neither (their own RX Gain
+    /// register above). main.rs's UI gates which control(s) it shows
+    /// on this same matrix.
+    ///
+    /// Stored as the raw 0-3 index (0=0dB, 1=10dB, 2=20dB, 3=30dB),
+    /// matching the wire encoding directly -- unlike rx_attenuation
+    /// there's no dB-to-wire conversion needed at the UI boundary.
+    /// ROOT CAUSE FIX for a real report on genuine Metis hardware:
+    /// this project's P1 sender never sent C&C register 0 (General
+    /// Control) AT ALL -- every other register (TX/RX frequency, drive,
+    /// mic config, CW keyer, etc.) was implemented, but register 0
+    /// specifically, where this bit lives, was simply missing from the
+    /// command rotation.
+    pub alex_attenuation: Arc<AtomicU32>,
     /// HermesLite/HermesLite2-only: hardware-managed LNA gain applied
     /// specifically while transmitting, dB, range -12..48 -- separate
     /// from rx_attenuation (the RX-time gain), and matters most for
@@ -1256,6 +1289,11 @@ impl RadioSession {
         // real-hardware testing confirmed causes front-end overload on
         // an ordinary HF antenna.
         let rx_attenuation = Arc::new(AtomicU32::new(settings.rx_attenuation));
+        // See RadioSession::alex_attenuation's doc comment. P1-only in
+        // practice, but harmless to create everywhere -- same pattern
+        // as rx_attenuation just above (start_protocol2/ozy/rx888 just
+        // never read it).
+        let alex_attenuation = Arc::new(AtomicU32::new(settings.alex_attenuation));
         // See RadioSession::lna_tx_db's doc comment.
         let lna_tx_db = Arc::new(AtomicI32::new(settings.lna_tx_db));
         // See RadioSession::ps_tx_attenuation's doc comment.
@@ -1341,6 +1379,7 @@ impl RadioSession {
             match device.protocol {
             1 => start_protocol1(
                 device, settings, frequency_hz, tx_frequency_hz, rx_frequency_hz, requested_frequency_hz, sample_rate, adc, rx_antenna, tx_antenna, rx_attenuation,
+                alex_attenuation,
                 lna_tx_db,
                 ps_tx_attenuation, mox, tx_iq, tci_tx_audio, tci_tx_gain, tx_power_watts, cw_keyer, cw_mode_active, pa_gain_db,
                 tx_forward_power, tx_reverse_power, adc0_overload, cw_ptt_active, cw_paddle_contacts, adc1_overload,
@@ -1657,6 +1696,7 @@ fn start_protocol1(
     rx_antenna: Arc<AtomicU32>,
     tx_antenna: Arc<AtomicU32>,
     rx_attenuation: Arc<AtomicU32>,
+    alex_attenuation: Arc<AtomicU32>,
     lna_tx_db: Arc<AtomicI32>,
     ps_tx_attenuation: Arc<AtomicU32>,
     mox: Arc<AtomicBool>,
@@ -1839,7 +1879,9 @@ fn start_protocol1(
         settings.frequency_hz,
         settings.sample_rate,
         matches!(device.board, Boards::HermesLite | Boards::HermesLite2),
+        matches!(device.board, Boards::Metis | Boards::Ozy),
         rx_attenuation.load(Ordering::Relaxed) as u8,
+        alex_attenuation.load(Ordering::Relaxed) as u8,
         lna_tx_db.load(Ordering::Relaxed),
         ps_tx_attenuation.load(Ordering::Relaxed) as u8,
         device.adcs,
@@ -1899,9 +1941,11 @@ fn start_protocol1(
     let sender_cw_mode_active = Arc::clone(&cw_mode_active);
     let sender_pa_gain_db = Arc::clone(&pa_gain_db);
     let sender_rx_attenuation = Arc::clone(&rx_attenuation);
+    let sender_alex_attenuation = Arc::clone(&alex_attenuation);
     let sender_lna_tx_db = Arc::clone(&lna_tx_db);
     let sender_ps_tx_attenuation = Arc::clone(&ps_tx_attenuation);
     let sender_is_hermes_lite = matches!(device.board, Boards::HermesLite | Boards::HermesLite2);
+    let sender_is_atlas_backplane = matches!(device.board, Boards::Metis | Boards::Ozy);
     let sender_disable_pa = Arc::clone(&disable_pa);
     let sender_tune_active = Arc::clone(&tune_active);
     let sender_oc_rx = Arc::clone(&oc_rx);
@@ -1941,9 +1985,11 @@ fn start_protocol1(
             sender_cw_mode_active,
             sender_pa_gain_db,
             sender_rx_attenuation,
+            sender_alex_attenuation,
             sender_lna_tx_db,
             sender_ps_tx_attenuation,
             sender_is_hermes_lite,
+            sender_is_atlas_backplane,
             sender_disable_pa,
             sender_tune_active,
             sender_oc_rx,
@@ -2032,6 +2078,7 @@ fn start_protocol1(
         oc_rx,
         oc_tx,
         rx_attenuation,
+        alex_attenuation,
         ps_tx_attenuation,
         extra_frequencies_hz,
         extra_sample_rates_hz,
@@ -2347,6 +2394,10 @@ fn start_protocol1_ozy_usb(
         oc_rx,
         oc_tx,
         rx_attenuation,
+        // P1-only in practice -- see RadioSession::alex_attenuation's
+        // doc comment. Same "fresh dummy Arc, never wired to anything"
+        // pattern this function already uses for lna_tx_db below.
+        alex_attenuation: Arc::new(AtomicU32::new(0)),
         ps_tx_attenuation,
         extra_frequencies_hz,
         extra_sample_rates_hz,
@@ -2605,6 +2656,10 @@ fn start_rx888_usb(
         oc_rx,
         oc_tx,
         rx_attenuation,
+        // P1-only in practice -- see RadioSession::alex_attenuation's
+        // doc comment. Same "fresh dummy Arc, never wired to anything"
+        // pattern this function already uses for lna_tx_db below.
+        alex_attenuation: Arc::new(AtomicU32::new(0)),
         ps_tx_attenuation,
         extra_frequencies_hz,
         extra_sample_rates_hz,
@@ -3274,7 +3329,9 @@ fn p1_send_preconfig_and_start(
     frequency_hz: u32,
     sample_rate: u32,
     is_hermes_lite: bool,
+    is_atlas_backplane: bool,
     rx_attenuation: u8,
+    alex_attenuation: u8,
     // See RadioSession::lna_tx_db's doc comment.
     lna_tx_db: i32,
     ps_tx_attenuation: u8,
@@ -3325,6 +3382,7 @@ fn p1_send_preconfig_and_start(
             sample_rate,
             false, // mox: never keyed during startup config
             is_hermes_lite,
+            is_atlas_backplane,
             false, // hl2_ak4951_codec: irrelevant this early -- no RX audio flows until sender_loop takes over, whose live value applies to every subsequent packet
             false, // disable_pa: nothing to key yet this early -- sender_loop's live value takes over immediately after
             false, // tune_active: never during startup config, nothing keyed yet
@@ -3333,6 +3391,7 @@ fn p1_send_preconfig_and_start(
             0, // oc_rx: nothing to key yet this early -- sender_loop's live value takes over immediately after
             0, // oc_tx: not transmitting during startup config (mox false above), so never actually used
             rx_attenuation,
+            alex_attenuation,
             lna_tx_db,
             ps_tx_attenuation,
             num_adcs,
@@ -3431,6 +3490,12 @@ fn p1_build_packet(
     sample_rate_hz: u32,
     mox_on: bool,
     is_hermes_lite: bool,
+    // See frame0's own construction below (the always-sent C0=0 "General
+    // Control" frame) -- true for Metis/Ozy (the older 3-board "Atlas"
+    // backplane family), which need CONFIG_MERCURY/clock-source bits in
+    // that frame's C1 byte that other
+    // (single-board) P1 boards don't use at all.
+    is_atlas_backplane: bool,
     // See RadioSession::hl2_ak4951_codec's doc comment. Only consulted
     // for command 4's C3 byte below (forces the codec-present/dither
     // bit) -- the RX-audio-vs-zeros decision itself is made by the
@@ -3454,6 +3519,9 @@ fn p1_build_packet(
     oc_rx: u8,
     oc_tx: u8,
     rx_attenuation: u8,
+    // See RadioSession::alex_attenuation's doc comment -- consumed by
+    // frame0's construction below. Raw 0-3 index, sent as-is.
+    alex_attenuation: u8,
     // See RadioSession::lna_tx_db's doc comment -- consumed by command
     // 11's match arm below.
     lna_tx_db: i32,
@@ -3545,7 +3613,22 @@ fn p1_build_packet(
     // determines the byte stride of the interleaved IQ stream the
     // radio sends back. Duplex (bit 2) is unconditionally set in
     // the reference.
-    let c1 = sample_rate_code(sample_rate_hz);
+    // CONFIG_BOTH (0x60 = CONFIG_MERCURY 0x40 | CONFIG_PENELOPE 0x20),
+    // ONLY for the older 3-board "Atlas" backplane family (Metis/Ozy) --
+    // confirmed against piHPSDR's old_protocol.c: unconditional
+    // CONFIG_MERCURY ("Assume a mercury board is *always* present") plus
+    // its own comment on CONFIG_BOTH specifically, "seems to be critical
+    // to getting ozy to respond". Hermes/Hermes2/Angelia/Orion/Orion2 are
+    // single-board designs with their own on-board clocking that don't
+    // use this Atlas-specific config at all (piHPSDR only sets these bits
+    // inside its own `device == DEVICE_OZY || DEVICE_METIS` check). This
+    // project has no per-user "10MHz src"/"122M src" setting (piHPSDR's
+    // own Radio dialog) to source these from, so the clock-source sub-
+    // bits are left at 0x00 (no extra bits beyond CONFIG_BOTH itself),
+    // matching a real confirmed-working piHPSDR config for a Metis/
+    // Mercury/Alex/Penelope Atlas rack ("122M src: Penelope", "10MHz
+    // src: Atlas").
+    let c1 = sample_rate_code(sample_rate_hz) | if is_atlas_backplane { 0x60 } else { 0x00 };
 
     // Antenna selection: C3 bits 5-7 route Ext1/Ext2/XVTR-in to RX1
     // (BYPASS-style relay boards) or select the Orion2-family "master RX
@@ -3584,6 +3667,31 @@ fn p1_build_packet(
         5 => XVTR | BYPASS,
         _ => 0x00,
     };
+    // ALEX front-end attenuator relay (bits 0-1), sharing this same byte
+    // with the antenna-selection bits above (bits 5-7) -- confirmed
+    // against piHPSDR's old_protocol.c: `buffer[C3] =
+    // adc[0].alex_attenuation & 0x03`, gated there on `have_alex_att` ||
+    // filter_board==CHARLY25. has_alex_att mirrors piHPSDR's own
+    // have_alex_att matrix (radio.c): every standard P1 board except
+    // Orion2 and the HermesLite family -- Metis, Hermes, Hermes2,
+    // Angelia, and Orion all have a real ALEX relay, whether or not they
+    // ALSO have the separate step attenuator command 4's C4 byte
+    // controls (Metis has ALEX only; Hermes/Hermes2/Angelia/Orion have
+    // both). ROOT CAUSE FIX for a real report: this used to live in a
+    // separate, newly-added "command 12" match arm that only fired once
+    // per full 1-12 command rotation and sent its OWN (incomplete,
+    // differently-valued) C0=0 frame -- but frame0 here ALREADY sends a
+    // complete, correct C0=0 general-control frame on every single
+    // packet. Two different "register 0" updates disagreeing with each
+    // other in the same packet stream (this frame0, always right, vs.
+    // that rotating command's stale/wrong C1/C4) is exactly the kind of
+    // thing that could make a physical relay chatter -- confirmed via a
+    // real-hardware A/B test against a known-good piHPSDR session on the
+    // same radio: the attenuator relay itself is fine (piHPSDR engages
+    // it cleanly at every step), the extra conflicting packet was this
+    // project's own bug.
+    let has_alex_att = !is_hermes_lite && !is_orion2;
+    let c3 = c3 | if has_alex_att { alex_attenuation & 0x03 } else { 0x00 };
     let mut c4: u8 = 0x04; // Duplex -- confirmed always set
     c4 |= if ext_xvtr_selector > 2 {
         // Using Ext1/Ext2/XVTR for RX: the ANT1/2/3 relay position is
@@ -4106,8 +4214,8 @@ fn p1_build_packet(
             // itself, not the host, decides when to actually apply it.
             // Inert on non-HermesLite boards (this project has no
             // equivalent per-chip LNA register for them -- those boards
-            // use discrete ALEX preamp/attenuator relays instead,
-            // already covered by commands 4/9 above).
+            // use the discrete ALEX attenuator relay instead, frame0's
+            // construction below).
             if is_hermes_lite {
                 let clamped = lna_tx_db.clamp(-12, 48);
                 let c3 = (((clamped + 12) as u8) & 0x3F) | 0xC0;
@@ -4175,9 +4283,11 @@ fn sender_loop(
     cw_mode_active: Arc<AtomicBool>,
     pa_gain_db: Arc<AtomicU32>,
     rx_attenuation: Arc<AtomicU32>,
+    alex_attenuation: Arc<AtomicU32>,
     lna_tx_db: Arc<AtomicI32>,
     ps_tx_attenuation: Arc<AtomicU32>,
     is_hermes_lite: bool,
+    is_atlas_backplane: bool,
     disable_pa: Arc<std::sync::atomic::AtomicBool>,
     // See RadioSession::tune_active's doc comment -- read live, same as
     // disable_pa just above.
@@ -4284,7 +4394,9 @@ fn sender_loop(
                 frequency_hz.load(Ordering::Relaxed),
                 sample_rate.load(Ordering::Relaxed),
                 is_hermes_lite,
+                is_atlas_backplane,
                 rx_attenuation.load(Ordering::Relaxed) as u8,
+                alex_attenuation.load(Ordering::Relaxed) as u8,
                 lna_tx_db.load(Ordering::Relaxed),
                 ps_tx_attenuation.load(Ordering::Relaxed) as u8,
                 num_adcs,
@@ -4325,7 +4437,9 @@ fn sender_loop(
                 frequency_hz.load(Ordering::Relaxed),
                 sample_rate.load(Ordering::Relaxed),
                 is_hermes_lite,
+                is_atlas_backplane,
                 rx_attenuation.load(Ordering::Relaxed) as u8,
+                alex_attenuation.load(Ordering::Relaxed) as u8,
                 lna_tx_db.load(Ordering::Relaxed),
                 ps_tx_attenuation.load(Ordering::Relaxed) as u8,
                 num_adcs,
@@ -4438,6 +4552,7 @@ fn sender_loop(
             current_rate,
             mox_on,
             is_hermes_lite,
+            is_atlas_backplane,
             hl2_ak4951_codec_on,
             disable_pa.load(Ordering::Relaxed),
             tune_active.load(Ordering::Relaxed),
@@ -4446,6 +4561,7 @@ fn sender_loop(
             oc_rx.load(Ordering::Relaxed),
             oc_tx.load(Ordering::Relaxed),
             rx_attenuation.load(Ordering::Relaxed) as u8,
+            alex_attenuation.load(Ordering::Relaxed) as u8,
             lna_tx_db.load(Ordering::Relaxed),
             ps_tx_attenuation.load(Ordering::Relaxed) as u8,
             num_adcs,
@@ -4903,6 +5019,7 @@ fn ozy_sender_loop(
             current_rate,
             mox_on,
             false, // is_hermes_lite -- Ozy is never a HermesLite-family board
+            true, // is_atlas_backplane -- Ozy is definitionally part of the Atlas backplane family
             false, // hl2_ak4951_codec -- irrelevant when is_hermes_lite is false above
             disable_pa.load(Ordering::Relaxed),
             false, // tune_active -- irrelevant when is_hermes_lite is false above
@@ -4920,6 +5037,7 @@ fn ozy_sender_loop(
             oc_rx.load(Ordering::Relaxed),
             oc_tx.load(Ordering::Relaxed),
             rx_attenuation.load(Ordering::Relaxed) as u8,
+            0, // alex_attenuation -- inert, this project's Ozy path has no UI/setting for it yet (out of scope, see start_protocol1_ozy_usb's own doc comment)
             0, // lna_tx_db -- inert, is_hermes_lite is false above; Ozy has no such register
             ps_tx_attenuation.load(Ordering::Relaxed) as u8,
             num_adcs,
@@ -5803,6 +5921,10 @@ fn start_protocol2(
         oc_rx,
         oc_tx,
         rx_attenuation,
+        // P1-only in practice -- see RadioSession::alex_attenuation's
+        // doc comment. Same "fresh dummy Arc, never wired to anything"
+        // pattern this function already uses for lna_tx_db below.
+        alex_attenuation: Arc::new(AtomicU32::new(0)),
         ps_tx_attenuation,
         extra_frequencies_hz,
         extra_sample_rates_hz,
