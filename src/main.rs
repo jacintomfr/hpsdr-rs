@@ -1599,6 +1599,18 @@ struct ConnectedState {
     tx_db_high: f32,
     tx_waterfall_db_low: f32,
     tx_waterfall_db_high: f32,
+    /// See Config::panadapter_step_db's own doc comment -- matches
+    /// piHPSDR's Display menu "Panadapter Step" (5/10/15/20 dB, per
+    /// RX and per TX independently). Read at the spectrum gridline
+    /// draw site instead of the previous hardcoded 10.0.
+    panadapter_step_db: f32,
+    tx_panadapter_step_db: f32,
+    /// See Config::spectrum_fps's own doc comment -- matches piHPSDR's
+    /// Display menu "Frames/sec" (1-64, per RX and per TX
+    /// independently). Read at the request_repaint_after call site
+    /// instead of the previous fixed ~30Hz (33ms).
+    spectrum_fps: u32,
+    tx_spectrum_fps: u32,
     waterfall_palette: Palette,
     /// S-meter style (Settings -> Meter) -- see MeterStyle's own doc
     /// comment.
@@ -2892,6 +2904,10 @@ fn connect_to_device(device: Device, cfg: &Config) -> Result<ConnectedState, Str
                 tx_waterfall_db_high: cfg
                     .tx_waterfall_db_high
                     .unwrap_or(cfg.waterfall_db_high.unwrap_or(-60.0) + 60.0),
+                panadapter_step_db: cfg.panadapter_step_db.unwrap_or(10.0),
+                tx_panadapter_step_db: cfg.tx_panadapter_step_db.unwrap_or(10.0),
+                spectrum_fps: cfg.spectrum_fps.unwrap_or(30),
+                tx_spectrum_fps: cfg.tx_spectrum_fps.unwrap_or(30),
                 waterfall_palette: cfg.waterfall_palette.unwrap_or(Palette::Ocean),
                 meter_style: cfg.meter_style.unwrap_or(MeterStyle::Analog),
                 spectrum_waterfall_ratio: cfg
@@ -6312,17 +6328,24 @@ impl eframe::App for HpsdrApp {
                         // but not calibrated to absolute dBm since the
                         // analyzer's fscLin/fscHin were left at 0.0.
                         //
-                        // Snapped to multiples of 10 dB (not equal
-                        // fractions of whatever db_low/db_high happen to
-                        // be) -- BUG FIX for a real report: the old equal-
-                        // fraction spacing produced arbitrary-looking
-                        // labels (e.g. "-2 dB"/"-15 dB"/"-28 dB") instead
-                        // of round, glanceable numbers. Same "nice tick"
-                        // idea as the frequency axis, just a fixed step
-                        // rather than an adaptive one, since 10dB is the
-                        // conventional spectrum-display grid spacing
-                        // regardless of the configured range.
-                        let mut db = (db_low / 10.0).ceil() * 10.0;
+                        // Snapped to multiples of the configured step
+                        // (not equal fractions of whatever db_low/
+                        // db_high happen to be) -- BUG FIX for a real
+                        // report: the old equal-fraction spacing
+                        // produced arbitrary-looking labels (e.g.
+                        // "-2 dB"/"-15 dB"/"-28 dB") instead of round,
+                        // glanceable numbers. Same "nice tick" idea as
+                        // the frequency axis, just a fixed step rather
+                        // than an adaptive one.
+                        //
+                        // Step itself (Settings -> Spectrum) matches
+                        // piHPSDR's own Display menu "Panadapter Step"
+                        // (5/10/15/20 dB, separately configurable per
+                        // RX/TX) -- was hardcoded to 10dB here before.
+                        let grid_step_db =
+                            if transmitting { connected.tx_panadapter_step_db } else { connected.panadapter_step_db }
+                                .max(1.0);
+                        let mut db = (db_low / grid_step_db).ceil() * grid_step_db;
                         while db <= db_high {
                             let frac = (db - db_low) / range;
                             let y = plot_bottom - frac * plot_height;
@@ -6337,7 +6360,7 @@ impl eframe::App for HpsdrApp {
                                 egui::FontId::monospace(10.0),
                                 egui::Color32::GRAY,
                             );
-                            db += 10.0;
+                            db += grid_step_db;
                         }
 
                         // Plain full-width bin mapping -- unlike an
@@ -9174,6 +9197,39 @@ impl eframe::App for HpsdrApp {
                                             settings_changed = true;
                                         }
                                     });
+                                    // Matches piHPSDR's own Display menu
+                                    // "Panadapter Step"/"Frames/sec"
+                                    // (display_menu.c) -- was hardcoded
+                                    // to 10dB/~30fps here before, with no
+                                    // UI at all.
+                                    ui.horizontal(|ui| {
+                                        ui.label("Grid step:");
+                                        let mut step = connected.panadapter_step_db as i32;
+                                        if scroll_slider_i32(
+                                            ui,
+                                            &mut connected.slider_scroll_accum,
+                                            &mut step,
+                                            5..=20,
+                                            5,
+                                            " dB",
+                                        ) {
+                                            connected.panadapter_step_db = step as f32;
+                                            settings_changed = true;
+                                        }
+                                        ui.label("FPS:");
+                                        let mut fps = connected.spectrum_fps as i32;
+                                        if scroll_slider_i32(
+                                            ui,
+                                            &mut connected.slider_scroll_accum,
+                                            &mut fps,
+                                            1..=64,
+                                            1,
+                                            "",
+                                        ) {
+                                            connected.spectrum_fps = fps as u32;
+                                            settings_changed = true;
+                                        }
+                                    });
 
                                     ui.separator();
                                     if ui
@@ -9317,6 +9373,39 @@ impl eframe::App for HpsdrApp {
                                             2.0,
                                         ) {
                                             connected.tx_waterfall_db_high = tx_whigh;
+                                            settings_changed = true;
+                                        }
+                                    });
+                                    // Matches piHPSDR's own Display menu
+                                    // "Panadapter Step"/"Frames/sec"
+                                    // (display_menu.c), TX side -- was
+                                    // hardcoded to 10dB/~30fps here
+                                    // before, with no UI at all.
+                                    ui.horizontal(|ui| {
+                                        ui.label("Grid step:");
+                                        let mut tx_step = connected.tx_panadapter_step_db as i32;
+                                        if scroll_slider_i32(
+                                            ui,
+                                            &mut connected.slider_scroll_accum,
+                                            &mut tx_step,
+                                            5..=20,
+                                            5,
+                                            " dB",
+                                        ) {
+                                            connected.tx_panadapter_step_db = tx_step as f32;
+                                            settings_changed = true;
+                                        }
+                                        ui.label("FPS:");
+                                        let mut tx_fps = connected.tx_spectrum_fps as i32;
+                                        if scroll_slider_i32(
+                                            ui,
+                                            &mut connected.slider_scroll_accum,
+                                            &mut tx_fps,
+                                            1..=64,
+                                            1,
+                                            "",
+                                        ) {
+                                            connected.tx_spectrum_fps = tx_fps as u32;
                                             settings_changed = true;
                                         }
                                     });
@@ -11183,6 +11272,10 @@ impl eframe::App for HpsdrApp {
                         tx_db_high: Some(connected.tx_db_high),
                         tx_waterfall_db_low: Some(connected.tx_waterfall_db_low),
                         tx_waterfall_db_high: Some(connected.tx_waterfall_db_high),
+                        panadapter_step_db: Some(connected.panadapter_step_db),
+                        tx_panadapter_step_db: Some(connected.tx_panadapter_step_db),
+                        spectrum_fps: Some(connected.spectrum_fps),
+                        tx_spectrum_fps: Some(connected.tx_spectrum_fps),
                         waterfall_palette: Some(connected.waterfall_palette),
                         meter_style: Some(connected.meter_style),
                         spectrum_waterfall_ratio: Some(connected.spectrum_waterfall_ratio),
@@ -11301,9 +11394,17 @@ impl eframe::App for HpsdrApp {
                 // immediate repaint every single frame turns this into
                 // an unthrottled busy-loop -- easily the single biggest
                 // cause of one CPU core sitting at/near 100% with this
-                // app open. ~30Hz is still smooth and comfortably above
-                // the analyzer's own ~10Hz update rate.
-                ui.ctx().request_repaint_after(Duration::from_millis(33));
+                // app open. Was a fixed ~30Hz (33ms) -- now the user's
+                // own Settings -> Spectrum "FPS" (per RX/TX, matching
+                // piHPSDR's Display menu "Frames/sec"), still clamped
+                // to a sane floor/ceiling here regardless of what gets
+                // saved to disk: 1 fps would make the whole UI (not
+                // just the spectrum -- this is the SAME repaint driving
+                // the S-meter, VFO, etc.) feel broken, and above 64
+                // fps buys nothing since the analyzer itself only
+                // updates at ~10Hz.
+                let fps = if transmitting { connected.tx_spectrum_fps } else { connected.spectrum_fps }.clamp(1, 64);
+                ui.ctx().request_repaint_after(Duration::from_millis(1000 / fps as u64));
 
                 if stop_clicked {
                     // Finalizes the WAV header (real RIFF/data sizes,

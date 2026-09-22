@@ -330,6 +330,28 @@ pub struct Config {
     pub tx_db_high: Option<f32>,
     pub tx_waterfall_db_low: Option<f32>,
     pub tx_waterfall_db_high: Option<f32>,
+    /// Spacing (dB) between the spectrum's power-level gridlines/labels
+    /// on the left -- matches piHPSDR's own Display menu "Panadapter
+    /// Step" (display_menu.c), which offers 5/10/15/20 per RX and per
+    /// TX independently. `#[serde(default)]` (i.e. `None`) so a config
+    /// saved before this existed keeps the previous hardcoded-10dB
+    /// behavior -- see its read site in main.rs for the actual fallback
+    /// value.
+    #[serde(default)]
+    pub panadapter_step_db: Option<f32>,
+    #[serde(default)]
+    pub tx_panadapter_step_db: Option<f32>,
+    /// Spectrum/waterfall redraw rate (Hz) -- matches piHPSDR's own
+    /// Display menu "Frames/sec" (per RX and per TX, 1-64), which
+    /// controls how often the panadapter/waterfall actually repaints,
+    /// independent of anything else in the UI. `#[serde(default)]` so a
+    /// config saved before this existed keeps the previous fixed ~30Hz
+    /// behavior -- see its read site in main.rs for the actual fallback
+    /// value.
+    #[serde(default)]
+    pub spectrum_fps: Option<u32>,
+    #[serde(default)]
+    pub tx_spectrum_fps: Option<u32>,
     #[serde(default)]
     pub band_settings: std::collections::HashMap<String, BandSettings>,
     /// Last filter width used per mode, keyed by Mode::label() (e.g.
