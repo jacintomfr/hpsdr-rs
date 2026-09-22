@@ -1496,6 +1496,15 @@ struct ConnectedState {
     /// would otherwise miss it. UI-only, never persisted. `None` shows
     /// nothing; overwritten by the next import attempt.
     midi_import_message: Option<String>,
+    /// Result of the last "Backup bindings..."/"Restore bindings..."
+    /// click (top of the MIDI settings page, next to "Enable MIDI
+    /// control") -- a real request: assigning encoders/switches to MIDI
+    /// controls takes real time to redo, so a plain JSON export/import
+    /// of just `midi_bindings` (already Serialize/Deserialize, same as
+    /// Config's own on-disk format) lets that work survive a config
+    /// reset or move to another machine without re-learning every
+    /// binding by hand. UI-only, never persisted itself.
+    midi_backup_message: Option<String>,
     /// Per-Wheel-binding rate limiting -- see MidiBinding::debounce_ms's
     /// doc comment. Keyed by the binding's own identity (event/channel/
     /// number, the same fields MidiBinding::matches compares), not its
@@ -2872,6 +2881,7 @@ fn connect_to_device(device: Device, cfg: &Config) -> Result<ConnectedState, Str
                 midi_unmatched_last_logged: None,
                 rx200: rx200::Rx200Monitor::start(),
                 midi_import_message: None,
+                midi_backup_message: None,
                 midi_wheel_last_step: std::collections::HashMap::new(),
                 audio_output,
                 audio_output_device,
@@ -7891,10 +7901,88 @@ impl eframe::App for HpsdrApp {
 
                                 SettingsTab::Midi => {
                                     ui.label("MIDI control surface:");
-                                    let mut midi_enabled_ui = connected.midi.enabled.load(Ordering::Relaxed);
-                                    if ui.checkbox(&mut midi_enabled_ui, "Enable MIDI control").changed() {
-                                        connected.midi.enabled.store(midi_enabled_ui, Ordering::Relaxed);
-                                        settings_changed = true;
+                                    ui.horizontal(|ui| {
+                                        let mut midi_enabled_ui = connected.midi.enabled.load(Ordering::Relaxed);
+                                        if ui.checkbox(&mut midi_enabled_ui, "Enable MIDI control").changed() {
+                                            connected.midi.enabled.store(midi_enabled_ui, Ordering::Relaxed);
+                                            settings_changed = true;
+                                        }
+                                        ui.add_space(16.0);
+                                        // Plain JSON export/import of just `midi_bindings`
+                                        // (MidiBinding is already Serialize/Deserialize, same
+                                        // as Config's own on-disk format) -- see
+                                        // midi_backup_message's own doc comment for why.
+                                        if ui
+                                            .button("Backup bindings...")
+                                            .on_hover_text(
+                                                "Save all current MIDI bindings to a file, so they \
+                                                 don't need to be re-learned by hand later.",
+                                            )
+                                            .clicked()
+                                        {
+                                            if let Some(path) = rfd::FileDialog::new()
+                                                .add_filter("MIDI bindings", &["json"])
+                                                .set_file_name("hpsdr-rs-midi-bindings.json")
+                                                .save_file()
+                                            {
+                                                match serde_json::to_string_pretty(&connected.midi_bindings) {
+                                                    Ok(json) => match std::fs::write(&path, json) {
+                                                        Ok(()) => {
+                                                            connected.midi_backup_message = Some(format!(
+                                                                "Saved {} binding(s) to {}",
+                                                                connected.midi_bindings.len(),
+                                                                path.display()
+                                                            ));
+                                                        }
+                                                        Err(e) => {
+                                                            connected.midi_backup_message =
+                                                                Some(format!("Couldn't write {}: {e}", path.display()));
+                                                        }
+                                                    },
+                                                    Err(e) => {
+                                                        connected.midi_backup_message =
+                                                            Some(format!("Couldn't encode bindings: {e}"));
+                                                    }
+                                                }
+                                            }
+                                        }
+                                        if ui
+                                            .button("Restore bindings...")
+                                            .on_hover_text(
+                                                "Load MIDI bindings from a file saved with \"Backup \
+                                                 bindings...\", replacing all current bindings.",
+                                            )
+                                            .clicked()
+                                        {
+                                            if let Some(path) =
+                                                rfd::FileDialog::new().add_filter("MIDI bindings", &["json"]).pick_file()
+                                            {
+                                                match std::fs::read_to_string(&path) {
+                                                    Ok(json) => match serde_json::from_str::<Vec<MidiBinding>>(&json) {
+                                                        Ok(bindings) => {
+                                                            connected.midi_backup_message = Some(format!(
+                                                                "Restored {} binding(s) from {}",
+                                                                bindings.len(),
+                                                                path.display()
+                                                            ));
+                                                            connected.midi_bindings = bindings;
+                                                            settings_changed = true;
+                                                        }
+                                                        Err(e) => {
+                                                            connected.midi_backup_message =
+                                                                Some(format!("Couldn't parse {}: {e}", path.display()));
+                                                        }
+                                                    },
+                                                    Err(e) => {
+                                                        connected.midi_backup_message =
+                                                            Some(format!("Couldn't read {}: {e}", path.display()));
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    });
+                                    if let Some(msg) = &connected.midi_backup_message {
+                                        ui.weak(msg);
                                     }
 
                                     // One checkbox per detected port, not a single-select
