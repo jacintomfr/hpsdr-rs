@@ -709,6 +709,58 @@ pub(crate) fn settings_dir() -> Option<PathBuf> {
     Some(path)
 }
 
+/// The 1024x600 LCD kiosk mode's UI scale (see main()'s HPSDR_LCD_1024X600
+/// doc comment) -- a MACHINE/panel preference, not a per-radio one, so it
+/// deliberately lives in its own small file rather than inside the
+/// per-MAC `Config` this module otherwise deals in (there's no single
+/// radio to key it by: the same panel might be used with several radios
+/// over time, and the scale should stay the same regardless of which one
+/// is currently connected). Read once at startup, before any radio is
+/// even discovered -- see main()'s own use of this -- since the kiosk
+/// window's fixed logical size has to be picked before eframe creates
+/// the window at all; there's no live "resize while running" path for
+/// it (changing pixels_per_point after the window exists wouldn't also
+/// shrink/grow the OS window to compensate, so the two would drift out
+/// of sync with the physical 1024x600 panel). 1.0 (100%) is the
+/// original, un-scaled kiosk size.
+const KIOSK_SCALE_PRESETS: [f32; 3] = [1.0, 1.10, 1.25];
+
+fn kiosk_scale_path() -> Option<PathBuf> {
+    let mut path = settings_dir()?;
+    path.push("kiosk_scale.json");
+    Some(path)
+}
+
+/// Loads the saved kiosk UI scale, falling back to 1.0 (100%, the
+/// original size) if nothing was ever saved or the file can't be read --
+/// same "missing means default" convention as the rest of this module.
+pub fn load_kiosk_ui_scale() -> f32 {
+    kiosk_scale_path()
+        .and_then(|p| std::fs::read_to_string(p).ok())
+        .and_then(|s| s.trim().parse::<f32>().ok())
+        .filter(|s| KIOSK_SCALE_PRESETS.contains(s))
+        .unwrap_or(1.0)
+}
+
+/// Saves the kiosk UI scale for the next launch to pick up -- see
+/// load_kiosk_ui_scale's doc comment for why this can't take effect
+/// live. A plain float-as-text file, not JSON: this is the only value
+/// in it, so the extra structure would be pure overhead.
+pub fn save_kiosk_ui_scale(scale: f32) {
+    if let Some(path) = kiosk_scale_path() {
+        let _ = std::fs::write(path, scale.to_string());
+    }
+}
+
+/// The fixed choices `save_kiosk_ui_scale` accepts -- see
+/// KIOSK_SCALE_PRESETS' own doc comment for why these are discrete
+/// presets rather than a free-form slider (a real request: "not every
+/// size, just a little room to grow"). Exposed for main.rs's Settings ->
+/// Screen tab to build its picker from, rather than duplicating the list.
+pub fn kiosk_ui_scale_presets() -> &'static [f32] {
+    &KIOSK_SCALE_PRESETS
+}
+
 /// A window's on-screen position and content size, in egui points
 /// (matches `egui::ViewportBuilder::with_position`/`with_inner_size`'s
 /// units -- see Config::window_geometry/ExtraReceiverConfig::window_geometry).

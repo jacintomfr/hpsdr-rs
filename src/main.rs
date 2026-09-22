@@ -990,6 +990,7 @@ enum SettingsTab {
     Firmware,
     Midi,
     Meter,
+    Screen,
     About,
 }
 
@@ -1940,10 +1941,31 @@ struct HpsdrApp {
 /// every light-theme override (the Settings and extra-receiver-settings
 /// windows) so the whole app stays visually consistent rather than only
 /// changing it in the main window.
-fn with_orange_selection(mut visuals: egui::Visuals) -> egui::Visuals {
+/// Applied to every window/viewport's visuals throughout the app, so
+/// the selected-item highlight color is consistent everywhere.
+pub(crate) fn with_orange_selection(mut visuals: egui::Visuals) -> egui::Visuals {
     visuals.selection.bg_fill = egui::Color32::from_rgb(230, 126, 34);
     visuals.selection.stroke.color = egui::Color32::WHITE;
     visuals
+}
+
+/// A yellow-filled button, used ONLY for kiosk mode's own window-chrome
+/// controls (STOP, SETTINGS, MIN, CLOSE) -- a real request: those are
+/// the small on-screen replacements for a native title bar's controls
+/// (this app has none in kiosk mode -- see lcd_kiosk_mode's own doc
+/// comment), easy to miss among all the other buttons on a small
+/// touchscreen panel, so they get their own attention-grabbing color
+/// distinct from every other meaning-carrying color already in use
+/// elsewhere (red = active/recording, green = PS correcting, orange =
+/// an already-on toggle) so it doesn't collide with any of those.
+/// Black text, not white -- yellow is light enough that white text on
+/// it would be low-contrast, unlike the red/orange fills those other
+/// buttons use.
+pub(crate) fn kiosk_accent_button(ui: &mut egui::Ui, label: &str) -> egui::Response {
+    ui.add(
+        egui::Button::new(egui::RichText::new(label).strong().color(egui::Color32::BLACK))
+            .fill(egui::Color32::from_rgb(235, 195, 40)),
+    )
 }
 
 impl HpsdrApp {
@@ -1964,6 +1986,32 @@ impl HpsdrApp {
         ctx.style_mut_of(egui::Theme::Dark, |style| {
             style.visuals = with_orange_selection(style.visuals.clone());
         });
+        // See config::load_kiosk_ui_scale's doc comment (Settings ->
+        // Screen, kiosk mode only). Scales the STYLE's own text sizes,
+        // not pixels_per_point/the window's physical size -- an earlier
+        // version of this tried the pixels_per_point route (shrinking
+        // the logical inner_size to compensate, so the physical window
+        // would stay 1024x600), but that fought with `with_fullscreen`
+        // for reasons not fully understood (the window came back
+        // windowed, undersized, with the taskbar visible -- a real
+        // regression from a real test). This is a strictly smaller,
+        // safer change: it can only make glyphs bigger within widgets
+        // that already existed at their normal layout size, never touch
+        // window geometry/fullscreen state at all. Widgets/painters that
+        // set an explicit `egui::FontId` size directly (the spectrum/
+        // waterfall/meter's own custom-painted text) aren't affected --
+        // out of scope for this "a little more room" request; only
+        // ordinary labels/buttons/etc. driven by the ambient style are.
+        if lcd_kiosk_mode() {
+            let scale = config::load_kiosk_ui_scale();
+            if scale != 1.0 {
+                ctx.style_mut_of(egui::Theme::Dark, |style| {
+                    for font_id in style.text_styles.values_mut() {
+                        font_id.size *= scale;
+                    }
+                });
+            }
+        }
         Self {
             state: AppState::Discovering(DiscoveryWindow::new(ctx)),
             was_focused: true,
@@ -3595,7 +3643,56 @@ impl eframe::App for HpsdrApp {
                             let freq_label = ui
                                 .group(|ui| {
                                     ui.vertical(|ui| {
-                                        ui.label("VFO-A");
+                                        ui.horizontal(|ui| {
+                                            ui.label("VFO-A");
+                                            // RX/TX badge, next to the
+                                            // VFO-A/VFO-B label -- a real
+                                            // request, replacing the
+                                            // separate "TRANSMITTING" text
+                                            // removed from the RIT/XIT row
+                                            // (redundant with this). Same
+                                            // red/green logic as
+                                            // freq_a_color just above, so
+                                            // this box's badge always
+                                            // agrees with its own
+                                            // frequency digits' color.
+                                            // ROOT CAUSE FIX for a real
+                                            // report (this box ballooning
+                                            // to the full window width,
+                                            // breaking the rest of the
+                                            // layout): an unconstrained
+                                            // ui.with_layout(right_to_left,
+                                            // ..) inside a plain
+                                            // ui.horizontal claims the
+                                            // FULL remaining available
+                                            // width to right-align within
+                                            // -- fine in a row that's
+                                            // already width-constrained,
+                                            // not here, where this
+                                            // group's own width is
+                                            // determined BY its content
+                                            // (a growth loop). Plain
+                                            // add_space + label instead:
+                                            // not right-aligned to the
+                                            // group's far edge, but safe.
+                                            ui.add_space(8.0);
+                                            // Reuses freq_a_color directly
+                                            // (not a hardcoded green)
+                                            // rather than assuming
+                                            // "not red" always means
+                                            // "actively receiving, show
+                                            // green" -- VFO-B's own badge
+                                            // needs the same GRAY-when-
+                                            // idle case freq_b_color
+                                            // already has (a real report:
+                                            // a hardcoded green RX badge
+                                            // on VFO-B claimed it was
+                                            // receiving even when it's
+                                            // just a stored frequency,
+                                            // not actually in use).
+                                            let rx_tx_label = if freq_a_color == egui::Color32::RED { "TX" } else { "RX" };
+                                            ui.colored_label(freq_a_color, rx_tx_label);
+                                        });
                                         let resp = ui
                                             .add(
                                                 egui::Label::new(
@@ -3813,7 +3910,32 @@ impl eframe::App for HpsdrApp {
                             let vfo_b_label = ui
                                 .group(|ui| {
                                     ui.vertical(|ui| {
-                                        ui.label("VFO-B");
+                                        ui.horizontal(|ui| {
+                                            ui.label("VFO-B");
+                                            // See VFO-A's own RX/TX badge
+                                            // comment above (both what
+                                            // this does and the layout
+                                            // bug its right_to_left
+                                            // version caused) -- same
+                                            // idea, matching
+                                            // freq_b_color's logic instead.
+                                            ui.add_space(8.0);
+                                            // Reuses freq_b_color directly
+                                            // (RED while transmitting on
+                                            // B, GRAY otherwise -- see
+                                            // freq_b_color's own doc
+                                            // comment) instead of a
+                                            // hardcoded green: VFO-B isn't
+                                            // "actively receiving" unless
+                                            // Split has it live, so its
+                                            // idle state should read as
+                                            // gray/inactive, matching its
+                                            // own frequency digits'
+                                            // color, not falsely claim
+                                            // green/RX (a real report).
+                                            let rx_tx_label = if freq_b_color == egui::Color32::RED { "TX" } else { "RX" };
+                                            ui.colored_label(freq_b_color, rx_tx_label);
+                                        });
                                         let resp = ui
                                             .add(
                                                 egui::Label::new(
@@ -3851,7 +3973,13 @@ impl eframe::App for HpsdrApp {
                             // avoiding.
                             ui.add_space(12.0);
                             ui.vertical(|ui| {
-                                if ui.button("Settings...").clicked() {
+                                // See kiosk_accent_button's own doc comment.
+                                let settings_clicked = if lcd_kiosk_mode() {
+                                    kiosk_accent_button(ui, "SETTINGS...").clicked()
+                                } else {
+                                    ui.button("Settings...").clicked()
+                                };
+                                if settings_clicked {
                                     connected.show_settings_window = !connected.show_settings_window;
                                 }
                                 // Used to be gated to protocol == 2 only -- P1
@@ -3900,6 +4028,49 @@ impl eframe::App for HpsdrApp {
                                     connected.show_juice_console_window = !connected.show_juice_console_window;
                                 }
                             });
+
+                            // LEV/PROC/CFC -- kiosk-only (a real report/
+                            // mockup), moved up here (next to Settings/
+                            // Add Receiver/Juice Console, in the top
+                            // VFO row) from its own dedicated row further
+                            // down (see that row's own comment) -- frees
+                            // that row's height for the spectrum/
+                            // waterfall. Stacked as 3 short lines, unlike
+                            // desktop's single-line version, to match the
+                            // mockup and fit this narrower column.
+                            if lcd_kiosk_mode() && connected.tx_enabled {
+                                if let Some(tx) = &connected.tx_handle {
+                                    ui.add_space(12.0);
+                                    ui.vertical(|ui| {
+                                        if tx.leveler_enabled() {
+                                            ui.colored_label(
+                                                egui::Color32::from_rgb(230, 150, 50),
+                                                format!("LEV +{:.0}", tx.leveler_gain_db()),
+                                            );
+                                        } else {
+                                            ui.weak("LEV");
+                                        }
+                                        if tx.compressor_enabled() {
+                                            ui.colored_label(
+                                                egui::Color32::from_rgb(230, 150, 50),
+                                                format!("PROC +{:.0}", tx.compressor_gain_db()),
+                                            );
+                                        } else {
+                                            ui.weak("PROC");
+                                        }
+                                        // CFC has no single scalar gain to
+                                        // show (12-band fixed profile) --
+                                        // just on/off, same dim/
+                                        // highlighted convention as
+                                        // LEV/PROC above.
+                                        if tx.cfc_enabled() {
+                                            ui.colored_label(egui::Color32::from_rgb(230, 150, 50), "CFC");
+                                        } else {
+                                            ui.weak("CFC");
+                                        }
+                                    });
+                                }
+                            }
 
                             (freq_label, vfo_b_label)
                         })
@@ -4175,6 +4346,36 @@ impl eframe::App for HpsdrApp {
                         }
                     }
 
+                    // rigctl/TCI/CAT/PS/Record status row -- factored out
+                    // to a closure (rather than left as a single inline
+                    // ui.horizontal call) so kiosk mode can fold rigctl/
+                    // TCI/CAT/PS onto the end of THIS mode-buttons row
+                    // below instead of giving it a whole row of its own:
+                    // a real report/mockup asked for these spread across
+                    // several existing rows' spare horizontal room
+                    // (this one, plus Audio gain's own SNB/ANF/BIN and
+                    // RX Gain's own NB/NR -- see those rows' comments)
+                    // rather than crowded together on just one or two
+                    // rows, so the freed-up row(s) can go to the
+                    // spectrum/waterfall instead. Normal desktop mode
+                    // keeps its own dedicated standalone row unchanged
+                    // (see that call site below) -- this is purely which
+                    // row(s) the SAME content ends up on, not a
+                    // behavior change.
+                    // NOTE: render_status_row is a standalone fn (see its
+                    // definition below the App impl), not a closure --
+                    // ROOT CAUSE FIX for a real "cannot borrow *connected
+                    // as mutable" compile error: a closure capturing
+                    // `connected` holds that borrow for its own whole
+                    // lifetime, which conflicts the moment it's called
+                    // from INSIDE another closure (e.g. the mode-buttons
+                    // row's ui.horizontal_wrapped below) that also
+                    // touches `connected` directly (apply_mode). A plain
+                    // fn taking `connected: &mut ConnectedState` as an
+                    // explicit argument only borrows it for the duration
+                    // of each individual call, so nesting like this is
+                    // fine.
+
                     ui.horizontal_wrapped(|ui| {
                         for mode in ALL_MODES {
                             let selected = mode == current_mode;
@@ -4187,7 +4388,29 @@ impl eframe::App for HpsdrApp {
                                 settings_changed = true;
                             }
                         }
+                        // rigctl/TCI/CAT/PS -- kiosk-only (a real
+                        // report/mockup), appended here instead of their
+                        // own row. Record stays out of this call (see
+                        // show_status_row's own !lcd_kiosk_mode() guard
+                        // around it) -- it lives on the RIT/XIT row
+                        // instead, alongside Clear.
+                        if lcd_kiosk_mode() {
+                            ui.add_space(16.0);
+                            render_status_row(ui, connected, rigctl_status, tci_status, cat_status);
+                        }
                     });
+
+                    // NOTE: render_nb_nr/render_snb_anf_bin are standalone
+                    // fns (see their definitions below the App impl, next
+                    // to render_status_row), not closures -- same
+                    // "cannot find function in scope"/borrow-conflict
+                    // reasons as render_status_row's own comment: kiosk
+                    // mode calls these from inside the gain_filter_grid's
+                    // own closure further down, and desktop mode calls
+                    // them from inside its own ui.horizontal_wrapped
+                    // closure -- both are exactly the nested-closure
+                    // situation a closure-based version of these hit real
+                    // compile errors on.
 
                     ui.scope(|ui| {
                         // Reserve room for the S-meter/Settings/Add
@@ -4248,6 +4471,7 @@ impl eframe::App for HpsdrApp {
                         // near scroll_slider_f64, since AGC Gain's own
                         // slider further down uses them too) for the
                         // actual fix and why.
+
                         egui::Grid::new("gain_filter_grid").num_columns(6).show(ui, |ui| {
                         ui.label("Audio gain:");
                         let mut gain = current_gain;
@@ -4327,6 +4551,14 @@ impl eframe::App for HpsdrApp {
                                 }
                             }
                         }
+                        // SNB/ANF/BIN used to be appended here (kiosk
+                        // mode) -- a real report: this row is already
+                        // near its natural width from Audio/Mic/TCI TX
+                        // gain alone, and adding 3 more buttons pushed
+                        // "BIN" straight off the edge of the fixed
+                        // 1024px kiosk window. Moved to the AGC row
+                        // instead (see that row's own comment), which
+                        // has more spare room to begin with.
                         ui.end_row();
 
                         // Live RX Gain/Attenuation -- matches piHPSDR's own layout
@@ -4432,12 +4664,119 @@ impl eframe::App for HpsdrApp {
                                 .insert(current_mode.label().to_string(), width);
                             settings_changed = true;
                         }
+                        // NB/NR used to be appended here (kiosk mode) --
+                        // moved to the AGC row instead, same reasoning as
+                        // SNB/ANF/BIN's own comment above (this row plus
+                        // 2 more buttons was too wide for the fixed
+                        // 1024px kiosk window).
+                        ui.end_row();
+
+                        // NB/NR was the last thing appended to THIS row
+                        // -- AGC Gain/AGC mode/NB/NR/SNB/ANF/BIN all live
+                        // together on ONE row entirely OUTSIDE this grid
+                        // now (right after it closes, below) -- ROOT
+                        // CAUSE FIX for two real, chained reports: first,
+                        // egui::Grid silently auto-wraps a row once it
+                        // reaches num_columns(6) cells without an
+                        // explicit end_row(), which AGC Gain + 6 more
+                        // button cells did, scattering them across the
+                        // grid's OTHER rows. Wrapping them in one
+                        // ui.horizontal (counting as a single cell) fixed
+                        // THAT, but egui::Grid shares each column's width
+                        // across every row -- so that one very wide cell
+                        // blew out the SAME column's width in row 1/2
+                        // ("TCI TX gain:"/"Filter width:" and their
+                        // sliders), pushing them off the right edge of
+                        // the fixed 1024px kiosk window instead. A real
+                        // follow-up report: a SEPARATE row (not sharing
+                        // this one's line) cost back the exact row of
+                        // spectrum/waterfall height this whole
+                        // reorganization was for -- so the fix is this
+                        // row, entirely outside the grid (no column-
+                        // width sharing to blow out), not a second row.
                         ui.end_row();
                         });
                     });
 
-                    // Moved here from Settings -> TX (still shown there
-                    // too) so it's visible alongside the TX power/SWR
+                    // AGC Gain/AGC mode/NB/NR/SNB/ANF/BIN -- kiosk-only,
+                    // ALL on one row, entirely outside gain_filter_grid
+                    // (see NB/NR's own doc comment in that grid, just
+                    // above, for why) -- appears directly under Filter
+                    // width's row, in the same visual position the grid
+                    // row used to occupy, just not grid-aligned to
+                    // Audio gain/RX Gain's own columns anymore (a
+                    // deliberate, accepted trade-off: real width safety
+                    // over pixel-perfect column alignment). Desktop mode
+                    // keeps AGC Gain/AGC/NB/NR/SNB/ANF/BIN on their own
+                    // separate rows further down, unchanged.
+                    if lcd_kiosk_mode() {
+                        ui.horizontal(|ui| {
+                            // Fixed width -- a real report: this row is
+                            // outside gain_filter_grid now (see this
+                            // row's own doc comment above for why), so
+                            // it no longer gets that Grid's automatic
+                            // column-0 width (sized to fit "Audio gain:",
+                            // the widest label sharing that column) --
+                            // "AGC Gain:" (2 chars shorter) started its
+                            // slider a little left of RX Gain's own.
+                            // Explicitly matching that width here lines
+                            // them back up.
+                            ui.add_sized([81.0, ui.spacing().interact_size.y], egui::Label::new("AGC Gain:"));
+                            let mut agc_top_db = connected.spectrum.agc_params().agc_top_db;
+                            if stable_f64_slider(ui, &mut connected.slider_scroll_accum, &mut agc_top_db, 0.0..=140.0, 2.0, " dB") {
+                                connected.spectrum.set_agc_top_db(agc_top_db);
+                                settings_changed = true;
+                            }
+                            // Fixed width -- a real report: "AGC Off"/
+                            // "AGC Long"/"AGC Slow"/"AGC Medium"/"AGC
+                            // Fast" are all different lengths, so this
+                            // button (and everything after it in the
+                            // row) visibly shifted every time the mode
+                            // cycled. Same fixed-width treatment as the
+                            // slider value boxes elsewhere (see
+                            // STABLE_SLIDER_TRACK_WIDTH), sized for the
+                            // longest label ("AGC Medium").
+                            if ui
+                                .add_sized(
+                                    [100.0, ui.spacing().interact_size.y],
+                                    egui::Button::selectable(current_agc != spectrum::Agc::Off, current_agc.label()),
+                                )
+                                .on_hover_text("Click to cycle: Off -> Long -> Slow -> Medium -> Fast -> Off")
+                                .clicked()
+                            {
+                                connected.spectrum.set_agc(current_agc.next());
+                                settings_changed = true;
+                            }
+                            // NB/NR/SNB/ANF/BIN -- kiosk-only, all
+                            // together right after the AGC mode button (a
+                            // real report/correction: splitting these
+                            // across the Audio gain/RX Gain rows instead
+                            // pushed "BIN" off the edge of the fixed
+                            // 1024px kiosk window -- this row has the
+                            // most spare room to begin with). No explicit
+                            // add_space between/around these -- plain
+                            // default spacing, uniform across AGC Long/
+                            // NB/NR/SNB/ANF/BIN alike (a real report:
+                            // manual gaps mixed with the automatic
+                            // spacing egui already applies between every
+                            // OTHER pair of widgets looked uneven).
+                            if connected.tx_enabled {
+                                let mut changed = render_nb_nr(ui, connected);
+                                changed |= render_snb_anf_bin(ui, connected);
+                                if changed {
+                                    settings_changed = true;
+                                }
+                            }
+                        });
+                    }
+
+                    // show_status_row's definition moved up, right before
+                    // the mode-buttons row it's now called from -- see
+                    // its own doc comment there.
+
+                    // LEV/PROC/CFC row -- moved here from Settings -> TX
+                    // (still shown there too) so it's visible alongside
+                    // the TX power/SWR
                     // gauge without needing a separate window open --
                     // added specifically to help tell apart "ALC is
                     // pumping / mic is clipping on real modulated audio"
@@ -4445,12 +4784,15 @@ impl eframe::App for HpsdrApp {
                     // power swing (steady on Tune's flat tone, bouncing
                     // on a real WSJT-X transmission) didn't correlate
                     // with any DUC IQ queue/mic buffer underrun log.
-                    if connected.tx_enabled {
+                    // Desktop-only -- kiosk mode moves this to the
+                    // S-meter panel instead (a real report/mockup, see
+                    // that panel's own comment), freeing this row's
+                    // height for the spectrum/waterfall.
+                    if !lcd_kiosk_mode() && connected.tx_enabled {
                         if let Some(tx) = &connected.tx_handle {
                             let disp = *tx.display.lock().unwrap();
                             ui.horizontal(|ui| {
                                 ui.weak(format!("Mic level: {:.3}    ALC: {:.1}", disp.mic_pk, disp.alc_av));
-
                                 // Leveler/Compressor status -- same idea as
                                 // deskHPSDR's top-bar "LEV +N"/"PROC +N"
                                 // (vfo.c): dim label when off, the
@@ -4489,196 +4831,139 @@ impl eframe::App for HpsdrApp {
                         }
                     }
 
-                    ui.horizontal_wrapped(|ui| {
-                        let nb = connected.spectrum.noise_blanker();
-                        if ui
-                            .add(egui::Button::selectable(nb != spectrum::NoiseBlanker::Off, nb.label()))
-                            .on_hover_text("Click to cycle: Off -> NB -> NB2 -> Off")
-                            .clicked()
-                        {
-                            connected.spectrum.set_noise_blanker(nb.next());
-                            settings_changed = true;
-                        }
-                        let nr = connected.spectrum.noise_reduction();
-                        if ui
-                            .add(egui::Button::selectable(nr != spectrum::NoiseReduction::Off, nr.label()))
-                            .on_hover_text("Click to cycle: Off -> NR -> NR2 -> NNR -> Off")
-                            .clicked()
-                        {
-                            connected.spectrum.set_noise_reduction(nr.next());
-                            settings_changed = true;
-                        }
-                        let snb = connected.spectrum.snb();
-                        if ui
-                            .add(egui::Button::selectable(snb, "SNB"))
-                            .on_hover_text(
-                                "Spectral Noise Blanker -- independent of NB/NR, can run alongside them",
-                            )
-                            .clicked()
-                        {
-                            connected.spectrum.set_snb(!snb);
-                            settings_changed = true;
-                        }
-                        let anf = connected.spectrum.anf();
-                        if ui
-                            .add(egui::Button::selectable(anf, "ANF"))
-                            .on_hover_text("Automatic Notch Filter -- removes a steady heterodyne/carrier")
-                            .clicked()
-                        {
-                            connected.spectrum.set_anf(!anf);
-                            settings_changed = true;
-                        }
-                        let binaural = connected.spectrum.binaural();
-                        if ui
-                            .add(egui::Button::selectable(binaural, "BIN"))
-                            .on_hover_text(
-                                "Binaural (phasing) RX audio -- genuinely different L/R for stereo \
-                                 listening, needs headphones/stereo speakers to hear the effect",
-                            )
-                            .clicked()
-                        {
-                            connected.spectrum.set_binaural(!binaural);
-                            settings_changed = true;
-                        }
-                        if ui
-                            .add(egui::Button::selectable(
-                                current_agc != spectrum::Agc::Off,
-                                current_agc.label(),
-                            ))
-                            .on_hover_text("Click to cycle: Off -> Long -> Slow -> Medium -> Fast -> Off")
-                            .clicked()
-                        {
-                            connected.spectrum.set_agc(current_agc.next());
-                            settings_changed = true;
-                        }
+                    // show_nb_nr/show_snb_anf_bin's definitions moved up,
+                    // right before the gain_filter_grid, since kiosk mode
+                    // now calls them from inside two of that grid's own
+                    // rows -- see their doc comment there.
 
-                        // AGC Gain -- WDSP's SetRXAAGCTop (already wired
-                        // as "Top" in Settings -> RX; this is a quick-
-                        // access control for the same value, matching
-                        // piHPSDR's own "AGC Gain" slider, confirmed via
-                        // its receiver.c: `SetRXAAGCTop(id, rx->agc_gain)`
-                        // -- same WDSP call, just this project's own name
-                        // for it predates this slider existing here at
-                        // all. Placed right after the AGC button, not
-                        // next to Audio gain -- it tunes the AGC itself,
-                        // not the speaker volume.
-                        ui.add_space(12.0);
-                        ui.label("AGC Gain:");
-                        let mut agc_top_db = connected.spectrum.agc_params().agc_top_db;
-                        // Same fixed-width value box as the gain/filter
-                        // grid above -- a real request: keep this
-                        // slider's value display looking the same as
-                        // those, not the plain variable-width one every
-                        // other scroll_slider_f64 call site still uses.
-                        if stable_f64_slider(ui, &mut connected.slider_scroll_accum, &mut agc_top_db, 0.0..=140.0, 2.0, " dB") {
-                            connected.spectrum.set_agc_top_db(agc_top_db);
-                            settings_changed = true;
-                        }
-                    });
-
-                    ui.add_space(4.0);
-                    ui.horizontal(|ui| {
-                        ui.colored_label(network_status_color(rigctl_status), "rigctl")
-                            .on_hover_text(network_status_hover("rigctl", rigctl_status, &connected.rigctl_addr));
-                        ui.add_space(12.0);
-                        ui.colored_label(network_status_color(tci_status), "TCI")
-                            .on_hover_text(tci_status_hover(
-                                tci_status,
-                                &connected.tci_addr,
-                                connected.tci_server.as_ref(),
-                            ));
-                        ui.add_space(12.0);
-                        ui.colored_label(network_status_color(cat_status), "CAT")
-                            .on_hover_text(network_status_hover("CAT", cat_status, &connected.cat_addr));
-                        // PureSignal: only shown when actually enabled for
-                        // this session (see ConnectedState::puresignal_enabled's
-                        // doc comment -- a connect-time setting, not live).
-                        // Same green/gray "Correcting" convention as the
-                        // Settings -> PureSignal panel's own indicator,
-                        // just compact enough for the main toolbar --
-                        // added so PS state is visible at a glance without
-                        // opening Settings, per a real report that this
-                        // was hard to tell at a glance while testing.
-                        if connected.puresignal_enabled {
-                            ui.add_space(12.0);
-                            let status = connected.tx_handle.as_ref().map(|tx| *tx.ps_status.lock().unwrap());
-                            let correcting_now = status.is_some_and(|s| s.correcting);
-                            // Auto-save on a false->true edge (not
-                            // "every frame it's true") so a good table
-                            // is persisted without a manual save
-                            // button, but without spamming a disk write
-                            // every frame while it stays true. Reset on
-                            // the trailing edge (true->false) rather
-                            // than latching "saved once ever this
-                            // session", so a LATER re-calibration (e.g.
-                            // after Calibrate Now) that converges again
-                            // also gets saved, capturing whatever the
-                            // most recent good table actually is.
-                            if correcting_now && !connected.ps_was_correcting {
-                                if let Some(tx) = &connected.tx_handle {
-                                    tx.save_ps_corr();
-                                }
+                    // Desktop-only -- kiosk mode spreads NB/NR/SNB/ANF/BIN
+                    // across the Audio gain/RX Gain grid rows and moves
+                    // AGC/AGC Gain into that same grid too (see those call
+                    // sites' own comments), freeing this row's height for
+                    // the spectrum/waterfall.
+                    if !lcd_kiosk_mode() {
+                        ui.horizontal_wrapped(|ui| {
+                            let mut changed = render_nb_nr(ui, connected);
+                            changed |= render_snb_anf_bin(ui, connected);
+                            if changed {
+                                settings_changed = true;
                             }
-                            connected.ps_was_correcting = correcting_now;
-                            let (color, hover) = match status {
-                                Some(s) if s.correcting => (
-                                    egui::Color32::from_rgb(80, 200, 80),
-                                    format!("PureSignal: Correcting (feedback level {})", s.feedback_level),
-                                ),
-                                Some(s) => (
-                                    egui::Color32::GRAY,
-                                    format!(
-                                        "PureSignal: enabled, not yet correcting (feedback level {})",
-                                        s.feedback_level
-                                    ),
-                                ),
-                                None => (egui::Color32::GRAY, "PureSignal: enabled".to_string()),
-                            };
-                            ui.colored_label(color, "PS").on_hover_text(hover);
-                        }
-
-                        // Records exactly the audio the local speaker
-                        // plays (post Audio Gain, muted the same way
-                        // during TX/mute_local_for_tci -- see
-                        // spectrum.rs's recorder.write_frame call site)
-                        // to a timestamped WAV file under the
-                        // recordings folder alongside this radio's
-                        // other persisted files -- see
-                        // audio_recorder::recording_path.
-                        ui.add_space(12.0);
-                        let recording = connected.spectrum.recorder.is_enabled();
-                        let (rec_label, rec_color) = if recording {
-                            ("Recording", egui::Color32::from_rgb(210, 50, 50))
-                        } else {
-                            ("Record", egui::Color32::from_gray(60))
-                        };
-                        let rec_resp = ui
-                            .add(
-                                egui::Button::new(
-                                    egui::RichText::new(rec_label).strong().color(egui::Color32::WHITE),
+                            // Fixed width -- a real report: "AGC Off"/
+                            // "AGC Long"/"AGC Slow"/"AGC Medium"/"AGC
+                            // Fast" are all different lengths, so this
+                            // button (and everything after it in the
+                            // row) visibly shifted every time the mode
+                            // cycled. Same fixed-width treatment as the
+                            // slider value boxes elsewhere (see
+                            // STABLE_SLIDER_TRACK_WIDTH), sized for the
+                            // longest label ("AGC Medium").
+                            if ui
+                                .add_sized(
+                                    [100.0, ui.spacing().interact_size.y],
+                                    egui::Button::selectable(current_agc != spectrum::Agc::Off, current_agc.label()),
                                 )
-                                .fill(rec_color),
-                            )
-                            .on_hover_text(if recording {
-                                "Click to stop recording"
+                                .on_hover_text("Click to cycle: Off -> Long -> Slow -> Medium -> Fast -> Off")
+                                .clicked()
+                            {
+                                connected.spectrum.set_agc(current_agc.next());
+                                settings_changed = true;
+                            }
+
+                            // AGC Gain -- WDSP's SetRXAAGCTop (already wired
+                            // as "Top" in Settings -> RX; this is a quick-
+                            // access control for the same value, matching
+                            // piHPSDR's own "AGC Gain" slider, confirmed via
+                            // its receiver.c: `SetRXAAGCTop(id, rx->agc_gain)`
+                            // -- same WDSP call, just this project's own name
+                            // for it predates this slider existing here at
+                            // all. Placed right after the AGC button, not
+                            // next to Audio gain -- it tunes the AGC itself,
+                            // not the speaker volume.
+                            ui.add_space(12.0);
+                            ui.label("AGC Gain:");
+                            let mut agc_top_db = connected.spectrum.agc_params().agc_top_db;
+                            // Same fixed-width value box as the gain/filter
+                            // grid above -- a real request: keep this
+                            // slider's value display looking the same as
+                            // those, not the plain variable-width one every
+                            // other scroll_slider_f64 call site still uses.
+                            if stable_f64_slider(ui, &mut connected.slider_scroll_accum, &mut agc_top_db, 0.0..=140.0, 2.0, " dB") {
+                                connected.spectrum.set_agc_top_db(agc_top_db);
+                                settings_changed = true;
+                            }
+                        });
+                    }
+
+                    // Standalone row -- desktop mode only; kiosk mode
+                    // folds this onto the mode-buttons row instead (see
+                    // show_status_row's own doc comment).
+                    if !lcd_kiosk_mode() {
+                        ui.add_space(4.0);
+                        ui.horizontal(|ui| {
+                            render_status_row(ui, connected, rigctl_status, tci_status, cat_status);
+                        });
+                    }
+
+                    // Kiosk mode's usual home for NB/NR/SNB/ANF/BIN/
+                    // Record is spread across the Audio gain/RX Gain grid
+                    // rows (NB/NR/SNB/ANF/BIN) and the RIT/XIT row
+                    // (Record) -- but the grid rows' own kiosk-only cells
+                    // for these are gated on tx_enabled too (they sit
+                    // next to TX-only controls), and the RIT/XIT row only
+                    // exists when tx_enabled at all (it's the MOX/TUNE/
+                    // RIT/XIT row). RX-888 (receive-only, tx_enabled
+                    // always false) and any other no-mic setup would
+                    // otherwise lose these RX-side controls entirely in
+                    // kiosk mode, so they get one combined fallback row
+                    // here instead. Desktop mode doesn't need this
+                    // fallback -- it already has its own unconditional
+                    // row above.
+                    if lcd_kiosk_mode() && !connected.tx_enabled {
+                        ui.add_space(4.0);
+                        ui.horizontal_wrapped(|ui| {
+                            let mut changed = render_nb_nr(ui, connected);
+                            ui.add_space(8.0);
+                            changed |= render_snb_anf_bin(ui, connected);
+                            if changed {
+                                settings_changed = true;
+                            }
+                            ui.add_space(8.0);
+                            let recording = connected.spectrum.recorder.is_enabled();
+                            let (rec_label, rec_color) = if recording {
+                                ("Recording", egui::Color32::from_rgb(210, 50, 50))
                             } else {
-                                "Record RX audio (what you hear) to a WAV file"
-                            });
-                        if rec_resp.clicked() {
-                            if recording {
-                                connected.spectrum.recorder.stop();
-                            } else {
-                                match audio_recorder::recording_path("main") {
-                                    Some(path) => {
-                                        if let Err(e) = connected.spectrum.recorder.start(&path) {
-                                            eprintln!("failed to start recording: {e}");
+                                ("Record", egui::Color32::from_gray(60))
+                            };
+                            let rec_resp = ui
+                                .add(
+                                    egui::Button::new(
+                                        egui::RichText::new(rec_label).strong().color(egui::Color32::WHITE),
+                                    )
+                                    .fill(rec_color),
+                                )
+                                .on_hover_text(if recording {
+                                    "Click to stop recording"
+                                } else {
+                                    "Record RX audio (what you hear) to a WAV file"
+                                });
+                            if rec_resp.clicked() {
+                                if recording {
+                                    connected.spectrum.recorder.stop();
+                                } else {
+                                    match audio_recorder::recording_path("main") {
+                                        Some(path) => {
+                                            if let Err(e) = connected.spectrum.recorder.start(&path) {
+                                                eprintln!("failed to start recording: {e}");
+                                            }
                                         }
+                                        None => eprintln!(
+                                            "failed to start recording: could not determine the recordings folder"
+                                        ),
                                     }
-                                    None => eprintln!("failed to start recording: could not determine the recordings folder"),
                                 }
                             }
-                        }
-                    });
+                        });
+                    }
 
                     if connected.tx_enabled {
                         ui.add_space(4.0);
@@ -5222,9 +5507,58 @@ impl eframe::App for HpsdrApp {
                                 settings_changed = true;
                             }
 
-                            if mox_now {
-                                ui.colored_label(egui::Color32::from_rgb(210, 50, 50), "TRANSMITTING");
+                            // Record -- kiosk-only (a real request), moved
+                            // here next to Clear from its own dedicated
+                            // row (see show_status_row's own doc comment
+                            // for why it used to live there). NB/NR/SNB/
+                            // ANF/BIN moved OFF this row too, but onto
+                            // the Audio gain/RX Gain grid rows instead of
+                            // here -- see show_nb_nr/show_snb_anf_bin's
+                            // own doc comment. Desktop mode leaves
+                            // everything in its original rows, unchanged.
+                            if lcd_kiosk_mode() {
+                                ui.add_space(12.0);
+                                let recording = connected.spectrum.recorder.is_enabled();
+                                let (rec_label, rec_color) = if recording {
+                                    ("Recording", egui::Color32::from_rgb(210, 50, 50))
+                                } else {
+                                    ("Record", egui::Color32::from_gray(60))
+                                };
+                                let rec_resp = ui
+                                    .add(
+                                        egui::Button::new(
+                                            egui::RichText::new(rec_label).strong().color(egui::Color32::WHITE),
+                                        )
+                                        .fill(rec_color),
+                                    )
+                                    .on_hover_text(if recording {
+                                        "Click to stop recording"
+                                    } else {
+                                        "Record RX audio (what you hear) to a WAV file"
+                                    });
+                                if rec_resp.clicked() {
+                                    if recording {
+                                        connected.spectrum.recorder.stop();
+                                    } else {
+                                        match audio_recorder::recording_path("main") {
+                                            Some(path) => {
+                                                if let Err(e) = connected.spectrum.recorder.start(&path) {
+                                                    eprintln!("failed to start recording: {e}");
+                                                }
+                                            }
+                                            None => eprintln!(
+                                                "failed to start recording: could not determine the recordings folder"
+                                            ),
+                                        }
+                                    }
+                                }
                             }
+
+                            // "TRANSMITTING" text removed from here (a
+                            // real report: redundant with the VFO-A/
+                            // VFO-B boxes' own RX/TX badge, which already
+                            // shows the same state right where the eye
+                            // is -- see freq_a_color's doc comment).
                         });
                     }
 
@@ -6006,7 +6340,21 @@ impl eframe::App for HpsdrApp {
                     // so it still degrades to wrapping instead of
                     // overflowing horizontally on a narrower window.
                     ui.horizontal_wrapped(|ui| {
-                        if ui.button("Stop").clicked() {
+                        // Uppercase specifically in kiosk mode -- a real
+                        // request: on the small 1024x600 panel this is
+                        // the main "disconnect" control, and the extra
+                        // visual weight of all-caps makes it stand out
+                        // more at a glance than mixed case does. Left as
+                        // normal "Stop" on a regular desktop window,
+                        // where it doesn't need to fight for attention
+                        // the same way.
+                        // See kiosk_accent_button's own doc comment.
+                        let stop_clicked_now = if lcd_kiosk_mode() {
+                            kiosk_accent_button(ui, "STOP").clicked()
+                        } else {
+                            ui.button("Stop").clicked()
+                        };
+                        if stop_clicked_now {
                             stop_clicked = true;
                         }
                         // See ConnectedState::status_message's doc
@@ -6256,6 +6604,47 @@ impl eframe::App for HpsdrApp {
                             }
                         }
 
+                        // Mic level/ALC -- kiosk-only (a real request) so
+                        // every "at a glance" reading lives together
+                        // under the S-meter, at the same fixed 180px
+                        // width, instead of taking a row of its own in
+                        // the main flow -- frees that row's height for
+                        // the spectrum/waterfall. Desktop mode keeps its
+                        // own separate row unchanged (see that row's own
+                        // kiosk gate). Same tx_enabled/tx_handle guard as
+                        // that row, since there's nothing to show without
+                        // a real mic input. Placed directly under the
+                        // meter, BEFORE the ADC overload/TX FIFO rows
+                        // below (a real request: this used to sit after
+                        // them, two row-heights lower than intended,
+                        // landing well below where it should visually
+                        // line up -- roughly the band-buttons row's own
+                        // height). Own line_height query (that row's
+                        // copy is declared further down, after this
+                        // point) rather than reordering it, to keep this
+                        // change small.
+                        if lcd_kiosk_mode() && connected.tx_enabled {
+                            if let Some(tx) = &connected.tx_handle {
+                                let disp = *tx.display.lock().unwrap();
+                                let mic_line_height = ui.text_style_height(&egui::TextStyle::Body);
+                                let mic_color = if connected.session.mox_active() {
+                                    egui::Color32::WHITE
+                                } else {
+                                    ui.visuals().weak_text_color()
+                                };
+                                ui.add_sized(
+                                    [180.0, mic_line_height],
+                                    egui::Label::new(
+                                        egui::RichText::new(format!(
+                                            "Mic: {:.3}  ALC: {:.1}",
+                                            disp.mic_pk, disp.alc_av
+                                        ))
+                                        .color(mic_color),
+                                    ),
+                                );
+                            }
+                        }
+
                         // ADC front-end overload -- see
                         // RadioSession::adc0_overload's doc comment.
                         // Reserves this row's height unconditionally (a
@@ -6482,12 +6871,12 @@ impl eframe::App for HpsdrApp {
                                     .anchor(egui::Align2::RIGHT_BOTTOM, egui::vec2(-6.0, -6.0))
                                     .show(ui, |ui| {
                                         ui.horizontal(|ui| {
-                                            if ui.button("\u{2013} Min").clicked() {
+                                            if kiosk_accent_button(ui, "\u{2013} MIN").clicked() {
                                                 ui.ctx().send_viewport_cmd(
                                                     egui::ViewportCommand::Minimized(true),
                                                 );
                                             }
-                                            if ui.button("\u{2715} Close").clicked() {
+                                            if kiosk_accent_button(ui, "\u{2715} CLOSE").clicked() {
                                                 let mut rx = rx_for_closure.lock().unwrap();
                                                 rx.open = false;
                                                 rx.settings_dirty.store(true, Ordering::Relaxed);
@@ -6518,7 +6907,7 @@ impl eframe::App for HpsdrApp {
                                 // theme override is needed) rather than
                                 // being confined to this receiver's own
                                 // viewport.
-                                let light_visuals = with_orange_selection(egui::Visuals::light());
+                                let light_visuals = with_orange_selection(egui::Visuals::dark());
                                 let light_style = egui::Style {
                                     visuals: light_visuals.clone(),
                                     ..Default::default()
@@ -6575,12 +6964,12 @@ impl eframe::App for HpsdrApp {
                                             .anchor(egui::Align2::RIGHT_BOTTOM, egui::vec2(-6.0, -6.0))
                                             .show(ui.ctx(), |ui| {
                                                 ui.horizontal(|ui| {
-                                                    if ui.button("\u{2013} Min").clicked() {
+                                                    if kiosk_accent_button(ui, "\u{2013} MIN").clicked() {
                                                         ui.ctx().send_viewport_cmd(
                                                             egui::ViewportCommand::Minimized(true),
                                                         );
                                                     }
-                                                    if ui.button("\u{2715} Close").clicked() {
+                                                    if kiosk_accent_button(ui, "\u{2715} CLOSE").clicked() {
                                                         rx_for_settings.lock().unwrap().show_settings_window =
                                                             false;
                                                     }
@@ -6612,7 +7001,7 @@ impl eframe::App for HpsdrApp {
                     // isn't focused. Overriding the whole window's
                     // visuals instead keeps it consistently white
                     // regardless of focus.
-                    let light_visuals = with_orange_selection(egui::Visuals::light());
+                    let light_visuals = with_orange_selection(egui::Visuals::dark());
                     let light_style = egui::Style { visuals: light_visuals.clone(), ..Default::default() };
                     // Rendered in its own OS-level viewport (like the
                     // extra receiver windows) rather than an
@@ -6730,12 +7119,12 @@ impl eframe::App for HpsdrApp {
                                     .anchor(egui::Align2::RIGHT_BOTTOM, egui::vec2(-6.0, -6.0))
                                     .show(ui.ctx(), |ui| {
                                         ui.horizontal(|ui| {
-                                            if ui.button("\u{2013} Min").clicked() {
+                                            if kiosk_accent_button(ui, "\u{2013} MIN").clicked() {
                                                 ui.ctx().send_viewport_cmd(
                                                     egui::ViewportCommand::Minimized(true),
                                                 );
                                             }
-                                            if ui.button("\u{2715} Close").clicked() {
+                                            if kiosk_accent_button(ui, "\u{2715} CLOSE").clicked() {
                                                 close_requested = true;
                                             }
                                         });
@@ -6768,6 +7157,7 @@ impl eframe::App for HpsdrApp {
                                     (SettingsTab::PaCalibration, "PA Calibration"),
                                     (SettingsTab::PureSignal, "PureSignal"),
                                     (SettingsTab::Agc, "RX"),
+                                    (SettingsTab::Screen, "Screen"),
                                     (SettingsTab::Spectrum, "Spectrum"),
                                     (SettingsTab::Tx, "TX"),
                                     (SettingsTab::Xvtr, "XVTR"),
@@ -6781,6 +7171,16 @@ impl eframe::App for HpsdrApp {
                                     if tab == SettingsTab::Diversity && connected.device.adcs != 2 {
                                         continue;
                                     }
+                                    // Screen (UI scale) only means anything
+                                    // in the fixed 1024x600 kiosk layout --
+                                    // see config::load_kiosk_ui_scale's doc
+                                    // comment. A normal resizable desktop
+                                    // window already lets the OS/user resize
+                                    // freely, so this tab would be a no-op
+                                    // (and confusing) there.
+                                    if tab == SettingsTab::Screen && !lcd_kiosk_mode() {
+                                        continue;
+                                    }
                                     if ui
                                         .selectable_label(connected.settings_tab == tab, label)
                                         .clicked()
@@ -6791,6 +7191,16 @@ impl eframe::App for HpsdrApp {
                             });
                             ui.separator();
 
+                            // Real report: several tabs (PA Calibration
+                            // in particular) run taller than the fixed
+                            // kiosk Settings window, with no native
+                            // title bar/OS chrome to resize by -- the
+                            // bottom of those tabs was simply unreachable.
+                            // Only the tab CONTENT scrolls, not the tab
+                            // row/separator above -- those stay pinned so
+                            // switching tabs is always visible/reachable
+                            // regardless of scroll position.
+                            egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
                             match connected.settings_tab {
                                 SettingsTab::Network => {
                                     ui.label("rigctl (for WSJT-X's \"Hamlib NET rigctl\", etc.):");
@@ -7452,6 +7862,34 @@ impl eframe::App for HpsdrApp {
                                             settings_changed = true;
                                         }
                                     }
+                                }
+
+                                SettingsTab::Screen => {
+                                    // See config::load_kiosk_ui_scale's doc
+                                    // comment for why this is a fixed set
+                                    // of presets picked here and applied on
+                                    // the NEXT launch, not a live slider --
+                                    // the kiosk window's physical size is
+                                    // locked in before this UI even exists.
+                                    ui.add_space(4.0);
+                                    ui.label("UI scale (this 1024x600 panel only):");
+                                    ui.add_space(4.0);
+                                    let current = crate::config::load_kiosk_ui_scale();
+                                    ui.horizontal(|ui| {
+                                        for &preset in crate::config::kiosk_ui_scale_presets() {
+                                            let label = format!("{:.0}%", preset * 100.0);
+                                            if ui.selectable_label((current - preset).abs() < 0.001, label).clicked()
+                                                && (current - preset).abs() >= 0.001
+                                            {
+                                                crate::config::save_kiosk_ui_scale(preset);
+                                            }
+                                        }
+                                    });
+                                    ui.add_space(8.0);
+                                    ui.weak(
+                                        "Takes effect the next time you start hpsdr-rs -- the panel's \
+                                         fixed window size is picked once, at startup.",
+                                    );
                                 }
 
                                 SettingsTab::About => {
@@ -10019,6 +10457,7 @@ impl eframe::App for HpsdrApp {
                                     }
                                 }
                             }
+                            });
 
                             if let Some(fw) = &mut connected.firmware_update {
                                 fw.show(ui);
@@ -10061,7 +10500,7 @@ impl eframe::App for HpsdrApp {
 
                 if connected.show_juice_console_window {
                     if let Some(console) = connected.juice_console.clone() {
-                        let light_visuals = egui::Visuals::light();
+                        let light_visuals = with_orange_selection(egui::Visuals::dark());
                         let light_style = egui::Style { visuals: light_visuals.clone(), ..Default::default() };
                         let mut close_requested = false;
                         let juice_kiosk = lcd_kiosk_mode();
@@ -10112,12 +10551,12 @@ impl eframe::App for HpsdrApp {
                                         .anchor(egui::Align2::RIGHT_BOTTOM, egui::vec2(-6.0, -6.0))
                                         .show(ui.ctx(), |ui| {
                                             ui.horizontal(|ui| {
-                                                if ui.button("\u{2013} Min").clicked() {
+                                                if kiosk_accent_button(ui, "\u{2013} MIN").clicked() {
                                                     ui.ctx().send_viewport_cmd(
                                                         egui::ViewportCommand::Minimized(true),
                                                     );
                                                 }
-                                                if ui.button("\u{2715} Close").clicked() {
+                                                if kiosk_accent_button(ui, "\u{2715} CLOSE").clicked() {
                                                     close_requested = true;
                                                 }
                                             });
@@ -10984,6 +11423,172 @@ fn start_stop_button(ui: &mut egui::Ui, running: bool) -> bool {
         ("Start", egui::Color32::from_rgb(50, 160, 50))
     };
     ui.add(egui::Button::new(egui::RichText::new(label).color(egui::Color32::WHITE)).fill(color)).clicked()
+}
+
+/// rigctl/TCI/CAT/PS/Record status indicators -- a standalone fn (not a
+/// closure) specifically so it can be called from inside another
+/// closure (the mode-buttons row's ui.horizontal_wrapped, in kiosk
+/// mode) without a borrow-checker conflict -- see its call sites' own
+/// comments for the real compile error a closure version hit.
+fn render_status_row(
+    ui: &mut egui::Ui,
+    connected: &mut ConnectedState,
+    rigctl_status: Option<bool>,
+    tci_status: Option<bool>,
+    cat_status: Option<bool>,
+) {
+    ui.colored_label(network_status_color(rigctl_status), "rigctl")
+        .on_hover_text(network_status_hover("rigctl", rigctl_status, &connected.rigctl_addr));
+    ui.add_space(12.0);
+    ui.colored_label(network_status_color(tci_status), "TCI").on_hover_text(tci_status_hover(
+        tci_status,
+        &connected.tci_addr,
+        connected.tci_server.as_ref(),
+    ));
+    ui.add_space(12.0);
+    ui.colored_label(network_status_color(cat_status), "CAT")
+        .on_hover_text(network_status_hover("CAT", cat_status, &connected.cat_addr));
+    // PureSignal: only shown when actually enabled for this session (see
+    // ConnectedState::puresignal_enabled's doc comment -- a connect-time
+    // setting, not live). Same green/gray "Correcting" convention as the
+    // Settings -> PureSignal panel's own indicator, just compact enough
+    // for the main toolbar -- added so PS state is visible at a glance
+    // without opening Settings, per a real report that this was hard to
+    // tell at a glance while testing.
+    if connected.puresignal_enabled {
+        ui.add_space(12.0);
+        let status = connected.tx_handle.as_ref().map(|tx| *tx.ps_status.lock().unwrap());
+        let correcting_now = status.is_some_and(|s| s.correcting);
+        // Auto-save on a false->true edge (not "every frame it's true")
+        // so a good table is persisted without a manual save button, but
+        // without spamming a disk write every frame while it stays true.
+        // Reset on the trailing edge (true->false) rather than latching
+        // "saved once ever this session", so a LATER re-calibration
+        // (e.g. after Calibrate Now) that converges again also gets
+        // saved, capturing whatever the most recent good table actually is.
+        if correcting_now && !connected.ps_was_correcting {
+            if let Some(tx) = &connected.tx_handle {
+                tx.save_ps_corr();
+            }
+        }
+        connected.ps_was_correcting = correcting_now;
+        let (color, hover) = match status {
+            Some(s) if s.correcting => (
+                egui::Color32::from_rgb(80, 200, 80),
+                format!("PureSignal: Correcting (feedback level {})", s.feedback_level),
+            ),
+            Some(s) => (
+                egui::Color32::GRAY,
+                format!("PureSignal: enabled, not yet correcting (feedback level {})", s.feedback_level),
+            ),
+            None => (egui::Color32::GRAY, "PureSignal: enabled".to_string()),
+        };
+        ui.colored_label(color, "PS").on_hover_text(hover);
+    }
+
+    // Records exactly the audio the local speaker plays (post Audio
+    // Gain, muted the same way during TX/mute_local_for_tci -- see
+    // spectrum.rs's recorder.write_frame call site) to a timestamped WAV
+    // file under the recordings folder alongside this radio's other
+    // persisted files -- see audio_recorder::recording_path. Kiosk mode
+    // moves this to the RIT/XIT row instead (a real request, alongside
+    // Clear -- see that row's own comment); desktop mode keeps it here,
+    // unchanged.
+    if !lcd_kiosk_mode() {
+        ui.add_space(12.0);
+        let recording = connected.spectrum.recorder.is_enabled();
+        let (rec_label, rec_color) = if recording {
+            ("Recording", egui::Color32::from_rgb(210, 50, 50))
+        } else {
+            ("Record", egui::Color32::from_gray(60))
+        };
+        let rec_resp = ui
+            .add(egui::Button::new(egui::RichText::new(rec_label).strong().color(egui::Color32::WHITE)).fill(rec_color))
+            .on_hover_text(if recording {
+                "Click to stop recording"
+            } else {
+                "Record RX audio (what you hear) to a WAV file"
+            });
+        if rec_resp.clicked() {
+            if recording {
+                connected.spectrum.recorder.stop();
+            } else {
+                match audio_recorder::recording_path("main") {
+                    Some(path) => {
+                        if let Err(e) = connected.spectrum.recorder.start(&path) {
+                            eprintln!("failed to start recording: {e}");
+                        }
+                    }
+                    None => eprintln!("failed to start recording: could not determine the recordings folder"),
+                }
+            }
+        }
+    }
+}
+
+/// NB/NR toggle buttons -- standalone fn for the same nested-closure
+/// reason as render_status_row's own doc comment (kiosk mode calls this
+/// from inside the gain_filter_grid's own closure; desktop mode from
+/// inside its own ui.horizontal_wrapped closure). Returns whether
+/// anything changed, same convention as start_stop_button-style helpers.
+fn render_nb_nr(ui: &mut egui::Ui, connected: &mut ConnectedState) -> bool {
+    let mut changed = false;
+    let nb = connected.spectrum.noise_blanker();
+    if ui
+        .add(egui::Button::selectable(nb != spectrum::NoiseBlanker::Off, nb.label()))
+        .on_hover_text("Click to cycle: Off -> NB -> NB2 -> Off")
+        .clicked()
+    {
+        connected.spectrum.set_noise_blanker(nb.next());
+        changed = true;
+    }
+    let nr = connected.spectrum.noise_reduction();
+    if ui
+        .add(egui::Button::selectable(nr != spectrum::NoiseReduction::Off, nr.label()))
+        .on_hover_text("Click to cycle: Off -> NR -> NR2 -> NNR -> Off")
+        .clicked()
+    {
+        connected.spectrum.set_noise_reduction(nr.next());
+        changed = true;
+    }
+    changed
+}
+
+/// SNB/ANF/BIN toggle buttons -- see render_nb_nr's own doc comment for
+/// why this is a standalone fn.
+fn render_snb_anf_bin(ui: &mut egui::Ui, connected: &mut ConnectedState) -> bool {
+    let mut changed = false;
+    let snb = connected.spectrum.snb();
+    if ui
+        .add(egui::Button::selectable(snb, "SNB"))
+        .on_hover_text("Spectral Noise Blanker -- independent of NB/NR, can run alongside them")
+        .clicked()
+    {
+        connected.spectrum.set_snb(!snb);
+        changed = true;
+    }
+    let anf = connected.spectrum.anf();
+    if ui
+        .add(egui::Button::selectable(anf, "ANF"))
+        .on_hover_text("Automatic Notch Filter -- removes a steady heterodyne/carrier")
+        .clicked()
+    {
+        connected.spectrum.set_anf(!anf);
+        changed = true;
+    }
+    let binaural = connected.spectrum.binaural();
+    if ui
+        .add(egui::Button::selectable(binaural, "BIN"))
+        .on_hover_text(
+            "Binaural (phasing) RX audio -- genuinely different L/R for stereo listening, needs \
+             headphones/stereo speakers to hear the effect",
+        )
+        .clicked()
+    {
+        connected.spectrum.set_binaural(!binaural);
+        changed = true;
+    }
+    changed
 }
 
 fn network_status_color(status: Option<bool>) -> egui::Color32 {
@@ -12344,7 +12949,13 @@ fn render_extra_receiver_ui(ui: &mut egui::Ui, rx: &Arc<Mutex<ExtraReceiver>>) {
         // location as the main receiver's own Settings/Add Receiver
         // move -- see that block's own comment.
         ui.add_space(12.0);
-        if ui.button("Settings...").clicked() {
+        // See kiosk_accent_button's own doc comment.
+        let settings_clicked = if lcd_kiosk_mode() {
+            kiosk_accent_button(ui, "SETTINGS...").clicked()
+        } else {
+            ui.button("Settings...").clicked()
+        };
+        if settings_clicked {
             rx.show_settings_window = !rx.show_settings_window;
         }
     });
@@ -12982,6 +13593,10 @@ fn render_extra_receiver_settings(ui: &mut egui::Ui, rx: &Arc<Mutex<ExtraReceive
         // not per-receiver -- no separate CW tab for extra receivers,
         // redirect same as Audio/Network above.
         SettingsTab::Cw => rx.settings_tab = SettingsTab::Agc,
+        // Screen (kiosk UI scale) is a machine-level preference set once
+        // from the main Settings window -- no separate copy of it for
+        // extra receivers, same redirect-if-somehow-selected pattern.
+        SettingsTab::Screen => rx.settings_tab = SettingsTab::Agc,
 
         // TX (and PA Calibration/PureSignal, split out of it) are all
         // global (one radio, one PA/mic path), not per-receiver -- no

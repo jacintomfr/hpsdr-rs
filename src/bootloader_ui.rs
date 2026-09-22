@@ -168,13 +168,13 @@ impl FirmwareUpdateWindow {
             && self.upload.as_ref().is_some_and(|h| matches!(*h.progress.lock().unwrap(), UploadStage::Done))
     }
 
-    /// Draw the window for this frame -- same viewport/light-theme
+    /// Draw the window for this frame -- same viewport/dark-theme
     /// conventions as every other secondary window in this app (see
     /// discovery_ui.rs's DiscoveryWindow::show doc comment). Called from
     /// within the caller's own viewport closure (nested viewports are
     /// fine -- egui's per-receiver Settings sub-window already does this).
     pub fn show(&mut self, ui: &mut egui::Ui) {
-        let light_visuals = egui::Visuals::light();
+        let light_visuals = crate::with_orange_selection(egui::Visuals::dark());
         let light_style = egui::Style { visuals: light_visuals.clone(), ..Default::default() };
         let mut still_open = self.open;
         let kiosk = crate::lcd_kiosk_mode();

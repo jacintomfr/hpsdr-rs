@@ -298,12 +298,15 @@ impl DiscoveryWindow {
             }
         }
 
-        // Light theme, matching the Settings window's own override (see
-        // its doc comment in main.rs) -- for the same reason: egui only
-        // tints a window's title bar while focused, so overriding the
-        // whole window's visuals is the only way to keep it consistently
-        // white regardless of focus.
-        let light_visuals = egui::Visuals::light();
+        // Dark theme, matching the main window and every other window in
+        // the app (a real report: the earlier light/white override here
+        // was uncomfortable to read on a bright kiosk LCD, and looked
+        // inconsistent next to the rest of the app's own dark styling
+        // anyway) -- explicitly set rather than left to inherit, for the
+        // same reason as before: egui only tints a window's title bar
+        // while focused, so overriding the whole window's visuals is the
+        // only way to keep it consistently themed regardless of focus.
+        let light_visuals = crate::with_orange_selection(egui::Visuals::dark());
         let light_style = egui::Style { visuals: light_visuals.clone(), ..Default::default() };
         // Rendered in its own OS-level viewport (like the extra receiver
         // windows and the Settings window -- see its doc comment in
@@ -673,8 +676,11 @@ impl DiscoveryWindow {
                     // running in the background.
                     if kiosk {
                         ui.separator();
-                        if ui
-                            .button("Exit")
+                        // See crate::kiosk_accent_button's own doc
+                        // comment -- same attention-grabbing treatment
+                        // as this app's other kiosk-only window-chrome
+                        // controls (STOP/SETTINGS/MIN/CLOSE).
+                        if crate::kiosk_accent_button(ui, "EXIT")
                             .on_hover_text(
                                 "Quit hpsdr-rs. If a Radioberry Juice process is running (see \
                                  below), stop it first if you don't want it left running in \
