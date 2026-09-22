@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=hpsdr-rs (Kiosk 1024x600)
+Comment=hpsdr-rs in fixed 1024x600 fullscreen kiosk mode, for a dedicated LCD panel
+Exec=env HPSDR_LCD_1024X600=1 hpsdr-rs
+Icon=hpsdr-rs
+Terminal=false
+Categories=HamRadio;Network;
+Keywords=SDR;HPSDR;Ham Radio;Amateur Radio;Software Defined Radio;Kiosk;
