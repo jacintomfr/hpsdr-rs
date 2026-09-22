@@ -2182,6 +2182,23 @@ pub(crate) fn kiosk_accent_button(ui: &mut egui::Ui, label: &str) -> egui::Respo
     )
 }
 
+/// Same idea as kiosk_accent_button, but red -- specifically for STOP
+/// (disconnect), which relocates up next to SETTINGS in kiosk mode (see
+/// that call site's own comment). A real request: STOP is a more final,
+/// consequential action than the window-chrome controls
+/// kiosk_accent_button covers (MIN/CLOSE/EXIT), so it gets its own
+/// distinct color rather than sharing their yellow -- red is already
+/// this app's established "stop/disconnect" color elsewhere (Record's
+/// "Recording" state, the "TRANSMITTING" indicator this project used to
+/// have), so this stays consistent with that rather than inventing a
+/// third meaning for yellow.
+pub(crate) fn kiosk_stop_button(ui: &mut egui::Ui, label: &str) -> egui::Response {
+    ui.add(
+        egui::Button::new(egui::RichText::new(label).strong().color(egui::Color32::WHITE))
+            .fill(egui::Color32::from_rgb(210, 50, 50)),
+    )
+}
+
 impl HpsdrApp {
     fn new(ctx: &egui::Context) -> Self {
         // Pin the app to dark, rather than leaving egui's default
@@ -4241,39 +4258,57 @@ impl eframe::App for HpsdrApp {
                                 if settings_clicked {
                                     connected.show_settings_window = !connected.show_settings_window;
                                 }
-                                // Used to be gated to protocol == 2 only -- P1
-                                // genuinely supports independent per-receiver
-                                // tuning too (classic Metis/Ozy DDC round-robin),
-                                // it just wasn't wired up: see start_protocol1's
-                                // extra_frequencies_hz and p1_build_packet's
-                                // ozy_command==2 branch for the actual fix.
-                                let active =
-                                    connected.session.active_receiver_count.load(Ordering::Relaxed) as usize;
-                                let max = connected.session.iq_buffers.len();
-                                if active < max {
-                                    if ui.button(format!("Add Receiver ({active}/{max})")).clicked() {
-                                        if let Some(rx) = spawn_extra_receiver(
-                                            &connected.session,
-                                            connected.device.adcs,
-                                            connected.device.protocol,
-                                            connected.device.board,
-                                            connected.device.frequency_min,
-                                            connected.device.frequency_max,
-                                            Arc::clone(&connected.settings_dirty),
-                                            None,
-                                        ) {
-                                            connected.extra_receivers.push(rx);
-                                            // Without this, a freshly added
-                                            // receiver is only persisted if
-                                            // some other setting happens to
-                                            // change afterward -- closing the
-                                            // app right after adding one
-                                            // would silently lose it.
-                                            connected.settings_dirty.store(true, Ordering::Relaxed);
-                                        }
+                                // Kiosk mode: no Add Receiver at all --
+                                // a real report, this panel only ever
+                                // runs one receiver, so the button was
+                                // permanent dead space. STOP moves up
+                                // here instead (was bottom-left -- see
+                                // that call site's own comment), with
+                                // its own distinct red (not this
+                                // section's usual yellow -- see
+                                // kiosk_stop_button's own doc comment
+                                // for why) since it's a more
+                                // consequential action than SETTINGS/
+                                // Juice Console next to it.
+                                if lcd_kiosk_mode() {
+                                    if kiosk_stop_button(ui, "STOP").clicked() {
+                                        stop_clicked = true;
                                     }
                                 } else {
-                                    ui.weak(format!("All {max} receivers active"));
+                                    // Used to be gated to protocol == 2 only -- P1
+                                    // genuinely supports independent per-receiver
+                                    // tuning too (classic Metis/Ozy DDC round-robin),
+                                    // it just wasn't wired up: see start_protocol1's
+                                    // extra_frequencies_hz and p1_build_packet's
+                                    // ozy_command==2 branch for the actual fix.
+                                    let active =
+                                        connected.session.active_receiver_count.load(Ordering::Relaxed) as usize;
+                                    let max = connected.session.iq_buffers.len();
+                                    if active < max {
+                                        if ui.button(format!("Add Receiver ({active}/{max})")).clicked() {
+                                            if let Some(rx) = spawn_extra_receiver(
+                                                &connected.session,
+                                                connected.device.adcs,
+                                                connected.device.protocol,
+                                                connected.device.board,
+                                                connected.device.frequency_min,
+                                                connected.device.frequency_max,
+                                                Arc::clone(&connected.settings_dirty),
+                                                None,
+                                            ) {
+                                                connected.extra_receivers.push(rx);
+                                                // Without this, a freshly added
+                                                // receiver is only persisted if
+                                                // some other setting happens to
+                                                // change afterward -- closing the
+                                                // app right after adding one
+                                                // would silently lose it.
+                                                connected.settings_dirty.store(true, Ordering::Relaxed);
+                                            }
+                                        }
+                                    } else {
+                                        ui.weak(format!("All {max} receivers active"));
+                                    }
                                 }
                                 // Belongs with Settings/Add Receiver, not off on its own --
                                 // this whole vertical only renders once for the main
@@ -6663,13 +6698,15 @@ impl eframe::App for HpsdrApp {
                         // normal "Stop" on a regular desktop window,
                         // where it doesn't need to fight for attention
                         // the same way.
-                        // See kiosk_accent_button's own doc comment.
-                        let stop_clicked_now = if lcd_kiosk_mode() {
-                            kiosk_accent_button(ui, "STOP").clicked()
-                        } else {
-                            ui.button("Stop").clicked()
-                        };
-                        if stop_clicked_now {
+                        // Kiosk mode moves this up next to Settings
+                        // instead (where Add Receiver used to be -- see
+                        // that call site's own comment) -- a real
+                        // report: this panel will only ever run one
+                        // receiver, so Add Receiver was permanent dead
+                        // space Stop could use instead, and the bottom-
+                        // left corner isn't reachable at a glance the
+                        // same way. Desktop mode keeps it here, unchanged.
+                        if !lcd_kiosk_mode() && ui.button("Stop").clicked() {
                             stop_clicked = true;
                         }
                         // See ConnectedState::status_message's doc

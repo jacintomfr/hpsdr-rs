@@ -362,6 +362,13 @@ impl DiscoveryWindow {
         } else {
             egui::WindowLevel::AlwaysOnTop
         };
+        // 1000x580 in kiosk mode (matching the Settings window's own
+        // kiosk size, the widest a secondary window gets here) -- a
+        // real report: even at the desktop size below, the 7-column
+        // device table's trailing Status column still clipped off the
+        // right edge on the fixed kiosk window. Plain 900x500 outside
+        // kiosk mode, unchanged.
+        let discovery_size = if kiosk { [1000.0, 580.0] } else { [900.0, 500.0] };
         let mut discovery_viewport = egui::ViewportBuilder::default()
             .with_title("Discover HPSDR Radios")
             // Widened from 700 -- the Interface column now shows the
@@ -369,23 +376,21 @@ impl DiscoveryWindow {
             // (192.168.1.50)"), which combined with the MAC column's
             // own width was pushing the trailing Status column past
             // the fixed window edge and clipping it.
-            .with_inner_size([900.0, 500.0])
+            .with_inner_size(discovery_size)
             .with_active(true)
             .with_window_level(window_level);
         if kiosk {
             // Fixed 1024x600 kiosk mode -- see lcd_kiosk_mode's/
-            // kiosk_centered_pos's doc comments in main.rs. Already
-            // smaller than the main window on both axes, just needs to
-            // stay centered within it and not get dragged/resized past
-            // it. Decorations off too -- see the main Settings window's
-            // own with_decorations(false) comment for why (native title
-            // bar chrome would otherwise push it past the main window's
-            // own size); the existing Cancel button below (and Escape,
+            // kiosk_centered_pos's doc comments in main.rs. Decorations
+            // off too -- see the main Settings window's own
+            // with_decorations(false) comment for why (native title bar
+            // chrome would otherwise push it past the main window's own
+            // size); the existing Cancel button below (and Escape,
             // added below) already covers dismissing this window, so no
             // separate on-screen Close is needed here.
             discovery_viewport = discovery_viewport
-                .with_position(crate::kiosk_centered_pos([900.0, 500.0]))
-                .with_max_inner_size([900.0, 500.0])
+                .with_position(crate::kiosk_centered_pos(discovery_size))
+                .with_max_inner_size(discovery_size)
                 .with_resizable(false)
                 .with_decorations(false);
         }
