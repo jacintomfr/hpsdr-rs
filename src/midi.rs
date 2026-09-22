@@ -130,6 +130,7 @@ pub enum MidiAction {
     VfoStepDown,
     NoiseBlankerCycle,
     NoiseReductionCycle,
+    AgcCycle,
     AfGain,
     AgcGain,
     MicGain,
@@ -209,6 +210,17 @@ impl MidiAction {
             MidiAction::VfoStepDown => "VFO Step Down",
             MidiAction::NoiseBlankerCycle => "Noise Blanker Cycle",
             MidiAction::NoiseReductionCycle => "Noise Reduction Cycle",
+            // A real request: a single control (one press = advance one
+            // step, wrapping around) matching piHPSDR's own AGC action
+            // (actions.c's `case AGC:` -- `active_receiver->agc + 1`,
+            // wrapping past AGC_LAST) and this project's own NB/NR
+            // Cycle actions just above, instead of needing separate
+            // per-state bindings (a real report: NB/NR/AGC's states
+            // aren't independent toggles, they're one rotary position
+            // at a time, so one control that steps through them all
+            // matches the physical behavior better than N individual
+            // switches would).
+            MidiAction::AgcCycle => "AGC Cycle",
             MidiAction::AfGain => "AF Gain",
             MidiAction::AgcGain => "AGC Gain",
             MidiAction::MicGain => "Mic Gain",
@@ -276,6 +288,7 @@ pub const KEY_ACTIONS: &[MidiAction] = &[
     MidiAction::VfoStepDown,
     MidiAction::NoiseBlankerCycle,
     MidiAction::NoiseReductionCycle,
+    MidiAction::AgcCycle,
     MidiAction::CtunToggle,
     MidiAction::RxEqToggle,
     MidiAction::DiversityToggle,
@@ -318,6 +331,27 @@ pub const KNOB_ACTIONS: &[MidiAction] = &[
 ];
 
 /// Actions valid for a Wheel (relative encoder) binding.
+///
+/// Every KNOB_ACTIONS entry above is ALSO here -- unlike VfoTune/
+/// RitAdjust/etc. (Wheel-only), they're all deliberately usable as
+/// either kind, so the Learn workflow lets the user pick whichever
+/// matches their actual controller, same as piHPSDR's own KnobOrWheel
+/// (actions.c) does for every one of its equivalent actions (AF_GAIN,
+/// AGC_GAIN, MIC_GAIN, RF_GAIN, DRIVE, CW_SPEED all accept both
+/// ABSOLUTE and RELATIVE there too -- ported here per a real request
+/// to follow that reference rather than inventing a different
+/// convention). ROOT CAUSE FIX for a real report (confirmed on AF Gain,
+/// then found to affect every other Knob-only action the same way): a
+/// genuine relative (no-detent, "infinite rotation") encoder sends the
+/// SAME one or two raw CC values for "turn left"/"turn right" every
+/// time, regardless of how far or how many times it's actually turned
+/// -- bound as a Knob (which treats that raw value as an ABSOLUTE fader
+/// position 0-127), every "left" turn maps to the exact same value, and
+/// every "right" turn maps to the exact same (different) value, so the
+/// control only ever toggles between those two positions no matter how
+/// many times it's turned, instead of continuing to move further each
+/// time. See each action's own Wheel match arm (main.rs) for the
+/// relative-step handling this enables.
 pub const WHEEL_ACTIONS: &[MidiAction] = &[
     MidiAction::VfoTune,
     MidiAction::RitAdjust,
@@ -325,6 +359,13 @@ pub const WHEEL_ACTIONS: &[MidiAction] = &[
     MidiAction::VfoBTune,
     MidiAction::DiversityGainAdjust,
     MidiAction::DiversityPhaseAdjust,
+    MidiAction::AfGain,
+    MidiAction::AgcGain,
+    MidiAction::MicGain,
+    MidiAction::RfAttenuation,
+    MidiAction::TxDrive,
+    MidiAction::CwSpeed,
+    MidiAction::FilterWidth,
 ];
 
 /// How a ControlChange/PitchBend binding's value should be interpreted.

@@ -796,7 +796,15 @@ fn dispatch_midi_event(connected: &mut ConnectedState, ev: RawMidiEvent, freq_hz
             connected.width_memory.insert(current_mode.label().to_string(), width);
         }
         MidiAction::FilterWidth => {
-            let width = midi_knob_range(ev.value, 50.0, 5000.0);
+            // Dual Knob/Wheel -- see WHEEL_ACTIONS' own doc comment.
+            // 50Hz per tick, matching the main window's own Filter
+            // width slider's step size.
+            let width = if binding.kind == MidiBindingKind::Wheel {
+                let Some(step) = midi_wheel_step(ev, &binding, 50.0) else { return };
+                (connected.spectrum.width_hz() + step).round().clamp(50.0, 5000.0)
+            } else {
+                midi_knob_range(ev.value, 50.0, 5000.0)
+            };
             connected.spectrum.set_width_hz(width);
             if let Some(tx) = &connected.tx_handle {
                 tx.set_width_hz(width);
@@ -923,6 +931,14 @@ fn dispatch_midi_event(connected: &mut ConnectedState, ev: RawMidiEvent, freq_hz
         MidiAction::NoiseReductionCycle => {
             connected.spectrum.set_noise_reduction(connected.spectrum.noise_reduction().next());
         }
+        MidiAction::AgcCycle => {
+            // Same cycle a bound control steps through as the on-screen
+            // AGC button (main window and Settings -> RX both use
+            // `.next()` the same way) -- see MidiAction::AgcCycle's own
+            // doc comment (midi.rs) for why this exists as one control
+            // instead of needing a separate binding per AGC mode.
+            connected.spectrum.set_agc(connected.spectrum.agc().next());
+        }
         // Direct-select alternatives to the Cycle actions above -- mutually
         // exclusive (only one NB/NR state active at a time, same as the
         // Cycle actions and the on-screen NB/NR buttons), but each bound
@@ -936,19 +952,56 @@ fn dispatch_midi_event(connected: &mut ConnectedState, ev: RawMidiEvent, freq_hz
         MidiAction::NoiseReductionNr2 => connected.spectrum.set_noise_reduction(spectrum::NoiseReduction::Nr2),
         MidiAction::NoiseReductionNr3 => connected.spectrum.set_noise_reduction(spectrum::NoiseReduction::Nr3),
         MidiAction::AfGain => {
-            let db = midi_knob_range(ev.value, -100.0, 18.0);
-            connected.spectrum.set_gain(10f32.powf(db as f32 / 20.0));
+            // Dual Knob/Wheel action -- see WHEEL_ACTIONS' own doc
+            // comment on AfGain for the real report this Wheel arm
+            // fixes (a relative encoder bound as a Knob only ever
+            // toggled between two adjacent dB values, never moving
+            // further no matter how many times it was turned). Ported
+            // from piHPSDR's own KnobOrWheel (actions.c) rather than a
+            // homegrown approach, per a real request -- same 1.0dB-
+            // per-tick RELATIVE step, and the same round-to-nearest-inc
+            // before clamping (`inc * round(oldval / inc)` there) so
+            // repeated turns can't drift the value off a whole dB over
+            // time the way an un-rounded running total could.
+            if binding.kind == MidiBindingKind::Wheel {
+                let Some(step) = midi_wheel_step(ev, &binding, 1.0) else { return };
+                let current_db = 20.0 * (connected.spectrum.gain() as f64).log10();
+                let new_db = (current_db + step).round().clamp(-100.0, 18.0);
+                connected.spectrum.set_gain(10f32.powf(new_db as f32 / 20.0));
+            } else {
+                let db = midi_knob_range(ev.value, -100.0, 18.0);
+                connected.spectrum.set_gain(10f32.powf(db as f32 / 20.0));
+            }
         }
         MidiAction::AgcGain => {
-            // Same range/call as the main window's own AGC Gain slider
-            // (see its doc comment -- WDSP's SetRXAAGCTop, "Top" in
-            // Settings -> RX under a different name).
-            let agc_top_db = midi_knob_range(ev.value, 0.0, 140.0);
-            connected.spectrum.set_agc_top_db(agc_top_db);
+            // Dual Knob/Wheel -- see WHEEL_ACTIONS' own doc comment
+            // (ported from piHPSDR's KnobOrWheel, same 1.0dB-per-tick
+            // RELATIVE step it uses for AGC_GAIN).
+            if binding.kind == MidiBindingKind::Wheel {
+                let Some(step) = midi_wheel_step(ev, &binding, 1.0) else { return };
+                let current = connected.spectrum.agc_params().agc_top_db;
+                let new_db = (current + step).round().clamp(0.0, 140.0);
+                connected.spectrum.set_agc_top_db(new_db);
+            } else {
+                // Same range/call as the main window's own AGC Gain
+                // slider (see its doc comment -- WDSP's SetRXAAGCTop,
+                // "Top" in Settings -> RX under a different name).
+                let agc_top_db = midi_knob_range(ev.value, 0.0, 140.0);
+                connected.spectrum.set_agc_top_db(agc_top_db);
+            }
         }
         MidiAction::MicGain => {
             if connected.tx_enabled && connected.tx_handle.is_some() {
-                let db = midi_knob_range(ev.value, -60.0, 6.0);
+                // Dual Knob/Wheel -- see WHEEL_ACTIONS' own doc comment
+                // (ported from piHPSDR's KnobOrWheel, same 1.0dB-per-tick
+                // RELATIVE step it uses for MIC_GAIN).
+                let db = if binding.kind == MidiBindingKind::Wheel {
+                    let Some(step) = midi_wheel_step(ev, &binding, 1.0) else { return };
+                    let current_db = 20.0 * (connected.mic_gain as f64).log10();
+                    (current_db + step).round().clamp(-60.0, 6.0)
+                } else {
+                    midi_knob_range(ev.value, -60.0, 6.0)
+                };
                 let gain = 10f32.powf(db as f32 / 20.0);
                 connected.mic_gain = gain;
                 if let Some(tx) = &connected.tx_handle {
@@ -964,12 +1017,32 @@ fn dispatch_midi_event(connected: &mut ConnectedState, ev: RawMidiEvent, freq_hz
             // instead a -12..+48 dB RF Gain value (stored as the wire
             // value gain_db+12, 0-60); every other case (including a
             // HermesLite2 on Protocol 2, which has no RF Gain concept)
-            // is the standard 0-31 dB attenuator.
+            // is the standard 0-31 dB attenuator. Dual Knob/Wheel -- see
+            // WHEEL_ACTIONS' own doc comment (ported from piHPSDR's
+            // KnobOrWheel, same 1.0-unit-per-tick RELATIVE step it uses
+            // for RF_GAIN -- 1dB for the HL/HL2 gain case, 1 step for
+            // the plain attenuator case).
             if connected.device.protocol == 1
                 && matches!(connected.device.board, Boards::HermesLite | Boards::HermesLite2)
             {
-                let gain_db = midi_knob_range(ev.value, -12.0, 48.0);
-                connected.session.rx_attenuation.store((gain_db + 12.0).clamp(0.0, 60.0) as u32, Ordering::Relaxed);
+                if binding.kind == MidiBindingKind::Wheel {
+                    let Some(step) = midi_wheel_step(ev, &binding, 1.0) else { return };
+                    let current_gain_db =
+                        connected.session.rx_attenuation.load(Ordering::Relaxed) as f64 - 12.0;
+                    let new_gain_db = (current_gain_db + step).round().clamp(-12.0, 48.0);
+                    connected
+                        .session
+                        .rx_attenuation
+                        .store((new_gain_db + 12.0).clamp(0.0, 60.0) as u32, Ordering::Relaxed);
+                } else {
+                    let gain_db = midi_knob_range(ev.value, -12.0, 48.0);
+                    connected.session.rx_attenuation.store((gain_db + 12.0).clamp(0.0, 60.0) as u32, Ordering::Relaxed);
+                }
+            } else if binding.kind == MidiBindingKind::Wheel {
+                let Some(step) = midi_wheel_step(ev, &binding, 1.0) else { return };
+                let current = connected.session.rx_attenuation.load(Ordering::Relaxed) as f64;
+                let new_atten = (current + step).round().clamp(0.0, 31.0);
+                connected.session.rx_attenuation.store(new_atten as u32, Ordering::Relaxed);
             } else {
                 let atten = (ev.value as u32 * 31) / 127;
                 connected.session.rx_attenuation.store(atten, Ordering::Relaxed);
@@ -977,7 +1050,16 @@ fn dispatch_midi_event(connected: &mut ConnectedState, ev: RawMidiEvent, freq_hz
         }
         MidiAction::TxDrive => {
             if connected.tx_enabled {
-                let watts = (ev.value as u32 * connected.max_tx_power_watts) / 127;
+                // Dual Knob/Wheel -- see WHEEL_ACTIONS' own doc comment
+                // (ported from piHPSDR's KnobOrWheel, same 1.0-watt-
+                // per-tick RELATIVE step it uses for DRIVE).
+                let watts = if binding.kind == MidiBindingKind::Wheel {
+                    let Some(step) = midi_wheel_step(ev, &binding, 1.0) else { return };
+                    let current = connected.session.tx_power_watts.load(Ordering::Relaxed) as f64;
+                    (current + step).round().clamp(0.0, connected.max_tx_power_watts as f64) as u32
+                } else {
+                    (ev.value as u32 * connected.max_tx_power_watts) / 127
+                };
                 connected.session.tx_power_watts.store(watts, Ordering::Relaxed);
                 // A manual adjustment while Tune/Two-Tone is active should
                 // stick when it ends, same as the TX Power slider's own
@@ -988,7 +1070,16 @@ fn dispatch_midi_event(connected: &mut ConnectedState, ev: RawMidiEvent, freq_hz
             }
         }
         MidiAction::CwSpeed => {
-            let speed = 1 + (ev.value as u32 * 59) / 127;
+            // Dual Knob/Wheel -- see WHEEL_ACTIONS' own doc comment
+            // (ported from piHPSDR's KnobOrWheel, same 1.0-WPM-per-tick
+            // RELATIVE step it uses for CW_SPEED).
+            let speed = if binding.kind == MidiBindingKind::Wheel {
+                let Some(step) = midi_wheel_step(ev, &binding, 1.0) else { return };
+                let current = connected.session.cw_keyer.speed_wpm.load(Ordering::Relaxed) as f64;
+                (current + step).round().clamp(1.0, 60.0) as u32
+            } else {
+                1 + (ev.value as u32 * 59) / 127
+            };
             connected.session.cw_keyer.speed_wpm.store(speed, Ordering::Relaxed);
         }
         MidiAction::RitAdjust => {
