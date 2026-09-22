@@ -81,7 +81,23 @@ pub enum DiscoveryAction {
     /// ConnectedState and keep the live console available after this
     /// window itself is gone. `None` for every other radio type, or if
     /// Juice was never launched this session.
-    Start(Device, Option<crate::radioberry_juice::JuiceHandle>),
+    ///
+    /// ROOT CAUSE FIX for a real report: the third field does the exact
+    /// same hand-off for `sim_handle` (hpsdrsim.rs's built-in emulator),
+    /// which this action previously left behind entirely -- `SimHandle`
+    /// isn't `Clone` (unlike `JuiceHandle`, an external process this
+    /// app doesn't own the lifetime of the same way), so this MOVES it
+    /// out via `Option::take()` at the call site instead of cloning.
+    /// Without this, `DiscoveryWindow` (which owned `sim_handle`) gets
+    /// dropped the moment `AppState` switches from `Discovering` to
+    /// `Connected` -- and `SimHandle`'s own `Drop` impl calls `stop()`,
+    /// silently killing the emulator's listening thread within a couple
+    /// of milliseconds of a successful Start, before it could ever
+    /// actually stream anything. Confirmed via `netstat` showing UDP
+    /// 1024 unbound again moments after "Started HermesLite2..." logged,
+    /// with no panic and no error -- exactly what an intentional,
+    /// clean `stop()` from a value going out of scope looks like.
+    Start(Device, Option<crate::radioberry_juice::JuiceHandle>, Option<crate::hpsdrsim::SimHandle>),
 }
 
 pub struct DiscoveryWindow {
@@ -576,7 +592,7 @@ impl DiscoveryWindow {
                             }
                             if row_double_clicked && available {
                                 self.selected = Some(i);
-                                action = DiscoveryAction::Start(*dev, self.juice_console.clone());
+                                action = DiscoveryAction::Start(*dev, self.juice_console.clone(), self.sim_handle.take());
                             }
 
                             ui.end_row();
@@ -638,7 +654,7 @@ impl DiscoveryWindow {
 
                     if ui.add_enabled(can_start, egui::Button::new("Start")).clicked() {
                         if let Some(dev) = self.selected.and_then(|i| devices_snapshot.get(i)) {
-                            action = DiscoveryAction::Start(*dev, self.juice_console.clone());
+                            action = DiscoveryAction::Start(*dev, self.juice_console.clone(), self.sim_handle.take());
                         }
                     }
 
@@ -990,6 +1006,15 @@ impl DiscoveryWindow {
                 // attached at all, similar in spirit to piHPSDR's
                 // separate hpsdrsim command-line tool, but built in
                 // here instead of a standalone program.
+                //
+                // Hidden entirely (not even this collapsible header)
+                // unless HPSDR_SIM=1 -- see hpsdrsim_enabled's own doc
+                // comment. A real request: this is purely a development/
+                // testing aid, unrelated to and must not visibly
+                // intrude on this app's normal operation with real
+                // hardware -- same opt-in-only treatment as kiosk mode's
+                // own HPSDR_LCD_1024X600.
+                if crate::hpsdrsim::hpsdrsim_enabled() {
                 egui::CollapsingHeader::new("hpsdrsim").show(ui, |ui| {
                     ui.label(
                         "Runs an in-process fake radio that answers \
@@ -1050,6 +1075,7 @@ impl DiscoveryWindow {
                         ui.colored_label(egui::Color32::RED, err);
                     }
                 });
+                }
                 });
             },
         );

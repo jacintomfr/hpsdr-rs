@@ -106,7 +106,46 @@ int WDSPwisdom(char *directory) {
     fprintf(stdout, "\nFFTW planning complete.\n");
     fflush(stdout);
     sprintf(status, "\nFFTW planning complete.\n");
-    fftw_export_wisdom_to_filename(wisdom_file);
+    // PATCHED (hpsdr-rs): write to a ".tmp" file and only replace the
+    // real wisdom_file once that write actually succeeds, keeping a
+    // ".bak" copy of whatever was there before -- a real report: this
+    // multi-minute pass got interrupted (the whole process killed
+    // partway through) by an unrelated window-manager mishap, forcing
+    // a full from-scratch redo on the next launch. The planning loop
+    // itself was never the risk (nothing is written to disk until
+    // this point, after it's already fully done) -- but writing
+    // straight to wisdom_file directly, as upstream does, still leaves
+    // a real (if narrow) window where a crash/kill during THIS export
+    // call itself could leave a truncated, corrupt file at the path
+    // the next launch trusts as "already cached", which is worse than
+    // simply missing (that just redoes the pass; a corrupt file could
+    // make fftw_import_wisdom_from_filename below fail unpredictably
+    // instead). Exporting to a separate temp path first and renaming
+    // into place only on success means wisdom_file is never observed
+    // in a half-written state, and the .bak keeps one known-good
+    // fallback copy even if a rebuild somehow produces a bad file.
+    {
+      char wisdom_tmp[1040];
+      char wisdom_bak[1040];
+      snprintf(wisdom_tmp, sizeof(wisdom_tmp), "%s.tmp", wisdom_file);
+      snprintf(wisdom_bak, sizeof(wisdom_bak), "%s.bak", wisdom_file);
+      if (fftw_export_wisdom_to_filename(wisdom_tmp)) {
+        remove(wisdom_bak); // ignore ENOENT -- no previous file is fine
+        rename(wisdom_file, wisdom_bak); // best-effort; ignore failure (no previous file yet)
+        remove(wisdom_file); // rename() on Windows needs the destination gone first
+        if (rename(wisdom_tmp, wisdom_file) != 0) {
+          // Same-volume rename right after a successful write to the
+          // same directory should never realistically fail -- but if
+          // it somehow does, importing wisdom_tmp directly next launch
+          // is still possible by hand, so leave it in place rather
+          // than deleting it.
+          fprintf(stdout, "wisdom: rename to final path failed, wisdom_tmp left in place\n");
+        }
+      } else {
+        fprintf(stdout, "wisdom: export failed, keeping previous cache (if any)\n");
+        remove(wisdom_tmp);
+      }
+    }
     _aligned_free(fftout);
     _aligned_free(fftin);
     wisdom_return = 1;

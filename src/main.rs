@@ -1670,6 +1670,19 @@ struct ConnectedState {
     /// this session (e.g. it was already running from an earlier
     /// launch outside hpsdr-rs).
     juice_console: Option<crate::radioberry_juice::JuiceHandle>,
+    /// hpsdrsim.rs's built-in emulator, if the Discover window launched
+    /// one before this connection was started -- kept alive here for
+    /// the same reason juice_console is (see its own doc comment just
+    /// above): the DiscoveryWindow that originally owned it is dropped
+    /// once AppState switches to Connected, and SimHandle's own Drop
+    /// impl stops the emulator, so without this hand-off the emulator
+    /// died within milliseconds of every single connection attempt --
+    /// see DiscoveryAction::Start's own doc comment for the real report
+    /// this fixes. `None` for a real radio, or if hpsdrsim was never
+    /// launched this session. Never read after being stored (no console
+    /// UI for it, unlike Juice) -- its only job here is to keep living.
+    #[allow(dead_code)]
+    sim_handle: Option<crate::hpsdrsim::SimHandle>,
     /// Fixed correction folded into the S-meter/panadapter dBm reading
     /// -- see the Settings -> RX control's own doc comment (matches
     /// piHPSDR's rx_gain_calibration). NOT the live RX Gain/Attenuation
@@ -2894,6 +2907,7 @@ fn connect_to_device(device: Device, cfg: &Config) -> Result<ConnectedState, Str
                 settings_tab: SettingsTab::Agc,
                 firmware_update: None,
                 juice_console: None,
+                sim_handle: None,
                 show_juice_console_window: false,
                 rx_gain_calibration_db: cfg.rx_gain_calibration_db.unwrap_or(0),
                 extra_receivers,
@@ -3135,7 +3149,7 @@ impl eframe::App for HpsdrApp {
             AppState::Discovering(window) => {
                 sys_stats.set_radio_ip(None);
                 match window.show(ui) {
-                DiscoveryAction::Start(device, juice_console) => {
+                DiscoveryAction::Start(device, juice_console, sim_handle) => {
                     let cfg = Config::load(device.mac);
                     // Move/resize the main window to wherever it was
                     // last left for THIS radio -- see
@@ -3165,6 +3179,7 @@ impl eframe::App for HpsdrApp {
                     match connect_to_device(device, &cfg) {
                         Ok(mut connected) => {
                             connected.juice_console = juice_console;
+                            connected.sim_handle = sim_handle;
                             self.state = AppState::Connected(connected);
                         }
                         Err(e) => self.state = AppState::Error(e),
@@ -6711,17 +6726,16 @@ impl eframe::App for HpsdrApp {
                             stop_clicked = true;
                         }
                         // See ConnectedState::status_message's doc
-                        // comment. Wisdom generation takes priority
-                        // while it's actually relevant (matches the
-                        // waterfall overlay's own condition above) --
-                        // it's the one thing this area was specifically
-                        // added for, and it's already transient/self-
-                        // clearing once the waterfall starts rendering,
-                        // unlike status_message which persists until
-                        // something else overwrites it.
-                        if waterfall_texture_id.is_none() {
-                            ui.colored_label(egui::Color32::from_rgb(220, 60, 60), wisdom_status_text());
-                        } else if let Some(msg) = &connected.status_message {
+                        // comment. Deliberately NOT also repeating
+                        // wisdom_status_text() here while the waterfall
+                        // has no texture yet -- a real report: that
+                        // duplicated the exact same message already
+                        // shown centered over the waterfall itself (see
+                        // that overlay's own condition above), crowding
+                        // out this row's CPU/MEM/network indicators for
+                        // no benefit (the center placeholder is already
+                        // impossible to miss).
+                        if let Some(msg) = &connected.status_message {
                             ui.weak(msg);
                         }
                         ui.separator();
@@ -14947,7 +14961,27 @@ fn change_extra_receiver_sample_rate(rx: &mut ExtraReceiver, new_rate: u32) {
 /// poll it, so a torn read at worst shows one garbled frame of text
 /// rather than anything unsafe.
 fn wisdom_status_text() -> String {
-    const FALLBACK: &str = "Creating FFTW Wisdom File...";
+    // ROOT CAUSE FIX for a real report: this text is shown whenever the
+    // waterfall simply has no rows yet, for ANY reason -- not only while
+    // wisdom.c's FFTW_PATIENT pass is genuinely running. wisdom.c's
+    // `status` C global is only ever written to from inside that pass
+    // (see wisdom.c's own WDSPwisdom, gated on
+    // `!fftw_import_wisdom_from_filename(...)`); when the cached wisdom
+    // file is found and imported instead (the common case after the
+    // very first run), that pass never executes and `status` stays
+    // whatever it was left as (empty, for a fresh process that's never
+    // gone through it at all) -- so the OLD fallback text below claimed
+    // wisdom generation was in progress even when it demonstrably
+    // wasn't (confirmed against a real report: no wisdom.c activity in
+    // the log, wisdom cache file untouched, yet this text stayed on
+    // screen indefinitely because the real problem was simply no RX
+    // data arriving at all). Only show the wisdom-specific wording when
+    // `status` is actually non-empty, i.e. wisdom.c really did just
+    // print something this session; otherwise say the plain, honest
+    // thing this text is actually reporting -- no data yet, cause
+    // unknown from here.
+    const FALLBACK: &str = "Waiting for data... (no waterfall rows yet -- if this doesn't clear \
+        within a few seconds, the radio may not actually be streaming)";
     unsafe {
         let ptr = wdsp_sys::wisdom_get_status();
         if ptr.is_null() {

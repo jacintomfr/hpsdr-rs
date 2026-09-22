@@ -33,6 +33,35 @@ const USB_FRAME_SIZE: usize = 512;
 const HEADER_SIZE: usize = 8;
 const PACKET_SIZE: usize = HEADER_SIZE + USB_FRAME_SIZE * 2;
 const EP_IQ_DATA: u8 = 0x06;
+/// Host -> radio C&C/mic-audio packets -- matches radio.rs's own
+/// `EP_COMMAND_AUDIO`. Real request: the synthesized tone used to stay
+/// at a fixed offset inside the baseband regardless of VFO, unlike a
+/// real signal (which stays put on the actual RF spectrum and moves
+/// THROUGH the baseband as you tune past it) -- parsing this lets the
+/// tone behave the same way.
+const EP_COMMAND_AUDIO: u8 = 0x02;
+/// The synthesized signal's fixed position on the "RF dial", Hz --
+/// arbitrary (doesn't correspond to a real transmitter), picked to sit
+/// inside the 40m band's SSB/CW portion where a fresh discovery-time
+/// default VFO frequency is likely to already be tuned nearby.
+const TEST_SIGNAL_ABS_FREQ_HZ: i64 = 7_100_700;
+
+/// Whether the Discover window's whole "hpsdrsim" section (board
+/// picker, Start/Stop, this module's own explanatory text) is shown at
+/// all -- a real request: this is purely a development/testing aid for
+/// exercising the discovery/connect/RX pipeline with no radio attached,
+/// completely unrelated to this app's own normal operation, and should
+/// have zero footprint (not even visible in the UI) unless deliberately
+/// opted into -- same `HPSDR_xxx=1` env var convention as
+/// `lcd_kiosk_mode()` (main.rs) uses for its own opt-in-only feature.
+/// Checked once per frame at the UI call site rather than cached, same
+/// reasoning as that function: cheap, and lets toggling the env var
+/// take effect on the next Discover window repaint without a restart
+/// being required to LEAVE it off (only relevant for someone actively
+/// developing this feature itself).
+pub fn hpsdrsim_enabled() -> bool {
+    std::env::var("HPSDR_SIM").map(|v| v != "0").unwrap_or(false)
+}
 
 /// Which board this session pretends to be -- see board_id/version/
 /// mac/receivers below for exactly what differs on the wire (a real
@@ -139,7 +168,30 @@ impl SimHandle {
         socket.set_read_timeout(Some(Duration::from_millis(2)))?;
         let stop = Arc::new(AtomicBool::new(false));
         let thread_stop = Arc::clone(&stop);
-        let thread = thread::spawn(move || run(socket, board, thread_stop));
+        let thread = thread::spawn(move || {
+            // Diagnostic wrapper (temporary, chasing a real report): a
+            // second silent thread death was observed even after
+            // fixing recv_from's WSAEMSGSIZE crash -- no "fatal error"
+            // line THIS time either, which rules that specific error
+            // path out and points at an unwinding panic somewhere else
+            // in run() instead (send_to's own error is already
+            // discarded via `let _ =`, so it's not that either, unless
+            // something upstream of it -- e.g. build_iq_packet's slice
+            // indexing -- panics first). catch_unwind + an explicit
+            // eprintln! makes that panic's actual message/location
+            // show up in the log instead of the thread just vanishing.
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                run(socket, board, thread_stop);
+            }));
+            if let Err(e) = result {
+                let msg = e
+                    .downcast_ref::<&str>()
+                    .map(|s| s.to_string())
+                    .or_else(|| e.downcast_ref::<String>().cloned())
+                    .unwrap_or_else(|| "<non-string panic payload>".to_string());
+                eprintln!("hpsdrsim: run() PANICKED: {msg}");
+            }
+        });
         Ok(Self { stop, thread: Some(thread), board })
     }
 
@@ -182,7 +234,24 @@ fn bind_shared_udp(port: u16) -> io::Result<UdpSocket> {
 /// The emulator's main loop: answers discovery, tracks Start/Stop, and
 /// streams synthetic IQ at the correct pace/format while "running".
 fn run(socket: UdpSocket, board: SimBoard, stop: Arc<AtomicBool>) {
-    let mut buf = [0u8; 1024];
+    // ROOT CAUSE FIX for a real report: was `[0u8; 1024]`, exactly the
+    // size of this emulator's own largest packet (PACKET_SIZE, P1 IQ
+    // data) -- but hpsdr-rs's own discover() always tries BOTH P1 and
+    // P2 discovery on every interface (discovery.rs, protocol1_discovery
+    // then protocol2_discovery back to back), and a P2 discovery/general
+    // packet this Protocol-1-only emulator was never meant to parse can
+    // exceed 1024 bytes. On Windows, recv_from into a too-small buffer
+    // doesn't truncate the datagram -- it fails outright with
+    // WSAEMSGSIZE ("os error 10040"), which used to hit this loop's
+    // catch-all error branch and silently kill the ENTIRE emulator
+    // thread (no panic, no log) the moment discovery included any P2
+    // traffic at all, closing this socket and leaving Protocol 1's own
+    // subsequent Start command (which by itself was always fine) with
+    // nowhere left to arrive. 2048 comfortably covers any real openHPSDR
+    // P1 or P2 packet on a local network with room to spare -- oversized
+    // traffic should just be ignored (falls through the `0xEF 0xFE`
+    // check below), never treated as fatal.
+    let mut buf = [0u8; 2048];
     let mut client: Option<SocketAddr> = None;
     let mut running = false;
     let mut seq: u32 = 0;
@@ -190,6 +259,14 @@ fn run(socket: UdpSocket, board: SimBoard, stop: Arc<AtomicBool>) {
     // comment for what they drive.
     let mut tone_phase: f64 = 0.0;
     let mut rng_state: u64 = 0x2545_F491_4F6C_DD1D;
+    // RX0's current dial frequency, as last seen in the host's own C&C
+    // stream (register 0x04 -- see extract_rx0_frequency's own doc
+    // comment) -- drives the synthesized tone's baseband offset so it
+    // behaves like a real, fixed-frequency signal that moves through
+    // the passband as you tune, instead of always sitting at the same
+    // spot on screen. Seeded at the test signal's own frequency so it
+    // starts centered even before the first C&C packet updates it.
+    let mut rx0_freq_hz: i64 = TEST_SIGNAL_ABS_FREQ_HZ;
 
     let receivers = board.wire_receivers();
     // Same integer-division stride radio.rs's own parse_iq_stream uses
@@ -222,6 +299,28 @@ fn run(socket: UdpSocket, board: SimBoard, stop: Arc<AtomicBool>) {
                             let reply = discovery_reply(board);
                             let _ = socket.send_to(&reply, src);
                         }
+                        // Host -> radio C&C/mic-audio (EP 0x01, buf[3]
+                        // distinguishes WHICH command within that EP --
+                        // see radio.rs's own `packet[2] = 0x01;
+                        // packet[3] = EP_COMMAND_AUDIO;`; buf[2] alone
+                        // is the EP, not the sub-command, unlike every
+                        // other case in this match). See
+                        // extract_rx0_frequency's own doc comment for
+                        // why this is the one thing this emulator DOES
+                        // parse out of this otherwise-ignored packet
+                        // family. ROOT CAUSE FIX for a real report: this
+                        // used to be matched as `EP_COMMAND_AUDIO =>`
+                        // directly against buf[2] -- since
+                        // EP_COMMAND_AUDIO is 0x02, the SAME value as
+                        // the Discovery arm just above, that branch was
+                        // unreachable dead code, so rx0_freq_hz never
+                        // actually updated and the tone silently stayed
+                        // wherever the initial seed left it.
+                        0x01 if amt >= 4 && buf[3] == EP_COMMAND_AUDIO => {
+                            if let Some(freq) = extract_rx0_frequency(&buf[..amt]) {
+                                rx0_freq_hz = freq;
+                            }
+                        }
                         // General Control command -- byte[3]==0x03 is
                         // Start (both RX+TX run bits), 0x00 is Stop --
                         // see radio.rs's p1_send_preconfig_and_start/
@@ -232,16 +331,17 @@ fn run(socket: UdpSocket, board: SimBoard, stop: Arc<AtomicBool>) {
                                 client = Some(src);
                                 running = true;
                                 next_send = Instant::now();
+                                eprintln!("hpsdrsim: Start received from {src}, streaming to it now");
                             } else if buf[3] == 0x00 {
                                 running = false;
+                                eprintln!("hpsdrsim: Stop received from {src}");
                             }
                         }
-                        // Ordinary C&C (EP_COMMAND_AUDIO) packets --
-                        // frequency/mode/etc. requests this emulator
-                        // deliberately doesn't parse (see the module
-                        // doc comment); still worth remembering the
-                        // sender in case Start's own packet is ever
-                        // missed/reordered relative to these.
+                        // Anything else (e.g. a stray Protocol 2 packet
+                        // -- see the buffer-size comment above) --
+                        // still worth remembering the sender in case
+                        // Start's own packet is ever missed/reordered
+                        // relative to these.
                         _ => {
                             if client.is_none() {
                                 client = Some(src);
@@ -250,16 +350,58 @@ fn run(socket: UdpSocket, board: SimBoard, stop: Arc<AtomicBool>) {
                     }
                 }
             }
-            Err(e) if e.kind() == io::ErrorKind::WouldBlock || e.kind() == io::ErrorKind::TimedOut => {}
-            Err(_) => break,
+            // ROOT CAUSE FIX for a real report: this used to be `Err(e)
+            // if WouldBlock || TimedOut => {}, Err(_) => break` -- ANY
+            // other error silently killed the whole receive loop (no
+            // panic, no log line, the thread just returned normally),
+            // which on Windows turned out to be a real, reproducible
+            // trap for a UDP socket specifically: sending a reply to a
+            // client whose own listening socket has since closed (e.g.
+            // discovery.rs's own protocol1_discovery closes its socket
+            // after its own SOCKET_TIMEOUT, which can easily have
+            // already elapsed by the time this emulator gets around to
+            // replying to a LATER interface in the same discovery pass)
+            // provokes an ICMP Port Unreachable back at the OS level,
+            // which Windows then surfaces as `WSAECONNRESET` (mapped to
+            // `ErrorKind::ConnectionReset`) on this SAME socket's *next*
+            // `recv_from` call -- even though nothing about that next,
+            // unrelated packet was actually reset. Confirmed against a
+            // real hang: `netstat` showed nothing at all bound to UDP
+            // 1024 minutes after the UI still claimed "Status: running"
+            // (`SimHandle::is_running` only checks the JoinHandle/stop
+            // flag, not whether the thread's own loop is still alive --
+            // a thread that returns normally, as this one now no longer
+            // does, leaves both of those looking exactly like "still
+            // running"), while the actual Start command the client kept
+            // sending correctly (confirmed via its own send() succeeding)
+            // had nowhere left to be received. `ConnectionReset` treated
+            // the same as WouldBlock/TimedOut -- meaningless noise for a
+            // connectionless UDP socket, not a reason to ever stop
+            // listening. Every OTHER error is still treated as fatal,
+            // but now at least says so instead of vanishing silently.
+            Err(e)
+                if e.kind() == io::ErrorKind::WouldBlock
+                    || e.kind() == io::ErrorKind::TimedOut
+                    || e.kind() == io::ErrorKind::ConnectionReset => {}
+            Err(e) => {
+                eprintln!("hpsdrsim: recv_from fatal error ({e}), emulator loop exiting");
+                break;
+            }
         }
 
         if running {
             if let Some(dest) = client {
                 let now = Instant::now();
                 if now >= next_send {
-                    let packet =
-                        build_iq_packet(seq, receivers, samples_per_frame, &mut tone_phase, &mut rng_state);
+                    let packet = build_iq_packet(
+                        seq,
+                        receivers,
+                        samples_per_frame,
+                        rx0_freq_hz,
+                        SAMPLE_RATE_HZ,
+                        &mut tone_phase,
+                        &mut rng_state,
+                    );
                     let _ = socket.send_to(&packet, dest);
                     seq = seq.wrapping_add(1);
                     // Fixed-cadence scheduling (add one period, not
@@ -294,25 +436,64 @@ fn discovery_reply(board: SimBoard) -> [u8; 60] {
     reply
 }
 
+/// Extracts RX0's dial frequency from a host -> radio C&C packet, if
+/// this specific one happens to carry it -- `None` for every other
+/// register (mic audio, TX frequency, drive level, etc.), which is
+/// most of them; the caller simply keeps the last value it saw. Mirrors
+/// radio.rs's own `p1_build_packet` register-2 encoding exactly (see
+/// its own `2 =>` match arm): each 1032-byte packet holds 2 USB frames
+/// (offsets HEADER_SIZE and HEADER_SIZE+USB_FRAME_SIZE), each an 8-byte
+/// sync+C&C header (`7F 7F 7F`, then C0-C4) followed by payload; C0's
+/// low bit is the MOX flag (unrelated to register addressing -- masked
+/// off here), and register `0x04` is specifically RX0 (vs. `0x04 + 2*n`
+/// for extra receivers, which this single-RX emulator has no use for)
+/// with its frequency as a big-endian u32 in C1-C4.
+fn extract_rx0_frequency(packet: &[u8]) -> Option<i64> {
+    for frame_start in [HEADER_SIZE, HEADER_SIZE + USB_FRAME_SIZE] {
+        let frame = packet.get(frame_start..frame_start + 8)?;
+        if frame[0] != 0x7F || frame[1] != 0x7F || frame[2] != 0x7F {
+            continue;
+        }
+        if frame[3] & 0xFE == 0x04 {
+            return Some(u32::from_be_bytes([frame[4], frame[5], frame[6], frame[7]]) as i64);
+        }
+    }
+    None
+}
+
 /// One synthetic I/Q sample -- a single fixed tone (so a connected
-/// client's spectrum/waterfall shows a real, visible, stationary
-/// signal to confirm against) plus light white noise (so it doesn't
-/// look suspiciously like a pure test signal, and so NR/NB/etc. have
-/// something to actually act on). Deliberately simple compared to
-/// piHPSDR's own hpsdrsim (pre-recorded speech IQ, man-made-noise
-/// tables, etc.) -- see the module doc comment for why.
-fn synth_sample(tone_phase: &mut f64, rng_state: &mut u64) -> (f32, f32) {
-    const SAMPLE_RATE_HZ: f64 = 48000.0;
-    const TONE_HZ: f64 = 700.0;
+/// client's spectrum/waterfall shows a real, visible signal to confirm
+/// against) plus light white noise (so it doesn't look suspiciously
+/// like a pure test signal, and so NR/NB/etc. have something to
+/// actually act on). Deliberately simple compared to piHPSDR's own
+/// hpsdrsim (pre-recorded speech IQ, man-made-noise tables, etc.) --
+/// see the module doc comment for why.
+///
+/// `tone_offset_hz` (baseband, can be negative) is TEST_SIGNAL_ABS_FREQ_HZ
+/// minus the currently tuned RX0 frequency -- a real request: this used
+/// to be a fixed 700Hz regardless of VFO, so the tone never moved
+/// on-screen no matter where you tuned, unlike a real transmitter
+/// (which stays at a fixed spot on the RF spectrum and sweeps THROUGH
+/// the passband as you tune past it). `None` when the offset has moved
+/// outside this baseband entirely (beyond +-Nyquist) -- the tone
+/// correctly disappears off-screen instead of aliasing back in from the
+/// wrong side, same as a real signal tuned out of range would.
+fn synth_sample(tone_offset_hz: Option<f64>, sample_rate_hz: f64, tone_phase: &mut f64, rng_state: &mut u64) -> (f32, f32) {
     const TONE_AMPLITUDE: f32 = 0.25;
     const NOISE_AMPLITUDE: f32 = 0.02;
 
-    *tone_phase += 2.0 * std::f64::consts::PI * TONE_HZ / SAMPLE_RATE_HZ;
-    if *tone_phase > 2.0 * std::f64::consts::PI {
-        *tone_phase -= 2.0 * std::f64::consts::PI;
-    }
-    let i_tone = TONE_AMPLITUDE * tone_phase.cos() as f32;
-    let q_tone = TONE_AMPLITUDE * tone_phase.sin() as f32;
+    let (i_tone, q_tone) = match tone_offset_hz {
+        Some(hz) => {
+            *tone_phase += 2.0 * std::f64::consts::PI * hz / sample_rate_hz;
+            if *tone_phase > 2.0 * std::f64::consts::PI {
+                *tone_phase -= 2.0 * std::f64::consts::PI;
+            } else if *tone_phase < -2.0 * std::f64::consts::PI {
+                *tone_phase += 2.0 * std::f64::consts::PI;
+            }
+            (TONE_AMPLITUDE * tone_phase.cos() as f32, TONE_AMPLITUDE * tone_phase.sin() as f32)
+        }
+        None => (0.0, 0.0),
+    };
 
     // xorshift64 -- fast, seedable, good enough for "not a pure tone",
     // no real randomness/security property needed here.
@@ -350,9 +531,22 @@ fn build_iq_packet(
     seq: u32,
     receivers: usize,
     samples_per_frame: usize,
+    rx0_freq_hz: i64,
+    sample_rate_hz: f64,
     tone_phase: &mut f64,
     rng_state: &mut u64,
 ) -> [u8; PACKET_SIZE] {
+    // Baseband offset of the fixed test signal from the currently tuned
+    // RX0 frequency -- see synth_sample's own doc comment. Recomputed
+    // once per packet (not per sample -- rx0_freq_hz only changes when
+    // a C&C packet updates it, far less often than every sample) and
+    // clamped to a hair inside +-Nyquist rather than the exact edge, so
+    // a signal parked exactly at the passband boundary doesn't flicker
+    // in and out from floating-point rounding alone.
+    let nyquist_hz = sample_rate_hz / 2.0;
+    let offset_hz = (TEST_SIGNAL_ABS_FREQ_HZ - rx0_freq_hz) as f64;
+    let tone_offset_hz = if offset_hz.abs() < nyquist_hz * 0.999 { Some(offset_hz) } else { None };
+
     let mut packet = [0u8; PACKET_SIZE];
     packet[0] = 0xEF;
     packet[1] = 0xFE;
@@ -379,7 +573,7 @@ fn build_iq_packet(
                 // unused feedback queues, exactly as it would real
                 // hardware's genuine feedback ADC output while PS is
                 // off.
-                let (i, q) = synth_sample(tone_phase, rng_state);
+                let (i, q) = synth_sample(tone_offset_hz, sample_rate_hz, tone_phase, rng_state);
                 packet[b..b + 3].copy_from_slice(&pack_24(i));
                 b += 3;
                 packet[b..b + 3].copy_from_slice(&pack_24(q));
