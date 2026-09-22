@@ -6911,7 +6911,9 @@ impl eframe::App for HpsdrApp {
                 });
 
                 egui::Area::new(egui::Id::new("s_meter_area"))
-                    .anchor(egui::Align2::RIGHT_TOP, egui::vec2(-10.0, 10.0))
+                    // -40 (was -10) -- a real report: the panel sat flush
+                    // against the window's right edge, moved ~30px left.
+                    .anchor(egui::Align2::RIGHT_TOP, egui::vec2(-40.0, 10.0))
                     .show(ui, |ui| {
                         // Height lowered from 110 -- once draw_s_meter's
                         // Y_SQUASH flattened the arc, 110 left a real gap
