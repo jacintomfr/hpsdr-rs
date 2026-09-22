@@ -26,6 +26,7 @@ mod midi_import;
 mod ozy;
 mod radio;
 mod radioberry_juice;
+mod report_recorder;
 mod rigctl;
 mod rx200;
 mod rx888;
@@ -2737,6 +2738,7 @@ fn connect_to_device(device: Device, cfg: &Config) -> Result<ConnectedState, Str
                         Arc::clone(&session.tci_tx_audio),
                         Arc::clone(&session.radio_mic_audio),
                         Arc::clone(&session.tx_audio_source),
+                        spectrum.report_recorder.clone(),
                         Arc::clone(&session.tci_wants_mic),
                         Arc::clone(&session.tx_iq),
                         Arc::clone(&tx_spectrum_iq),
@@ -4879,12 +4881,58 @@ impl eframe::App for HpsdrApp {
                                 // max exactly, -60dB floor matches Audio
                                 // gain's own.
                                 ui.label("TCI TX gain:");
-                                let mut tci_tx_gain = connected.tci_tx_gain;
-                                if stable_db_slider(ui, &mut connected.slider_scroll_accum, &mut tci_tx_gain, -60.0, 60.0, 1.0) {
-                                    connected.tci_tx_gain = tci_tx_gain;
-                                    *connected.session.tci_tx_gain.lock().unwrap() = tci_tx_gain;
-                                    settings_changed = true;
-                                }
+                                ui.horizontal(|ui| {
+                                    let mut tci_tx_gain = connected.tci_tx_gain;
+                                    if stable_db_slider(ui, &mut connected.slider_scroll_accum, &mut tci_tx_gain, -60.0, 60.0, 1.0) {
+                                        connected.tci_tx_gain = tci_tx_gain;
+                                        *connected.session.tci_tx_gain.lock().unwrap() = tci_tx_gain;
+                                        settings_changed = true;
+                                    }
+
+                                    // REC -- see report_recorder.rs's own doc
+                                    // comment: temporary (in-memory, never
+                                    // written to disk) RX-audio capture for
+                                    // giving a contact a quick signal report,
+                                    // NOT the same thing as the "Record"
+                                    // WAV-to-disk button elsewhere in this UI.
+                                    // Placed here (a real request) rather than
+                                    // as its own grid cell -- adding a 7th
+                                    // cell to this row would silently wrap
+                                    // into a phantom new row (egui::Grid's
+                                    // num_columns(6) auto-wrap, the same
+                                    // already-hit bug the AGC row's own doc
+                                    // comment above describes) instead of
+                                    // sitting beside the slider the way a
+                                    // bundled single ui.horizontal cell does.
+                                    ui.add_space(6.0);
+                                    let rr = connected.spectrum.report_recorder.clone();
+                                    let recording = rr.is_recording();
+                                    let playing = rr.is_playing();
+                                    let rec = egui::Button::new(
+                                        egui::RichText::new("REC").size(16.0).strong().color(egui::Color32::WHITE),
+                                    )
+                                    .fill(egui::Color32::from_rgb(190, 30, 30));
+                                    if ui
+                                        .add_enabled(!playing, rec)
+                                        .on_hover_text(if recording {
+                                            "Click to stop recording now (records up to 60s)"
+                                        } else {
+                                            "Record RX audio (what you hear), up to 60s -- to play \
+                                             back and give the contact a signal report"
+                                        })
+                                        .clicked()
+                                    {
+                                        rr.toggle_record();
+                                    }
+                                    if let Some(progress) = rr.record_progress() {
+                                        ui.add(
+                                            egui::ProgressBar::new(progress)
+                                                .desired_width(60.0)
+                                                .desired_height(14.0)
+                                                .text(format!("{:.0}s", progress * report_recorder::MAX_SECONDS)),
+                                        );
+                                    }
+                                });
                             }
                         }
                         // SNB/ANF/BIN used to be appended here (kiosk
@@ -5045,17 +5093,56 @@ impl eframe::App for HpsdrApp {
                         // as "how much signal in/out" rather than sharing
                         // a row with the mode buttons.
                         ui.label("Filter width:");
-                        let mut width = current_width;
-                        if stable_f64_slider(ui, &mut connected.slider_scroll_accum, &mut width, 50.0..=5000.0, 50.0, " Hz") {
-                            connected.spectrum.set_width_hz(width);
-                            if let Some(tx) = &connected.tx_handle {
-                                tx.set_width_hz(width);
+                        ui.horizontal(|ui| {
+                            let mut width = current_width;
+                            if stable_f64_slider(ui, &mut connected.slider_scroll_accum, &mut width, 50.0..=5000.0, 50.0, " Hz") {
+                                connected.spectrum.set_width_hz(width);
+                                if let Some(tx) = &connected.tx_handle {
+                                    tx.set_width_hz(width);
+                                }
+                                connected
+                                    .width_memory
+                                    .insert(current_mode.label().to_string(), width);
+                                settings_changed = true;
                             }
-                            connected
-                                .width_memory
-                                .insert(current_mode.label().to_string(), width);
-                            settings_changed = true;
-                        }
+
+                            // PLAY -- same cell-count reasoning as REC's own
+                            // comment above (TCI TX gain row); this is the
+                            // row directly below it, so PLAY lines up right
+                            // under REC. Only offered with TX actually
+                            // available -- there's no point offering a
+                            // report you could never transmit.
+                            if connected.tx_enabled && connected.tx_handle.is_some() {
+                                ui.add_space(6.0);
+                                let rr = connected.spectrum.report_recorder.clone();
+                                let recording = rr.is_recording();
+                                let playing = rr.is_playing();
+                                let play = egui::Button::new(
+                                    egui::RichText::new("PLAY").size(16.0).strong().color(egui::Color32::WHITE),
+                                )
+                                .fill(egui::Color32::from_rgb(30, 150, 50));
+                                if ui
+                                    .add_enabled(!recording && rr.has_recording(), play)
+                                    .on_hover_text(if playing {
+                                        "Click to stop playback now"
+                                    } else {
+                                        "Transmit the recorded audio back (while PTT/MOX is on), so \
+                                         the contact can hear how they were received"
+                                    })
+                                    .clicked()
+                                {
+                                    rr.toggle_play();
+                                }
+                                if let Some(progress) = rr.play_progress() {
+                                    ui.add(
+                                        egui::ProgressBar::new(progress)
+                                            .desired_width(60.0)
+                                            .desired_height(14.0)
+                                            .text(format!("{:.0}%", progress * 100.0)),
+                                    );
+                                }
+                            }
+                        });
                         // NB/NR used to be appended here (kiosk mode) --
                         // moved to the AGC row instead, same reasoning as
                         // SNB/ANF/BIN's own comment above (this row plus
@@ -9871,6 +9958,7 @@ impl eframe::App for HpsdrApp {
                                                         Arc::clone(&connected.session.tci_tx_audio),
                                                         Arc::clone(&connected.session.radio_mic_audio),
                                                         Arc::clone(&connected.session.tx_audio_source),
+                                                        connected.spectrum.report_recorder.clone(),
                                                         Arc::clone(&connected.session.tci_wants_mic),
                                                         Arc::clone(&connected.session.tx_iq),
                                                         Arc::clone(&tx_spectrum_iq),

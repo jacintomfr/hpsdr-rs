@@ -63,6 +63,7 @@
     verification is what actually validates it.
 */
 
+use crate::report_recorder::ReportRecorder;
 use crate::radio::{
     CwKeyerAtomics, IqSample, TX_AUDIO_SOURCE_LOCAL_MIC, TX_AUDIO_SOURCE_RADIO_MIC,
 };
@@ -1903,6 +1904,16 @@ fn run(
     // that one is consulted for the whole chunk.
     radio_mic_audio: Arc<Mutex<VecDeque<f32>>>,
     tx_audio_source: Arc<AtomicU8>,
+    // Temporary REC/PLAY "signal report" playback -- see
+    // report_recorder.rs's own doc comment. Checked BEFORE the
+    // tx_audio_source dispatch below and, while active, overrides
+    // whichever source is otherwise selected -- same "special mode
+    // takes priority over the normal chain" precedent as Tune/Two-Tone
+    // overriding the mic->ALC chain further down in process(), just
+    // acting one step earlier (on mic_samples itself, so it still goes
+    // through the normal mic gain/EQ/ALC/compressor processing a real
+    // voice report would, rather than bypassing it like PostGen does).
+    report_recorder: ReportRecorder,
     // Set by tci.rs's `trx` command handler from that command's optional
     // signal-source argument (spec section 4.2) -- true only when a TCI
     // client explicitly names a non-"tci" source. Consulted only by the
@@ -2281,6 +2292,22 @@ fn run(
         }
         last_read_at = Some(read_now);
 
+        if report_recorder.is_playing() {
+            // See report_recorder's own doc comment above -- takes
+            // priority over the normal source selection while active.
+            // Silence-padded (via unwrap_or(0.0), same "silence on
+            // underrun" policy every other source branch below uses)
+            // once next_sample() returns None, whether that's mid-chunk
+            // (the recording ran out partway through) or because
+            // playback was aborted by a second click -- either way
+            // is_playing() itself is already false again by the time
+            // that happens, so the NEXT chunk falls straight through to
+            // the normal source selection with no special-casing needed
+            // here.
+            for slot in chunk.iter_mut() {
+                *slot = report_recorder.next_sample().unwrap_or(0.0);
+            }
+        } else {
         let selected_source = tx_audio_source.load(Ordering::Relaxed);
         if selected_source == TX_AUDIO_SOURCE_RADIO_MIC {
             // Explicit source selection (Settings -> TX) -- bypasses
@@ -2376,6 +2403,7 @@ fn run(
                     *slot = buf.pop_front().unwrap_or(0.0); // silence on underrun, not silence on stall
                 }
             }
+        }
         }
         // See tx_slew_current's doc comment above -- smooths over any
         // underrun-silence step (or any other discontinuity) introduced
@@ -2602,6 +2630,8 @@ impl TxHandle {
         radio_mic_audio: Arc<Mutex<VecDeque<f32>>>,
         tx_audio_source: Arc<AtomicU8>,
         // See run()'s doc comment on the parameter of the same name.
+        report_recorder: ReportRecorder,
+        // See run()'s doc comment on the parameter of the same name.
         tci_wants_mic: Arc<AtomicBool>,
         tx_iq_out: Arc<Mutex<VecDeque<f32>>>,
         // See run()'s doc comment on the parameter of the same name.
@@ -2650,7 +2680,7 @@ impl TxHandle {
             let cw_text_busy = Arc::clone(&cw_text_busy);
             thread::spawn(move || {
                 run(
-                    mic_buffer, tci_tx_audio, radio_mic_audio, tx_audio_source, tci_wants_mic,
+                    mic_buffer, tci_tx_audio, radio_mic_audio, tx_audio_source, report_recorder, tci_wants_mic,
                     tx_iq_out, tx_spectrum_iq, tx_audio_monitor, waveform_tap, mox, params, display, channel,
                     protocol, mic_rate, duc_rate, puresignal_enabled, ps_rx_feedback_iq, ps_tx_feedback_iq,
                     ps_params, ps_status, ps_corr_path, cw_keyer, cw_text_elements, cw_text_active, cw_text_busy, stop,

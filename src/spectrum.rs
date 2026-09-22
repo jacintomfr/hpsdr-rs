@@ -7,6 +7,7 @@
 
 use crate::audio_recorder::AudioRecorder;
 use crate::cw_decoder::CwDecoder;
+use crate::report_recorder::ReportRecorder;
 use crate::radio::IqSample;
 use crate::wdsp_sys as wdsp;
 use std::collections::VecDeque;
@@ -1623,6 +1624,13 @@ fn run(
     // so recording behaves like a second local speaker: muted the same
     // way, unaffected by TCI. Cheap no-op when not currently recording.
     recorder: AudioRecorder,
+    // Temporary REC/PLAY "signal report" tap -- see report_recorder.rs's
+    // own doc comment. Same call site/guard as `recorder` above, written
+    // alongside it rather than instead of it: the two are independent
+    // (one streams to a permanent WAV file, the other holds up to 60s in
+    // RAM for PLAY to transmit back), so both can be active together
+    // with no interaction.
+    report_recorder: ReportRecorder,
     rx_audio_to_radio: Option<Arc<Mutex<VecDeque<f32>>>>,
     // Muted (not pushed to any of the four audio outputs above) while
     // MOX is active -- see SpectrumHandle::start's doc comment on why.
@@ -1899,6 +1907,7 @@ fn run(
                     }
                     out.push_back((l, r));
                     recorder.write_frame(l, r);
+                    report_recorder.write_frame(l, r);
                 }
                 if tci_out.len() >= AUDIO_BUFFER_CAPACITY {
                     tci_out.pop_front();
@@ -1963,6 +1972,7 @@ pub struct SpectrumHandle {
     /// pieces), so this is `pub` rather than needing its own
     /// start()/stop() forwarding methods here.
     pub recorder: AudioRecorder,
+    pub report_recorder: ReportRecorder,
     demod_params: Arc<Mutex<DemodParams>>,
     /// The IQ input queue run()'s analyzer thread consumes from -- kept
     /// here too (not just inside that thread) so clear_display can drain
@@ -2029,6 +2039,7 @@ impl SpectrumHandle {
         let cw_text = Arc::new(Mutex::new(String::new()));
         let cw_decode_enabled = Arc::new(AtomicBool::new(true));
         let recorder = AudioRecorder::new();
+        let report_recorder = ReportRecorder::new();
         let stop = Arc::new(AtomicBool::new(false));
         let iq_buffer_for_clear = Arc::clone(&iq_buffer);
         let thread = {
@@ -2041,6 +2052,7 @@ impl SpectrumHandle {
             let cw_text = Arc::clone(&cw_text);
             let cw_decode_enabled = Arc::clone(&cw_decode_enabled);
             let recorder = recorder.clone();
+            let report_recorder = report_recorder.clone();
             let stop = Arc::clone(&stop);
             thread::spawn(move || {
                 run(
@@ -2056,6 +2068,7 @@ impl SpectrumHandle {
                     cw_text,
                     cw_decode_enabled,
                     recorder,
+                    report_recorder,
                     rx_audio_to_radio,
                     mox,
                     mute_local_for_tci,
@@ -2072,6 +2085,7 @@ impl SpectrumHandle {
             cw_text,
             cw_decode_enabled,
             recorder,
+            report_recorder,
             demod_params,
             iq_buffer: iq_buffer_for_clear,
             channel,
