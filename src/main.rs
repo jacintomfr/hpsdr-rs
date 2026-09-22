@@ -6680,16 +6680,42 @@ impl eframe::App for HpsdrApp {
                         // it doesn't affect any other slider elsewhere
                         // in the window.
                         //
-                        // REAL BUG FIX: a real report -- 230.0 under-
-                        // estimated the actual fixed content ("Zoom:" +
-                        // its value box + "Pan:" + its value box + the
-                        // Reset button + the item spacing between all of
-                        // them, roughly 260px), so the two sliders were
-                        // handed a couple more pixels each than the row
-                        // actually had room for, and Reset got pushed
-                        // past the window's own right edge as a result.
-                        let reserved = 260.0;
-                        ui.spacing_mut().slider_width = ((ui.available_width() - reserved) / 2.0).max(80.0);
+                        // REAL BUG FIX (three real reports on this row):
+                        // 230.0, then 260.0, both still let Reset get
+                        // pushed past the window's own right edge at
+                        // 110%/125% Windows display scaling (100% was
+                        // fine) -- egui's Slider draws its live value
+                        // text (e.g. "16x", "-1.0") OUTSIDE the
+                        // `slider_width` box any fixed reservation
+                        // accounts for, and how much extra width that
+                        // takes shifts with the OS scale factor's effect
+                        // on font hinting/rounding. Two more targeted
+                        // fixes were tried and both regressed something
+                        // else on this fixed-600px-tall kiosk window
+                        // (zero spare vertical slack): `horizontal_wrapped`
+                        // pushed the CPU/MEM/network status row below
+                        // completely off the bottom of the window when
+                        // Reset wrapped to its own line, and anchoring
+                        // Reset to a fixed-width rect flush against the
+                        // row's own right edge left zero margin for
+                        // Reset's OWN minimum button size (text + padding)
+                        // to still exceed that rect and clip anyway --
+                        // egui doesn't hard-clip a widget to a UiBuilder's
+                        // max_rect, that rect only steers layout/
+                        // available-space accounting. Settled on the
+                        // simplest fix that's actually safe at every
+                        // scale: a much larger reserved budget (was 260,
+                        // now 340) than either real fixed-content estimate
+                        // needed at 100% scale, so there's real slack left
+                        // over for the scale-dependent extra width instead
+                        // of being right at the edge of it. Costs the
+                        // sliders themselves a bit of width (roomy at
+                        // 1024pt window width, most of it back to the
+                        // gridline drawing math which only cares about
+                        // the fixed 5/10/15/20dB step values, not slider
+                        // pixel width) but nothing else changes.
+                        let reserved = 340.0;
+                        ui.spacing_mut().slider_width = ((ui.available_width() - reserved) / 2.0).max(60.0);
 
                         ui.label("Zoom:");
                         let mut zoom = connected.spectrum_zoom;
@@ -6717,7 +6743,12 @@ impl eframe::App for HpsdrApp {
                         }
                     });
 
-                    ui.add_space(8.0);
+                    // REAL BUG FIX: was 8.0 -- on the fixed-600px-tall
+                    // kiosk window this left the CPU/MEM/network status
+                    // row (below) partially clipped off the bottom edge,
+                    // a real report. -2.0 (add_space accepts negative,
+                    // pulling the cursor back up) claws back that ~10px.
+                    ui.add_space(-2.0);
                     // Single row, deliberately -- see the status-bar
                     // indicators' own comment just below for why they're
                     // packed into this SAME horizontal_wrapped row
@@ -14061,12 +14092,13 @@ fn render_extra_receiver_ui(ui: &mut egui::Ui, rx: &Arc<Mutex<ExtraReceiver>>) {
         );
     }
 
-    // Zoom/Pan -- see the main receiver's identical controls.
+    // Zoom/Pan -- see the main receiver's identical controls and its
+    // reserved=340.0 doc comment for why (three real reports narrowed
+    // this down to a plain generous safety margin being the actual fix,
+    // not wrapping or rect-anchoring).
     ui.horizontal(|ui| {
-        // Fill the available width -- see the main receiver's identical
-        // treatment.
-        let reserved = 230.0;
-        ui.spacing_mut().slider_width = ((ui.available_width() - reserved) / 2.0).max(80.0);
+        let reserved = 340.0;
+        ui.spacing_mut().slider_width = ((ui.available_width() - reserved) / 2.0).max(60.0);
 
         ui.label("Zoom:");
         let mut zoom = rx.spectrum_zoom;
