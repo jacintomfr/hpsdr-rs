@@ -1989,6 +1989,23 @@ fn run(
     let mut read_max_gap = Duration::ZERO;
     let mut chunks_this_window: u32 = 0;
 
+    // Mirrors AudioOutput's own SLEW_RAMP_SECS in audio.rs (see that
+    // constant's doc comment for the full reasoning): every source
+    // branch above silence-pads on underrun with an instant
+    // `unwrap_or(0.0)`, which for a mid-word/mid-tone mic signal is a
+    // hard step discontinuity -- audible as a click on receiving
+    // stations, and a transient WDSP's own ALC/compressor has to react
+    // to rather than one smoothed away before it ever reaches them.
+    // Applied here (raw mic chunk, before `processor.process`) rather
+    // than after WDSP so both the TX audio monitor tap below and WDSP
+    // itself see the ramped signal, not a hard edge. Same 3ms constant
+    // as the RX side -- fast enough that legitimate fast speech
+    // transients aren't audibly softened, slow enough to sit below the
+    // ear's click-detection threshold for a discontinuity this small.
+    const TX_SLEW_RAMP_SECS: f32 = 0.003;
+    let tx_max_step = 2.0 / (TX_SLEW_RAMP_SECS * mic_rate as f32);
+    let mut tx_slew_current: f32 = 0.0;
+
     // Second diagnostic, added after the mic-buffer one above didn't
     // reproduce anything (no underruns logged, yet power/ALC still
     // bounced): fexchange0's `error` output was being silently
@@ -2360,6 +2377,15 @@ fn run(
                 }
             }
         }
+        // See tx_slew_current's doc comment above -- smooths over any
+        // underrun-silence step (or any other discontinuity) introduced
+        // by whichever source branch just ran, before it reaches either
+        // the monitor tap or WDSP.
+        for sample in chunk.iter_mut() {
+            tx_slew_current += (*sample - tx_slew_current).clamp(-tx_max_step, tx_max_step);
+            *sample = tx_slew_current;
+        }
+
         // TX audio monitor tap -- the exact content about to be fed to
         // WDSP's fexchange0 (post source-selection, pre-processing), so
         // listening to this queue reveals whether a problem is already
