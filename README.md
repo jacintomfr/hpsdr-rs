@@ -31,6 +31,7 @@ This project started as an experiment: could Claude port the discovery code from
 - Selectable RX output / TX input audio devices (independent of the OS default), for routing through virtual audio cables
 - Per-radio settings persistence (keyed by the radio's MAC address, so multiple physical radios each keep their own saved configuration)
 - FPGA firmware upload and static IP configuration — see [Firmware update](#firmware-update) below
+- MIDI control-surface support, several devices at once — see [MIDI control surface](#midi-control-surface) below
 
 ## Supported hardware
 
@@ -125,6 +126,18 @@ Since there's no native title bar to close a secondary window from, each one ins
 Off by default -- this is a fixed-size kiosk layout for a specific small panel, not a general "small screen" mode, so it would be actively wrong on a normal resizable desktop monitor.
 
 **Known limitation**: a native OS file-picker dialog (e.g. "Choose..." for the Radioberry Juice executable path, or a firmware `.rbf` file) is a real Windows window, not part of this app's own UI -- its size/position is controlled by Windows itself, not by this app, so it can open larger than the 1024x600 panel or need scrolling to reach its own buttons. Windows remembers a common dialog's last-used size per user, so resizing it down once on the actual kiosk PC should make it stay that size on future opens.
+
+## MIDI control surface
+
+Any class-compliant MIDI controller's notes/CCs/pitch-bend can be bound to a radio action from **Settings -> MIDI**:
+
+- **Several devices at once** -- check as many detected ports as you like (e.g. a button box AND a separate jog-wheel controller); every enabled device feeds the same set of bindings, so it doesn't matter which physical controller a given message came from.
+- **Learn mode**: click **Learn**, move a control on your MIDI device, then pick which radio action to bind it to from a searchable list -- mirrors piHPSDR's own MIDI learn workflow. Covers VFO/RIT/XIT tuning, mode/band/filter-width stepping, MOX/Tune/Split, noise blanker/reduction, AF/AGC/mic/RF gain, PureSignal's live Running toggle, Diversity gain/phase, and sending one of Settings -> CW's 5 saved CW messages.
+- **Buttons** (Note On/Off) can be bound "momentary" (act on both press AND release -- e.g. press-to-transmit/release-to-receive for MOX) instead of the default toggle-per-press.
+- **Relative encoders/jog wheels** (Control Change, "Wheel" bindings) have a **Sensitivity** multiplier and a **Rate limit** (debounce) to tame a chatty, no-detent encoder, plus a choice of **Acceleration** style per binding:
+  - **Fixed** (the default) -- every message moves by the same amount regardless of how hard/fast you spun the control; only how many messages arrive per second changes the effective speed. Deliberately magnitude-independent, so landing on an exact frequency stays predictable even on a controller whose relative-CC magnitude is itself erratic.
+  - **Value-based** -- piHPSDR/deskHPSDR's own convention instead: a bigger/faster physical turn (which most encoders report as a larger CC value swing) moves further per message too, not just more messages per second.
+- **Importing from Thetis**: Settings -> MIDI can import a Midi2Cat XML export (Thetis's Settings -> CAT/Midi -> Save As) directly into hpsdr-rs's own bindings, translating each recognized CAT command to its closest hpsdr-rs equivalent and reporting anything it couldn't translate.
 
 ## Firmware update
 

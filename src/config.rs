@@ -534,9 +534,21 @@ pub struct Config {
     pub midi_enabled: Option<bool>,
     /// Target MIDI input port name, matched by name (see midi.rs's
     /// `connect()` doc comment for why name rather than a backend-
-    /// specific port id).
+    /// specific port id). Superseded by `midi_device_names` (plural,
+    /// below) -- kept only so a config saved before multi-device support
+    /// existed still has something to migrate from on load (see
+    /// connect_to_device's own migration comment); no longer written to
+    /// by a save from this version onward.
     #[serde(default)]
     pub midi_device_name: Option<String>,
+    /// Target MIDI input port names -- unlike the old single-device
+    /// `midi_device_name` above, every one of these is connected
+    /// simultaneously and feeds the same binding table (see midi.rs's
+    /// `MidiWorker` doc comment for why: e.g. a button box and a
+    /// separate jog-wheel controller can both be used at once, matching
+    /// piHPSDR's own multi-device model).
+    #[serde(default)]
+    pub midi_device_names: Vec<String>,
     /// User-configured note/CC-to-action bindings (Settings -> MIDI's
     /// learn mode) -- see crate::midi::MidiBinding. A naturally repeated/
     /// keyed list, same precedent as `xvtrs` above, not a flat field.

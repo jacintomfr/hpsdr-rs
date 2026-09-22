@@ -163,6 +163,27 @@ pub enum MidiAction {
     NoiseReductionNr,
     NoiseReductionNr2,
     NoiseReductionNr3,
+    /// Live PureSignal "Running (continuous auto-calibrate)" toggle --
+    /// distinct from the session-level `puresignal_enabled` setting
+    /// (which only takes effect on the next connect, so isn't a sane
+    /// MIDI target); this is `ps_enabled`, the same live checkbox
+    /// Settings -> PureSignal has, only meaningful once PureSignal
+    /// itself is enabled and a tx_handle exists. See dispatch_midi_
+    /// event's own arm for the exact guard.
+    PureSignalRunningToggle,
+    /// Diversity gain/phase -- Wheel bindings, live while Diversity is
+    /// enabled (see dispatch_midi_event's own arms), same -27..=27 dB /
+    /// -180..=180 deg ranges as their Settings -> Diversity sliders.
+    DiversityGainAdjust,
+    DiversityPhaseAdjust,
+    /// Send (or, if already sending, stop) one of Settings -> CW's 5
+    /// saved messages -- same action/gate as the main window's own
+    /// SEND CW button (see dispatch_midi_event's own arm).
+    CwMacro1,
+    CwMacro2,
+    CwMacro3,
+    CwMacro4,
+    CwMacro5,
 }
 
 impl MidiAction {
@@ -221,6 +242,14 @@ impl MidiAction {
             MidiAction::NoiseReductionNr => "Noise Reduction: NR",
             MidiAction::NoiseReductionNr2 => "Noise Reduction: NR2",
             MidiAction::NoiseReductionNr3 => "Noise Reduction: NNR",
+            MidiAction::PureSignalRunningToggle => "PureSignal Running On/Off",
+            MidiAction::DiversityGainAdjust => "Diversity Gain",
+            MidiAction::DiversityPhaseAdjust => "Diversity Phase",
+            MidiAction::CwMacro1 => "Send CW Message 1",
+            MidiAction::CwMacro2 => "Send CW Message 2",
+            MidiAction::CwMacro3 => "Send CW Message 3",
+            MidiAction::CwMacro4 => "Send CW Message 4",
+            MidiAction::CwMacro5 => "Send CW Message 5",
         }
     }
 }
@@ -269,6 +298,12 @@ pub const KEY_ACTIONS: &[MidiAction] = &[
     MidiAction::NoiseReductionNr,
     MidiAction::NoiseReductionNr2,
     MidiAction::NoiseReductionNr3,
+    MidiAction::PureSignalRunningToggle,
+    MidiAction::CwMacro1,
+    MidiAction::CwMacro2,
+    MidiAction::CwMacro3,
+    MidiAction::CwMacro4,
+    MidiAction::CwMacro5,
 ];
 
 /// Actions valid for a Knob (absolute value) binding.
@@ -283,8 +318,14 @@ pub const KNOB_ACTIONS: &[MidiAction] = &[
 ];
 
 /// Actions valid for a Wheel (relative encoder) binding.
-pub const WHEEL_ACTIONS: &[MidiAction] =
-    &[MidiAction::VfoTune, MidiAction::RitAdjust, MidiAction::XitAdjust, MidiAction::VfoBTune];
+pub const WHEEL_ACTIONS: &[MidiAction] = &[
+    MidiAction::VfoTune,
+    MidiAction::RitAdjust,
+    MidiAction::XitAdjust,
+    MidiAction::VfoBTune,
+    MidiAction::DiversityGainAdjust,
+    MidiAction::DiversityPhaseAdjust,
+];
 
 /// How a ControlChange/PitchBend binding's value should be interpreted.
 /// (A Key/Note binding has no ambiguity, so this only matters for CC and
@@ -299,6 +340,35 @@ pub enum MidiBindingKind {
     /// centers its value around 64 (piHPSDR's own convention, used
     /// as-is here: `value as i16 - 64` is the signed step).
     Wheel,
+}
+
+/// How a Wheel binding's per-message step is derived from the raw
+/// relative-encoder value. Two coexisting options rather than one
+/// replacing the other -- different controllers (and different
+/// operators' taste) genuinely want different things here, and there's
+/// no way to tell in advance which a given piece of hardware needs:
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum WheelAccelMode {
+    /// Fixed step per message regardless of the raw value's magnitude,
+    /// direction only -- this project's own original default (see
+    /// `MIDI_WHEEL_HZ_PER_MESSAGE`'s doc comment in main.rs for the real
+    /// report that motivated it: an encoder whose per-message magnitude
+    /// was itself unpredictable made landing on an exact frequency hard
+    /// under a magnitude-based step).
+    #[default]
+    Fixed,
+    /// piHPSDR/deskHPSDR's own convention instead: the raw value's
+    /// distance from center (64) selects one of three step multipliers
+    /// (small/medium/large), so spinning the SAME physical encoder
+    /// further/faster per message (which most encoders report as a
+    /// larger magnitude) jumps by more per message, not just more
+    /// messages per second. Worth having as the other option precisely
+    /// because plenty of real controllers (and users used to piHPSDR's
+    /// feel) behave fine under it -- the `Fixed` report above was about
+    /// one specific misbehaving encoder, not a blanket problem with
+    /// magnitude-based stepping in general. See `midi_wheel_step`'s own
+    /// doc comment in main.rs for the exact thresholds/multipliers.
+    ValueBased,
 }
 
 /// One user-configured note/CC-to-action mapping. Persisted in
@@ -352,6 +422,11 @@ pub struct MidiBinding {
     /// wheel events are generated at a very high rate."
     #[serde(default)]
     pub debounce_ms: u32,
+    /// Wheel bindings only: see `WheelAccelMode`'s own doc comment.
+    /// `#[serde(default)]` (i.e. `Fixed`) so a config saved before this
+    /// option existed keeps behaving exactly as it always did.
+    #[serde(default)]
+    pub accel_mode: WheelAccelMode,
 }
 
 fn default_sensitivity() -> f32 {
@@ -369,23 +444,42 @@ impl MidiBinding {
     }
 }
 
-/// Live connection state, shown in the Settings -> MIDI page.
+/// Live connection state, shown in the Settings -> MIDI page. Reflects
+/// ALL configured devices at once (see `MidiWorker::device_names`), not
+/// just one -- e.g. two devices configured, one physically connected and
+/// one not yet found, is `Connected` with that one name plus `missing`
+/// listing the other, not a single flat status the way a one-device-only
+/// design could get away with.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub enum MidiStatus {
     #[default]
     Disabled,
+    /// No configured device is connected yet (either none exist, or
+    /// none of the configured names are currently present).
     Searching,
-    Connected(String),
+    /// At least one configured device is connected. `missing` lists any
+    /// OTHER configured device names not currently connected (empty if
+    /// everything configured is connected).
+    Connected { connected: Vec<String>, missing: Vec<String> },
     Error(String),
 }
 
 /// The app's handle to the MIDI worker thread: a live enable flag, a live
-/// target device name, a status readback, and the inbound event queue.
-/// Changing `enabled`/`device_name` takes effect on the worker's next
-/// tick -- no restart needed, same pattern as `audio::CwSidetone::enabled`.
+/// set of target device names, a status readback, and the inbound event
+/// queue. Changing `enabled`/`device_names` takes effect on the worker's
+/// next tick -- no restart needed, same pattern as `audio::CwSidetone::
+/// enabled`.
+///
+/// Multiple devices (unlike an earlier single-`Option<String>` design):
+/// matches piHPSDR's own model (`MAX_MIDI_DEVICES = 10`, see its
+/// `midi_devices[]`) -- every configured device's events feed the SAME
+/// `events` queue/binding table below, they aren't kept separate per
+/// device, so e.g. a button controller and a jog-wheel controller can be
+/// used together without the binding layer needing to know which
+/// physical device an event came from.
 pub struct MidiWorker {
     pub enabled: Arc<AtomicBool>,
-    pub device_name: Arc<Mutex<Option<String>>>,
+    pub device_names: Arc<Mutex<Vec<String>>>,
     pub status: Arc<Mutex<MidiStatus>>,
     pub events: Arc<Mutex<std::collections::VecDeque<RawMidiEvent>>>,
     stop: Arc<AtomicBool>,
@@ -395,21 +489,21 @@ pub struct MidiWorker {
 impl MidiWorker {
     pub fn start() -> Self {
         let enabled = Arc::new(AtomicBool::new(false));
-        let device_name = Arc::new(Mutex::new(None));
+        let device_names = Arc::new(Mutex::new(Vec::new()));
         let status = Arc::new(Mutex::new(MidiStatus::Disabled));
         let events = Arc::new(Mutex::new(std::collections::VecDeque::new()));
         let stop = Arc::new(AtomicBool::new(false));
 
         let thread_enabled = Arc::clone(&enabled);
-        let thread_device_name = Arc::clone(&device_name);
+        let thread_device_names = Arc::clone(&device_names);
         let thread_status = Arc::clone(&status);
         let thread_events = Arc::clone(&events);
         let thread_stop = Arc::clone(&stop);
         let thread = thread::spawn(move || {
-            run(thread_enabled, thread_device_name, thread_status, thread_events, thread_stop);
+            run(thread_enabled, thread_device_names, thread_status, thread_events, thread_stop);
         });
 
-        Self { enabled, device_name, status, events, stop, thread: Some(thread) }
+        Self { enabled, device_names, status, events, stop, thread: Some(thread) }
     }
 
     pub fn stop(&mut self) {
@@ -437,57 +531,78 @@ pub fn list_port_names() -> Vec<String> {
 
 fn run(
     enabled: Arc<AtomicBool>,
-    device_name: Arc<Mutex<Option<String>>>,
+    device_names: Arc<Mutex<Vec<String>>>,
     status: Arc<Mutex<MidiStatus>>,
     events: Arc<Mutex<std::collections::VecDeque<RawMidiEvent>>>,
     stop: Arc<AtomicBool>,
 ) {
-    let mut connection: Option<(String, midir::MidiInputConnection<()>)> = None;
+    // Keyed by device name (matching device_names above) rather than a
+    // single Option<(String, Connection)> -- see MidiWorker's own doc
+    // comment on why several devices can be live at once.
+    let mut connections: std::collections::HashMap<String, midir::MidiInputConnection<()>> =
+        std::collections::HashMap::new();
 
     while !stop.load(Ordering::Relaxed) {
         if !enabled.load(Ordering::Relaxed) {
-            if connection.take().is_some() {
+            if !connections.is_empty() {
+                connections.clear();
                 *status.lock().unwrap() = MidiStatus::Disabled;
             }
             thread::sleep(IDLE_TICK);
             continue;
         }
 
-        let wanted = device_name.lock().unwrap().clone();
-        let Some(wanted) = wanted else {
-            if connection.take().is_some() {
+        let wanted = device_names.lock().unwrap().clone();
+        if wanted.is_empty() {
+            if !connections.is_empty() {
+                connections.clear();
                 *status.lock().unwrap() = MidiStatus::Disabled;
             }
             thread::sleep(IDLE_TICK);
             continue;
-        };
-
-        // Drop a stale connection: either the user picked a different
-        // device, or the previously-connected one vanished (no unplug
-        // event exists, so the only way to notice is to re-enumerate and
-        // check the name we're connected to is still there).
-        let still_present = midir::MidiInput::new(CLIENT_NAME)
-            .map(|probe| probe.ports().iter().any(|p| probe.port_name(p).as_deref() == Ok(wanted.as_str())))
-            .unwrap_or(false);
-        if let Some((name, _)) = &connection {
-            if *name != wanted || !still_present {
-                connection = None;
-            }
         }
 
-        if connection.is_none() {
-            if !still_present {
-                *status.lock().unwrap() = MidiStatus::Searching;
-            } else {
-                match connect(&wanted, Arc::clone(&events)) {
-                    Ok(conn) => {
-                        *status.lock().unwrap() = MidiStatus::Connected(wanted.clone());
-                        connection = Some((wanted, conn));
-                    }
-                    Err(e) => *status.lock().unwrap() = MidiStatus::Error(e),
+        // Re-enumerate once per tick rather than per configured device --
+        // cheap, and needed anyway to notice a wanted device that just
+        // (re)appeared or a connected one that vanished (no unplug event
+        // exists on any of ALSA/CoreMIDI/WinMM/midir itself, see this
+        // module's own doc comment).
+        let present: std::collections::HashSet<String> = midir::MidiInput::new(CLIENT_NAME)
+            .map(|probe| probe.ports().iter().filter_map(|p| probe.port_name(p).ok()).collect())
+            .unwrap_or_default();
+
+        // Drop anything no longer wanted (user unchecked it) or no
+        // longer present (unplugged) -- a later tick reconnects it once
+        // both are true again.
+        connections.retain(|name, _| wanted.contains(name) && present.contains(name));
+
+        // Connect anything wanted, present, and not already connected.
+        // A connect error (a real port name suddenly unopenable, e.g.
+        // claimed by another app) is shown for this tick only -- the
+        // next tick's normal Connected/Searching recompute below
+        // supersedes it rather than latching an error forever once
+        // whatever caused it clears up.
+        let mut connect_error: Option<String> = None;
+        for name in &wanted {
+            if !present.contains(name) || connections.contains_key(name) {
+                continue;
+            }
+            match connect(name, Arc::clone(&events)) {
+                Ok(conn) => {
+                    connections.insert(name.clone(), conn);
                 }
+                Err(e) => connect_error = Some(format!("{name}: {e}")),
             }
         }
+
+        *status.lock().unwrap() = if let Some(e) = connect_error {
+            MidiStatus::Error(e)
+        } else if connections.is_empty() {
+            MidiStatus::Searching
+        } else {
+            let missing: Vec<String> = wanted.iter().filter(|n| !connections.contains_key(*n)).cloned().collect();
+            MidiStatus::Connected { connected: connections.keys().cloned().collect(), missing }
+        };
 
         thread::sleep(RESCAN_INTERVAL);
     }
@@ -592,6 +707,7 @@ mod tests {
             momentary: false,
             sensitivity: 1.0,
             debounce_ms: 0,
+            accel_mode: WheelAccelMode::Fixed,
         };
         let ev = RawMidiEvent { kind: MidiEventKind::ControlChange, channel: 5, number: 20, value: 100, off: false };
         assert!(binding.matches(&ev));
@@ -608,6 +724,7 @@ mod tests {
             momentary: false,
             sensitivity: 1.0,
             debounce_ms: 0,
+            accel_mode: WheelAccelMode::Fixed,
         };
         let ev = RawMidiEvent { kind: MidiEventKind::ControlChange, channel: 5, number: 20, value: 100, off: false };
         assert!(!binding.matches(&ev));

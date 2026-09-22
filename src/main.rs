@@ -41,8 +41,8 @@ use discovery::{manual_discovery, Boards, Device};
 use discovery_ui::{DiscoveryAction, DiscoveryWindow};
 use eframe::egui;
 use midi::{
-    MidiAction, MidiBinding, MidiBindingKind, MidiEventKind, MidiStatus, MidiWorker, RawMidiEvent, KEY_ACTIONS,
-    KNOB_ACTIONS, WHEEL_ACTIONS,
+    MidiAction, MidiBinding, MidiBindingKind, MidiEventKind, MidiStatus, MidiWorker, RawMidiEvent, WheelAccelMode,
+    KEY_ACTIONS, KNOB_ACTIONS, WHEEL_ACTIONS,
 };
 use radio::{
     IqSample, RadioSession, RadioSettings, CW_KEYER_MODE_IAMBIC_A, CW_KEYER_MODE_IAMBIC_B,
@@ -552,13 +552,49 @@ const MIDI_WHEEL_HZ_PER_MESSAGE: i64 = 10;
 /// this ignores the delta's magnitude. Returns `None` for a centered/
 /// no-op value (delta == 0) so callers can bail out without touching
 /// anything.
-fn midi_wheel_step_hz(ev: RawMidiEvent, binding: &MidiBinding) -> Option<i64> {
+/// The signed multiplier a Wheel binding's raw MIDI value contributes,
+/// before `unit_per_message`/`sensitivity` are applied -- `None` for a
+/// centered/no-op value (delta == 0). `WheelAccelMode::Fixed` (this
+/// project's own default) always returns ±1: direction only, magnitude
+/// ignored -- see `WheelAccelMode::Fixed`'s own doc comment for why.
+/// `WheelAccelMode::ValueBased` instead mirrors piHPSDR/deskHPSDR's own
+/// convention (`midi2.c`'s `NewMidiEvent`, its `vfl/fl/lft/rgt/fr/vfr`
+/// ranges collapsed here into 3 magnitude bands per direction rather
+/// than 6 configurable ones, for a simpler binding model -- piHPSDR
+/// itself ships with only the innermost band enabled by default anyway,
+/// i.e. plain ±1, so this is no less capable for the common case and
+/// still gives real acceleration for a controller/operator that wants
+/// it): a `|delta|` of 1-8 is treated as a small/deliberate turn (±1),
+/// 9-24 a faster turn (±4), and above that a fast spin (±16).
+fn midi_wheel_multiplier(ev: RawMidiEvent, binding: &MidiBinding) -> Option<i64> {
     let delta = ev.value as i64 - 64;
     if delta == 0 {
         return None;
     }
     let direction = delta.signum();
-    Some((MIDI_WHEEL_HZ_PER_MESSAGE as f64 * direction as f64 * binding.sensitivity as f64).round() as i64)
+    Some(match binding.accel_mode {
+        WheelAccelMode::Fixed => direction,
+        WheelAccelMode::ValueBased => {
+            let magnitude = delta.abs();
+            let tier = if magnitude > 24 { 16 } else if magnitude > 8 { 4 } else { 1 };
+            direction * tier
+        }
+    })
+}
+
+fn midi_wheel_step_hz(ev: RawMidiEvent, binding: &MidiBinding) -> Option<i64> {
+    let multiplier = midi_wheel_multiplier(ev, binding)?;
+    Some((MIDI_WHEEL_HZ_PER_MESSAGE as f64 * multiplier as f64 * binding.sensitivity as f64).round() as i64)
+}
+
+/// Same convention as `midi_wheel_step_hz` (see `midi_wheel_multiplier`'s
+/// own doc comment), generalized to a caller-supplied `unit_per_message`
+/// for non-Hz quantities (e.g. Diversity gain in dB, phase in degrees)
+/// rather than duplicating the direction/accel-mode/sensitivity logic
+/// per action.
+fn midi_wheel_step(ev: RawMidiEvent, binding: &MidiBinding, unit_per_message: f64) -> Option<f64> {
+    let multiplier = midi_wheel_multiplier(ev, binding)?;
+    Some(unit_per_message * multiplier as f64 * binding.sensitivity as f64)
 }
 
 /// Looks up `ev` against `connected.midi_bindings` and, on a match, applies
@@ -967,6 +1003,90 @@ fn dispatch_midi_event(connected: &mut ConnectedState, ev: RawMidiEvent, freq_hz
             connected.xit_offset_hz = new_offset as f64;
             connected.session.xit_offset_hz.store(new_offset as i32, Ordering::Relaxed);
         }
+        MidiAction::PureSignalRunningToggle => {
+            // Mirrors Settings -> PureSignal's own "Running (continuous
+            // auto-calibrate)" checkbox -- see that checkbox's own
+            // comment for why this is `ps_enabled` (the live engine
+            // on/off) and NOT `puresignal_enabled` (session-level,
+            // reconnect-required). A no-op if PureSignal itself isn't
+            // enabled this session or there's no live tx_handle yet,
+            // same as the checkbox being hidden entirely in that case.
+            if !connected.puresignal_enabled {
+                return;
+            }
+            let Some(tx) = &connected.tx_handle else { return };
+            connected.ps_enabled = !connected.ps_enabled;
+            tx.set_ps_enabled(connected.ps_enabled);
+        }
+        MidiAction::DiversityGainAdjust => {
+            // Mirrors Settings -> Diversity's own Gain slider -- see its
+            // own -27.0..=27.0 range. No-op while Diversity itself is
+            // off, same as that slider being hidden entirely then.
+            if !connected.session.diversity_enabled.load(Ordering::Relaxed) {
+                return;
+            }
+            let Some(step) = midi_wheel_step(ev, &binding, 0.5) else { return };
+            let current = f32::from_bits(connected.session.diversity_gain_db.load(Ordering::Relaxed));
+            let new_gain = (current as f64 + step).clamp(-27.0, 27.0) as f32;
+            connected.session.diversity_gain_db.store(new_gain.to_bits(), Ordering::Relaxed);
+        }
+        MidiAction::DiversityPhaseAdjust => {
+            // Mirrors Settings -> Diversity's own Phase slider -- see its
+            // own -180.0..=180.0 range.
+            if !connected.session.diversity_enabled.load(Ordering::Relaxed) {
+                return;
+            }
+            let Some(step) = midi_wheel_step(ev, &binding, 2.0) else { return };
+            let current = f32::from_bits(connected.session.diversity_phase_deg.load(Ordering::Relaxed));
+            let new_phase = (current as f64 + step).clamp(-180.0, 180.0) as f32;
+            connected.session.diversity_phase_deg.store(new_phase.to_bits(), Ordering::Relaxed);
+        }
+        MidiAction::CwMacro1
+        | MidiAction::CwMacro2
+        | MidiAction::CwMacro3
+        | MidiAction::CwMacro4
+        | MidiAction::CwMacro5 => {
+            // Mirrors the main window's own SEND CW / STOP button --
+            // see its own doc comment for why this exact gate (CW mode
+            // selected, nothing else already using mox, in-band) rather
+            // than just "not currently sending".
+            if connected.cw_text_sending {
+                if let Some(tx) = &connected.tx_handle {
+                    tx.stop_cw_text();
+                }
+                return;
+            }
+            let cw_text_mode_selected =
+                matches!(connected.spectrum.mode(), spectrum::Mode::Cwl | spectrum::Mode::Cwu);
+            if !cw_text_mode_selected
+                || connected.session.mox_active()
+                || connected.tune_active
+                || connected.two_tone_active
+                || !tx_frequency_allowed(
+                    connected.session.tx_frequency_hz.load(Ordering::Relaxed),
+                    connected.allow_out_of_band_tx.load(Ordering::Relaxed),
+                )
+            {
+                return;
+            }
+            let index = match binding.action {
+                MidiAction::CwMacro1 => 0,
+                MidiAction::CwMacro2 => 1,
+                MidiAction::CwMacro3 => 2,
+                MidiAction::CwMacro4 => 3,
+                _ => 4,
+            };
+            let text = connected.cw_text_messages[index].clone();
+            if text.trim().is_empty() {
+                return;
+            }
+            let Some(tx) = &connected.tx_handle else { return };
+            let speed_wpm = connected.session.cw_keyer.speed_wpm.load(Ordering::Relaxed);
+            let weight = connected.session.cw_keyer.weight.load(Ordering::Relaxed);
+            tx.send_cw_text(&text, speed_wpm, weight);
+            connected.session.set_mox(true);
+            connected.cw_text_sending = true;
+        }
     }
 
     connected.settings_dirty.store(true, Ordering::Relaxed);
@@ -1190,6 +1310,8 @@ struct MidiLearnState {
     /// unlimited a loaded-from-disk binding predating this field gets),
     /// since 0 is exactly the behavior that prompted adding this.
     debounce_ms: u32,
+    /// Wheel bindings only -- see MidiBinding::accel_mode/WheelAccelMode.
+    accel_mode: WheelAccelMode,
     /// `Some(i)` while editing `ConnectedState::midi_bindings[i]`, `None`
     /// while building a brand new binding from a fresh capture.
     edit_index: Option<usize>,
@@ -1206,6 +1328,7 @@ impl Default for MidiLearnState {
             momentary: false,
             sensitivity: 1.0,
             debounce_ms: 25,
+            accel_mode: WheelAccelMode::Fixed,
             edit_index: None,
         }
     }
@@ -2586,7 +2709,18 @@ fn connect_to_device(device: Device, cfg: &Config) -> Result<ConnectedState, Str
             cw_sidetone.enabled.store(cfg.cw_pc_sidetone_enabled.unwrap_or(false), Ordering::Relaxed);
             let midi = MidiWorker::start();
             midi.enabled.store(cfg.midi_enabled.unwrap_or(false), Ordering::Relaxed);
-            *midi.device_name.lock().unwrap() = cfg.midi_device_name.clone();
+            // Migrate a pre-multi-device config's single midi_device_name
+            // into the new list -- see Config::midi_device_name's own doc
+            // comment. Only when midi_device_names itself is empty, so a
+            // config already saved by this version (which always writes
+            // the plural field, even as an empty list once MIDI is set up
+            // with zero devices) isn't re-seeded from stale old data.
+            let initial_devices = if cfg.midi_device_names.is_empty() {
+                cfg.midi_device_name.clone().into_iter().collect()
+            } else {
+                cfg.midi_device_names.clone()
+            };
+            *midi.device_names.lock().unwrap() = initial_devices;
             let midi_bindings = cfg.midi_bindings.clone();
             Ok(ConnectedState {
                 interface_name: discovery::interface_name_for(device.my_address.ip()),
@@ -7476,38 +7610,55 @@ impl eframe::App for HpsdrApp {
                                         settings_changed = true;
                                     }
 
-                                    ui.horizontal(|ui| {
-                                        ui.label("Device:");
-                                        let ports = midi::list_port_names();
-                                        let current_device = connected.midi.device_name.lock().unwrap().clone();
-                                        let current_label =
-                                            current_device.clone().unwrap_or_else(|| "(None)".to_string());
-                                        egui::ComboBox::from_id_salt("midi_device")
-                                            .selected_text(current_label)
-                                            .show_ui(ui, |ui| {
-                                                if ui
-                                                    .selectable_label(current_device.is_none(), "(None)")
-                                                    .clicked()
-                                                    && current_device.is_some()
-                                                {
-                                                    *connected.midi.device_name.lock().unwrap() = None;
-                                                    settings_changed = true;
-                                                }
-                                                for name in &ports {
-                                                    let selected = current_device.as_deref() == Some(name.as_str());
-                                                    if ui.selectable_label(selected, name).clicked() && !selected {
-                                                        *connected.midi.device_name.lock().unwrap() =
-                                                            Some(name.clone());
-                                                        settings_changed = true;
-                                                    }
-                                                }
-                                            });
-                                    });
+                                    // One checkbox per detected port, not a single-select
+                                    // dropdown -- several controllers (e.g. a button box
+                                    // AND a separate jog-wheel) can all be enabled and
+                                    // used together at once. See MidiWorker's own doc
+                                    // comment: every enabled device's events feed the
+                                    // same binding table, so there's nothing further to
+                                    // configure per device beyond "on or off" here.
+                                    ui.label("Devices:");
+                                    let ports = midi::list_port_names();
+                                    let mut wanted = connected.midi.device_names.lock().unwrap().clone();
+                                    if ports.is_empty() {
+                                        ui.weak("(none detected)");
+                                    }
+                                    for name in &ports {
+                                        let mut on = wanted.contains(name);
+                                        if ui.checkbox(&mut on, name).changed() {
+                                            if on {
+                                                wanted.push(name.clone());
+                                            } else {
+                                                wanted.retain(|n| n != name);
+                                            }
+                                            *connected.midi.device_names.lock().unwrap() = wanted.clone();
+                                            settings_changed = true;
+                                        }
+                                    }
+                                    // A configured device this system doesn't currently
+                                    // see (unplugged, or just not enumerated yet) --
+                                    // still shown, checked, so it isn't silently dropped
+                                    // from the config the moment it's unplugged.
+                                    for name in wanted.iter().filter(|n| !ports.contains(n)).cloned().collect::<Vec<_>>() {
+                                        let mut on = true;
+                                        if ui.checkbox(&mut on, format!("{name} (not currently detected)")).changed()
+                                            && !on
+                                        {
+                                            connected.midi.device_names.lock().unwrap().retain(|n| n != &name);
+                                            settings_changed = true;
+                                        }
+                                    }
 
                                     let status_text = match &*connected.midi.status.lock().unwrap() {
                                         MidiStatus::Disabled => "Disabled".to_string(),
                                         MidiStatus::Searching => "Searching...".to_string(),
-                                        MidiStatus::Connected(name) => format!("Connected to \"{name}\""),
+                                        MidiStatus::Connected { connected: names, missing } => {
+                                            let mut s = format!("Connected: {}", names.join(", "));
+                                            if !missing.is_empty() {
+                                                s.push_str(&format!(" -- still searching for: {}", missing.join(", ")));
+                                            }
+                                            s
+                                        }
                                         MidiStatus::Error(e) => format!("Error: {e}"),
                                     };
                                     ui.label(format!("Status: {status_text}"));
@@ -7649,6 +7800,34 @@ impl eframe::App for HpsdrApp {
                                                     connected.midi_learn.debounce_ms = debounce_ms as u32;
                                                 }
                                             });
+                                            ui.horizontal(|ui| {
+                                                ui.label("Acceleration:").on_hover_text(
+                                                    "Fixed: every message moves by the same amount, \
+                                                     direction only -- predictable, recommended \
+                                                     first. Value-based: a bigger/faster physical \
+                                                     turn moves further per message too (like \
+                                                     piHPSDR/deskHPSDR) -- try this if Fixed feels \
+                                                     too slow for a fast spin on this controller.",
+                                                );
+                                                if ui
+                                                    .selectable_label(
+                                                        connected.midi_learn.accel_mode == WheelAccelMode::Fixed,
+                                                        "Fixed",
+                                                    )
+                                                    .clicked()
+                                                {
+                                                    connected.midi_learn.accel_mode = WheelAccelMode::Fixed;
+                                                }
+                                                if ui
+                                                    .selectable_label(
+                                                        connected.midi_learn.accel_mode == WheelAccelMode::ValueBased,
+                                                        "Value-based (piHPSDR-style)",
+                                                    )
+                                                    .clicked()
+                                                {
+                                                    connected.midi_learn.accel_mode = WheelAccelMode::ValueBased;
+                                                }
+                                            });
                                         }
 
                                         ui.horizontal(|ui| {
@@ -7675,6 +7854,7 @@ impl eframe::App for HpsdrApp {
                                                         momentary: connected.midi_learn.momentary,
                                                         sensitivity: connected.midi_learn.sensitivity,
                                                         debounce_ms: connected.midi_learn.debounce_ms,
+                                                        accel_mode: connected.midi_learn.accel_mode,
                                                     };
                                                     if let Some(i) = connected.midi_learn.edit_index {
                                                         connected.midi_bindings[i] = binding;
@@ -7854,6 +8034,7 @@ impl eframe::App for HpsdrApp {
                                                 momentary: binding.momentary,
                                                 sensitivity: binding.sensitivity,
                                                 debounce_ms: binding.debounce_ms,
+                                                accel_mode: binding.accel_mode,
                                                 edit_index: Some(i),
                                             };
                                         }
@@ -10866,7 +11047,14 @@ impl eframe::App for HpsdrApp {
                         oc_tune: connected.oc_tune,
                         antenna_settings: connected.antenna_settings.clone(),
                         midi_enabled: Some(connected.midi.enabled.load(Ordering::Relaxed)),
-                        midi_device_name: connected.midi.device_name.lock().unwrap().clone(),
+                        // Explicitly cleared (not just "no longer set"),
+                        // so a future load's migration check
+                        // (midi_device_names.is_empty()) can't mistake
+                        // this stale field for a config that's never
+                        // been through the multi-device migration --
+                        // see that migration's own comment.
+                        midi_device_name: None,
+                        midi_device_names: connected.midi.device_names.lock().unwrap().clone(),
                         midi_bindings: connected.midi_bindings.clone(),
                     }
                     .save(connected.device.mac);
