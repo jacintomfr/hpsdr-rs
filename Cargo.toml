@@ -175,6 +175,7 @@ assets = [
     ["docs/manual/*.md", "usr/share/doc/hpsdr-rs/manual/", "644"],
     ["docs/manual/images/*", "usr/share/doc/hpsdr-rs/manual/images/", "644"],
     ["assets/hpsdr-rs.desktop", "usr/share/applications/hpsdr-rs.desktop", "644"],
+    ["assets/hpsdr-rs-kiosk.desktop", "usr/share/applications/hpsdr-rs-kiosk.desktop", "644"],
     ["assets/icons/hpsdr-rs.png", "usr/share/icons/hicolor/256x256/apps/hpsdr-rs.png", "644"],
     # Not auto-installed to /etc/udev/rules.d/ (a .deb shouldn't silently
     # install udev rules without the user's say-so) -- shipped as a
