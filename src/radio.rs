@@ -1777,8 +1777,30 @@ fn start_protocol1(
     if settings.diversity_enabled {
         real_receivers = real_receivers.max(2);
     }
-    let ps_wire_total: Option<u8> = ps_config.map(|(_, tx_idx, _)| tx_idx + 1);
-    let ps_feedback_indices: Option<(u8, u8)> = ps_config.map(|(rx_idx, tx_idx, _)| (rx_idx, tx_idx));
+    // BUG FIX, confirmed via a real report on genuine Metis hardware
+    // (RX permanently silent -- iq_buffer never received a single
+    // sample -- despite a clean connect and no crash after the
+    // real_receivers fix above): `ps_wire_total`/`ps_feedback_indices`
+    // used to stay `Some(_)` on Metis/HermesLite regardless of the
+    // `max_real == 0` case just handled above, still unconditionally
+    // declaring the wire "2 receivers" (rx_feedback_idx=0,
+    // tx_feedback_idx=1) and telling receiver_loop's demux to divert
+    // BOTH wire slots into the PS feedback queues -- with real_receivers
+    // now 1 (not 0), that left `buffers[0]` permanently unfed: every
+    // incoming sample matched `ps_feedback_indices`' rx_fb==0 arm first
+    // and got diverted to ps_rx_feedback_iq instead, so the RX
+    // spectrum/audio pipeline never received a single real sample,
+    // silently (no crash, no error -- receiver_loop's own packet/jitter
+    // counters looked completely healthy, since UDP delivery itself was
+    // never the problem). `max_real == 0` genuinely means this board's
+    // one and only ADC has nowhere to source a feedback signal from
+    // without giving up real RX entirely -- since real_receivers above
+    // already chooses "keep RX working" over "honor PS's reservation"
+    // for these boards, the wire declaration must agree: no PS
+    // reservation at all here, same as a board with no ps_config entry.
+    let ps_config_for_wire = ps_config.filter(|(_, _, max_real)| *max_real != Some(0));
+    let ps_wire_total: Option<u8> = ps_config_for_wire.map(|(_, tx_idx, _)| tx_idx + 1);
+    let ps_feedback_indices: Option<(u8, u8)> = ps_config_for_wire.map(|(rx_idx, tx_idx, _)| (rx_idx, tx_idx));
     // Initial value active_receiver_count starts at (see its own
     // creation just below) -- the count actually being streamed from
     // the very first packet, as opposed to `real_receivers` (this

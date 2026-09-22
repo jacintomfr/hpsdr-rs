@@ -767,7 +767,24 @@ impl SpectrumAnalyzer {
             // an $HOME/.config-only version of the same thing here).
             if let Some(dir) = crate::config::settings_dir().map(|d| d.join("wdsp_wisdom")) {
                 if std::fs::create_dir_all(&dir).is_ok() {
-                    if let Ok(cstring) = std::ffi::CString::new(dir.to_string_lossy().as_bytes()) {
+                    // BUG FIX: WDSPwisdom (wisdom.c) builds its filename with a
+                    // bare `strcat`, no path separator inserted -- it expects
+                    // `directory` to already end in one. Without a trailing
+                    // separator here, the "file" it opens is actually
+                    // "<parent>/wdsp_wisdomwdspWisdom01", OUTSIDE the directory
+                    // just created above (confirmed: a real file by that exact
+                    // concatenated name was found sitting next to, not inside,
+                    // the wdsp_wisdom/ folder). Harmless once a cache exists (the
+                    // same wrong path is at least computed consistently, so a
+                    // later run still finds the earlier run's file) -- but it
+                    // defeats the one-time-cost intent for anyone whose FIRST
+                    // run's wisdom pass doesn't finish (e.g. hits the AllocConsole
+                    // hang fixed below and gets killed): every retry starts the
+                    // full multi-minute FFTW_PATIENT pass over again rather than
+                    // finding a partial/complete cache from the previous attempt.
+                    let dir_str = dir.to_string_lossy().into_owned();
+                    let separator = if dir_str.ends_with(std::path::MAIN_SEPARATOR) { "" } else { "/" };
+                    if let Ok(cstring) = std::ffi::CString::new(format!("{dir_str}{separator}")) {
                         unsafe {
                             wdsp::WDSPwisdom(cstring.as_ptr());
                         }

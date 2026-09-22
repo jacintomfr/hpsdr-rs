@@ -39,7 +39,6 @@ int WDSPwisdom(char *directory) {
   int wisdom_return = 0; // 0 from existing, 1 rebuilt
   fftw_plan tplan;
   int psize;
-  FILE *stream;
   double *fftin;
   double *fftout;
   char wisdom_file[1024];
@@ -49,10 +48,20 @@ int WDSPwisdom(char *directory) {
   if (!fftw_import_wisdom_from_filename(wisdom_file)) {
     fftin = (double *) malloc0(maxsize * sizeof(complex));
     fftout = (double *) malloc0(maxsize * sizeof(complex));
-#ifdef _WIN32
-    AllocConsole();               // create console
-    freopen_s(&stream, "conout$", "w", stdout); // redirect output to console
-#endif
+    // PATCHED (hpsdr-rs): upstream calls AllocConsole()/freopen_s here to
+    // pop up a visible console window for this pass's progress output.
+    // Removed for two reasons: (1) this whole project runs as a
+    // windows_subsystem="windows" GUI app with no console ever, by
+    // design (release builds redirect stdout/stderr to a log file
+    // instead, see main.rs's redirect_stdio_to_log_file) -- a surprise
+    // console window popping up mid-connect doesn't fit that, and (2)
+    // this function runs on a background (RX spectrum) thread, not the
+    // main UI thread; a real hang was observed here (CPU near-idle,
+    // stuck indefinitely at "Creating FFTW Wisdom File...") consistent
+    // with AllocConsole's known issues when called off the main thread
+    // of a GUI process. wisdom_get_status()'s sprintf-based progress
+    // string (read by main.rs's UI) already covers the "show progress"
+    // need without a second, separate console output path.
     fprintf(stdout, "Optimizing FFT sizes through %d\n\n", maxsize);
     fprintf(stdout, "Please do not close this window until wisdom plans are completed.\n\n");
     sprintf(status, "Optimizing FFT sizes through %d", maxsize);
@@ -100,9 +109,6 @@ int WDSPwisdom(char *directory) {
     fftw_export_wisdom_to_filename(wisdom_file);
     _aligned_free(fftout);
     _aligned_free(fftin);
-#ifdef _WIN32
-    FreeConsole();              // dismiss console
-#endif
     wisdom_return = 1;
   }
   return wisdom_return;
