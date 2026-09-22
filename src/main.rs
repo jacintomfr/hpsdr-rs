@@ -20,6 +20,7 @@ mod cw_encoder;
 mod debug_log;
 mod discovery;
 mod discovery_ui;
+mod hpsdrsim;
 mod midi;
 mod midi_import;
 mod ozy;

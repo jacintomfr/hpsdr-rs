@@ -148,6 +148,14 @@ pub struct DiscoveryWindow {
     /// `discovery::RX888_SENTINEL_MAC`'s doc comment for why this uses a
     /// different sentinel MAC than Ozy's.
     rx888_firmware_path: Option<String>,
+    /// Built-in hardware emulator (see hpsdrsim.rs's own module doc
+    /// comment) -- `None` while stopped, matching juice_console's own
+    /// "only set while actually running" idiom. `sim_board` is the
+    /// user's Metis/HermesLite2 choice, kept even while stopped so it's
+    /// remembered for the next Start.
+    sim_handle: Option<crate::hpsdrsim::SimHandle>,
+    sim_board: crate::hpsdrsim::SimBoard,
+    sim_launch_error: Option<String>,
 }
 
 /// How long to wait after launching juice before automatically
@@ -222,6 +230,9 @@ impl DiscoveryWindow {
             juice_refresh_at: None,
             juice_console,
             rx888_firmware_path: rx888_cfg.rx888_firmware_path,
+            sim_handle: None,
+            sim_board: crate::hpsdrsim::SimBoard::Metis,
+            sim_launch_error: None,
         };
         // Persist an auto-detected path (see above) so it survives even
         // if the user never touches this panel at all this session --
@@ -326,42 +337,23 @@ impl DiscoveryWindow {
         // concern (focus vs. stacking order) that happens to have
         // shared this same window_level gate before.
         let kiosk = crate::lcd_kiosk_mode();
-        // In kiosk mode: AlwaysOnTop ONLY during the same initial
-        // `focus_deadline` grace period used below for the keyboard-
-        // focus grab (a real test confirmed this window still needs
-        // SOME AlwaysOnTop period -- dropping it entirely reintroduced
-        // exactly the original "buried behind the main window itself"
-        // bug this field's own doc comment describes, this time against
+        // AlwaysOnTop for this window's whole lifetime, in kiosk mode too
+        // -- a real report: dropping to Normal after the initial
+        // `focus_deadline` grace period (the previous behavior here) let
         // the kiosk main window's own fullscreen undecorated viewport
-        // rather than a terminal/browser: main.rs's root viewport is a
-        // separate OS-level window created around the same time as this
-        // one, and without AlwaysOnTop during that initial race, it can
-        // end up on top instead, showing as a plain black window since
-        // the root only ever renders real content once a radio is
-        // connected). Once past that grace period (normally ~1.5s, or
-        // as soon as this window is actually focused -- see
-        // `focus_deadline`'s own doc comment), dropped to Normal so a
-        // native dialog opened later from THIS window (e.g. the
-        // Radioberry Juice setup section's "Choose..." rfd::FileDialog)
-        // can still come to the front above it -- AlwaysOnTop for this
-        // window's whole lifetime was confirmed to permanently block
-        // that instead. Outside kiosk mode, unchanged: AlwaysOnTop for
-        // the window's whole lifetime, which is what actually fixed the
-        // "buried behind other windows (a terminal, a browser)" desktop
-        // report this field's own doc comment above describes -- kiosk
-        // mode's fullscreen main window doesn't have other apps to
-        // compete with the same way, so trading permanent AlwaysOnTop
-        // for a native-dialog-friendly Normal after the initial race is
-        // a better trade there specifically.
-        let window_level = if kiosk {
-            if self.focus_deadline.is_some() {
-                egui::WindowLevel::AlwaysOnTop
-            } else {
-                egui::WindowLevel::Normal
-            }
-        } else {
-            egui::WindowLevel::AlwaysOnTop
-        };
+        // reappear on top of this one once the user spent more than that
+        // ~1.5s grace period inside it (e.g. expanding a section, picking
+        // a radio type), showing as a plain black window since the root
+        // only ever renders real content once a radio is connected --
+        // exactly the same underlying race `focus_deadline` was already
+        // guarding against, just not for its whole lifetime. The
+        // tradeoff this used to buy (a native dialog opened from THIS
+        // window, e.g. the Radioberry Juice / RX-888 firmware "Choose..."
+        // rfd::FileDialog, coming to the front above it) is no longer
+        // made in kiosk mode -- if that resurfaces as its own report, it
+        // needs a narrower fix than reintroducing this race.
+        let window_level = egui::WindowLevel::AlwaysOnTop;
+        let _ = kiosk;
         // 1000x580 in kiosk mode (matching the Settings window's own
         // kiosk size, the widest a secondary window gets here) -- a
         // real report: even at the desktop size below, the 7-column
@@ -990,6 +982,73 @@ impl DiscoveryWindow {
                             }
                         }
                     });
+                });
+
+                // Built-in hardware emulator -- see hpsdrsim.rs's own
+                // module doc comment. A real request: lets the RX/
+                // discovery/connect pipeline be tested with no radio
+                // attached at all, similar in spirit to piHPSDR's
+                // separate hpsdrsim command-line tool, but built in
+                // here instead of a standalone program.
+                egui::CollapsingHeader::new("hpsdrsim").show(ui, |ui| {
+                    ui.label(
+                        "Runs an in-process fake radio that answers \
+                         discovery and streams a synthetic RX signal (a \
+                         fixed tone + light noise), so the app can be \
+                         connected to and tested with no real hardware \
+                         attached. Choose which board it pretends to be \
+                         -- the wire commands genuinely differ between \
+                         them -- then Start.",
+                    );
+                    ui.horizontal(|ui| {
+                        let running = self.sim_handle.as_ref().is_some_and(|h| h.is_running());
+                        ui.add_enabled_ui(!running, |ui| {
+                            ui.radio_value(&mut self.sim_board, crate::hpsdrsim::SimBoard::Metis, "Metis");
+                            ui.radio_value(
+                                &mut self.sim_board,
+                                crate::hpsdrsim::SimBoard::HermesLite2,
+                                "HermesLite2",
+                            );
+                        });
+                    });
+                    ui.horizontal(|ui| {
+                        let running = self.sim_handle.as_ref().is_some_and(|h| h.is_running());
+                        if ui.add_enabled(!running, egui::Button::new("Start")).clicked() {
+                            self.sim_launch_error = None;
+                            match crate::hpsdrsim::SimHandle::start(self.sim_board) {
+                                Ok(handle) => self.sim_handle = Some(handle),
+                                Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
+                                    // WSAEACCES (os error 10013) on this
+                                    // exact port -- a real conflict seen
+                                    // this session: radioberry-juice-x64
+                                    // (the Radioberry bridge) already
+                                    // holds UDP 1024 exclusively whenever
+                                    // it's running, since it's a real P1
+                                    // "device" on the wire in exactly the
+                                    // same way this emulator is. Only one
+                                    // of them can own the port at a time.
+                                    self.sim_launch_error = Some(
+                                        "couldn't start hpsdrsim: UDP port 1024 is already in \
+                                         use -- likely by Radioberry Juice (or another hpsdr-rs \
+                                         instance) already running. Stop that first, then Start \
+                                         again."
+                                            .to_string(),
+                                    );
+                                }
+                                Err(e) => {
+                                    self.sim_launch_error =
+                                        Some(format!("couldn't start hpsdrsim: {e}"));
+                                }
+                            }
+                        }
+                        if ui.add_enabled(running, egui::Button::new("Stop")).clicked() {
+                            self.sim_handle = None;
+                        }
+                        ui.label(if running { "Status: running" } else { "Status: stopped" });
+                    });
+                    if let Some(err) = &self.sim_launch_error {
+                        ui.colored_label(egui::Color32::RED, err);
+                    }
                 });
                 });
             },
