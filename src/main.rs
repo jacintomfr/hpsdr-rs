@@ -4293,11 +4293,16 @@ impl eframe::App for HpsdrApp {
                             // avoiding.
                             ui.add_space(12.0);
                             ui.vertical(|ui| {
-                                // See kiosk_accent_button's own doc comment.
+                                // See kiosk_accent_button's own doc
+                                // comment -- uppercase label kept
+                                // kiosk-only (matches the rest of that
+                                // mode's own window-chrome controls);
+                                // desktop keeps normal case, just the
+                                // same yellow fill now (a real request).
                                 let settings_clicked = if lcd_kiosk_mode() {
                                     kiosk_accent_button(ui, "SETTINGS...").clicked()
                                 } else {
-                                    ui.button("Settings...").clicked()
+                                    kiosk_accent_button(ui, "Settings...").clicked()
                                 };
                                 if settings_clicked {
                                     connected.show_settings_window = !connected.show_settings_window;
@@ -4367,16 +4372,15 @@ impl eframe::App for HpsdrApp {
                                 }
                             });
 
-                            // LEV/PROC/CFC -- kiosk-only (a real report/
-                            // mockup), moved up here (next to Settings/
-                            // Add Receiver/Juice Console, in the top
-                            // VFO row) from its own dedicated row further
-                            // down (see that row's own comment) -- frees
-                            // that row's height for the spectrum/
-                            // waterfall. Stacked as 3 short lines, unlike
-                            // desktop's single-line version, to match the
-                            // mockup and fit this narrower column.
-                            if lcd_kiosk_mode() && connected.tx_enabled {
+                            // LEV/PROC/CFC -- moved up here (next to
+                            // Settings/Add Receiver/Juice Console, in the
+                            // top VFO row) from its own dedicated row
+                            // further down (see that row's own comment)
+                            // -- frees that row's height for the
+                            // spectrum/waterfall. No longer kiosk-only
+                            // (a real request): shown the same way in
+                            // both modes now, stacked as 3 short lines.
+                            if connected.tx_enabled {
                                 if let Some(tx) = &connected.tx_handle {
                                     ui.add_space(12.0);
                                     ui.vertical(|ui| {
@@ -4726,16 +4730,14 @@ impl eframe::App for HpsdrApp {
                                 settings_changed = true;
                             }
                         }
-                        // rigctl/TCI/CAT/PS -- kiosk-only (a real
-                        // report/mockup), appended here instead of their
-                        // own row. Record stays out of this call (see
-                        // show_status_row's own !lcd_kiosk_mode() guard
-                        // around it) -- it lives on the RIT/XIT row
-                        // instead, alongside Clear.
-                        if lcd_kiosk_mode() {
-                            ui.add_space(16.0);
-                            render_status_row(ui, connected, rigctl_status, tci_status, cat_status);
-                        }
+                        // rigctl/TCI/CAT/PS -- appended here (after DRM)
+                        // instead of their own row. No longer kiosk-only
+                        // (a real request): both modes fold this onto
+                        // the mode-buttons row now. Record stays out of
+                        // this call -- it lives on the RIT/XIT row
+                        // instead, alongside Clear (see that call site).
+                        ui.add_space(16.0);
+                        render_status_row(ui, connected, rigctl_status, tci_status, cat_status);
                     });
 
                     // NOTE: render_nb_nr/render_snb_anf_bin are standalone
@@ -4750,6 +4752,13 @@ impl eframe::App for HpsdrApp {
                     // situation a closure-based version of these hit real
                     // compile errors on.
 
+                    // Measured (not guessed) inside the grid below, and
+                    // reused by the AGC Gain row further down (outside
+                    // this ui.scope) to line its own label up with this
+                    // column -- see that row's own comment. Declared
+                    // here, not inside the scope below, so it's still in
+                    // scope once that closure ends.
+                    let mut audio_gain_label_width: f32 = 81.0;
                     ui.scope(|ui| {
                         // Reserve room for the S-meter/Settings/Add
                         // Receiver column -- a separately-positioned
@@ -4811,7 +4820,7 @@ impl eframe::App for HpsdrApp {
                         // actual fix and why.
 
                         egui::Grid::new("gain_filter_grid").num_columns(6).show(ui, |ui| {
-                        ui.label("Audio gain:");
+                        audio_gain_label_width = ui.label("Audio gain:").rect.width();
                         let mut gain = current_gain;
                         // ROOT CAUSE FIX: max raised from 1.5 -- a real
                         // report needed more than that even with the
@@ -5177,18 +5186,23 @@ impl eframe::App for HpsdrApp {
                         });
                     });
 
-                    // AGC Gain/AGC mode/NB/NR/SNB/ANF/BIN -- kiosk-only,
-                    // ALL on one row, entirely outside gain_filter_grid
-                    // (see NB/NR's own doc comment in that grid, just
-                    // above, for why) -- appears directly under Filter
-                    // width's row, in the same visual position the grid
-                    // row used to occupy, just not grid-aligned to
-                    // Audio gain/RX Gain's own columns anymore (a
-                    // deliberate, accepted trade-off: real width safety
-                    // over pixel-perfect column alignment). Desktop mode
-                    // keeps AGC Gain/AGC/NB/NR/SNB/ANF/BIN on their own
-                    // separate rows further down, unchanged.
-                    if lcd_kiosk_mode() {
+                    // AGC Gain/AGC mode/NB/NR/SNB/ANF/BIN -- ALL on one
+                    // row, entirely outside gain_filter_grid (see NB/NR's
+                    // own doc comment in that grid, just above, for why)
+                    // -- appears directly under Filter width's row, in
+                    // the same visual position the grid row used to
+                    // occupy, just not grid-aligned to Audio gain/RX
+                    // Gain's own columns anymore (a deliberate, accepted
+                    // trade-off: real width safety over pixel-perfect
+                    // column alignment). No longer kiosk-only (a real
+                    // request): desktop now matches this same layout
+                    // instead of its own former separate row.
+                    {
+                        // -3px -- a real report/screenshot: this whole
+                        // row sat about 3px lower than RX Gain's own row
+                        // right above it (outside gain_filter_grid, so it
+                        // doesn't inherit that Grid's own row spacing).
+                        ui.add_space(-3.0);
                         ui.horizontal(|ui| {
                             // Fixed width -- a real report: this row is
                             // outside gain_filter_grid now (see this
@@ -5198,9 +5212,42 @@ impl eframe::App for HpsdrApp {
                             // the widest label sharing that column) --
                             // "AGC Gain:" (2 chars shorter) started its
                             // slider a little left of RX Gain's own.
-                            // Explicitly matching that width here lines
-                            // them back up.
-                            ui.add_sized([81.0, ui.spacing().interact_size.y], egui::Label::new("AGC Gain:"));
+                            // Measured from "Audio gain:"'s own rendered
+                            // width above (not a guessed constant) so
+                            // the SLIDER lines up exactly regardless of
+                            // font/DPI, matching RX Gain's column start.
+                            //
+                            // The label TEXT itself needed its own
+                            // separate couple-px nudge on top of that (a
+                            // real follow-up screenshot showed it
+                            // starting slightly left of "RX Gain:"'s own
+                            // text, even with the slider now correctly
+                            // aligned) -- painted manually via
+                            // ui.painter().text() at an exact pixel
+                            // offset instead of ui.add_sized(...,
+                            // Label::new(...)): that Label's own internal
+                            // alignment inside the sized box turned out
+                            // to not actually be flush-left the way a
+                            // Grid cell's text is (a real report: shifting
+                            // the box width by a couple px through that
+                            // path made no visible difference at all),
+                            // so adjusting box width couldn't reliably
+                            // move it. Manual painting still allocates
+                            // the SAME total width via
+                            // allocate_exact_size below, so the slider
+                            // right after this keeps its own already-
+                            // correct start position.
+                            let (agc_label_rect, _agc_label_resp) = ui.allocate_exact_size(
+                                egui::vec2(audio_gain_label_width, ui.spacing().interact_size.y),
+                                egui::Sense::hover(),
+                            );
+                            ui.painter().text(
+                                agc_label_rect.left_center(),
+                                egui::Align2::LEFT_CENTER,
+                                "AGC Gain:",
+                                egui::TextStyle::Body.resolve(ui.style()),
+                                ui.visuals().text_color(),
+                            );
                             let mut agc_top_db = connected.spectrum.agc_params().agc_top_db;
                             if stable_f64_slider(ui, &mut connected.slider_scroll_accum, &mut agc_top_db, 0.0..=140.0, 2.0, " dB") {
                                 connected.spectrum.set_agc_top_db(agc_top_db);
@@ -5253,135 +5300,22 @@ impl eframe::App for HpsdrApp {
                     // the mode-buttons row it's now called from -- see
                     // its own doc comment there.
 
-                    // LEV/PROC/CFC row -- moved here from Settings -> TX
-                    // (still shown there too) so it's visible alongside
-                    // the TX power/SWR
-                    // gauge without needing a separate window open --
-                    // added specifically to help tell apart "ALC is
-                    // pumping / mic is clipping on real modulated audio"
-                    // from a buffering/timing issue when a reported
-                    // power swing (steady on Tune's flat tone, bouncing
-                    // on a real WSJT-X transmission) didn't correlate
-                    // with any DUC IQ queue/mic buffer underrun log.
-                    // Desktop-only -- kiosk mode moves this to the
-                    // S-meter panel instead (a real report/mockup, see
-                    // that panel's own comment), freeing this row's
-                    // height for the spectrum/waterfall.
-                    if !lcd_kiosk_mode() && connected.tx_enabled {
-                        if let Some(tx) = &connected.tx_handle {
-                            let disp = *tx.display.lock().unwrap();
-                            ui.horizontal(|ui| {
-                                ui.weak(format!("Mic level: {:.3}    ALC: {:.1}", disp.mic_pk, disp.alc_av));
-                                // Leveler/Compressor status -- same idea as
-                                // deskHPSDR's top-bar "LEV +N"/"PROC +N"
-                                // (vfo.c): dim label when off, the
-                                // configured gain value highlighted when
-                                // on, so it's visible without opening
-                                // Settings -> TX.
-                                ui.add_space(12.0);
-                                if tx.leveler_enabled() {
-                                    ui.colored_label(
-                                        egui::Color32::from_rgb(230, 150, 50),
-                                        format!("LEV +{:.0}", tx.leveler_gain_db()),
-                                    );
-                                } else {
-                                    ui.weak("LEV");
-                                }
-                                ui.add_space(8.0);
-                                if tx.compressor_enabled() {
-                                    ui.colored_label(
-                                        egui::Color32::from_rgb(230, 150, 50),
-                                        format!("PROC +{:.0}", tx.compressor_gain_db()),
-                                    );
-                                } else {
-                                    ui.weak("PROC");
-                                }
-                                ui.add_space(8.0);
-                                // CFC has no single scalar gain to show
-                                // (12-band fixed profile) -- just on/off,
-                                // same dim/highlighted convention as
-                                // LEV/PROC above.
-                                if tx.cfc_enabled() {
-                                    ui.colored_label(egui::Color32::from_rgb(230, 150, 50), "CFC");
-                                } else {
-                                    ui.weak("CFC");
-                                }
-                            });
-                        }
-                    }
+                    // LEV/PROC/CFC and Mic level/ALC used to have their
+                    // own dedicated row here, desktop-only. A real
+                    // request: desktop now matches kiosk mode's own
+                    // layout instead -- LEV/PROC/CFC moved up next to
+                    // Settings/Add Receiver/Juice Console (see that call
+                    // site's own comment, no longer kiosk-gated), and
+                    // Mic/ALC moved under the S-meter panel (see that
+                    // call site's own comment, likewise no longer
+                    // kiosk-gated) -- freeing this row's height for the
+                    // spectrum/waterfall in both modes now, not just
+                    // kiosk.
 
                     // show_nb_nr/show_snb_anf_bin's definitions moved up,
-                    // right before the gain_filter_grid, since kiosk mode
-                    // now calls them from inside two of that grid's own
+                    // right before the gain_filter_grid, since both modes
+                    // now call them from inside two of that grid's own
                     // rows -- see their doc comment there.
-
-                    // Desktop-only -- kiosk mode spreads NB/NR/SNB/ANF/BIN
-                    // across the Audio gain/RX Gain grid rows and moves
-                    // AGC/AGC Gain into that same grid too (see those call
-                    // sites' own comments), freeing this row's height for
-                    // the spectrum/waterfall.
-                    if !lcd_kiosk_mode() {
-                        ui.horizontal_wrapped(|ui| {
-                            let mut changed = render_nb_nr(ui, connected);
-                            changed |= render_snb_anf_bin(ui, connected);
-                            if changed {
-                                settings_changed = true;
-                            }
-                            // Fixed width -- a real report: "AGC Off"/
-                            // "AGC Long"/"AGC Slow"/"AGC Medium"/"AGC
-                            // Fast" are all different lengths, so this
-                            // button (and everything after it in the
-                            // row) visibly shifted every time the mode
-                            // cycled. Same fixed-width treatment as the
-                            // slider value boxes elsewhere (see
-                            // STABLE_SLIDER_TRACK_WIDTH), sized for the
-                            // longest label ("AGC Medium").
-                            if ui
-                                .add_sized(
-                                    [100.0, ui.spacing().interact_size.y],
-                                    egui::Button::selectable(current_agc != spectrum::Agc::Off, current_agc.label()),
-                                )
-                                .on_hover_text("Click to cycle: Off -> Long -> Slow -> Medium -> Fast -> Off")
-                                .clicked()
-                            {
-                                connected.spectrum.set_agc(current_agc.next());
-                                settings_changed = true;
-                            }
-
-                            // AGC Gain -- WDSP's SetRXAAGCTop (already wired
-                            // as "Top" in Settings -> RX; this is a quick-
-                            // access control for the same value, matching
-                            // piHPSDR's own "AGC Gain" slider, confirmed via
-                            // its receiver.c: `SetRXAAGCTop(id, rx->agc_gain)`
-                            // -- same WDSP call, just this project's own name
-                            // for it predates this slider existing here at
-                            // all. Placed right after the AGC button, not
-                            // next to Audio gain -- it tunes the AGC itself,
-                            // not the speaker volume.
-                            ui.add_space(12.0);
-                            ui.label("AGC Gain:");
-                            let mut agc_top_db = connected.spectrum.agc_params().agc_top_db;
-                            // Same fixed-width value box as the gain/filter
-                            // grid above -- a real request: keep this
-                            // slider's value display looking the same as
-                            // those, not the plain variable-width one every
-                            // other scroll_slider_f64 call site still uses.
-                            if stable_f64_slider(ui, &mut connected.slider_scroll_accum, &mut agc_top_db, 0.0..=140.0, 2.0, " dB") {
-                                connected.spectrum.set_agc_top_db(agc_top_db);
-                                settings_changed = true;
-                            }
-                        });
-                    }
-
-                    // Standalone row -- desktop mode only; kiosk mode
-                    // folds this onto the mode-buttons row instead (see
-                    // show_status_row's own doc comment).
-                    if !lcd_kiosk_mode() {
-                        ui.add_space(4.0);
-                        ui.horizontal(|ui| {
-                            render_status_row(ui, connected, rigctl_status, tci_status, cat_status);
-                        });
-                    }
 
                     // Kiosk mode's usual home for NB/NR/SNB/ANF/BIN/
                     // Record is spread across the Audio gain/RX Gain grid
@@ -5986,16 +5920,12 @@ impl eframe::App for HpsdrApp {
                                 settings_changed = true;
                             }
 
-                            // Record -- kiosk-only (a real request), moved
-                            // here next to Clear from its own dedicated
-                            // row (see show_status_row's own doc comment
-                            // for why it used to live there). NB/NR/SNB/
-                            // ANF/BIN moved OFF this row too, but onto
-                            // the Audio gain/RX Gain grid rows instead of
-                            // here -- see show_nb_nr/show_snb_anf_bin's
-                            // own doc comment. Desktop mode leaves
-                            // everything in its original rows, unchanged.
-                            if lcd_kiosk_mode() {
+                            // Record -- moved here next to Clear from its
+                            // own dedicated row (see render_status_row's
+                            // own doc comment for why it used to live
+                            // there). No longer kiosk-only (a real
+                            // request): both modes now show it here.
+                            {
                                 ui.add_space(12.0);
                                 let recording = connected.spectrum.recorder.is_enabled();
                                 let (rec_label, rec_color) = if recording {
@@ -6873,7 +6803,11 @@ impl eframe::App for HpsdrApp {
                         // space Stop could use instead, and the bottom-
                         // left corner isn't reachable at a glance the
                         // same way. Desktop mode keeps it here, unchanged.
-                        if !lcd_kiosk_mode() && ui.button("Stop").clicked() {
+                        // Red (same kiosk_stop_button styling as kiosk
+                        // mode's own STOP) -- a real request: made
+                        // consistent between the two modes rather than
+                        // plain/unstyled here.
+                        if !lcd_kiosk_mode() && kiosk_stop_button(ui, "Stop").clicked() {
                             stop_clicked = true;
                         }
                         // See ConnectedState::status_message's doc
@@ -7124,26 +7058,24 @@ impl eframe::App for HpsdrApp {
                             }
                         }
 
-                        // Mic level/ALC -- kiosk-only (a real request) so
-                        // every "at a glance" reading lives together
-                        // under the S-meter, at the same fixed 180px
-                        // width, instead of taking a row of its own in
-                        // the main flow -- frees that row's height for
-                        // the spectrum/waterfall. Desktop mode keeps its
-                        // own separate row unchanged (see that row's own
-                        // kiosk gate). Same tx_enabled/tx_handle guard as
-                        // that row, since there's nothing to show without
-                        // a real mic input. Placed directly under the
-                        // meter, BEFORE the ADC overload/TX FIFO rows
-                        // below (a real request: this used to sit after
-                        // them, two row-heights lower than intended,
-                        // landing well below where it should visually
-                        // line up -- roughly the band-buttons row's own
-                        // height). Own line_height query (that row's
-                        // copy is declared further down, after this
-                        // point) rather than reordering it, to keep this
-                        // change small.
-                        if lcd_kiosk_mode() && connected.tx_enabled {
+                        // Mic level/ALC -- so every "at a glance" reading
+                        // lives together under the S-meter, at the same
+                        // fixed 180px width, instead of taking a row of
+                        // its own in the main flow -- frees that row's
+                        // height for the spectrum/waterfall. No longer
+                        // kiosk-only (a real request): both modes now
+                        // show it here instead of desktop's own former
+                        // separate row. Placed directly under the meter,
+                        // BEFORE the ADC overload/TX FIFO rows below (a
+                        // real request: this used to sit after them, two
+                        // row-heights lower than intended, landing well
+                        // below where it should visually line up --
+                        // roughly the band-buttons row's own height).
+                        // Own line_height query (that row's copy is
+                        // declared further down, after this point)
+                        // rather than reordering it, to keep this change
+                        // small.
+                        if connected.tx_enabled {
                             if let Some(tx) = &connected.tx_handle {
                                 let disp = *tx.display.lock().unwrap();
                                 let mic_line_height = ui.text_style_height(&egui::TextStyle::Body);
@@ -12220,44 +12152,9 @@ fn render_status_row(
         ui.colored_label(color, "PS").on_hover_text(hover);
     }
 
-    // Records exactly the audio the local speaker plays (post Audio
-    // Gain, muted the same way during TX/mute_local_for_tci -- see
-    // spectrum.rs's recorder.write_frame call site) to a timestamped WAV
-    // file under the recordings folder alongside this radio's other
-    // persisted files -- see audio_recorder::recording_path. Kiosk mode
-    // moves this to the RIT/XIT row instead (a real request, alongside
-    // Clear -- see that row's own comment); desktop mode keeps it here,
-    // unchanged.
-    if !lcd_kiosk_mode() {
-        ui.add_space(12.0);
-        let recording = connected.spectrum.recorder.is_enabled();
-        let (rec_label, rec_color) = if recording {
-            ("Recording", egui::Color32::from_rgb(210, 50, 50))
-        } else {
-            ("Record", egui::Color32::from_gray(60))
-        };
-        let rec_resp = ui
-            .add(egui::Button::new(egui::RichText::new(rec_label).strong().color(egui::Color32::WHITE)).fill(rec_color))
-            .on_hover_text(if recording {
-                "Click to stop recording"
-            } else {
-                "Record RX audio (what you hear) to a WAV file"
-            });
-        if rec_resp.clicked() {
-            if recording {
-                connected.spectrum.recorder.stop();
-            } else {
-                match audio_recorder::recording_path("main") {
-                    Some(path) => {
-                        if let Err(e) = connected.spectrum.recorder.start(&path) {
-                            eprintln!("failed to start recording: {e}");
-                        }
-                    }
-                    None => eprintln!("failed to start recording: could not determine the recordings folder"),
-                }
-            }
-        }
-    }
+    // Record used to live at the end of this row -- moved to the
+    // RIT/XIT row instead (both modes now, a real request, alongside
+    // Clear -- see that row's own comment) so it's not repeated here.
 }
 
 /// NB/NR toggle buttons -- standalone fn for the same nested-closure
