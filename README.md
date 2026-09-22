@@ -127,6 +127,19 @@ Off by default -- this is a fixed-size kiosk layout for a specific small panel, 
 
 **Known limitation**: a native OS file-picker dialog (e.g. "Choose..." for the Radioberry Juice executable path, or a firmware `.rbf` file) is a real Windows window, not part of this app's own UI -- its size/position is controlled by Windows itself, not by this app, so it can open larger than the 1024x600 panel or need scrolling to reach its own buttons. Windows remembers a common dialog's last-used size per user, so resizing it down once on the actual kiosk PC should make it stay that size on future opens.
 
+### Testing without real hardware (hpsdrsim)
+
+A minimal, built-in Protocol 1 (Metis/HermesLite2) hardware emulator lets the discovery/connect/RX pipeline be exercised with no radio physically attached -- similar in spirit to piHPSDR's separate `hpsdrsim` command-line tool, but built in here instead of a standalone program. It answers discovery/Start/Stop correctly on the wire and streams a synthetic RX signal (a fixed tone on a fixed absolute frequency, plus light noise) that behaves like a real signal would -- it appears/disappears as you tune across it, rather than always sitting at the same spot on screen.
+
+Hidden entirely by default (not shown anywhere in the UI) -- it's purely a development/testing aid and has zero footprint unless deliberately opted into with `HPSDR_SIM=1`:
+
+```powershell
+$env:HPSDR_SIM = "1"
+.\target\release\hpsdr-rs.exe
+```
+
+With that set, the Discover window gains an **hpsdrsim** section (alongside Ozy/Radioberry Juice/RX-888 USB setup) to pick which board it pretends to be and Start/Stop it; it then shows up in the device list like any other network radio. Deliberately scoped down compared to piHPSDR's own tool (no TX feedback distortion modeling, no pre-recorded speech IQ, etc.) -- just enough to confirm the app's own connect/RX pipeline works end-to-end without needing real hardware on hand.
+
 ## MIDI control surface
 
 Any class-compliant MIDI controller's notes/CCs/pitch-bend can be bound to a radio action from **Settings -> MIDI**:
