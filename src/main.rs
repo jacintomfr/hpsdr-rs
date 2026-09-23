@@ -3069,6 +3069,40 @@ impl eframe::App for HpsdrApp {
     // eframe 0.35 replaced `update(&Context)` with `ui(&mut Ui)` -- see
     // https://github.com/emilk/egui/blob/main/CHANGELOG.md (0.35.0).
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        // Kiosk mode assumes an exact 1024x600 PHYSICAL pixel panel (see
+        // main()'s ViewportBuilder::with_inner_size for that mode) --
+        // this counteracts whatever HiDPI scale factor the OS/window
+        // system reports, so it always renders at a true 1:1 logical-
+        // to-physical pixel mapping regardless of that setting. A real
+        // report: a Raspberry Pi 5's Wayland compositor (labwc)
+        // reporting a stale `initScale` of 2.0 to XWayland clients (this
+        // app forces X11/XWayland by default -- see that flag's own
+        // extensive doc comment) even though the panel's own live
+        // output scale was actually 1.0 -- every font/widget rendered
+        // 2x too large, AND the actual framebuffer was rendered at
+        // 2048x1200 physical pixels instead of 1024x600, quadrupling
+        // the pixel count the Pi's GPU had to push and visibly tanking
+        // the frame rate (2-3fps). zoom_factor is a pure egui rendering
+        // scale, independent of ViewportBuilder/window geometry/
+        // fullscreen state, so unlike an earlier attempt at this same
+        // "make kiosk mode ignore host scaling" goal (see
+        // config::load_kiosk_ui_scale's doc comment -- that one tried
+        // shrinking the window's own inner_size instead, which fought
+        // with `with_fullscreen` and regressed to windowed/undersized),
+        // this can't touch fullscreen/window state at all. Cheap to
+        // redo every frame -- just a float compare/set -- so it self-
+        // corrects if the reported scale ever changes mid-session.
+        if lcd_kiosk_mode() {
+            if let Some(native) = ui.ctx().native_pixels_per_point() {
+                if native > 0.0 {
+                    let desired_zoom = 1.0 / native;
+                    if (ui.ctx().zoom_factor() - desired_zoom).abs() > 0.001 {
+                        ui.ctx().set_zoom_factor(desired_zoom);
+                    }
+                }
+            }
+        }
+
         // Track this window's current position/size every frame (cheap --
         // just copying floats already computed by egui-winit) so a final
         // value is always ready whenever the periodic per-radio Config
