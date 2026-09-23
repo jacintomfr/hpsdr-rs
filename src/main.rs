@@ -15550,6 +15550,32 @@ fn main() -> eframe::Result<()> {
     };
     let options = eframe::NativeOptions {
         viewport,
+        // Glow (classic OpenGL/GLES, eframe's original renderer) instead
+        // of the default wgpu on Linux/aarch64 (Raspberry Pi) -- a real
+        // report on a Pi 5 (Mesa V3D driver): wgpu's Vulkan backend
+        // crashed outright ("wgpu error: Out of Memory"), and forcing
+        // wgpu's GL backend instead (a first attempt at fixing that,
+        // since reverted -- see git history) "fixed" the crash but
+        // replaced it with a much worse problem -- a solid black window
+        // for 60-90+ SECONDS
+        // before anything ever rendered, confirmed via a real
+        // screenshot taken mid-delay (genuinely no draw calls
+        // succeeding yet, not just a hidden/unmapped window -- the
+        // window existed and was mapped the whole time). Once past that
+        // delay it then ran perfectly (0% CPU/network issues, correct
+        // layout). That multi-minute stall is consistent with wgpu's GL
+        // backend cold-compiling every shader through Mesa's V3D GLSL
+        // compiler (known to be far slower than desktop GPU drivers)
+        // with no working disk cache for it, rather than any ongoing
+        // rendering problem. Glow is eframe's older, simpler, far more
+        // exercised Linux/embedded renderer -- switching entirely
+        // sidesteps this rather than chasing wgpu's own GL-backend
+        // shader-cache behavior on this exact driver. Every other
+        // platform (Windows/macOS, and any other Linux) keeps using
+        // wgpu unchanged, since only aarch64 Linux has actually hit
+        // this.
+        #[cfg(all(target_os = "linux", target_arch = "aarch64"))]
+        renderer: eframe::Renderer::Glow,
         wgpu_options: eframe::egui_wgpu::WgpuConfiguration {
             // NOTE: this used to override `surface` to force
             // PresentMode::Fifo (true vsync), added 2026-09-11 on
@@ -15602,28 +15628,6 @@ fn main() -> eframe::Result<()> {
                     required_limits: adapter.limits(),
                     ..Default::default()
                 });
-                // Forces the GL backend on Linux/aarch64 (Raspberry
-                // Pi) -- a real report: wgpu's default backend
-                // selection there hit "wgpu error: Out of Memory" on
-                // a Pi 5 immediately on launch (Mesa's V3DV Vulkan
-                // driver, confirmed via WGPU_BACKEND=gl working
-                // around it), even though this project's OWN device
-                // limits fix above already handles V3D's actual
-                // hardware limits correctly -- this is a separate,
-                // Vulkan-driver-specific failure, not a limits
-                // mismatch. GL (Mesa's V3D GLES driver) is the
-                // long-established, stable path on this hardware, so
-                // it's forced here rather than left to
-                // Backends::from_env()'s normal "try Vulkan first"
-                // default, sparing every Pi user from needing to set
-                // WGPU_BACKEND=gl by hand. Scoped to aarch64 Linux
-                // specifically (not all Linux) since x86_64 desktop
-                // Linux doesn't share this driver and generally has
-                // working Vulkan.
-                #[cfg(all(target_os = "linux", target_arch = "aarch64"))]
-                {
-                    setup.instance_descriptor.backends = eframe::wgpu::Backends::GL;
-                }
                 eframe::egui_wgpu::WgpuSetup::CreateNew(setup)
             },
             ..Default::default()

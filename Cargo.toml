@@ -36,6 +36,11 @@ eframe = { version = "0.35", default-features = false, features = [
     "wayland",
     "web_screen_reader",
     "wgpu",
+    # See main()'s NativeOptions::renderer doc comment -- Linux/aarch64
+    # (Raspberry Pi) selects Renderer::Glow at runtime instead of the
+    # wgpu default used everywhere else, so this feature needs to be
+    # compiled in even though most builds never actually use it.
+    "glow",
     "x11",
 ] }
 egui = "0.35"
