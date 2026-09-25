@@ -321,18 +321,21 @@ fn run(socket: UdpSocket, board: SimBoard, stop: Arc<AtomicBool>) {
                                 rx0_freq_hz = freq;
                             }
                         }
-                        // General Control command -- byte[3]==0x03 is
-                        // Start (both RX+TX run bits), 0x00 is Stop --
-                        // see radio.rs's p1_send_preconfig_and_start/
-                        // sender_loop's own stop_pkt for the exact same
-                        // two packets a real client sends.
+                        // General Control command -- bit 0 of byte[3] is the
+                        // real "run" bit (bit 1 is a separate wideband
+                        // toggle this emulator ignores). Used to require
+                        // byte[3]==0x03 exactly, which hpsdr-rs's own
+                        // sender happens to send but real clients like
+                        // deskHPSDR/piHPSDR send 0x01 -- they were never
+                        // recognized as Start, so this emulator just
+                        // silently never streamed IQ to them.
                         0x04 if amt >= 4 => {
-                            if buf[3] == 0x03 {
+                            if buf[3] & 0x01 != 0 {
                                 client = Some(src);
                                 running = true;
                                 next_send = Instant::now();
                                 eprintln!("hpsdrsim: Start received from {src}, streaming to it now");
-                            } else if buf[3] == 0x00 {
+                            } else {
                                 running = false;
                                 eprintln!("hpsdrsim: Stop received from {src}");
                             }
