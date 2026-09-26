@@ -8,6 +8,7 @@
 use crate::audio_recorder::AudioRecorder;
 use crate::cw_decoder::CwDecoder;
 use crate::report_recorder::ReportRecorder;
+use crate::rade_link::RadeHandle;
 use crate::rtty_link::RttyHandle;
 use crate::sstv_link::SstvHandle;
 use crate::radio::IqSample;
@@ -1652,6 +1653,13 @@ fn run(
     // SSTV decoder tap -- see sstv_link.rs. Same shape/gating as `rtty`
     // just above (set via SpectrumHandle::set_sstv, main receiver only).
     sstv: Arc<Mutex<Option<SstvHandle>>>,
+    // RADE decoder tap -- see rade_link.rs. Same shape/gating as `rtty`/
+    // `sstv` above (set via SpectrumHandle::set_rade, main receiver only),
+    // but UNLIKE them also REPLACES the normal demodulated audio in
+    // audio_out/tci_audio_out with RADE's decoded speech while active --
+    // see this function's own rade_rx-gated block below for why (RADE's
+    // received audio is modem tones, not intelligible SSB).
+    rade: Arc<Mutex<Option<RadeHandle>>>,
     rx_audio_to_radio: Option<Arc<Mutex<VecDeque<f32>>>>,
     // Muted (not pushed to any of the four audio outputs above) while
     // MOX is active -- see SpectrumHandle::start's doc comment on why.
@@ -1668,6 +1676,12 @@ fn run(
     let mut cw_decoder = CwDecoder::new(Arc::clone(&cw_text));
     let mut rtty_scratch: Vec<f32> = Vec::new();
     let mut sstv_scratch: Vec<f32> = Vec::new();
+    let mut rade_scratch: Vec<f32> = Vec::new();
+    let mut rade_speech: Vec<f32> = Vec::new();
+    // Jitter buffer absorbing RADE's bursty decode -- see the post-loop
+    // rade_rx block's own doc comment for why this exists (a real report
+    // of stuttering RX audio despite a strong, steadily-synced signal).
+    let mut rade_jitter: VecDeque<f32> = VecDeque::new();
     // Anti-aliasing lowpass for rx_audio_to_radio only -- confirmed via a
     // real packet capture (radio.rs's RX-audio-to-radio feature) that
     // WDSP's raw 48kHz RXA output carries a large, persistent near-
@@ -1814,6 +1828,8 @@ fn run(
         rtty_scratch.clear();
         let sstv_rx = sstv.lock().unwrap().clone().filter(|s| s.rx_enabled());
         sstv_scratch.clear();
+        let rade_rx = rade.lock().unwrap().clone().filter(|r| r.rx_enabled());
+        rade_scratch.clear();
         {
             let mut out = audio_out.lock().unwrap();
             // Dedicated tap for TCI's audio_start streaming -- same
@@ -1929,30 +1945,43 @@ fn run(
                 if sstv_rx.is_some() {
                     sstv_scratch.push(mono);
                 }
+                if rade_rx.is_some() {
+                    rade_scratch.push(mono);
+                }
                 // Local speaker playback and TCI's RX audio stream carry
                 // the real (l, r) pair -- identical (l==r) when binaural
                 // is off, same as every consumer effectively saw before
                 // this was ever a stereo pair at all.
                 let (l, r) = ((l * params.gain).clamp(-1.0, 1.0), (r * params.gain).clamp(-1.0, 1.0));
-                if !mute_local {
-                    if out.len() >= AUDIO_BUFFER_CAPACITY {
-                        out.pop_front();
+                // While RADE is the active decoder its OWN decoded speech
+                // (pushed below, after this lock scope) replaces the
+                // normal demodulated audio here entirely -- see this
+                // function's own `rade` field doc comment for why:
+                // unlike RTTY/SSTV (which only ever ADD a text/image
+                // side-channel), what WDSP demodulated from a RADE
+                // signal is modem tones, not something worth sending to
+                // a speaker.
+                if rade_rx.is_none() {
+                    if !mute_local {
+                        if out.len() >= AUDIO_BUFFER_CAPACITY {
+                            out.pop_front();
+                        }
+                        out.push_back((l, r));
+                        recorder.write_frame(l, r);
+                        report_recorder.write_frame(l, r);
                     }
-                    out.push_back((l, r));
-                    recorder.write_frame(l, r);
-                    report_recorder.write_frame(l, r);
-                }
-                if tci_out.len() >= AUDIO_BUFFER_CAPACITY {
-                    tci_out.pop_front();
-                }
-                tci_out.push_back((l, r));
-                if let Some(radio_out) = radio_out.as_mut() {
-                    let mono_gained = (mono * params.gain).clamp(-1.0, 1.0);
-                    let filtered = radio_audio_lpf.feed(mono_gained);
-                    if radio_out.len() >= AUDIO_BUFFER_CAPACITY {
-                        radio_out.pop_front();
+                    if tci_out.len() >= AUDIO_BUFFER_CAPACITY {
+                        tci_out.pop_front();
                     }
-                    radio_out.push_back(filtered);
+                    tci_out.push_back((l, r));
+                    if let Some(radio_out) = radio_out.as_mut() {
+                        let mono_gained = (mono * params.gain).clamp(-1.0, 1.0);
+                        let filtered = radio_audio_lpf.feed(mono_gained);
+                        if radio_out.len() >= AUDIO_BUFFER_CAPACITY {
+                            radio_out.pop_front();
+                        }
+                        radio_out.push_back(filtered);
+                    }
                 }
             }
         }
@@ -1963,6 +1992,61 @@ fn run(
         }
         if let Some(s) = &sstv_rx {
             s.feed_rx(&sstv_scratch);
+        }
+        if let Some(r) = &rade_rx {
+            rade_speech.clear();
+            r.feed_rx(&rade_scratch, &mut rade_speech);
+            // ROOT CAUSE FIX for a real report: with a strong, steadily
+            // synced signal, decoded speech was pushed to audio_out/
+            // tci_out AS IT ARRIVED -- but RADE's decoder is
+            // asynchronous (its own worker thread, 120ms modem frames --
+            // see rade_link.rs's own module doc comment) and hands back
+            // speech in BURSTS (up to ~120ms/5760 samples in one call),
+            // not the one-sample-per-input-sample rate WDSP's demod
+            // produces. AudioOutput's cpal callback drains audio_out at
+            // a steady real-time rate regardless, so a bursty producer
+            // feeding a steady consumer is exactly what audibly stutters
+            // -- confirmed by a real report ("gaguejar", like a squelch
+            // cutting in and out) on a signal that was decoding cleanly
+            // (SDRoxide's own playback of the same signal was smooth).
+            // rade_jitter absorbs the bursts; only ever draining/adding
+            // rade_scratch.len() samples per chunk (this chunk's REAL
+            // elapsed time) into audio_out/tci_out below keeps their own
+            // fill rate steady regardless of how lumpily the decoder
+            // itself produced the samples now sitting in the jitter
+            // buffer.
+            rade_jitter.extend(rade_speech.iter().copied());
+            // Cap growth -- e.g. a burst of several frames at once
+            // catching up after a long hunt -- so a spell of the
+            // decoder running ahead of real-time doesn't turn into ever-
+            // growing latency; drops the OLDEST audio, same "keep up
+            // rather than fall further behind" policy AUDIO_BUFFER_
+            // CAPACITY's own pop_front()-oldest below uses.
+            const RADE_JITTER_CAP: usize = 48_000; // 1s
+            while rade_jitter.len() > RADE_JITTER_CAP {
+                rade_jitter.pop_front();
+            }
+            // See the per-sample loop's own comment above -- this is
+            // what plays in place of the muted normal demod audio while
+            // RADE is active. Re-read mute_local_for_tci here rather
+            // than reusing the per-chunk copy above (out of scope past
+            // the lock block it was read inside).
+            let mute_local = mute_local_for_tci.load(Ordering::Relaxed);
+            let mut out = audio_out.lock().unwrap();
+            let mut tci_out = tci_audio_out.lock().unwrap();
+            for _ in 0..rade_scratch.len() {
+                let s = rade_jitter.pop_front().unwrap_or(0.0).clamp(-1.0, 1.0);
+                if !mute_local {
+                    if out.len() >= AUDIO_BUFFER_CAPACITY {
+                        out.pop_front();
+                    }
+                    out.push_back((s, s));
+                }
+                if tci_out.len() >= AUDIO_BUFFER_CAPACITY {
+                    tci_out.pop_front();
+                }
+                tci_out.push_back((s, s));
+            }
         }
     }
 }
@@ -2018,6 +2102,8 @@ pub struct SpectrumHandle {
     rtty: Arc<Mutex<Option<RttyHandle>>>,
     /// See run()'s param of the same name and set_sstv.
     sstv: Arc<Mutex<Option<SstvHandle>>>,
+    /// See run()'s param of the same name and set_rade.
+    rade: Arc<Mutex<Option<RadeHandle>>>,
     demod_params: Arc<Mutex<DemodParams>>,
     /// The IQ input queue run()'s analyzer thread consumes from -- kept
     /// here too (not just inside that thread) so clear_display can drain
@@ -2087,6 +2173,7 @@ impl SpectrumHandle {
         let report_recorder = ReportRecorder::new();
         let rtty: Arc<Mutex<Option<RttyHandle>>> = Arc::new(Mutex::new(None));
         let sstv: Arc<Mutex<Option<SstvHandle>>> = Arc::new(Mutex::new(None));
+        let rade: Arc<Mutex<Option<RadeHandle>>> = Arc::new(Mutex::new(None));
         let stop = Arc::new(AtomicBool::new(false));
         let iq_buffer_for_clear = Arc::clone(&iq_buffer);
         let thread = {
@@ -2102,6 +2189,7 @@ impl SpectrumHandle {
             let report_recorder = report_recorder.clone();
             let rtty = Arc::clone(&rtty);
             let sstv = Arc::clone(&sstv);
+            let rade = Arc::clone(&rade);
             let stop = Arc::clone(&stop);
             thread::spawn(move || {
                 run(
@@ -2120,6 +2208,7 @@ impl SpectrumHandle {
                     report_recorder,
                     rtty,
                     sstv,
+                    rade,
                     rx_audio_to_radio,
                     mox,
                     mute_local_for_tci,
@@ -2139,6 +2228,7 @@ impl SpectrumHandle {
             report_recorder,
             rtty,
             sstv,
+            rade,
             demod_params,
             iq_buffer: iq_buffer_for_clear,
             channel,
@@ -2225,6 +2315,15 @@ impl SpectrumHandle {
     /// receiver's decoder tap. Same pattern as set_rtty.
     pub fn set_sstv(&self, handle: &SstvHandle) {
         let mut slot = self.sstv.lock().unwrap();
+        if !slot.as_ref().is_some_and(|h| h.same_as(handle)) {
+            *slot = Some(handle.clone());
+        }
+    }
+
+    /// Attaches the session's RADE handle (see rade_link.rs) as this
+    /// receiver's decoder tap. Same pattern as set_rtty/set_sstv.
+    pub fn set_rade(&self, handle: &RadeHandle) {
+        let mut slot = self.rade.lock().unwrap();
         if !slot.as_ref().is_some_and(|h| h.same_as(handle)) {
             *slot = Some(handle.clone());
         }

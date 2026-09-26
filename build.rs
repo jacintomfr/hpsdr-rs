@@ -42,6 +42,9 @@
     different name. Fixed here by calling `.compile()` once.
 */
 
+#[path = "build_rade.rs"]
+mod build_rade;
+
 fn main() {
     // ROOT CAUSE FIX for a real report ("cannot open input file
     // Packet.lib" persisting even after correctly setting
@@ -360,6 +363,8 @@ fn main() {
     // .ico directly and doesn't need this.
     #[cfg(windows)]
     embed_windows_icon();
+
+    build_rade::build();
 }
 
 // winresource (a maintained fork of the abandoned `winres` crate) is only

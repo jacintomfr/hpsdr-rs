@@ -24,6 +24,11 @@ pub struct Config {
     /// rtty_link::RttySettings's own doc comment. None/missing (configs
     /// saved before this existed) falls back to RttySettings::default().
     pub rtty: Option<crate::rtty_link::RttySettings>,
+    /// The callsign RADE V1 transmits in its End-of-Over frame -- see
+    /// rade_link.rs's own doc comment. None/missing/empty means no
+    /// callsign is sent (a well-formed but identity-less over).
+    #[serde(default)]
+    pub rade_callsign: Option<String>,
     /// Output device for local RX audio playback (Settings -> Audio's
     /// "Output device" picker), by name -- e.g. "CABLE Input (VB-Audio
     /// Virtual Cable)" to feed a decoder instead of/alongside real

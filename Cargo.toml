@@ -104,6 +104,15 @@ sysinfo = "0.33"
 # Complex<f32> for the RTTY modem (rtty.rs, adapted from SDRoxide, which
 # uses this same crate/version). Pure Rust, no system dependency.
 num-complex = "0.4"
+# RADE V1 (rade.rs, adapted from SDRoxide's sdroxide-rade crate -- see that
+# file's own doc comment): rtrb/crossbeam-channel are the worker thread's
+# lock-free audio rings and control channel, rubato is the 8kHz/16kHz <->
+# 48kHz sample-rate conversion at the worker's edges, thiserror is RadeError.
+# Same versions SDRoxide itself uses.
+rtrb = "0.4"
+crossbeam-channel = "0.5"
+rubato = "5.0.0"
+thiserror = "2"
 
 [target.'cfg(windows)'.dependencies]
 # SetStdHandle, used by main.rs's redirect_stdio_to_log_file() to send
@@ -140,6 +149,15 @@ pkg-config = "0.3"
 # robust than fighting pkg-config's cross-compilation guard and PATH
 # resolution for what's ultimately the same vcpkg install).
 vcpkg = "0.2"
+# Builds vendor/rade_c (a git submodule -- see README/CONTRIBUTING for the
+# `git submodule update --init` step a fresh clone needs) plus the patched
+# Opus/FARGAN vocoder it depends on, for the RADE V1 digital-voice mode --
+# see build_rade.rs's own doc comment for the full story, including the
+# extra host tools (autoconf/automake/libtool/gettext/clang) this needs
+# beyond what WDSP's own cc-only build above does, and the network access
+# the first build needs (rade_c's own CMake downloads Opus from GitHub).
+cmake = "0.1"
+bindgen = "0.72"
 
 [target.'cfg(windows)'.build-dependencies]
 # Embeds assets/icons/hpsdr-rs.ico into hpsdr-rs.exe (see build.rs) --

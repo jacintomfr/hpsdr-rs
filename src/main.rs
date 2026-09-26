@@ -28,6 +28,9 @@ mod radio;
 mod radioberry_juice;
 mod report_recorder;
 mod rigctl;
+mod rade;
+mod rade_link;
+mod rade_mic_agc;
 mod rtty;
 mod rtty_link;
 mod sstv;
@@ -1448,6 +1451,7 @@ struct FrequencyEntry {
 enum DigitalMode {
     Rtty,
     Sstv,
+    Rade,
 }
 
 struct ConnectedState {
@@ -1725,14 +1729,15 @@ struct ConnectedState {
     /// reference, set once and rarely touched.
     rx_gain_calibration_db: i32,
     show_juice_console_window: bool,
-    /// "Digital..." window (digital modes -- RTTY and SSTV). See
-    /// rtty_link.rs/sstv_link.rs; `rtty`/`sstv` are owned here, not by
-    /// SpectrumHandle, so they survive the main SpectrumHandle being
-    /// rebuilt on a sample-rate change (TxHandle holds a clone of `rtty`).
+    /// "Digital..." window (digital modes -- RTTY, SSTV and RADE). See
+    /// rtty_link.rs/sstv_link.rs/rade_link.rs; `rtty`/`sstv`/`rade` are
+    /// owned here, not by SpectrumHandle, so they survive the main
+    /// SpectrumHandle being rebuilt on a sample-rate change (TxHandle holds
+    /// a clone of `rtty`/`rade`).
     show_digital_window: bool,
-    /// Which of the two decoders the window is currently showing -- only
+    /// Which of the three decoders the window is currently showing -- only
     /// the selected one is fed audio (see spectrum.rs's own rx_enabled
-    /// gating), so switching doesn't run both DSPs for no UI anyone is
+    /// gating), so switching doesn't run all three DSPs for no UI anyone is
     /// looking at.
     digital_mode: DigitalMode,
     rtty: rtty_link::RttyHandle,
@@ -1743,6 +1748,11 @@ struct ConnectedState {
     /// egui::Image::from(...) called fresh with raw bytes every frame.
     sstv_texture: Option<egui::TextureHandle>,
     sstv_texture_image_id: u32,
+    rade: rade_link::RadeHandle,
+    /// The callsign RADE transmits in its End-of-Over frame -- see
+    /// render_rade_panel and rade::text's own doc comment. Persisted in
+    /// Config the same way rtty's settings are.
+    rade_callsign: String,
     extra_receivers: Vec<Arc<Mutex<ExtraReceiver>>>,
     settings_dirty: Arc<std::sync::atomic::AtomicBool>,
     band_memory: std::collections::HashMap<String, BandSettings>,
@@ -2766,6 +2776,11 @@ fn connect_to_device(device: Device, cfg: &Config) -> Result<ConnectedState, Str
                 rtty.set_settings(s);
             }
             let sstv = sstv_link::SstvHandle::new();
+            let rade = rade_link::RadeHandle::new();
+            let rade_callsign = cfg.rade_callsign.clone().unwrap_or_default();
+            if !rade_callsign.is_empty() {
+                rade.set_callsign(&rade_callsign);
+            }
             let mic_buffer = Arc::new(Mutex::new(VecDeque::new()));
             let mic_input_device = cfg.mic_input_device.clone();
             let (tx_enabled, mic_input, tx_handle) =
@@ -2778,6 +2793,7 @@ fn connect_to_device(device: Device, cfg: &Config) -> Result<ConnectedState, Str
                         Arc::clone(&session.tx_audio_source),
                         spectrum.report_recorder.clone(),
                         rtty.clone(),
+                        rade.clone(),
                         Arc::clone(&session.tci_wants_mic),
                         Arc::clone(&session.tx_iq),
                         Arc::clone(&tx_spectrum_iq),
@@ -2983,6 +2999,8 @@ fn connect_to_device(device: Device, cfg: &Config) -> Result<ConnectedState, Str
                 sstv,
                 sstv_texture: None,
                 sstv_texture_image_id: 0,
+                rade,
+                rade_callsign,
                 rx_gain_calibration_db: cfg.rx_gain_calibration_db.unwrap_or(0),
                 extra_receivers,
                 settings_dirty,
@@ -3577,21 +3595,44 @@ impl eframe::App for HpsdrApp {
                     .spectrum
                     .set_ctun(connected.ctun || connected.rit_enabled, ctun_offset_hz + rit_offset_hz);
                 connected.spectrum.set_cw_decode_enabled(connected.cw_decode_enabled);
-                // See rtty_link.rs/sstv_link.rs -- decode only while the
-                // Digital window is open AND that decoder is the selected
-                // mode (only one of the two ever runs at a time); closing
-                // the window also disarms RTTY TX.
+                // See rtty_link.rs/sstv_link.rs/rade_link.rs -- decode
+                // only while the Digital window is open AND that decoder
+                // is the selected mode (only one of the three ever runs
+                // at a time); closing the window, OR switching the Mode
+                // tab away from a decoder, also disarms its TX.
+                //
+                // ROOT CAUSE FIX for a real report: this used to only
+                // disarm on the window CLOSING, not on switching tabs
+                // while it stayed open -- so arming "RTTY TX", then
+                // switching to the RADE tab without ever touching RTTY's
+                // own button again, left rtty.tx_armed() silently true.
+                // tx.rs's source-selection chain checks rtty.tx_armed()
+                // BEFORE rade.tx_armed(), so RTTY's idle-mark tone (a
+                // single steady carrier -- easy to mistake for a plain
+                // unmodulated carrier, not obviously "RTTY") silently
+                // hijacked every subsequent transmission regardless of
+                // which mode the operator thought they had armed, and
+                // rade.fill_tx was never even called (confirmed: not one
+                // of its own once-a-second diagnostic log lines showed up
+                // during a real TX test).
                 connected.spectrum.set_rtty(&connected.rtty);
                 connected.rtty.set_rx_enabled(
                     connected.show_digital_window && connected.digital_mode == DigitalMode::Rtty,
                 );
-                if !connected.show_digital_window {
+                if !connected.show_digital_window || connected.digital_mode != DigitalMode::Rtty {
                     connected.rtty.set_tx_armed(false);
                 }
                 connected.spectrum.set_sstv(&connected.sstv);
                 connected.sstv.set_rx_enabled(
                     connected.show_digital_window && connected.digital_mode == DigitalMode::Sstv,
                 );
+                connected.spectrum.set_rade(&connected.rade);
+                connected.rade.set_rx_enabled(
+                    connected.show_digital_window && connected.digital_mode == DigitalMode::Rade,
+                );
+                if !connected.show_digital_window || connected.digital_mode != DigitalMode::Rade {
+                    connected.rade.set_tx_armed(false);
+                }
                 // Zoom should keep the CTUN'd listen frequency (where the
                 // filter/passband actually is) centered, not the parked
                 // hardware LO -- otherwise the filter drifts toward one
@@ -6534,6 +6575,34 @@ impl eframe::App for HpsdrApp {
                             );
                         }
                     }
+                    // RADE V1 tuning reference -- the modem's own tone
+                    // band edges (~1060-1880 Hz, same figure
+                    // render_rade_panel's Fit Filter button and its own
+                    // hover text use -- confirmed against SDRoxide's own
+                    // RADE panel hint text), same sign-aware placement as
+                    // the RTTY/SSTV cursors just above. A per-user
+                    // request after those two already had one and RADE
+                    // didn't yet.
+                    if connected.show_digital_window && connected.digital_mode == DigitalMode::Rade {
+                        let sign = if matches!(current_mode, spectrum::Mode::Lsb | spectrum::Mode::Digl) {
+                            -1.0
+                        } else {
+                            1.0
+                        };
+                        let x_low = x_for_offset(sign * 1060.0 + ctun_offset_hz);
+                        let x_high = x_for_offset(sign * 1880.0 + ctun_offset_hz);
+                        let x_center = x_for_offset(sign * 1470.0 + ctun_offset_hz);
+                        for (x, color, width) in [
+                            (x_low, egui::Color32::from_rgb(90, 200, 220), 1.5),
+                            (x_high, egui::Color32::from_rgb(90, 200, 220), 1.5),
+                            (x_center, egui::Color32::from_rgb(70, 170, 255), 1.0),
+                        ] {
+                            ui.painter().line_segment(
+                                [egui::pos2(x, rect.top()), egui::pos2(x, rect.bottom())],
+                                egui::Stroke::new(width, color),
+                            );
+                        }
+                    }
 
                     // Label shown in RF space when a transverter is active
                     // (see xvtr_rf_offset_hz's doc comment above) -- tick
@@ -6924,6 +6993,29 @@ impl eframe::App for HpsdrApp {
                                 (x_sync, egui::Color32::from_rgb(180, 90, 220), 1.5),
                                 (x_white, egui::Color32::from_rgb(180, 90, 220), 1.5),
                                 (x_black, egui::Color32::from_rgb(70, 170, 255), 1.0),
+                            ] {
+                                ui.painter().line_segment(
+                                    [egui::pos2(x, rect.top()), egui::pos2(x, rect.bottom())],
+                                    egui::Stroke::new(width, color),
+                                );
+                            }
+                        }
+                        // RADE tuning reference, mirrored onto the
+                        // waterfall too -- see the spectrum trace's
+                        // identical block above.
+                        if connected.show_digital_window && connected.digital_mode == DigitalMode::Rade {
+                            let sign = if matches!(current_mode, spectrum::Mode::Lsb | spectrum::Mode::Digl) {
+                                -1.0
+                            } else {
+                                1.0
+                            };
+                            let x_low = x_for_offset(sign * 1060.0 + ctun_offset_hz);
+                            let x_high = x_for_offset(sign * 1880.0 + ctun_offset_hz);
+                            let x_center = x_for_offset(sign * 1470.0 + ctun_offset_hz);
+                            for (x, color, width) in [
+                                (x_low, egui::Color32::from_rgb(90, 200, 220), 1.5),
+                                (x_high, egui::Color32::from_rgb(90, 200, 220), 1.5),
+                                (x_center, egui::Color32::from_rgb(70, 170, 255), 1.0),
                             ] {
                                 ui.painter().line_segment(
                                     [egui::pos2(x, rect.top()), egui::pos2(x, rect.bottom())],
@@ -10147,6 +10239,7 @@ impl eframe::App for HpsdrApp {
                                                         Arc::clone(&connected.session.tx_audio_source),
                                                         connected.spectrum.report_recorder.clone(),
                                                         connected.rtty.clone(),
+                                                        connected.rade.clone(),
                                                         Arc::clone(&connected.session.tci_wants_mic),
                                                         Arc::clone(&connected.session.tx_iq),
                                                         Arc::clone(&tx_spectrum_iq),
@@ -11564,15 +11657,19 @@ impl eframe::App for HpsdrApp {
                     }
                     let rtty = connected.rtty.clone();
                     let sstv = connected.sstv.clone();
+                    let rade = connected.rade.clone();
                     let tx_available = connected.tx_enabled && connected.tx_handle.is_some();
                     let mox = connected.session.mox.load(Ordering::Relaxed);
                     let mode = connected.spectrum.mode();
                     let tx_input = &mut connected.rtty_tx_input;
                     let sstv_texture = &mut connected.sstv_texture;
                     let sstv_texture_image_id = &mut connected.sstv_texture_image_id;
+                    let rade_callsign = &mut connected.rade_callsign;
+                    let tx_handle_ref = connected.tx_handle.as_ref();
                     let mut digital_mode = connected.digital_mode;
                     let mut fit_filter_clicked = false;
                     let mut sstv_fit_filter_clicked = false;
+                    let mut rade_fit_filter_clicked = false;
                     ui.ctx().show_viewport_immediate(
                         egui::ViewportId::from_hash_of("digital_modes_window"),
                         digital_viewport,
@@ -11616,6 +11713,15 @@ impl eframe::App for HpsdrApp {
                                         {
                                             digital_mode = DigitalMode::Sstv;
                                         }
+                                        if ui
+                                            .add(egui::Button::selectable(
+                                                digital_mode == DigitalMode::Rade,
+                                                "RADE",
+                                            ))
+                                            .clicked()
+                                        {
+                                            digital_mode = DigitalMode::Rade;
+                                        }
                                     });
                                     ui.separator();
                                     match digital_mode {
@@ -11636,6 +11742,15 @@ impl eframe::App for HpsdrApp {
                                                 &sstv,
                                                 sstv_texture,
                                                 sstv_texture_image_id,
+                                            );
+                                        }
+                                        DigitalMode::Rade => {
+                                            rade_fit_filter_clicked = render_rade_panel(
+                                                ui,
+                                                &rade,
+                                                rade_callsign,
+                                                mox,
+                                                tx_handle_ref,
                                             );
                                         }
                                     }
@@ -11683,6 +11798,28 @@ impl eframe::App for HpsdrApp {
                         let margin = 100.0;
                         let low = 1200.0 - margin;
                         let high = 2300.0 + margin;
+                        let passband = if matches!(mode, spectrum::Mode::Lsb | spectrum::Mode::Digl) {
+                            (-high, -low)
+                        } else {
+                            (low, high)
+                        };
+                        connected.spectrum.set_explicit_passband(Some(passband));
+                        if let Some(tx) = &connected.tx_handle {
+                            tx.set_explicit_passband(Some(passband));
+                        }
+                        settings_changed = true;
+                    }
+                    if rade_fit_filter_clicked {
+                        // Same explicit_passband mechanism as RTTY/SSTV's
+                        // own Fit Filter -- RADE V1's band is fixed too
+                        // (~1060-1880 Hz, confirmed against SDRoxide's own
+                        // RADE panel hint text: "RADE V1 occupies roughly
+                        // 1060-1880 Hz of the passband"), not a
+                        // per-signal setting, so there is nothing from
+                        // rade_link.rs to read here either.
+                        let margin = 50.0;
+                        let low = 1060.0 - margin;
+                        let high = 1880.0 + margin;
                         let passband = if matches!(mode, spectrum::Mode::Lsb | spectrum::Mode::Digl) {
                             (-high, -low)
                         } else {
@@ -11783,6 +11920,7 @@ impl eframe::App for HpsdrApp {
                         mode: Some(connected.spectrum.mode()),
                         width_hz: Some(connected.spectrum.width_hz()),
                         rtty: Some(connected.rtty.settings()),
+                        rade_callsign: Some(connected.rade_callsign.clone()),
                         gain: Some(connected.spectrum.gain()),
                         audio_output_device: connected.audio_output_device.clone(),
                         mic_input_device: connected.mic_input_device.clone(),
@@ -12667,6 +12805,150 @@ fn render_sstv_panel(
     // Same repaint cadence as render_digital_panel -- an SSTV picture takes
     // many seconds to arrive, so a few redraws a second is still a smooth
     // progressive fill, not a stepping one.
+    ui.ctx().request_repaint_after(Duration::from_millis(300));
+    fit_filter_clicked
+}
+
+/// RADE V1 (FreeDV neural digital voice) panel. RX/TX both live -- see
+/// rade_link.rs's own module doc comment: unlike RTTY/SSTV, which only
+/// ever add a text/image side-channel, RADE's decoded speech REPLACES the
+/// normal demodulated audio in the speaker/TCI output while this mode is
+/// selected (spectrum.rs's own rade_rx-gated block), and its TX modulates
+/// the real microphone rather than typed text.
+fn render_rade_panel(
+    ui: &mut egui::Ui,
+    rade: &rade_link::RadeHandle,
+    callsign: &mut String,
+    mox: bool,
+    tx_handle: Option<&TxHandle>,
+) -> bool {
+    let mut fit_filter_clicked = false;
+    let amber = egui::Color32::from_rgb(230, 150, 50);
+    let red = egui::Color32::from_rgb(220, 50, 50);
+    let green = egui::Color32::from_rgb(40, 190, 70);
+
+    if !rade.available() {
+        ui.colored_label(
+            red,
+            "RADE failed to start this session (see the log) -- this mode is unavailable until the app is restarted.",
+        );
+        return false;
+    }
+
+    ui.horizontal(|ui| {
+        ui.label("My Call:");
+        let resp = ui.add(
+            egui::TextEdit::singleline(callsign)
+                .desired_width(100.0)
+                .char_limit(rade::text::MAX_CHARS)
+                .hint_text("(none)"),
+        );
+        if resp.lost_focus() || resp.changed() {
+            rade.set_callsign(callsign);
+        }
+        ui.add_space(8.0);
+        // Same explicit_passband mechanism as RTTY/SSTV's own Fit Filter
+        // -- see this panel's own call site for the fixed band this sets.
+        if ui
+            .button("Fit Filter")
+            .on_hover_text("Narrow the RX/TX filter to RADE V1's own tone band (~1060-1880 Hz)")
+            .clicked()
+        {
+            fit_filter_clicked = true;
+        }
+    });
+
+    // Mic-side leveler/compressor -- rade_mic_agc.rs, modeled on FreeDV
+    // GUI's own mic conditioning (see that module's doc comment: it acts
+    // on the raw microphone before the RADE modem ever sees it, NEVER on
+    // the modulated tones, which is why these are separate from and
+    // don't touch Settings -> TX's ordinary Leveler/Compressor/CFC).
+    if let Some(tx) = tx_handle {
+        ui.horizontal(|ui| {
+            ui.label("Mic conditioning:");
+            let mut lev = tx.rade_leveler_enabled();
+            if ui
+                .checkbox(&mut lev, "Leveler")
+                .on_hover_text(
+                    "Rides the mic gain toward a consistent level before the vocoder -- \
+                     FreeDV's own AgcStep, ported here",
+                )
+                .changed()
+            {
+                tx.set_rade_leveler_enabled(lev);
+            }
+            let mut comp = tx.rade_compressor_enabled();
+            if ui
+                .checkbox(&mut comp, "Compressor")
+                .on_hover_text(
+                    "Soft-knee compressor/limiter on the mic, same idea as FreeDV GUI's own",
+                )
+                .changed()
+            {
+                tx.set_rade_compressor_enabled(comp);
+            }
+        });
+    }
+
+    let st = rade.stats();
+    ui.horizontal(|ui| {
+        let (rect, _) = ui.allocate_exact_size(egui::vec2(14.0, 14.0), egui::Sense::hover());
+        ui.painter().circle_filled(rect.center(), 6.0, if st.sync { green } else { amber });
+        ui.label(if st.sync { "SYNC" } else { "no sync" });
+        if st.sync {
+            ui.label(format!("SNR {:.0} dB", st.snr_db));
+            ui.label(format!("offset {:+.0} Hz", st.freq_offset_hz));
+        }
+        ui.add(
+            egui::ProgressBar::new(st.rx_level.clamp(0.0, 1.0))
+                .desired_width(100.0)
+                .text("RX level"),
+        );
+        if st.dropped > 0 {
+            ui.colored_label(amber, format!("{} samples dropped", st.dropped));
+        }
+    });
+
+    ui.horizontal(|ui| {
+        let armed = rade.tx_armed();
+        if ui
+            .add(egui::Button::selectable(armed, "RADE TX"))
+            .on_hover_text(
+                "While on, keying MOX/PTT transmits the microphone through the RADE V1 \
+                 modem instead of ordinary SSB",
+            )
+            .clicked()
+        {
+            rade.set_tx_armed(!armed);
+        }
+        if armed && mox {
+            ui.colored_label(red, "ON AIR");
+        }
+        if ui.button("Reset RX").on_hover_text("Drop sync and start hunting again").clicked() {
+            rade.reset_rx();
+        }
+        if ui.button("Clear Log").clicked() {
+            rade.clear_rx_log();
+        }
+    });
+    ui.separator();
+    ui.label("Received callsigns:");
+    let log = rade.rx_log();
+    let rx_height = (ui.available_height() - 4.0).max(60.0);
+    egui::ScrollArea::vertical()
+        .id_salt("rade_rx_log")
+        .max_height(rx_height)
+        .auto_shrink([false, false])
+        .stick_to_bottom(true)
+        .show(ui, |ui| {
+            if log.is_empty() {
+                ui.weak("(none yet)");
+            }
+            for entry in &log {
+                ui.label(format!("{}  (SNR {:.0} dB)", entry.call, entry.snr_db));
+            }
+        });
+
     ui.ctx().request_repaint_after(Duration::from_millis(300));
     fit_filter_clicked
 }

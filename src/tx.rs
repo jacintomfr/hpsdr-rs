@@ -64,6 +64,8 @@
 */
 
 use crate::report_recorder::ReportRecorder;
+use crate::rade_link::RadeHandle;
+use crate::rade_mic_agc::{RadeCompressor, RadeLeveler};
 use crate::rtty_link::RttyHandle;
 use crate::radio::{
     CwKeyerAtomics, IqSample, TX_AUDIO_SOURCE_LOCAL_MIC, TX_AUDIO_SOURCE_RADIO_MIC,
@@ -484,6 +486,16 @@ pub struct TxParams {
     /// CFC_FREQ_HZ/CFC_DEFAULT_LVL_DB/CFC_DEFAULT_POST_DB below -- not a
     /// user-editable curve yet).
     pub cfc_enabled: bool,
+    /// RADE-only mic conditioning (rade_mic_agc.rs) -- see that module's
+    /// own doc comment for why these are separate controls from
+    /// leveler_enabled/compressor_enabled above rather than reusing them:
+    /// those act on the TX audio chain AFTER RADE has already replaced it
+    /// with modulated tones (a real report: running them there broke RX
+    /// at the far end), while these act on the raw microphone BEFORE
+    /// RadeWorker ever sees it, matching where FreeDV GUI's own
+    /// leveler/compressor actually run.
+    pub rade_leveler_enabled: bool,
+    pub rade_compressor_enabled: bool,
 }
 
 /// deskHPSDR transmitter.c's own default CFC band table (tx->cfc_freq[1..12]) --
@@ -537,6 +549,10 @@ impl Default for TxParams {
             // starting point; harmless while compressor_enabled is false.
             compressor_gain_db: 10.0,
             cfc_enabled: false,
+            // Off by default, same "explicit opt-in" reasoning as the
+            // analog leveler/compressor just above.
+            rade_leveler_enabled: false,
+            rade_compressor_enabled: false,
             explicit_passband: None,
         }
     }
@@ -1925,6 +1941,12 @@ fn run(
     // the normal source selection (checked right after REC/PLAY's
     // playback, same injection point and reasoning).
     rtty: RttyHandle,
+    // RADE "virtual mic" -- see rade_link.rs. Unlike rtty above (which
+    // synthesizes its own tones from typed text, no mic dependency),
+    // RADE modulates the REAL microphone through its neural codec+modem,
+    // so this branch reads mic_buffer itself rather than replacing the
+    // source selection outright -- see its own call site below.
+    rade: RadeHandle,
     // Set by tci.rs's `trx` command handler from that command's optional
     // signal-source argument (spec section 4.2) -- true only when a TCI
     // client explicitly names a non-"tci" source. Consulted only by the
@@ -2010,6 +2032,22 @@ fn run(
     let mut last_read_at: Option<Instant> = None;
     let mut read_max_gap = Duration::ZERO;
     let mut chunks_this_window: u32 = 0;
+    // TEMPORARY diagnostic for a real report of no RF output specifically
+    // while RADE TX is armed (SSB TX confirmed fine on the same setup) --
+    // logs the mic input level RADE is actually seeing and the modulated
+    // level coming back out of it, once a second, so the next real test
+    // shows exactly which side of rade.fill_tx the signal goes missing
+    // on. Remove once the report is resolved.
+    let mut rade_mic_peak: f32 = 0.0;
+    let mut rade_out_peak: f32 = 0.0;
+    let mut rade_out_nonzero_chunks: u32 = 0;
+    let mut rade_chunks_this_window: u32 = 0;
+    // Mic-side leveler/compressor for RADE TX -- see rade_mic_agc.rs's
+    // own module doc comment. Persistent across the whole session (not
+    // recreated per over) so the leveler's gain carries between
+    // transmissions the same way FreeDV's own AgcStep does.
+    let mut rade_leveler = RadeLeveler::new();
+    let mut rade_compressor = RadeCompressor::new();
 
     // Mirrors AudioOutput's own SLEW_RAMP_SECS in audio.rs (see that
     // constant's doc comment for the full reasoning): every source
@@ -2322,6 +2360,53 @@ fn run(
             // See rtty_link.rs -- AFSK tones (idle mark when nothing is
             // queued) in place of mic/TCI audio.
             rtty.fill_tx(&mut chunk);
+        } else if rade.tx_armed() {
+            // See rade_link.rs/rade's own field doc comment above --
+            // real mic audio in, RADE-modulated tone audio out. Reads
+            // mic_buffer directly (same "silence on underrun" policy as
+            // TX_AUDIO_SOURCE_LOCAL_MIC below) rather than going through
+            // the tx_audio_source dispatch: RADE is a digital-voice
+            // MODE, not a TX-audio SOURCE selection, so it always uses
+            // the local mic regardless of what Settings -> TX has
+            // picked (matching how rtty.tx_armed() above also bypasses
+            // that selection entirely).
+            let mut buf = mic_buffer.lock().unwrap();
+            if buf.len() < TX_BUFFER_SIZE {
+                starved_chunks_this_window += 1;
+            }
+            let mut mic_chunk = vec![0.0f32; chunk.len()];
+            for slot in mic_chunk.iter_mut() {
+                *slot = buf.pop_front().unwrap_or(0.0);
+            }
+            drop(buf);
+            // Mic-side conditioning (rade_mic_agc.rs), BEFORE the modem
+            // ever sees it -- see TxParams::rade_leveler_enabled's own
+            // doc comment for why these are separate from, and must run
+            // before, the ordinary WDSP Leveler/Compressor further down
+            // (which by this point in the chain would be acting on
+            // RADE's already-modulated tones, not speech). Leveler
+            // first, matching the reference's own pipeline order: get a
+            // consistent level, then guard the peaks.
+            let (rade_lev_on, rade_comp_on) = {
+                let p = params.lock().unwrap();
+                (p.rade_leveler_enabled, p.rade_compressor_enabled)
+            };
+            if rade_lev_on {
+                rade_leveler.process(&mut mic_chunk, mic_rate as f64);
+            }
+            if rade_comp_on {
+                rade_compressor.process(&mut mic_chunk, mic_rate as f64);
+            }
+            rade.fill_tx(mox.load(Ordering::Relaxed), &mic_chunk, &mut chunk);
+            // See rade_mic_peak's own doc comment above.
+            let mic_peak = mic_chunk.iter().fold(0.0f32, |a, &s| a.max(s.abs()));
+            let out_peak = chunk.iter().fold(0.0f32, |a, &s| a.max(s.abs()));
+            rade_mic_peak = rade_mic_peak.max(mic_peak);
+            rade_out_peak = rade_out_peak.max(out_peak);
+            if out_peak > 0.0 {
+                rade_out_nonzero_chunks += 1;
+            }
+            rade_chunks_this_window += 1;
         } else {
         let selected_source = tx_audio_source.load(Ordering::Relaxed);
         if selected_source == TX_AUDIO_SOURCE_RADIO_MIC {
@@ -2467,13 +2552,60 @@ fn run(
                 read_max_gap.as_secs_f64() * 1000.0,
                 chunk_interval.as_secs_f64() * 1000.0
             ));
+            if rade_chunks_this_window > 0 {
+                let st = rade.stats();
+                log_async(format!(
+                    "[rade-diag] mic_peak={rade_mic_peak:.4} out_peak={rade_out_peak:.4} \
+                     nonzero_out_chunks={rade_out_nonzero_chunks}/{rade_chunks_this_window} \
+                     tx_armed={} tx_drained={} sync={} snr_db={:.1}",
+                    rade.tx_armed(),
+                    rade.tx_drained(),
+                    st.sync,
+                    st.snr_db,
+                ));
+            }
+            rade_mic_peak = 0.0;
+            rade_out_peak = 0.0;
+            rade_out_nonzero_chunks = 0;
+            rade_chunks_this_window = 0;
             starve_window_start = Instant::now();
             starved_chunks_this_window = 0;
             chunks_this_window = 0;
             read_max_gap = Duration::ZERO;
         }
 
-        let p = *params.lock().unwrap();
+        let mut p = *params.lock().unwrap();
+        if rade.tx_armed() {
+            // ROOT CAUSE FIX for a real report: with Leveler/Compressor/
+            // CFC on, the carrier intermittently "oscillated" and broke
+            // RX at the far end; removing all three made it rock solid
+            // (at the cost of average power, 10W -> 3W -- expected, not
+            // a bug, see below). Those three are dynamics processors
+            // built for VOICE -- they track and reshape an audio
+            // envelope for intelligibility, which is exactly what must
+            // NOT happen to RADE's "audio": it is not speech, it is a
+            // multi-tone/OFDM-like modem waveform whose amplitude
+            // relationships between tones ARE the signal, encoding what
+            // the receiver's neural decoder is trying to recover. Any
+            // nonlinear reshaping of that envelope is exactly the kind
+            // of distortion that breaks lock at the far end -- the same
+            // reason every other digital mode (RTTY, PSK31, FT8, ...) is
+            // operated barefoot, no audio processing, on any radio.
+            // Forced here rather than left as an operator reminder: RADE
+            // is armed from its own dedicated button, a natural place to
+            // also guarantee the audio chain it modulates through is
+            // clean, the same way rtty.tx_armed() above already bypasses
+            // the mic/TCI source selection entirely for its own tones.
+            // The resulting lower average power (a compressor's whole
+            // point is raising average level within the same peak/ALC
+            // ceiling a raw high-crest-factor waveform can't reach) is
+            // correct behavior, not a regression -- RADE's own AGC/
+            // sync tracking at the far end is built around a clean,
+            // unprocessed signal at whatever power that leaves.
+            p.leveler_enabled = false;
+            p.compressor_enabled = false;
+            p.cfc_enabled = false;
+        }
         let (iq, exch_error) = processor.process(
             &chunk,
             p.mode,
@@ -2650,6 +2782,8 @@ impl TxHandle {
         // See run()'s doc comment on the parameter of the same name.
         rtty: RttyHandle,
         // See run()'s doc comment on the parameter of the same name.
+        rade: RadeHandle,
+        // See run()'s doc comment on the parameter of the same name.
         tci_wants_mic: Arc<AtomicBool>,
         tx_iq_out: Arc<Mutex<VecDeque<f32>>>,
         // See run()'s doc comment on the parameter of the same name.
@@ -2698,7 +2832,7 @@ impl TxHandle {
             let cw_text_busy = Arc::clone(&cw_text_busy);
             thread::spawn(move || {
                 run(
-                    mic_buffer, tci_tx_audio, radio_mic_audio, tx_audio_source, report_recorder, rtty, tci_wants_mic,
+                    mic_buffer, tci_tx_audio, radio_mic_audio, tx_audio_source, report_recorder, rtty, rade, tci_wants_mic,
                     tx_iq_out, tx_spectrum_iq, tx_audio_monitor, waveform_tap, mox, params, display, channel,
                     protocol, mic_rate, duc_rate, puresignal_enabled, ps_rx_feedback_iq, ps_tx_feedback_iq,
                     ps_params, ps_status, ps_corr_path, cw_keyer, cw_text_elements, cw_text_active, cw_text_busy, stop,
@@ -2880,6 +3014,21 @@ impl TxHandle {
     }
     pub fn set_cfc_enabled(&self, enabled: bool) {
         self.params.lock().unwrap().cfc_enabled = enabled;
+    }
+
+    /// See TxParams::rade_leveler_enabled's doc comment.
+    pub fn rade_leveler_enabled(&self) -> bool {
+        self.params.lock().unwrap().rade_leveler_enabled
+    }
+    pub fn set_rade_leveler_enabled(&self, enabled: bool) {
+        self.params.lock().unwrap().rade_leveler_enabled = enabled;
+    }
+    /// See TxParams::rade_compressor_enabled's doc comment.
+    pub fn rade_compressor_enabled(&self) -> bool {
+        self.params.lock().unwrap().rade_compressor_enabled
+    }
+    pub fn set_rade_compressor_enabled(&self, enabled: bool) {
+        self.params.lock().unwrap().rade_compressor_enabled = enabled;
     }
 
     pub fn set_ps_enabled(&self, enabled: bool) {
