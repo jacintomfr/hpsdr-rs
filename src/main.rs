@@ -11446,6 +11446,7 @@ impl eframe::App for HpsdrApp {
                     let mox = connected.session.mox.load(Ordering::Relaxed);
                     let mode = connected.spectrum.mode();
                     let tx_input = &mut connected.rtty_tx_input;
+                    let mut fit_filter_clicked = false;
                     ui.ctx().show_viewport_immediate(
                         egui::ViewportId::from_hash_of("digital_modes_window"),
                         digital_viewport,
@@ -11469,10 +11470,26 @@ impl eframe::App for HpsdrApp {
                                 .frame(egui::Frame::central_panel(&light_style))
                                 .show(ui, |ui| {
                                     ui.visuals_mut().clone_from(&light_visuals);
-                                    render_digital_panel(ui, &rtty, tx_input, tx_available, mox, mode);
+                                    fit_filter_clicked =
+                                        render_digital_panel(ui, &rtty, tx_input, tx_available, mox, mode);
                                 });
                         },
                     );
+                    if fit_filter_clicked {
+                        let s = connected.rtty.settings();
+                        // Half-shift margin on each side plus a fixed
+                        // 200Hz so the matched filters (which themselves
+                        // need a little roll-off room) aren't sitting
+                        // right at the RX filter's own edge.
+                        let needed = s.center_hz + s.shift_hz / 2.0 + 200.0;
+                        let width = needed.clamp(50.0, 5000.0);
+                        connected.spectrum.set_width_hz(width);
+                        if let Some(tx) = &connected.tx_handle {
+                            tx.set_width_hz(width);
+                        }
+                        connected.width_memory.insert(mode.label().to_string(), width);
+                        settings_changed = true;
+                    }
                     if close_requested {
                         connected.show_digital_window = false;
                     }
@@ -12114,6 +12131,10 @@ fn render_cw_decoder_panel(ui: &mut egui::Ui, spectrum: &SpectrumHandle) {
 /// Content of the "Digital..." window -- a mode picker (RTTY only for
 /// now; further digital modes slot in beside it) plus the RTTY
 /// decoder/encoder controls. See rtty_link.rs for how RX/TX are wired.
+/// Returns true if "Fit Filter" was clicked this frame -- the caller
+/// applies it (widening the RX/TX filter to cover the mark/space tone
+/// pair) since that touches `connected.spectrum`/`tx_handle`, which
+/// aren't available inside this panel.
 fn render_digital_panel(
     ui: &mut egui::Ui,
     rtty: &rtty_link::RttyHandle,
@@ -12121,7 +12142,8 @@ fn render_digital_panel(
     tx_available: bool,
     mox: bool,
     mode: spectrum::Mode,
-) {
+) -> bool {
+    let mut fit_filter_clicked = false;
     let amber = egui::Color32::from_rgb(230, 150, 50);
     let red = egui::Color32::from_rgb(220, 50, 50);
     let green = egui::Color32::from_rgb(40, 190, 70);
@@ -12154,6 +12176,21 @@ fn render_digital_panel(
         ui.add_space(8.0);
         ui.checkbox(&mut s.reverse, "Reverse");
         ui.checkbox(&mut s.afc, "AFC");
+        ui.add_space(8.0);
+        // A real report: the RX filter defaults/sliders were left
+        // narrower than center_hz+shift_hz/2, so WDSP's own passband
+        // filter was cutting the mark tone before it ever reached
+        // RttyRx -- the cursors were correctly positioned, the filter
+        // just didn't cover them. One click sets Filter width to the
+        // tone pair's own span plus a fixed margin, matching how
+        // SDRoxide keeps its RTTY filter wide enough by construction.
+        if ui
+            .button("Fit Filter")
+            .on_hover_text("Widen the RX/TX filter to cover the mark/space tone pair")
+            .clicked()
+        {
+            fit_filter_clicked = true;
+        }
     });
     rtty.set_settings(s);
 
@@ -12235,6 +12272,7 @@ fn render_digital_panel(
         });
     });
     ui.ctx().request_repaint_after(Duration::from_millis(100));
+    fit_filter_clicked
 }
 
 /// Draws the CW decoder panel pinned to exactly `rect` (the caller
