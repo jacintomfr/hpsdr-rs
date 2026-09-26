@@ -65,6 +65,7 @@
 
 use crate::report_recorder::ReportRecorder;
 use crate::rade_link::RadeHandle;
+use crate::rade_denoiser::RadeDenoiser;
 use crate::rade_mic_agc::{RadeCompressor, RadeLeveler};
 use crate::rtty_link::RttyHandle;
 use crate::radio::{
@@ -496,6 +497,22 @@ pub struct TxParams {
     /// leveler/compressor actually run.
     pub rade_leveler_enabled: bool,
     pub rade_compressor_enabled: bool,
+    /// RNNoise (rade_denoiser.rs) -- the same noise-reduction stage
+    /// FreeDV's own mic pipeline applies (tmiw/freedv-backend's
+    /// RNNoiseStep), confirmed by reading that source directly. Runs
+    /// first in the RADE mic chain, before the Leveler -- so the
+    /// leveler's own loudness measurement reads the cleaned signal, not
+    /// the noisy one.
+    pub rade_denoiser_enabled: bool,
+    /// General-purpose TX noise reduction (also rade_denoiser.rs's
+    /// RNNoise stage, a separate instance from the RADE-only one above)
+    /// -- for ordinary analog voice, not RADE. A per-user request after
+    /// hearing what it does for RADE's mic path: RNNoise itself has
+    /// nothing RADE-specific about it, so the same cleanup is just as
+    /// applicable to normal SSB/FM microphone audio. Lives in Settings
+    /// -> TX alongside leveler_enabled/compressor_enabled/cfc_enabled
+    /// above (same menu, per that request), NOT in the RADE panel.
+    pub tx_denoiser_enabled: bool,
 }
 
 /// deskHPSDR transmitter.c's own default CFC band table (tx->cfc_freq[1..12]) --
@@ -553,6 +570,8 @@ impl Default for TxParams {
             // analog leveler/compressor just above.
             rade_leveler_enabled: false,
             rade_compressor_enabled: false,
+            rade_denoiser_enabled: false,
+            tx_denoiser_enabled: false,
             explicit_passband: None,
         }
     }
@@ -2048,6 +2067,10 @@ fn run(
     // transmissions the same way FreeDV's own AgcStep does.
     let mut rade_leveler = RadeLeveler::new();
     let mut rade_compressor = RadeCompressor::new();
+    let mut rade_denoiser = RadeDenoiser::new();
+    // See tx_denoiser_enabled's own call site doc comment -- a separate
+    // instance from rade_denoiser above, for ordinary analog voice.
+    let mut tx_denoiser = RadeDenoiser::new();
 
     // Mirrors AudioOutput's own SLEW_RAMP_SECS in audio.rs (see that
     // constant's doc comment for the full reasoning): every source
@@ -2341,6 +2364,7 @@ fn run(
         }
         last_read_at = Some(read_now);
 
+        let tx_denoiser_enabled = params.lock().unwrap().tx_denoiser_enabled;
         if report_recorder.is_playing() {
             // See report_recorder's own doc comment above -- takes
             // priority over the normal source selection while active.
@@ -2387,10 +2411,16 @@ fn run(
             // RADE's already-modulated tones, not speech). Leveler
             // first, matching the reference's own pipeline order: get a
             // consistent level, then guard the peaks.
-            let (rade_lev_on, rade_comp_on) = {
+            let (rade_denoise_on, rade_lev_on, rade_comp_on) = {
                 let p = params.lock().unwrap();
-                (p.rade_leveler_enabled, p.rade_compressor_enabled)
+                (p.rade_denoiser_enabled, p.rade_leveler_enabled, p.rade_compressor_enabled)
             };
+            // Denoise first -- so the leveler's own loudness measurement
+            // (and the compressor's envelope) reads the cleaned signal,
+            // matching FreeDV's own pipeline order.
+            if rade_denoise_on {
+                rade_denoiser.process(&mut mic_chunk);
+            }
             if rade_lev_on {
                 rade_leveler.process(&mut mic_chunk, mic_rate as f64);
             }
@@ -2503,6 +2533,24 @@ fn run(
                     *slot = buf.pop_front().unwrap_or(0.0); // silence on underrun, not silence on stall
                 }
             }
+        }
+        // Optional TX noise reduction -- same RNNoise stage RADE's own
+        // mic conditioning uses (rade_denoiser.rs/render_rade_panel's
+        // "Noise Reduction"), a per-user request to make it available
+        // for ordinary analog voice too, not just RADE: it's a general
+        // speech denoiser with nothing RADE-specific about it. Lives in
+        // this branch specifically (report_recorder/RTTY/RADE above are
+        // all excluded) so it only ever touches genuine live analog
+        // voice -- never a WAV replay, RTTY's AFSK tones, or RADE's own
+        // already-modulated waveform, any of which this would corrupt
+        // the same way running the ordinary Leveler/Compressor on
+        // RADE's tones did (see TxParams::rade_leveler_enabled's own
+        // doc comment for that real report). Its own separate instance/
+        // toggle from RADE's, not shared -- the two are never active at
+        // the same time, but keeping them apart avoids one path's
+        // buffered state leaking into the other's.
+        if tx_denoiser_enabled {
+            tx_denoiser.process(&mut chunk);
         }
         }
         // See tx_slew_current's doc comment above -- smooths over any
@@ -3029,6 +3077,20 @@ impl TxHandle {
     }
     pub fn set_rade_compressor_enabled(&self, enabled: bool) {
         self.params.lock().unwrap().rade_compressor_enabled = enabled;
+    }
+    /// See TxParams::rade_denoiser_enabled's doc comment.
+    pub fn rade_denoiser_enabled(&self) -> bool {
+        self.params.lock().unwrap().rade_denoiser_enabled
+    }
+    pub fn set_rade_denoiser_enabled(&self, enabled: bool) {
+        self.params.lock().unwrap().rade_denoiser_enabled = enabled;
+    }
+    /// See TxParams::tx_denoiser_enabled's doc comment.
+    pub fn tx_denoiser_enabled(&self) -> bool {
+        self.params.lock().unwrap().tx_denoiser_enabled
+    }
+    pub fn set_tx_denoiser_enabled(&self, enabled: bool) {
+        self.params.lock().unwrap().tx_denoiser_enabled = enabled;
     }
 
     pub fn set_ps_enabled(&self, enabled: bool) {

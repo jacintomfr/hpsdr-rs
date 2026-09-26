@@ -44,6 +44,8 @@
 
 #[path = "build_rade.rs"]
 mod build_rade;
+#[path = "build_rnnoise.rs"]
+mod build_rnnoise;
 
 fn main() {
     // ROOT CAUSE FIX for a real report ("cannot open input file
@@ -365,6 +367,7 @@ fn main() {
     embed_windows_icon();
 
     build_rade::build();
+    build_rnnoise::build();
 }
 
 // winresource (a maintained fork of the abandoned `winres` crate) is only

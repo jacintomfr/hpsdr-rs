@@ -29,6 +29,16 @@ pub struct Config {
     /// callsign is sent (a well-formed but identity-less over).
     #[serde(default)]
     pub rade_callsign: Option<String>,
+    /// RADE's own mic conditioning (Noise Reduction/Leveler/Compressor,
+    /// render_rade_panel) -- see tx::TxParams::rade_denoiser_enabled's
+    /// doc comment for why these are separate from tx_denoiser_enabled/
+    /// tx_leveler_enabled/tx_compressor_enabled above.
+    #[serde(default)]
+    pub rade_denoiser_enabled: Option<bool>,
+    #[serde(default)]
+    pub rade_leveler_enabled: Option<bool>,
+    #[serde(default)]
+    pub rade_compressor_enabled: Option<bool>,
     /// Output device for local RX audio playback (Settings -> Audio's
     /// "Output device" picker), by name -- e.g. "CABLE Input (VB-Audio
     /// Virtual Cable)" to feed a decoder instead of/alongside real
@@ -196,6 +206,11 @@ pub struct Config {
     pub tx_compressor_gain_db: Option<f32>,
     #[serde(default)]
     pub tx_cfc_enabled: Option<bool>,
+    /// RNNoise TX noise reduction -- see tx::TxParams::tx_denoiser_enabled's
+    /// doc comment. Ordinary analog voice only, separate from RADE's own
+    /// (rade_denoiser_enabled below).
+    #[serde(default)]
+    pub tx_denoiser_enabled: Option<bool>,
     /// Gain applied specifically to TX audio received from a TCI
     /// client (WSJT-X, TCI Remote, etc.), independent of mic_gain
     /// above -- see radio::RadioSession::tci_tx_gain's doc comment for

@@ -29,6 +29,7 @@ mod radioberry_juice;
 mod report_recorder;
 mod rigctl;
 mod rade;
+mod rade_denoiser;
 mod rade_link;
 mod rade_mic_agc;
 mod rtty;
@@ -2836,6 +2837,18 @@ fn connect_to_device(device: Device, cfg: &Config) -> Result<ConnectedState, Str
                     }
                     if let Some(v) = cfg.tx_cfc_enabled {
                         tx_handle.set_cfc_enabled(v);
+                    }
+                    if let Some(v) = cfg.tx_denoiser_enabled {
+                        tx_handle.set_tx_denoiser_enabled(v);
+                    }
+                    if let Some(v) = cfg.rade_denoiser_enabled {
+                        tx_handle.set_rade_denoiser_enabled(v);
+                    }
+                    if let Some(v) = cfg.rade_leveler_enabled {
+                        tx_handle.set_rade_leveler_enabled(v);
+                    }
+                    if let Some(v) = cfg.rade_compressor_enabled {
+                        tx_handle.set_rade_compressor_enabled(v);
                     }
                     // Apply a previously-saved correction table
                     // immediately, if PS is enabled and one exists for
@@ -9954,6 +9967,25 @@ impl eframe::App for HpsdrApp {
                                     // TxParams::leveler_enabled/compressor_enabled's
                                     // doc comments for what each one actually does.
                                     if let Some(tx) = &connected.tx_handle {
+                                        // RNNoise -- same stage RADE's own mic
+                                        // panel uses (rade_denoiser.rs), a
+                                        // separate instance/toggle here for
+                                        // ordinary analog voice, per a real
+                                        // request after hearing what it does
+                                        // for RADE. See TxParams::
+                                        // tx_denoiser_enabled's doc comment.
+                                        let mut denoise = tx.tx_denoiser_enabled();
+                                        if ui
+                                            .checkbox(&mut denoise, "Noise Reduction")
+                                            .on_hover_text(
+                                                "RNNoise -- a neural denoiser on the microphone, \
+                                                 before Leveler/Compressor/CFC below",
+                                            )
+                                            .changed()
+                                        {
+                                            tx.set_tx_denoiser_enabled(denoise);
+                                            settings_changed = true;
+                                        }
                                         let mut leveler = tx.leveler_enabled();
                                         if ui
                                             .checkbox(&mut leveler, "Leveler")
@@ -11949,6 +11981,10 @@ impl eframe::App for HpsdrApp {
                         tx_compressor_enabled: connected.tx_handle.as_ref().map(|t| t.compressor_enabled()),
                         tx_compressor_gain_db: connected.tx_handle.as_ref().map(|t| t.compressor_gain_db()),
                         tx_cfc_enabled: connected.tx_handle.as_ref().map(|t| t.cfc_enabled()),
+                        tx_denoiser_enabled: connected.tx_handle.as_ref().map(|t| t.tx_denoiser_enabled()),
+                        rade_denoiser_enabled: connected.tx_handle.as_ref().map(|t| t.rade_denoiser_enabled()),
+                        rade_leveler_enabled: connected.tx_handle.as_ref().map(|t| t.rade_leveler_enabled()),
+                        rade_compressor_enabled: connected.tx_handle.as_ref().map(|t| t.rade_compressor_enabled()),
                         tci_tx_gain: Some(connected.tci_tx_gain),
                         tx_power_watts: Some(connected.session.tx_power_watts.load(Ordering::Relaxed)),
                         cw_keyer_mode: Some(connected.session.cw_keyer.mode.load(Ordering::Relaxed)),
@@ -12866,6 +12902,17 @@ fn render_rade_panel(
     if let Some(tx) = tx_handle {
         ui.horizontal(|ui| {
             ui.label("Mic conditioning:");
+            let mut denoise = tx.rade_denoiser_enabled();
+            if ui
+                .checkbox(&mut denoise, "Noise Reduction")
+                .on_hover_text(
+                    "RNNoise -- the same neural denoiser FreeDV's own mic pipeline uses, \
+                     applied before the Leveler/Compressor",
+                )
+                .changed()
+            {
+                tx.set_rade_denoiser_enabled(denoise);
+            }
             let mut lev = tx.rade_leveler_enabled();
             if ui
                 .checkbox(&mut lev, "Leveler")
