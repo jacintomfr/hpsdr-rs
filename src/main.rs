@@ -6408,10 +6408,24 @@ impl eframe::App for HpsdrApp {
                     // tone), matching RttyRx/RttyTx's own convention
                     // (see rtty.rs's module doc comment).
                     if connected.show_digital_window {
+                        // BUG FIX: this used to always add center_hz/
+                        // shift_hz, matching only USB/DIGU. On LSB/DIGL
+                        // the passband itself is mirrored negative (see
+                        // passband_for's own Mode::Lsb | Mode::Digl arm)
+                        // -- these lines need the same sign flip or they
+                        // land on the wrong side of the dial entirely
+                        // (a real report: cursors nowhere near the
+                        // actual signal on DIGU too, since the flip was
+                        // simply missing).
+                        let sign = if matches!(current_mode, spectrum::Mode::Lsb | spectrum::Mode::Digl) {
+                            -1.0
+                        } else {
+                            1.0
+                        };
                         let s = connected.rtty.settings();
-                        let x_center = x_for_offset(s.center_hz + ctun_offset_hz);
-                        let x_mark = x_for_offset(s.center_hz + s.shift_hz / 2.0 + ctun_offset_hz);
-                        let x_space = x_for_offset(s.center_hz - s.shift_hz / 2.0 + ctun_offset_hz);
+                        let x_center = x_for_offset(sign * s.center_hz + ctun_offset_hz);
+                        let x_mark = x_for_offset(sign * (s.center_hz + s.shift_hz / 2.0) + ctun_offset_hz);
+                        let x_space = x_for_offset(sign * (s.center_hz - s.shift_hz / 2.0) + ctun_offset_hz);
                         for (x, color, width) in [
                             (x_mark, egui::Color32::from_rgb(255, 165, 0), 1.5),
                             (x_space, egui::Color32::from_rgb(255, 165, 0), 1.5),
@@ -6775,10 +6789,16 @@ impl eframe::App for HpsdrApp {
                         // to it). Same x_for_offset closure, still in
                         // scope from the spectrum trace above.
                         if connected.show_digital_window {
+                            // See the spectrum trace's identical fix above.
+                            let sign = if matches!(current_mode, spectrum::Mode::Lsb | spectrum::Mode::Digl) {
+                                -1.0
+                            } else {
+                                1.0
+                            };
                             let s = connected.rtty.settings();
-                            let x_center = x_for_offset(s.center_hz + ctun_offset_hz);
-                            let x_mark = x_for_offset(s.center_hz + s.shift_hz / 2.0 + ctun_offset_hz);
-                            let x_space = x_for_offset(s.center_hz - s.shift_hz / 2.0 + ctun_offset_hz);
+                            let x_center = x_for_offset(sign * s.center_hz + ctun_offset_hz);
+                            let x_mark = x_for_offset(sign * (s.center_hz + s.shift_hz / 2.0) + ctun_offset_hz);
+                            let x_space = x_for_offset(sign * (s.center_hz - s.shift_hz / 2.0) + ctun_offset_hz);
                             for (x, color, width) in [
                                 (x_mark, egui::Color32::from_rgb(255, 165, 0), 1.5),
                                 (x_space, egui::Color32::from_rgb(255, 165, 0), 1.5),
