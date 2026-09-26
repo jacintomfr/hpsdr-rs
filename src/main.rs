@@ -12301,7 +12301,13 @@ fn render_digital_panel(
             }
         });
     });
-    ui.ctx().request_repaint_after(Duration::from_millis(100));
+    // 100ms was needlessly aggressive compared to every other utility
+    // window in this codebase (Juice Console uses 300ms at its own
+    // call site) -- RTTY text updates aren't time-critical the way
+    // the spectrum/waterfall's own 33ms cadence is, so matching Juice
+    // Console's 300ms is still plenty responsive for reading decoded
+    // text while asking for less CPU.
+    ui.ctx().request_repaint_after(Duration::from_millis(300));
     fit_filter_clicked
 }
 
