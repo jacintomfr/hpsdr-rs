@@ -2738,6 +2738,9 @@ fn connect_to_device(device: Device, cfg: &Config) -> Result<ConnectedState, Str
             // rather than round-tripped through a struct field.
             spectrum::set_cw_pitch_hz(cfg.cw_pitch_hz.unwrap_or(600.0));
             let rtty = rtty_link::RttyHandle::new();
+            if let Some(s) = cfg.rtty {
+                rtty.set_settings(s);
+            }
             let mic_buffer = Arc::new(Mutex::new(VecDeque::new()));
             let mic_input_device = cfg.mic_input_device.clone();
             let (tx_enabled, mic_input, tx_handle) =
@@ -11601,6 +11604,7 @@ impl eframe::App for HpsdrApp {
                         sample_rate: Some(connected.sample_rate),
                         mode: Some(connected.spectrum.mode()),
                         width_hz: Some(connected.spectrum.width_hz()),
+                        rtty: Some(connected.rtty.settings()),
                         gain: Some(connected.spectrum.gain()),
                         audio_output_device: connected.audio_output_device.clone(),
                         mic_input_device: connected.mic_input_device.clone(),

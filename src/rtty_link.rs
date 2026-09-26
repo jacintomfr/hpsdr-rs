@@ -38,7 +38,7 @@ const MAX_RX_TEXT_CHARS: usize = 20_000;
 pub const BAUD_CHOICES: [f64; 4] = [45.45, 50.0, 75.0, 100.0];
 pub const SHIFT_CHOICES: [f64; 4] = [170.0, 425.0, 450.0, 850.0];
 
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct RttySettings {
     pub center_hz: f64,
     pub baud: f64,

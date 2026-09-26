@@ -20,6 +20,10 @@ pub struct Config {
     pub mode: Option<Mode>,
     pub width_hz: Option<f64>,
     pub gain: Option<f32>,
+    /// Digital Modes (RTTY) center/baud/shift/reverse/afc -- see
+    /// rtty_link::RttySettings's own doc comment. None/missing (configs
+    /// saved before this existed) falls back to RttySettings::default().
+    pub rtty: Option<crate::rtty_link::RttySettings>,
     /// Output device for local RX audio playback (Settings -> Audio's
     /// "Output device" picker), by name -- e.g. "CABLE Input (VB-Audio
     /// Virtual Cable)" to feed a decoder instead of/alongside real
