@@ -6398,6 +6398,29 @@ impl eframe::App for HpsdrApp {
                     }
                     let x_dial = x_for_offset(ctun_offset_hz);
 
+                    // RTTY mark/space tuning cursors (SDRoxide has the
+                    // same pair of lines) -- only while the Digital
+                    // window is open, so they don't clutter the
+                    // panadapter for everyone else. center_hz/shift_hz
+                    // are audio offsets from the dial, same space as the
+                    // passband shading above, so x_for_offset applies
+                    // unchanged; mark is center+shift/2 (the higher
+                    // tone), matching RttyRx/RttyTx's own convention
+                    // (see rtty.rs's module doc comment).
+                    if connected.show_digital_window {
+                        let s = connected.rtty.settings();
+                        let x_mark = x_for_offset(s.center_hz + s.shift_hz / 2.0 + ctun_offset_hz);
+                        let x_space = x_for_offset(s.center_hz - s.shift_hz / 2.0 + ctun_offset_hz);
+                        for (x, color) in
+                            [(x_mark, egui::Color32::from_rgb(255, 210, 0)), (x_space, egui::Color32::from_rgb(0, 210, 255))]
+                        {
+                            ui.painter().line_segment(
+                                [egui::pos2(x, rect.top()), egui::pos2(x, rect.bottom())],
+                                egui::Stroke::new(1.5, color),
+                            );
+                        }
+                    }
+
                     // Label shown in RF space when a transverter is active
                     // (see xvtr_rf_offset_hz's doc comment above) -- tick
                     // x positions stay in real IF space, only the printed
