@@ -12212,6 +12212,8 @@ fn render_digital_panel(
         ui.add_space(8.0);
         ui.checkbox(&mut s.reverse, "Reverse");
         ui.checkbox(&mut s.afc, "AFC");
+        ui.checkbox(&mut s.squelch, "Squelch")
+            .on_hover_text("Discard decoded text while the signal is too noise-dominated to trust");
         ui.add_space(8.0);
         // A real report: the RX filter defaults/sliders were left
         // narrower than center_hz+shift_hz/2, so WDSP's own passband

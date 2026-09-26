@@ -45,7 +45,36 @@ pub struct RttySettings {
     pub shift_hz: f64,
     pub reverse: bool,
     pub afc: bool,
+    /// Gate feed_rx() on RttyRx::confidence() (tone-separation, NOT the
+    /// framing lock() -- confidence tracks moment-to-moment signal
+    /// quality, lock has multi-frame hysteresis and lags a fade) -- a
+    /// real report: on a weak/fading amateur signal, garbage characters
+    /// appeared IN THE GAPS BETWEEN otherwise-clean words/callsigns,
+    /// exactly where the tone separation collapses into noise but
+    /// framing (space-start/mark-stop bits) still validates by chance
+    /// often enough to emit a character anyway. On by default -- this
+    /// is what SDRoxide's own "SQL" toggle does. #[serde(default)]
+    /// since this field didn't exist in configs saved before it did --
+    /// without it, a saved RttySettings missing "squelch" would fail
+    /// to deserialize at all and silently reset every other RTTY
+    /// setting (center/baud/shift/...) back to defaults too, not just
+    /// this one field.
+    #[serde(default = "default_squelch")]
+    pub squelch: bool,
 }
+
+fn default_squelch() -> bool {
+    true
+}
+
+/// Below this RttyRx::confidence(), feed_rx() discards whatever text
+/// process() just returned rather than appending it. Not user-facing --
+/// exposing it as a slider invites cranking it low "to see more" and
+/// defeating the point; picked empirically as clearly above the noise
+/// floor's own confidence (which idles low but not at exactly 0) while
+/// well below what genuine tone-separated RTTY reads even on a
+/// mediocre signal.
+const SQUELCH_CONFIDENCE: f32 = 0.25;
 
 impl Default for RttySettings {
     fn default() -> Self {
@@ -55,7 +84,14 @@ impl Default for RttySettings {
         // Hz above the dial wherever you are, which is also why a real
         // report of the cursors not lining up with a live signal traced
         // back to this default being 1500 instead.
-        Self { center_hz: 2210.0, baud: 45.45, shift_hz: 170.0, reverse: false, afc: true }
+        Self {
+            center_hz: 2210.0,
+            baud: 45.45,
+            shift_hz: 170.0,
+            reverse: false,
+            afc: true,
+            squelch: true,
+        }
     }
 }
 
@@ -159,10 +195,18 @@ impl RttyHandle {
         if audio.is_empty() {
             return;
         }
-        let text = self.inner.rx.lock().unwrap().process(audio);
+        let mut rx = self.inner.rx.lock().unwrap();
+        let text = rx.process(audio);
         if text.is_empty() {
             return;
         }
+        // See RttySettings::squelch's own doc comment -- discard text
+        // decoded while the signal was too noise-dominated to trust,
+        // rather than let it get appended as garbage between real words.
+        if self.inner.settings.lock().unwrap().squelch && rx.confidence() < SQUELCH_CONFIDENCE {
+            return;
+        }
+        drop(rx);
         let mut buf = self.inner.rx_text.lock().unwrap();
         buf.push_str(&text);
         if buf.len() > MAX_RX_TEXT_CHARS {
