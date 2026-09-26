@@ -2206,6 +2206,11 @@ impl SpectrumHandle {
         self.demod_params.lock().unwrap().width_hz
     }
 
+    /// See DemodParams::explicit_passband's own doc comment.
+    pub fn explicit_passband(&self) -> Option<(f64, f64)> {
+        self.demod_params.lock().unwrap().explicit_passband
+    }
+
     pub fn set_mode(&self, mode: Mode) {
         let mut p = self.demod_params.lock().unwrap();
         p.mode = mode;

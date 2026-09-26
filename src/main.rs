@@ -3417,7 +3417,10 @@ impl eframe::App for HpsdrApp {
                 // passband stays fully on-screen) and by the passband
                 // overlay drawn below -- computed once here rather than
                 // separately in both places.
-                let passband = spectrum::passband_for(current_mode, current_width);
+                let passband = connected
+                    .spectrum
+                    .explicit_passband()
+                    .unwrap_or_else(|| spectrum::passband_for(current_mode, current_width));
 
                 // See RadioSession::requested_frequency_hz's doc comment.
                 // A network client (rigctl/CAT/TCI) requesting a new
