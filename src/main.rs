@@ -6409,14 +6409,17 @@ impl eframe::App for HpsdrApp {
                     // (see rtty.rs's module doc comment).
                     if connected.show_digital_window {
                         let s = connected.rtty.settings();
+                        let x_center = x_for_offset(s.center_hz + ctun_offset_hz);
                         let x_mark = x_for_offset(s.center_hz + s.shift_hz / 2.0 + ctun_offset_hz);
                         let x_space = x_for_offset(s.center_hz - s.shift_hz / 2.0 + ctun_offset_hz);
-                        for (x, color) in
-                            [(x_mark, egui::Color32::from_rgb(255, 210, 0)), (x_space, egui::Color32::from_rgb(0, 210, 255))]
-                        {
+                        for (x, color, width) in [
+                            (x_mark, egui::Color32::from_rgb(255, 165, 0), 1.5),
+                            (x_space, egui::Color32::from_rgb(255, 165, 0), 1.5),
+                            (x_center, egui::Color32::from_rgb(70, 170, 255), 1.0),
+                        ] {
                             ui.painter().line_segment(
                                 [egui::pos2(x, rect.top()), egui::pos2(x, rect.bottom())],
-                                egui::Stroke::new(1.5, color),
+                                egui::Stroke::new(width, color),
                             );
                         }
                     }
@@ -6763,6 +6766,29 @@ impl eframe::App for HpsdrApp {
                                         .color(egui::Color32::from_rgb(220, 60, 60)),
                                 ),
                             );
+                        }
+                        // RTTY mark/space/center cursors, mirrored onto
+                        // the waterfall too (SDRoxide draws its own pair
+                        // straight through the cascade, not just the
+                        // trace above it -- a real request after the
+                        // spectrum-only version looked incomplete next
+                        // to it). Same x_for_offset closure, still in
+                        // scope from the spectrum trace above.
+                        if connected.show_digital_window {
+                            let s = connected.rtty.settings();
+                            let x_center = x_for_offset(s.center_hz + ctun_offset_hz);
+                            let x_mark = x_for_offset(s.center_hz + s.shift_hz / 2.0 + ctun_offset_hz);
+                            let x_space = x_for_offset(s.center_hz - s.shift_hz / 2.0 + ctun_offset_hz);
+                            for (x, color, width) in [
+                                (x_mark, egui::Color32::from_rgb(255, 165, 0), 1.5),
+                                (x_space, egui::Color32::from_rgb(255, 165, 0), 1.5),
+                                (x_center, egui::Color32::from_rgb(70, 170, 255), 1.0),
+                            ] {
+                                ui.painter().line_segment(
+                                    [egui::pos2(x, rect.top()), egui::pos2(x, rect.bottom())],
+                                    egui::Stroke::new(width, color),
+                                );
+                            }
                         }
                         if let Some(pos) = waterfall_click_resp.hover_pos() {
                             let hover_freq = round_to_step_hz(freq_at_x(pos.x, rect, freq_hz, sample_rate, connected.spectrum_zoom, pan_offset_hz), main_hover_scroll_step_hz(connected.tune_step_hz, cw_mode, ui.input(|i| i.modifiers.shift), ui.input(|i| i.modifiers.ctrl)));
