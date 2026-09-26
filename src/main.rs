@@ -30,6 +30,8 @@ mod report_recorder;
 mod rigctl;
 mod rtty;
 mod rtty_link;
+mod sstv;
+mod sstv_link;
 mod rx200;
 mod rx888;
 mod spectrum;
@@ -1440,6 +1442,14 @@ struct FrequencyEntry {
     digits: String,
 }
 
+/// Which decoder the "Digital..." window is currently showing -- see
+/// ConnectedState::digital_mode's own doc comment.
+#[derive(Clone, Copy, PartialEq)]
+enum DigitalMode {
+    Rtty,
+    Sstv,
+}
+
 struct ConnectedState {
     device: Device,
     /// The local network interface (e.g. "eth0") `device.my_address`
@@ -1715,13 +1725,24 @@ struct ConnectedState {
     /// reference, set once and rarely touched.
     rx_gain_calibration_db: i32,
     show_juice_console_window: bool,
-    /// "Digital..." window (digital modes -- RTTY for now). See
-    /// rtty_link.rs; `rtty` is owned here, not by SpectrumHandle, so it
-    /// survives the main SpectrumHandle being rebuilt on a sample-rate
-    /// change (TxHandle holds a clone of it).
+    /// "Digital..." window (digital modes -- RTTY and SSTV). See
+    /// rtty_link.rs/sstv_link.rs; `rtty`/`sstv` are owned here, not by
+    /// SpectrumHandle, so they survive the main SpectrumHandle being
+    /// rebuilt on a sample-rate change (TxHandle holds a clone of `rtty`).
     show_digital_window: bool,
+    /// Which of the two decoders the window is currently showing -- only
+    /// the selected one is fed audio (see spectrum.rs's own rx_enabled
+    /// gating), so switching doesn't run both DSPs for no UI anyone is
+    /// looking at.
+    digital_mode: DigitalMode,
     rtty: rtty_link::RttyHandle,
     rtty_tx_input: String,
+    sstv: sstv_link::SstvHandle,
+    /// Rebuilt from `sstv`'s snapshot whenever its `image_id` changes --
+    /// see render_sstv_panel's own doc comment for why a GPU texture, not
+    /// egui::Image::from(...) called fresh with raw bytes every frame.
+    sstv_texture: Option<egui::TextureHandle>,
+    sstv_texture_image_id: u32,
     extra_receivers: Vec<Arc<Mutex<ExtraReceiver>>>,
     settings_dirty: Arc<std::sync::atomic::AtomicBool>,
     band_memory: std::collections::HashMap<String, BandSettings>,
@@ -2744,6 +2765,7 @@ fn connect_to_device(device: Device, cfg: &Config) -> Result<ConnectedState, Str
             if let Some(s) = cfg.rtty {
                 rtty.set_settings(s);
             }
+            let sstv = sstv_link::SstvHandle::new();
             let mic_buffer = Arc::new(Mutex::new(VecDeque::new()));
             let mic_input_device = cfg.mic_input_device.clone();
             let (tx_enabled, mic_input, tx_handle) =
@@ -2955,8 +2977,12 @@ fn connect_to_device(device: Device, cfg: &Config) -> Result<ConnectedState, Str
                 sim_handle: None,
                 show_juice_console_window: false,
                 show_digital_window: false,
+                digital_mode: DigitalMode::Rtty,
                 rtty,
                 rtty_tx_input: String::new(),
+                sstv,
+                sstv_texture: None,
+                sstv_texture_image_id: 0,
                 rx_gain_calibration_db: cfg.rx_gain_calibration_db.unwrap_or(0),
                 extra_receivers,
                 settings_dirty,
@@ -3551,13 +3577,21 @@ impl eframe::App for HpsdrApp {
                     .spectrum
                     .set_ctun(connected.ctun || connected.rit_enabled, ctun_offset_hz + rit_offset_hz);
                 connected.spectrum.set_cw_decode_enabled(connected.cw_decode_enabled);
-                // See rtty_link.rs -- decode only while the Digital
-                // window is open; closing it also disarms RTTY TX.
+                // See rtty_link.rs/sstv_link.rs -- decode only while the
+                // Digital window is open AND that decoder is the selected
+                // mode (only one of the two ever runs at a time); closing
+                // the window also disarms RTTY TX.
                 connected.spectrum.set_rtty(&connected.rtty);
-                connected.rtty.set_rx_enabled(connected.show_digital_window);
+                connected.rtty.set_rx_enabled(
+                    connected.show_digital_window && connected.digital_mode == DigitalMode::Rtty,
+                );
                 if !connected.show_digital_window {
                     connected.rtty.set_tx_armed(false);
                 }
+                connected.spectrum.set_sstv(&connected.sstv);
+                connected.sstv.set_rx_enabled(
+                    connected.show_digital_window && connected.digital_mode == DigitalMode::Sstv,
+                );
                 // Zoom should keep the CTUN'd listen frequency (where the
                 // filter/passband actually is) centered, not the parked
                 // hardware LO -- otherwise the filter drifts toward one
@@ -6441,7 +6475,7 @@ impl eframe::App for HpsdrApp {
                     // unchanged; mark is center+shift/2 (the higher
                     // tone), matching RttyRx/RttyTx's own convention
                     // (see rtty.rs's module doc comment).
-                    if connected.show_digital_window {
+                    if connected.show_digital_window && connected.digital_mode == DigitalMode::Rtty {
                         // BUG FIX: this used to always add center_hz/
                         // shift_hz, matching only USB/DIGU. On LSB/DIGL
                         // the passband itself is mirrored negative (see
@@ -6464,6 +6498,35 @@ impl eframe::App for HpsdrApp {
                             (x_mark, egui::Color32::from_rgb(255, 165, 0), 1.5),
                             (x_space, egui::Color32::from_rgb(255, 165, 0), 1.5),
                             (x_center, egui::Color32::from_rgb(70, 170, 255), 1.0),
+                        ] {
+                            ui.painter().line_segment(
+                                [egui::pos2(x, rect.top()), egui::pos2(x, rect.bottom())],
+                                egui::Stroke::new(width, color),
+                            );
+                        }
+                    }
+                    // SSTV tuning reference -- sync (1200 Hz, the low edge
+                    // every line's sync pulse sits at) through white
+                    // (2300 Hz, the high edge) with black (1500 Hz) between
+                    // them, same sign-aware placement as the RTTY cursors
+                    // just above (see sstv.rs's own BLACK_HZ/WHITE_HZ/
+                    // SYNC_HZ constants -- fixed by the SSTV standard, not
+                    // a per-signal setting the way RTTY's center/shift
+                    // are, so there is nothing here for the operator to
+                    // adjust).
+                    if connected.show_digital_window && connected.digital_mode == DigitalMode::Sstv {
+                        let sign = if matches!(current_mode, spectrum::Mode::Lsb | spectrum::Mode::Digl) {
+                            -1.0
+                        } else {
+                            1.0
+                        };
+                        let x_sync = x_for_offset(sign * 1200.0 + ctun_offset_hz);
+                        let x_black = x_for_offset(sign * 1500.0 + ctun_offset_hz);
+                        let x_white = x_for_offset(sign * 2300.0 + ctun_offset_hz);
+                        for (x, color, width) in [
+                            (x_sync, egui::Color32::from_rgb(180, 90, 220), 1.5),
+                            (x_white, egui::Color32::from_rgb(180, 90, 220), 1.5),
+                            (x_black, egui::Color32::from_rgb(70, 170, 255), 1.0),
                         ] {
                             ui.painter().line_segment(
                                 [egui::pos2(x, rect.top()), egui::pos2(x, rect.bottom())],
@@ -6540,7 +6603,8 @@ impl eframe::App for HpsdrApp {
                         // happens upstream, in WDSP's own FFT size, not
                         // here.
                         let n = spectrum_row.len().saturating_sub(1).max(1);
-                        let points: Vec<egui::Pos2> = spectrum_row
+                        let smoothed_row = smooth_spectrum_values(&spectrum_row);
+                        let points: Vec<egui::Pos2> = smoothed_row
                             .iter()
                             .enumerate()
                             .map(|(i, &v)| {
@@ -6551,7 +6615,7 @@ impl eframe::App for HpsdrApp {
                             })
                             .collect();
                         ui.painter().add(egui::Shape::line(
-                            points,
+                            smooth_trace(&points),
                             egui::Stroke::new(1.5, egui::Color32::LIGHT_GREEN),
                         ));
                     }
@@ -6822,7 +6886,7 @@ impl eframe::App for HpsdrApp {
                         // spectrum-only version looked incomplete next
                         // to it). Same x_for_offset closure, still in
                         // scope from the spectrum trace above.
-                        if connected.show_digital_window {
+                        if connected.show_digital_window && connected.digital_mode == DigitalMode::Rtty {
                             // See the spectrum trace's identical fix above.
                             let sign = if matches!(current_mode, spectrum::Mode::Lsb | spectrum::Mode::Digl) {
                                 -1.0
@@ -6837,6 +6901,29 @@ impl eframe::App for HpsdrApp {
                                 (x_mark, egui::Color32::from_rgb(255, 165, 0), 1.5),
                                 (x_space, egui::Color32::from_rgb(255, 165, 0), 1.5),
                                 (x_center, egui::Color32::from_rgb(70, 170, 255), 1.0),
+                            ] {
+                                ui.painter().line_segment(
+                                    [egui::pos2(x, rect.top()), egui::pos2(x, rect.bottom())],
+                                    egui::Stroke::new(width, color),
+                                );
+                            }
+                        }
+                        // SSTV tuning reference, mirrored onto the
+                        // waterfall too -- see the spectrum trace's
+                        // identical block above.
+                        if connected.show_digital_window && connected.digital_mode == DigitalMode::Sstv {
+                            let sign = if matches!(current_mode, spectrum::Mode::Lsb | spectrum::Mode::Digl) {
+                                -1.0
+                            } else {
+                                1.0
+                            };
+                            let x_sync = x_for_offset(sign * 1200.0 + ctun_offset_hz);
+                            let x_black = x_for_offset(sign * 1500.0 + ctun_offset_hz);
+                            let x_white = x_for_offset(sign * 2300.0 + ctun_offset_hz);
+                            for (x, color, width) in [
+                                (x_sync, egui::Color32::from_rgb(180, 90, 220), 1.5),
+                                (x_white, egui::Color32::from_rgb(180, 90, 220), 1.5),
+                                (x_black, egui::Color32::from_rgb(70, 170, 255), 1.0),
                             ] {
                                 ui.painter().line_segment(
                                     [egui::pos2(x, rect.top()), egui::pos2(x, rect.bottom())],
@@ -11476,11 +11563,16 @@ impl eframe::App for HpsdrApp {
                             .with_decorations(false);
                     }
                     let rtty = connected.rtty.clone();
+                    let sstv = connected.sstv.clone();
                     let tx_available = connected.tx_enabled && connected.tx_handle.is_some();
                     let mox = connected.session.mox.load(Ordering::Relaxed);
                     let mode = connected.spectrum.mode();
                     let tx_input = &mut connected.rtty_tx_input;
+                    let sstv_texture = &mut connected.sstv_texture;
+                    let sstv_texture_image_id = &mut connected.sstv_texture_image_id;
+                    let mut digital_mode = connected.digital_mode;
                     let mut fit_filter_clicked = false;
+                    let mut sstv_fit_filter_clicked = false;
                     ui.ctx().show_viewport_immediate(
                         egui::ViewportId::from_hash_of("digital_modes_window"),
                         digital_viewport,
@@ -11504,18 +11596,53 @@ impl eframe::App for HpsdrApp {
                                 .frame(egui::Frame::central_panel(&light_style))
                                 .show(ui, |ui| {
                                     ui.visuals_mut().clone_from(&light_visuals);
-                                    fit_filter_clicked = render_digital_panel(
-                                        ui,
-                                        &rtty,
-                                        tx_input,
-                                        tx_available,
-                                        mox,
-                                        mode,
-                                        dial_freq_hz,
-                                    );
+                                    ui.horizontal(|ui| {
+                                        ui.label("Mode:");
+                                        if ui
+                                            .add(egui::Button::selectable(
+                                                digital_mode == DigitalMode::Rtty,
+                                                "RTTY",
+                                            ))
+                                            .clicked()
+                                        {
+                                            digital_mode = DigitalMode::Rtty;
+                                        }
+                                        if ui
+                                            .add(egui::Button::selectable(
+                                                digital_mode == DigitalMode::Sstv,
+                                                "SSTV",
+                                            ))
+                                            .clicked()
+                                        {
+                                            digital_mode = DigitalMode::Sstv;
+                                        }
+                                    });
+                                    ui.separator();
+                                    match digital_mode {
+                                        DigitalMode::Rtty => {
+                                            fit_filter_clicked = render_digital_panel(
+                                                ui,
+                                                &rtty,
+                                                tx_input,
+                                                tx_available,
+                                                mox,
+                                                mode,
+                                                dial_freq_hz,
+                                            );
+                                        }
+                                        DigitalMode::Sstv => {
+                                            sstv_fit_filter_clicked = render_sstv_panel(
+                                                ui,
+                                                &sstv,
+                                                sstv_texture,
+                                                sstv_texture_image_id,
+                                            );
+                                        }
+                                    }
                                 });
                         },
                     );
+                    connected.digital_mode = digital_mode;
                     if fit_filter_clicked {
                         // NARROW band bracketing just the tone pair, like
                         // deskHPSDR's own independent Low/High cut --
@@ -11533,6 +11660,29 @@ impl eframe::App for HpsdrApp {
                         let margin = 100.0;
                         let low = s.center_hz - s.shift_hz / 2.0 - margin;
                         let high = s.center_hz + s.shift_hz / 2.0 + margin;
+                        let passband = if matches!(mode, spectrum::Mode::Lsb | spectrum::Mode::Digl) {
+                            (-high, -low)
+                        } else {
+                            (low, high)
+                        };
+                        connected.spectrum.set_explicit_passband(Some(passband));
+                        if let Some(tx) = &connected.tx_handle {
+                            tx.set_explicit_passband(Some(passband));
+                        }
+                        settings_changed = true;
+                    }
+                    if sstv_fit_filter_clicked {
+                        // Same explicit_passband mechanism as RTTY's Fit
+                        // Filter just above, but SSTV's band is fixed by
+                        // the standard (sync 1200 Hz through white 2300
+                        // Hz -- see sstv.rs's own SYNC_HZ/BLACK_HZ/
+                        // WHITE_HZ constants and render_sstv_panel's Fit
+                        // Filter button), not a per-signal setting like
+                        // RTTY's center/shift, so there is nothing from
+                        // sstv_link.rs to read here.
+                        let margin = 100.0;
+                        let low = 1200.0 - margin;
+                        let high = 2300.0 + margin;
                         let passband = if matches!(mode, spectrum::Mode::Lsb | spectrum::Mode::Digl) {
                             (-high, -low)
                         } else {
@@ -12215,12 +12365,6 @@ fn render_digital_panel(
     let red = egui::Color32::from_rgb(220, 50, 50);
     let green = egui::Color32::from_rgb(40, 190, 70);
 
-    ui.horizontal(|ui| {
-        ui.label("Mode:");
-        let _ = ui.add(egui::Button::selectable(true, "RTTY"));
-    });
-    ui.separator();
-
     let mut s = rtty.settings();
     ui.horizontal(|ui| {
         ui.label("Center:");
@@ -12368,6 +12512,161 @@ fn render_digital_panel(
     // the spectrum/waterfall's own 33ms cadence is, so matching Juice
     // Console's 300ms is still plenty responsive for reading decoded
     // text while asking for less CPU.
+    ui.ctx().request_repaint_after(Duration::from_millis(300));
+    fit_filter_clicked
+}
+
+/// SSTV panel -- RX only for now (see sstv_link.rs's own module doc
+/// comment). Mirrors render_digital_panel's status-row conventions
+/// (colour dot + label, progress bar) but with an image in place of a
+/// scrolling text transcript.
+///
+/// `texture`/`texture_image_id` are owned by ConnectedState (not local
+/// state here) so the decoded-so-far image survives this function
+/// returning -- egui's immediate-mode model rebuilds the whole UI every
+/// frame, but a GPU texture is comparatively expensive to allocate, so it
+/// is created once per picture (on `image_id` change) and updated in place
+/// (`TextureHandle::set`) for every line after that, rather than a fresh
+/// `load_texture` call every single frame.
+fn render_sstv_panel(
+    ui: &mut egui::Ui,
+    sstv: &sstv_link::SstvHandle,
+    texture: &mut Option<egui::TextureHandle>,
+    texture_image_id: &mut u32,
+) -> bool {
+    let amber = egui::Color32::from_rgb(230, 150, 50);
+    let green = egui::Color32::from_rgb(40, 190, 70);
+    let mut fit_filter_clicked = false;
+
+    // Mode picker: Auto (identify from the VIS header / sync cadence) or
+    // pinned to one specific mode (matches sdroxide's own Auto + explicit
+    // mode convention).
+    let mut expected = sstv.expected();
+    ui.horizontal(|ui| {
+        ui.label("Decode:");
+        if ui.add(egui::Button::selectable(expected.is_none(), "Auto")).clicked() {
+            expected = None;
+        }
+        egui::ComboBox::from_id_salt("sstv_expected_mode")
+            .selected_text(expected.map(|m| m.label()).unwrap_or("(pick mode)"))
+            .show_ui(ui, |ui| {
+                for m in sstv::SstvMode::ALL {
+                    if ui.selectable_label(expected == Some(m), m.label()).clicked() {
+                        expected = Some(m);
+                    }
+                }
+            });
+        if ui
+            .button("Restart RX")
+            .on_hover_text("Abandon the picture in progress and hunt for the next header")
+            .clicked()
+        {
+            sstv.restart();
+        }
+        ui.add_space(8.0);
+        // Same idea as RTTY's own Fit Filter (see render_digital_panel):
+        // narrows the RX/TX passband to just what SSTV actually needs
+        // (sync at 1200 Hz through white at 2300 Hz -- fixed by the
+        // standard, not a per-signal setting the way RTTY's center/shift
+        // are, so there is nothing here for the operator to tune first)
+        // plus a margin, instead of whatever the mode's ordinary SSB-width
+        // filter happens to be set to -- keeping adjacent-channel QRM
+        // (a real concern on the crowded SSTV calling frequencies) out of
+        // the decoder.
+        if ui
+            .button("Fit Filter")
+            .on_hover_text("Narrow the RX/TX filter to the SSTV tone band (1200-2300 Hz)")
+            .clicked()
+        {
+            fit_filter_clicked = true;
+        }
+    });
+    sstv.set_expected(expected);
+
+    let snap = sstv.snapshot();
+    ui.horizontal(|ui| {
+        let (rect, _) = ui.allocate_exact_size(egui::vec2(14.0, 14.0), egui::Sense::hover());
+        let color = if snap.receiving { green } else { amber };
+        ui.painter().circle_filled(rect.center(), 6.0, color);
+        ui.label(match snap.detected {
+            Some(m) => {
+                format!("{} {}", m.label(), if snap.receiving { "(receiving)" } else { "(last)" })
+            }
+            None => "hunting for a header...".to_string(),
+        });
+        ui.add(
+            egui::ProgressBar::new(snap.progress.clamp(0.0, 1.0))
+                .desired_width(120.0)
+                .text(format!("{:.0}%", snap.progress * 100.0)),
+        );
+        ui.label(format!("Level {:.0}%", (snap.level * 100.0).clamp(0.0, 100.0)));
+    });
+    // Sync-pulse quality -- the same tuning aid QSSTV's own "Sync" meter
+    // on its receive window is: how much of each line's sync pulse (the
+    // reference tone at 1200 Hz -- the purple lines on the panadapter/
+    // waterfall) actually showed up right where a line's decode expected
+    // it. A weak/absent bar while a picture is otherwise decoding usually
+    // means mistuned dial frequency or a passband cutting into the sync
+    // tone -- nudge a few Hz either way and watch which direction this
+    // climbs, the same way you'd read QSSTV's meter.
+    ui.horizontal(|ui| {
+        ui.label("Sync:");
+        let sync_color = if snap.sync_quality > 0.7 {
+            green
+        } else if snap.sync_quality > 0.3 {
+            amber
+        } else {
+            egui::Color32::from_rgb(140, 140, 140)
+        };
+        ui.add(
+            egui::ProgressBar::new(snap.sync_quality.clamp(0.0, 1.0))
+                .desired_width(120.0)
+                .fill(sync_color)
+                .text(format!("{:.0}%", snap.sync_quality * 100.0)),
+        );
+    });
+    if let Some(u) = &snap.unsupported {
+        ui.colored_label(amber, format!("Header seen for {u}, which this build does not decode."));
+    }
+    if let Some(id) = &snap.rx_id {
+        ui.label(format!("Last station ID: {id}"));
+    }
+    ui.separator();
+
+    if snap.w > 0 && snap.h > 0 && snap.rgb.len() == snap.w as usize * snap.h as usize * 3 {
+        let size = [snap.w as usize, snap.h as usize];
+        let pixels: Vec<egui::Color32> = snap
+            .rgb
+            .chunks_exact(3)
+            .map(|p| egui::Color32::from_rgb(p[0], p[1], p[2]))
+            .collect();
+        let image = egui::ColorImage::new(size, pixels);
+        match texture {
+            Some(tex) if *texture_image_id == snap.image_id => {
+                // Same picture as last frame, more lines decoded since --
+                // update the existing texture rather than reallocating one.
+                tex.set(image, egui::TextureOptions::LINEAR);
+            }
+            _ => {
+                *texture =
+                    Some(ui.ctx().load_texture("sstv_image", image, egui::TextureOptions::LINEAR));
+                *texture_image_id = snap.image_id;
+            }
+        }
+        if let Some(tex) = texture {
+            let avail = ui.available_size();
+            let scale = (avail.x / snap.w as f32).min(((avail.y - 8.0).max(1.0)) / snap.h as f32).min(1.0);
+            let scale = scale.max(0.05);
+            let draw_size = egui::vec2(snap.w as f32 * scale, snap.h as f32 * scale);
+            ui.image((tex.id(), draw_size));
+        }
+    } else {
+        ui.weak("No picture yet -- waiting for a VIS header.");
+    }
+
+    // Same repaint cadence as render_digital_panel -- an SSTV picture takes
+    // many seconds to arrive, so a few redraws a second is still a smooth
+    // progressive fill, not a stepping one.
     ui.ctx().request_repaint_after(Duration::from_millis(300));
     fit_filter_clicked
 }
@@ -14425,7 +14724,8 @@ fn render_extra_receiver_ui(ui: &mut egui::Ui, rx: &Arc<Mutex<ExtraReceiver>>) {
         // here (WDSP's own analyzer already returns just the visible
         // window's data).
         let n = spectrum_row.len().saturating_sub(1).max(1);
-        let points: Vec<egui::Pos2> = spectrum_row
+        let smoothed_row = smooth_spectrum_values(&spectrum_row);
+        let points: Vec<egui::Pos2> = smoothed_row
             .iter()
             .enumerate()
             .map(|(i, &v)| {
@@ -14435,8 +14735,10 @@ fn render_extra_receiver_ui(ui: &mut egui::Ui, rx: &Arc<Mutex<ExtraReceiver>>) {
                 egui::pos2(x, y)
             })
             .collect();
-        ui.painter()
-            .add(egui::Shape::line(points, egui::Stroke::new(1.5, egui::Color32::LIGHT_GREEN)));
+        ui.painter().add(egui::Shape::line(
+            smooth_trace(&points),
+            egui::Stroke::new(1.5, egui::Color32::LIGHT_GREEN),
+        ));
     }
 
     // See draw_band_edge_markers's own doc comment for why this moved
@@ -15656,6 +15958,98 @@ fn wisdom_status_text() -> String {
             _ => FALLBACK.to_string(),
         }
     }
+}
+
+/// Smooths the spectrum trace's dB VALUES across neighbouring bins before
+/// they are plotted -- ROOT CAUSE FIX for a real report that smooth_trace's
+/// spline alone made no visible difference: a spline drawn through the
+/// same noisy per-bin values is still a noisy-looking curve, just with
+/// rounded corners instead of sharp ones -- indistinguishable at a glance.
+/// The actual "soft" look in the reference SDR comes from the trace ITSELF
+/// being less noisy bin-to-bin, not from how the line between bins is
+/// drawn.
+///
+/// A small fixed 5-tap kernel (roughly Gaussian, sigma ~1 bin) -- mild
+/// enough that a real signal spanning more than a couple of bins (every
+/// mode this project decodes/displays does) keeps its actual peak height,
+/// while single-bin noise spikes get visibly tamed. Bins are already
+/// evenly spaced across the visible window regardless of zoom (see
+/// set_zoom_pan's doc comment), so this is a plain fixed-width kernel, not
+/// one that needs to scale with span.
+fn smooth_spectrum_values(row: &[f32]) -> Vec<f32> {
+    const KERNEL: [f32; 5] = [0.06, 0.24, 0.40, 0.24, 0.06];
+    let n = row.len();
+    (0..n)
+        .map(|i| {
+            let mut sum = 0.0f32;
+            let mut wsum = 0.0f32;
+            for (k, &w) in KERNEL.iter().enumerate() {
+                let offset = k as isize - 2;
+                let idx = i as isize + offset;
+                if idx >= 0 && (idx as usize) < n {
+                    sum += row[idx as usize] * w;
+                    wsum += w;
+                }
+            }
+            sum / wsum
+        })
+        .collect()
+}
+
+/// Smooths a spectrum trace polyline for display: replaces the plain
+/// straight-segment connection between adjacent bins with a Catmull-Rom
+/// spline through the same points, so a zoomed-in trace (where each bin
+/// already spans several screen pixels -- see set_zoom_pan's own doc
+/// comment: WDSP always rebins down to a fixed SPECTRUM_WIDTH regardless of
+/// zoom) reads as a continuous curve instead of a visible zigzag of
+/// straight segments. A real comparison against another SDR's panadapter
+/// prompted this -- its trace looked noticeably smoother/"softer" at high
+/// zoom despite showing the same underlying bin count.
+///
+/// Purely a rendering choice: the input points (and therefore the
+/// underlying dB values and bin positions) are unchanged, only how the
+/// line between them is drawn. Passes `points` straight through below 3 of
+/// them, where a spline has nothing to interpolate.
+fn smooth_trace(points: &[egui::Pos2]) -> Vec<egui::Pos2> {
+    let n = points.len();
+    if n < 3 {
+        return points.to_vec();
+    }
+    // 4 interpolated points per original span is enough to look like a
+    // continuous curve at any zoom this project's fixed SPECTRUM_WIDTH
+    // (1024 bins) can be stretched to on a real monitor, without
+    // meaningfully adding to a frame's draw cost (a few thousand extra
+    // Pos2s, well under egui's own per-frame shape budget).
+    const SEGMENTS: usize = 4;
+    let mut out = Vec::with_capacity(n * SEGMENTS + 1);
+    for i in 0..n - 1 {
+        // Catmull-Rom needs a point on each side of the [p1, p2] span
+        // being interpolated; clamped to the first/last point at the
+        // ends, which flattens the tangent there instead of extrapolating
+        // off the trace.
+        let p0 = points[i.saturating_sub(1)];
+        let p1 = points[i];
+        let p2 = points[i + 1];
+        let p3 = points[(i + 2).min(n - 1)];
+        for s in 0..SEGMENTS {
+            let t = s as f32 / SEGMENTS as f32;
+            let t2 = t * t;
+            let t3 = t2 * t;
+            let x = 0.5
+                * ((2.0 * p1.x)
+                    + (-p0.x + p2.x) * t
+                    + (2.0 * p0.x - 5.0 * p1.x + 4.0 * p2.x - p3.x) * t2
+                    + (-p0.x + 3.0 * p1.x - 3.0 * p2.x + p3.x) * t3);
+            let y = 0.5
+                * ((2.0 * p1.y)
+                    + (-p0.y + p2.y) * t
+                    + (2.0 * p0.y - 5.0 * p1.y + 4.0 * p2.y - p3.y) * t2
+                    + (-p0.y + 3.0 * p1.y - 3.0 * p2.y + p3.y) * t3);
+            out.push(egui::pos2(x, y));
+        }
+    }
+    out.push(points[n - 1]);
+    out
 }
 
 /// `display_rows`: the waterfall pane's own real on-screen pixel height
