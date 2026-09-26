@@ -49,7 +49,13 @@ pub struct RttySettings {
 
 impl Default for RttySettings {
     fn default() -> Self {
-        Self { center_hz: 1500.0, baud: 45.45, shift_hz: 170.0, reverse: false, afc: true }
+        // center_hz: 2210.0, not some arbitrary round number -- this is
+        // RTTY_CENTER_HZ in SDRoxide (crates/sdroxide-types/src/mode.rs),
+        // the actual amateur-RTTY convention: mark/space sit at 2295/2125
+        // Hz above the dial wherever you are, which is also why a real
+        // report of the cursors not lining up with a live signal traced
+        // back to this default being 1500 instead.
+        Self { center_hz: 2210.0, baud: 45.45, shift_hz: 170.0, reverse: false, afc: true }
     }
 }
 
