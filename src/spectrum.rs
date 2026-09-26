@@ -421,6 +421,17 @@ impl Default for EqualizerParams {
 pub struct DemodParams {
     pub mode: Mode,
     pub width_hz: f64,
+    /// Overrides passband_for(mode, width_hz) with an exact (low, high)
+    /// pair when set -- the mode-based formula assumes a passband
+    /// anchored near the dial (SSB-shaped), which is wrong for RTTY:
+    /// the tone pair sits off at center_hz +/- shift_hz/2, and Fit
+    /// Filter needs a NARROW band bracketing just that, not the
+    /// (150, width_hz) DIGU/DIGL shape. A real report: the DIGU
+    /// formula's filter caught everything from ~150Hz to the tone
+    /// pair, dragging in noise the narrow deskHPSDR-style Low/High
+    /// cut a real RTTY filter doesn't need at all. None restores the
+    /// normal mode-based behavior.
+    pub explicit_passband: Option<(f64, f64)>,
     pub gain: f32,
     pub agc: Agc,
     // Units assumed (not confirmed against your reference): attack/decay/
@@ -591,6 +602,7 @@ impl Default for DemodParams {
             zoom: 1,
             pan: 0.0,
             meter_calibration_db: 0.0,
+            explicit_passband: None,
         }
     }
 }
@@ -1783,7 +1795,7 @@ fn run(
             d.revision = d.revision.wrapping_add(1);
         }
 
-        let passband = passband_for(params.mode, params.width_hz);
+        let passband = params.explicit_passband.unwrap_or_else(|| passband_for(params.mode, params.width_hz));
         let audio = analyzer.demod(&chunk, params, passband);
         // See DemodParams::meter_calibration_db's own doc comment.
         let meter_db = analyzer.meter_db() + params.meter_calibration_db;
@@ -2202,6 +2214,12 @@ impl SpectrumHandle {
     pub fn set_width_hz(&self, width_hz: f64) {
         let mut p = self.demod_params.lock().unwrap();
         p.width_hz = width_hz;
+    }
+
+    /// See DemodParams::explicit_passband's own doc comment.
+    pub fn set_explicit_passband(&self, passband: Option<(f64, f64)>) {
+        let mut p = self.demod_params.lock().unwrap();
+        p.explicit_passband = passband;
     }
 
     pub fn gain(&self) -> f32 {

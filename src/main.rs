@@ -11483,21 +11483,42 @@ impl eframe::App for HpsdrApp {
                         },
                     );
                     if fit_filter_clicked {
+                        // NARROW band bracketing just the tone pair, like
+                        // deskHPSDR's own independent Low/High cut --
+                        // ROOT CAUSE FIX for a real report: the old
+                        // set_width_hz(needed) call fed passband_for's
+                        // DIGU/DIGL formula, which always anchors the LOW
+                        // edge near the dial (150Hz) and only moves the
+                        // HIGH edge -- so the "filter" actually spanned
+                        // 150Hz..mark+200, dragging in ~2000Hz of
+                        // unrelated audio below the space tone that the
+                        // matched filters never needed. explicit_passband
+                        // bypasses that formula entirely with the exact
+                        // (space-margin, mark+margin) pair.
                         let s = connected.rtty.settings();
-                        // Half-shift margin on each side plus a fixed
-                        // 200Hz so the matched filters (which themselves
-                        // need a little roll-off room) aren't sitting
-                        // right at the RX filter's own edge.
-                        let needed = s.center_hz + s.shift_hz / 2.0 + 200.0;
-                        let width = needed.clamp(50.0, 5000.0);
-                        connected.spectrum.set_width_hz(width);
+                        let margin = 100.0;
+                        let low = s.center_hz - s.shift_hz / 2.0 - margin;
+                        let high = s.center_hz + s.shift_hz / 2.0 + margin;
+                        let passband = if matches!(mode, spectrum::Mode::Lsb | spectrum::Mode::Digl) {
+                            (-high, -low)
+                        } else {
+                            (low, high)
+                        };
+                        connected.spectrum.set_explicit_passband(Some(passband));
                         if let Some(tx) = &connected.tx_handle {
-                            tx.set_width_hz(width);
+                            tx.set_explicit_passband(Some(passband));
                         }
-                        connected.width_memory.insert(mode.label().to_string(), width);
                         settings_changed = true;
                     }
                     if close_requested {
+                        // Restore normal mode-based filtering -- the
+                        // narrow RTTY passband would otherwise silently
+                        // linger and strangle ordinary SSB audio the
+                        // next time this receiver is used for voice.
+                        connected.spectrum.set_explicit_passband(None);
+                        if let Some(tx) = &connected.tx_handle {
+                            tx.set_explicit_passband(None);
+                        }
                         connected.show_digital_window = false;
                     }
                 }

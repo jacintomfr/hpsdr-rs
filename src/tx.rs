@@ -416,6 +416,10 @@ pub fn ps_state_name(state: i32) -> String {
 #[derive(Copy, Clone)]
 pub struct TxParams {
     pub mode: Mode,
+    /// See spectrum::DemodParams::explicit_passband's own doc comment --
+    /// same override, mirrored here so TX's bandpass filter matches
+    /// whatever RX is narrowed to (Fit Filter sets both).
+    pub explicit_passband: Option<(f64, f64)>,
     pub mic_gain: f32,
     /// Filter width (Hz), same UI control/meaning as RX's per-mode
     /// width slider (spectrum::width_for_mode) -- ROOT CAUSE FIX, see
@@ -533,6 +537,7 @@ impl Default for TxParams {
             // starting point; harmless while compressor_enabled is false.
             compressor_gain_db: 10.0,
             cfc_enabled: false,
+            explicit_passband: None,
         }
     }
 }
@@ -1005,6 +1010,7 @@ impl TxProcessor {
         mode: Mode,
         mic_gain: f32,
         width_hz: f64,
+        explicit_passband: Option<(f64, f64)>,
         tune: bool,
         two_tone: bool,
         eq: EqualizerParams,
@@ -1023,7 +1029,7 @@ impl TxProcessor {
         // keyed on the computed (f_low, f_high) pair instead of the
         // raw mode/width so a width change alone (same mode) still
         // triggers it.
-        let passband = crate::spectrum::passband_for(mode, width_hz);
+        let passband = explicit_passband.unwrap_or_else(|| crate::spectrum::passband_for(mode, width_hz));
         if self.last_passband != Some(passband) {
             unsafe {
                 wdsp::SetTXABandpassFreqs(self.channel, passband.0, passband.1);
@@ -2473,6 +2479,7 @@ fn run(
             p.mode,
             p.mic_gain,
             p.width_hz,
+            p.explicit_passband,
             p.tune,
             p.two_tone,
             p.eq,
@@ -2808,6 +2815,11 @@ impl TxHandle {
     /// filter's passband, same UI control as RX's per-mode width.
     pub fn set_width_hz(&self, width_hz: f64) {
         self.params.lock().unwrap().width_hz = width_hz;
+    }
+
+    /// See TxParams::explicit_passband's own doc comment.
+    pub fn set_explicit_passband(&self, passband: Option<(f64, f64)>) {
+        self.params.lock().unwrap().explicit_passband = passband;
     }
 
     /// See TxParams::tune's doc comment.
