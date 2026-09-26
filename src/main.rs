@@ -2368,6 +2368,9 @@ fn connect_to_device(device: Device, cfg: &Config) -> Result<ConnectedState, Str
     if let Some(atten) = cfg.alex_attenuation {
         settings.alex_attenuation = atten as u32;
     }
+    if let Some(preamp) = cfg.preamp_enabled {
+        settings.preamp_enabled = preamp;
+    }
     if let Some(db) = cfg.lna_tx_db {
         settings.lna_tx_db = db;
     }
@@ -5081,6 +5084,31 @@ impl eframe::App for HpsdrApp {
                                 if alex_att_combo(ui, &mut alex_atten) {
                                     connected.session.alex_attenuation.store(alex_atten as u32, Ordering::Relaxed);
                                     settings_changed = true;
+                                }
+                                // Metis only, not Ozy -- the wire bit
+                                // itself is Metis/Ozy per
+                                // RadioSession::preamp_enabled's doc
+                                // comment, but Ozy always connects
+                                // through start_protocol1_ozy_usb (a
+                                // separate, dummy/unwired path -- same
+                                // "no UI/setting for it yet" reasoning
+                                // as alex_att_combo's own Ozy row above),
+                                // so showing this for Ozy would be a
+                                // checkbox that silently does nothing.
+                                // Also sidesteps the has_alex_att &&
+                                // has_rx_att dual-control grid-cell-
+                                // budget issue the has_rx_att block's own
+                                // "BUG FIX" comment describes (Ozy is the
+                                // one board where both are true; Metis
+                                // has ALEX only, has_rx_att is false).
+                                let has_preamp = connected.device.board == Boards::Metis;
+                                if has_preamp {
+                                    let mut preamp =
+                                        connected.session.preamp_enabled.load(Ordering::Relaxed);
+                                    if ui.checkbox(&mut preamp, "Preamp").changed() {
+                                        connected.session.preamp_enabled.store(preamp, Ordering::Relaxed);
+                                        settings_changed = true;
+                                    }
                                 }
                             }
                             if has_rx_att {
@@ -11712,6 +11740,9 @@ impl eframe::App for HpsdrApp {
                         ),
                         alex_attenuation: Some(
                             connected.session.alex_attenuation.load(std::sync::atomic::Ordering::Relaxed) as u8,
+                        ),
+                        preamp_enabled: Some(
+                            connected.session.preamp_enabled.load(std::sync::atomic::Ordering::Relaxed),
                         ),
                         lna_tx_db: Some(
                             connected.session.lna_tx_db.load(std::sync::atomic::Ordering::Relaxed),

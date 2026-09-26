@@ -415,6 +415,11 @@ pub struct Config {
     /// Missing falls back to RadioSettings::default's own 0dB.
     #[serde(default)]
     pub alex_attenuation: Option<u8>,
+    /// Protocol 1 Metis/Ozy front-end preamp -- see
+    /// radio::RadioSession::preamp_enabled's doc comment. Missing falls
+    /// back to RadioSettings::default's own off.
+    #[serde(default)]
+    pub preamp_enabled: Option<bool>,
     /// PureSignal calibration values (Settings -> PureSignal) -- see
     /// tx::PsParams's field docs for what each one means. Missing
     /// (e.g. configs saved before Phase 3 existed) falls back to the
