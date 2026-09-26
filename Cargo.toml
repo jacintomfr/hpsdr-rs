@@ -101,6 +101,9 @@ midir = "0.11"
 # features are fine here, this is a small, infrequently-polled query
 # (see main.rs's status bar refresh), not a hot path.
 sysinfo = "0.33"
+# Complex<f32> for the RTTY modem (rtty.rs, adapted from SDRoxide, which
+# uses this same crate/version). Pure Rust, no system dependency.
+num-complex = "0.4"
 
 [target.'cfg(windows)'.dependencies]
 # SetStdHandle, used by main.rs's redirect_stdio_to_log_file() to send
