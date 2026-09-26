@@ -64,6 +64,7 @@
 */
 
 use crate::report_recorder::ReportRecorder;
+use crate::rtty_link::RttyHandle;
 use crate::radio::{
     CwKeyerAtomics, IqSample, TX_AUDIO_SOURCE_LOCAL_MIC, TX_AUDIO_SOURCE_RADIO_MIC,
 };
@@ -1914,6 +1915,10 @@ fn run(
     // through the normal mic gain/EQ/ALC/compressor processing a real
     // voice report would, rather than bypassing it like PostGen does).
     report_recorder: ReportRecorder,
+    // RTTY "virtual mic" -- see rtty_link.rs. While tx_armed, replaces
+    // the normal source selection (checked right after REC/PLAY's
+    // playback, same injection point and reasoning).
+    rtty: RttyHandle,
     // Set by tci.rs's `trx` command handler from that command's optional
     // signal-source argument (spec section 4.2) -- true only when a TCI
     // client explicitly names a non-"tci" source. Consulted only by the
@@ -2307,6 +2312,10 @@ fn run(
             for slot in chunk.iter_mut() {
                 *slot = report_recorder.next_sample().unwrap_or(0.0);
             }
+        } else if rtty.tx_armed() {
+            // See rtty_link.rs -- AFSK tones (idle mark when nothing is
+            // queued) in place of mic/TCI audio.
+            rtty.fill_tx(&mut chunk);
         } else {
         let selected_source = tx_audio_source.load(Ordering::Relaxed);
         if selected_source == TX_AUDIO_SOURCE_RADIO_MIC {
@@ -2632,6 +2641,8 @@ impl TxHandle {
         // See run()'s doc comment on the parameter of the same name.
         report_recorder: ReportRecorder,
         // See run()'s doc comment on the parameter of the same name.
+        rtty: RttyHandle,
+        // See run()'s doc comment on the parameter of the same name.
         tci_wants_mic: Arc<AtomicBool>,
         tx_iq_out: Arc<Mutex<VecDeque<f32>>>,
         // See run()'s doc comment on the parameter of the same name.
@@ -2680,7 +2691,7 @@ impl TxHandle {
             let cw_text_busy = Arc::clone(&cw_text_busy);
             thread::spawn(move || {
                 run(
-                    mic_buffer, tci_tx_audio, radio_mic_audio, tx_audio_source, report_recorder, tci_wants_mic,
+                    mic_buffer, tci_tx_audio, radio_mic_audio, tx_audio_source, report_recorder, rtty, tci_wants_mic,
                     tx_iq_out, tx_spectrum_iq, tx_audio_monitor, waveform_tap, mox, params, display, channel,
                     protocol, mic_rate, duc_rate, puresignal_enabled, ps_rx_feedback_iq, ps_tx_feedback_iq,
                     ps_params, ps_status, ps_corr_path, cw_keyer, cw_text_elements, cw_text_active, cw_text_busy, stop,

@@ -28,6 +28,8 @@ mod radio;
 mod radioberry_juice;
 mod report_recorder;
 mod rigctl;
+mod rtty;
+mod rtty_link;
 mod rx200;
 mod rx888;
 mod spectrum;
@@ -1713,6 +1715,13 @@ struct ConnectedState {
     /// reference, set once and rarely touched.
     rx_gain_calibration_db: i32,
     show_juice_console_window: bool,
+    /// "Digital..." window (digital modes -- RTTY for now). See
+    /// rtty_link.rs; `rtty` is owned here, not by SpectrumHandle, so it
+    /// survives the main SpectrumHandle being rebuilt on a sample-rate
+    /// change (TxHandle holds a clone of it).
+    show_digital_window: bool,
+    rtty: rtty_link::RttyHandle,
+    rtty_tx_input: String,
     extra_receivers: Vec<Arc<Mutex<ExtraReceiver>>>,
     settings_dirty: Arc<std::sync::atomic::AtomicBool>,
     band_memory: std::collections::HashMap<String, BandSettings>,
@@ -2728,6 +2737,7 @@ fn connect_to_device(device: Device, cfg: &Config) -> Result<ConnectedState, Str
             // ConnectedState -- restored directly into the atomic here
             // rather than round-tripped through a struct field.
             spectrum::set_cw_pitch_hz(cfg.cw_pitch_hz.unwrap_or(600.0));
+            let rtty = rtty_link::RttyHandle::new();
             let mic_buffer = Arc::new(Mutex::new(VecDeque::new()));
             let mic_input_device = cfg.mic_input_device.clone();
             let (tx_enabled, mic_input, tx_handle) =
@@ -2739,6 +2749,7 @@ fn connect_to_device(device: Device, cfg: &Config) -> Result<ConnectedState, Str
                         Arc::clone(&session.radio_mic_audio),
                         Arc::clone(&session.tx_audio_source),
                         spectrum.report_recorder.clone(),
+                        rtty.clone(),
                         Arc::clone(&session.tci_wants_mic),
                         Arc::clone(&session.tx_iq),
                         Arc::clone(&tx_spectrum_iq),
@@ -2937,6 +2948,9 @@ fn connect_to_device(device: Device, cfg: &Config) -> Result<ConnectedState, Str
                 juice_console: None,
                 sim_handle: None,
                 show_juice_console_window: false,
+                show_digital_window: false,
+                rtty,
+                rtty_tx_input: String::new(),
                 rx_gain_calibration_db: cfg.rx_gain_calibration_db.unwrap_or(0),
                 extra_receivers,
                 settings_dirty,
@@ -3528,6 +3542,13 @@ impl eframe::App for HpsdrApp {
                     .spectrum
                     .set_ctun(connected.ctun || connected.rit_enabled, ctun_offset_hz + rit_offset_hz);
                 connected.spectrum.set_cw_decode_enabled(connected.cw_decode_enabled);
+                // See rtty_link.rs -- decode only while the Digital
+                // window is open; closing it also disarms RTTY TX.
+                connected.spectrum.set_rtty(&connected.rtty);
+                connected.rtty.set_rx_enabled(connected.show_digital_window);
+                if !connected.show_digital_window {
+                    connected.rtty.set_tx_armed(false);
+                }
                 // Zoom should keep the CTUN'd listen frequency (where the
                 // filter/passband actually is) centered, not the parked
                 // hardware LO -- otherwise the filter drifts toward one
@@ -4403,6 +4424,16 @@ impl eframe::App for HpsdrApp {
                                 // session, matching the one board it drives).
                                 if connected.juice_console.is_some() && ui.button("Juice Console...").clicked() {
                                     connected.show_juice_console_window = !connected.show_juice_console_window;
+                                }
+                                // Digital modes (RTTY for now) -- one
+                                // entry point for all of them, see
+                                // render_digital_window.
+                                if ui
+                                    .button("Digital...")
+                                    .on_hover_text("Digital modes: RTTY decoder/encoder")
+                                    .clicked()
+                                {
+                                    connected.show_digital_window = !connected.show_digital_window;
                                 }
                             });
 
@@ -9925,6 +9956,7 @@ impl eframe::App for HpsdrApp {
                                                         Arc::clone(&connected.session.radio_mic_audio),
                                                         Arc::clone(&connected.session.tx_audio_source),
                                                         connected.spectrum.report_recorder.clone(),
+                                                        connected.rtty.clone(),
                                                         Arc::clone(&connected.session.tci_wants_mic),
                                                         Arc::clone(&connected.session.tx_iq),
                                                         Arc::clone(&tx_spectrum_iq),
@@ -11317,6 +11349,66 @@ impl eframe::App for HpsdrApp {
                     }
                 }
 
+                // "Digital..." window -- same viewport pattern as the
+                // Juice Console window just above.
+                if connected.show_digital_window {
+                    let light_visuals = with_orange_selection(egui::Visuals::dark());
+                    let light_style = egui::Style { visuals: light_visuals.clone(), ..Default::default() };
+                    let mut close_requested = false;
+                    let digital_kiosk = lcd_kiosk_mode();
+                    let size = [640.0, 480.0];
+                    let mut digital_viewport = egui::ViewportBuilder::default()
+                        .with_title("Digital Modes")
+                        .with_inner_size(size)
+                        .with_window_level(if digital_kiosk {
+                            egui::WindowLevel::Normal
+                        } else {
+                            egui::WindowLevel::AlwaysOnTop
+                        });
+                    if digital_kiosk {
+                        digital_viewport = digital_viewport
+                            .with_position(kiosk_centered_pos(size))
+                            .with_max_inner_size(size)
+                            .with_resizable(false)
+                            .with_decorations(false);
+                    }
+                    let rtty = connected.rtty.clone();
+                    let tx_available = connected.tx_enabled && connected.tx_handle.is_some();
+                    let mox = connected.session.mox.load(Ordering::Relaxed);
+                    let mode = connected.spectrum.mode();
+                    let tx_input = &mut connected.rtty_tx_input;
+                    ui.ctx().show_viewport_immediate(
+                        egui::ViewportId::from_hash_of("digital_modes_window"),
+                        digital_viewport,
+                        |ui, _class| {
+                            let escape_pressed = digital_kiosk
+                                && ui.input(|i| i.key_pressed(egui::Key::Escape));
+                            if ui.input(|i| i.viewport().close_requested()) || escape_pressed {
+                                close_requested = true;
+                                return;
+                            }
+                            if digital_kiosk {
+                                egui::Area::new(egui::Id::new("kiosk_close_digital"))
+                                    .anchor(egui::Align2::RIGHT_BOTTOM, egui::vec2(-6.0, -6.0))
+                                    .show(ui.ctx(), |ui| {
+                                        if kiosk_accent_button(ui, "\u{2715} CLOSE").clicked() {
+                                            close_requested = true;
+                                        }
+                                    });
+                            }
+                            egui::CentralPanel::default()
+                                .frame(egui::Frame::central_panel(&light_style))
+                                .show(ui, |ui| {
+                                    ui.visuals_mut().clone_from(&light_visuals);
+                                    render_digital_panel(ui, &rtty, tx_input, tx_available, mox, mode);
+                                });
+                        },
+                    );
+                    if close_requested {
+                        connected.show_digital_window = false;
+                    }
+                }
+
                 // root_close_requested/stop_clicked (computed earlier
                 // this frame -- see their own declarations) also force a
                 // save here rather than relying on settings_dirty alone,
@@ -11948,6 +12040,132 @@ fn render_cw_decoder_panel(ui: &mut egui::Ui, spectrum: &SpectrumHandle) {
     egui::ScrollArea::vertical().stick_to_bottom(true).show(ui, |ui| {
         ui.label(egui::RichText::new(spectrum.cw_text()).monospace());
     });
+}
+
+/// Content of the "Digital..." window -- a mode picker (RTTY only for
+/// now; further digital modes slot in beside it) plus the RTTY
+/// decoder/encoder controls. See rtty_link.rs for how RX/TX are wired.
+fn render_digital_panel(
+    ui: &mut egui::Ui,
+    rtty: &rtty_link::RttyHandle,
+    tx_input: &mut String,
+    tx_available: bool,
+    mox: bool,
+    mode: spectrum::Mode,
+) {
+    let amber = egui::Color32::from_rgb(230, 150, 50);
+    let red = egui::Color32::from_rgb(220, 50, 50);
+    let green = egui::Color32::from_rgb(40, 190, 70);
+
+    ui.horizontal(|ui| {
+        ui.label("Mode:");
+        let _ = ui.add(egui::Button::selectable(true, "RTTY"));
+    });
+    ui.separator();
+
+    let mut s = rtty.settings();
+    ui.horizontal(|ui| {
+        ui.label("Center:");
+        ui.add(egui::DragValue::new(&mut s.center_hz).range(300.0..=3000.0).speed(5.0).suffix(" Hz"));
+        ui.add_space(8.0);
+        ui.label("Baud:");
+        for b in rtty_link::BAUD_CHOICES {
+            if ui.add(egui::Button::selectable(s.baud == b, format!("{b}"))).clicked() {
+                s.baud = b;
+            }
+        }
+    });
+    ui.horizontal(|ui| {
+        ui.label("Shift:");
+        for sh in rtty_link::SHIFT_CHOICES {
+            if ui.add(egui::Button::selectable(s.shift_hz == sh, format!("{sh:.0}"))).clicked() {
+                s.shift_hz = sh;
+            }
+        }
+        ui.add_space(8.0);
+        ui.checkbox(&mut s.reverse, "Reverse");
+        ui.checkbox(&mut s.afc, "AFC");
+    });
+    rtty.set_settings(s);
+
+    let st = rtty.rx_status();
+    ui.horizontal(|ui| {
+        let (rect, _) = ui.allocate_exact_size(egui::vec2(14.0, 14.0), egui::Sense::hover());
+        let color = if st.lock >= 1.0 {
+            green
+        } else if st.lock > 0.0 {
+            amber
+        } else {
+            red
+        };
+        ui.painter().circle_filled(rect.center(), 6.0, color);
+        ui.label(if st.lock >= 1.0 { "LOCK" } else { "no lock" });
+        ui.add(
+            egui::ProgressBar::new(st.confidence.clamp(0.0, 1.0))
+                .desired_width(120.0)
+                .text(format!("conf {:.0}%", st.confidence * 100.0)),
+        );
+        if s.afc {
+            ui.label(format!("AFC {:+.0} Hz", st.afc_offset_hz));
+        }
+        if ui.button("Clear RX").clicked() {
+            rtty.clear_rx_text();
+        }
+    });
+    if !matches!(mode, spectrum::Mode::Usb | spectrum::Mode::Digu | spectrum::Mode::Lsb | spectrum::Mode::Digl) {
+        ui.colored_label(amber, "RTTY needs USB/DIGU (or LSB/DIGL with Reverse) selected.");
+    }
+
+    let rx_height = (ui.available_height() - 90.0).max(80.0);
+    egui::ScrollArea::vertical()
+        .id_salt("rtty_rx_text")
+        .max_height(rx_height)
+        .auto_shrink([false, false])
+        .stick_to_bottom(true)
+        .show(ui, |ui| {
+            ui.label(egui::RichText::new(rtty.rx_text()).monospace());
+        });
+    ui.separator();
+
+    if !tx_available {
+        ui.weak("TX unavailable (transmit disabled or no mic input device).");
+    }
+    ui.add_enabled_ui(tx_available, |ui| {
+        ui.horizontal(|ui| {
+            let armed = rtty.tx_armed();
+            if ui
+                .add(egui::Button::selectable(armed, "RTTY TX"))
+                .on_hover_text(
+                    "While on, keying MOX/PTT transmits RTTY tones (idle mark when \
+                     nothing is queued) instead of the microphone",
+                )
+                .clicked()
+            {
+                rtty.set_tx_armed(!armed);
+            }
+            let (sent, total) = rtty.tx_progress();
+            ui.label(format!("Sent {sent}/{total}"));
+            if armed && mox {
+                ui.colored_label(red, "ON AIR");
+            }
+            if ui.button("Clear TX").clicked() {
+                rtty.clear_tx();
+            }
+        });
+        ui.horizontal(|ui| {
+            let resp = ui.add(
+                egui::TextEdit::singleline(tx_input)
+                    .desired_width((ui.available_width() - 60.0).max(80.0))
+                    .hint_text("Text to send"),
+            );
+            let enter = resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+            if (ui.button("Send").clicked() || enter) && !tx_input.is_empty() {
+                rtty.send_text(tx_input);
+                tx_input.clear();
+            }
+        });
+    });
+    ui.ctx().request_repaint_after(Duration::from_millis(100));
 }
 
 /// Draws the CW decoder panel pinned to exactly `rect` (the caller

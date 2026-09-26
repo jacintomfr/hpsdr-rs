@@ -8,6 +8,7 @@
 use crate::audio_recorder::AudioRecorder;
 use crate::cw_decoder::CwDecoder;
 use crate::report_recorder::ReportRecorder;
+use crate::rtty_link::RttyHandle;
 use crate::radio::IqSample;
 use crate::wdsp_sys as wdsp;
 use std::collections::VecDeque;
@@ -1631,6 +1632,10 @@ fn run(
     // RAM for PLAY to transmit back), so both can be active together
     // with no interaction.
     report_recorder: ReportRecorder,
+    // RTTY decoder tap -- see rtty_link.rs. Set via
+    // SpectrumHandle::set_rtty (main receiver only); fed the same mono
+    // downmix as the CW decoder, only while the handle's rx_enabled.
+    rtty: Arc<Mutex<Option<RttyHandle>>>,
     rx_audio_to_radio: Option<Arc<Mutex<VecDeque<f32>>>>,
     // Muted (not pushed to any of the four audio outputs above) while
     // MOX is active -- see SpectrumHandle::start's doc comment on why.
@@ -1645,6 +1650,7 @@ fn run(
     let mut analyzer = SpectrumAnalyzer::open(channel, sample_rate);
     let mut chunk = Vec::with_capacity(BUFFER_SIZE);
     let mut cw_decoder = CwDecoder::new(Arc::clone(&cw_text));
+    let mut rtty_scratch: Vec<f32> = Vec::new();
     // Anti-aliasing lowpass for rx_audio_to_radio only -- confirmed via a
     // real packet capture (radio.rs's RX-audio-to-radio feature) that
     // WDSP's raw 48kHz RXA output carries a large, persistent near-
@@ -1787,6 +1793,8 @@ fn run(
         if !cw_active {
             cw_decoder.reset();
         }
+        let rtty_rx = rtty.lock().unwrap().clone().filter(|r| r.rx_enabled());
+        rtty_scratch.clear();
         {
             let mut out = audio_out.lock().unwrap();
             // Dedicated tap for TCI's audio_start streaming -- same
@@ -1896,6 +1904,9 @@ fn run(
                 if cw_active {
                     cw_decoder.process_sample(mono);
                 }
+                if rtty_rx.is_some() {
+                    rtty_scratch.push(mono);
+                }
                 // Local speaker playback and TCI's RX audio stream carry
                 // the real (l, r) pair -- identical (l==r) when binaural
                 // is off, same as every consumer effectively saw before
@@ -1922,6 +1933,11 @@ fn run(
                     radio_out.push_back(filtered);
                 }
             }
+        }
+        // After the audio queues' locks are released above, so the
+        // modem's DSP never delays the speaker/TCI consumers.
+        if let Some(r) = &rtty_rx {
+            r.feed_rx(&rtty_scratch);
         }
     }
 }
@@ -1973,6 +1989,8 @@ pub struct SpectrumHandle {
     /// start()/stop() forwarding methods here.
     pub recorder: AudioRecorder,
     pub report_recorder: ReportRecorder,
+    /// See run()'s param of the same name and set_rtty.
+    rtty: Arc<Mutex<Option<RttyHandle>>>,
     demod_params: Arc<Mutex<DemodParams>>,
     /// The IQ input queue run()'s analyzer thread consumes from -- kept
     /// here too (not just inside that thread) so clear_display can drain
@@ -2040,6 +2058,7 @@ impl SpectrumHandle {
         let cw_decode_enabled = Arc::new(AtomicBool::new(true));
         let recorder = AudioRecorder::new();
         let report_recorder = ReportRecorder::new();
+        let rtty: Arc<Mutex<Option<RttyHandle>>> = Arc::new(Mutex::new(None));
         let stop = Arc::new(AtomicBool::new(false));
         let iq_buffer_for_clear = Arc::clone(&iq_buffer);
         let thread = {
@@ -2053,6 +2072,7 @@ impl SpectrumHandle {
             let cw_decode_enabled = Arc::clone(&cw_decode_enabled);
             let recorder = recorder.clone();
             let report_recorder = report_recorder.clone();
+            let rtty = Arc::clone(&rtty);
             let stop = Arc::clone(&stop);
             thread::spawn(move || {
                 run(
@@ -2069,6 +2089,7 @@ impl SpectrumHandle {
                     cw_decode_enabled,
                     recorder,
                     report_recorder,
+                    rtty,
                     rx_audio_to_radio,
                     mox,
                     mute_local_for_tci,
@@ -2086,6 +2107,7 @@ impl SpectrumHandle {
             cw_decode_enabled,
             recorder,
             report_recorder,
+            rtty,
             demod_params,
             iq_buffer: iq_buffer_for_clear,
             channel,
@@ -2155,6 +2177,17 @@ impl SpectrumHandle {
     /// panel is being drawn.
     pub fn set_cw_decode_enabled(&self, enabled: bool) {
         self.cw_decode_enabled.store(enabled, Ordering::Relaxed);
+    }
+
+    /// Attaches the session's RTTY handle (see rtty_link.rs) as this
+    /// receiver's decoder tap. Pushed from main.rs every frame, same as
+    /// set_cw_decode_enabled, so a SpectrumHandle rebuilt on a
+    /// sample-rate change picks it back up with no extra wiring there.
+    pub fn set_rtty(&self, handle: &RttyHandle) {
+        let mut slot = self.rtty.lock().unwrap();
+        if !slot.as_ref().is_some_and(|h| h.same_as(handle)) {
+            *slot = Some(handle.clone());
+        }
     }
 
     pub fn width_hz(&self) -> f64 {
