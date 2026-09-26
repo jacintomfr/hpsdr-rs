@@ -11470,8 +11470,15 @@ impl eframe::App for HpsdrApp {
                                 .frame(egui::Frame::central_panel(&light_style))
                                 .show(ui, |ui| {
                                     ui.visuals_mut().clone_from(&light_visuals);
-                                    fit_filter_clicked =
-                                        render_digital_panel(ui, &rtty, tx_input, tx_available, mox, mode);
+                                    fit_filter_clicked = render_digital_panel(
+                                        ui,
+                                        &rtty,
+                                        tx_input,
+                                        tx_available,
+                                        mox,
+                                        mode,
+                                        dial_freq_hz,
+                                    );
                                 });
                         },
                     );
@@ -12142,6 +12149,7 @@ fn render_digital_panel(
     tx_available: bool,
     mox: bool,
     mode: spectrum::Mode,
+    dial_freq_hz: u32,
 ) -> bool {
     let mut fit_filter_clicked = false;
     let amber = egui::Color32::from_rgb(230, 150, 50);
@@ -12193,6 +12201,28 @@ fn render_digital_panel(
         }
     });
     rtty.set_settings(s);
+
+    // Plain numbers, not just the on-screen cursors -- a real report
+    // that the drawn lines and the visible signal in the waterfall
+    // didn't look aligned turned out impossible to resolve from
+    // screenshots alone (pixel position depends on zoom/pan too).
+    // These are the exact on-air frequencies the cursors are drawn at,
+    // computed the same way SDRoxide's own on_air_hz does (dial minus
+    // the offset on LSB/DIGL, plus it otherwise) -- compare this
+    // directly against the frequency shown by hovering the mouse over
+    // the actual signal peak in the waterfall.
+    let lsb_sense = matches!(mode, spectrum::Mode::Lsb | spectrum::Mode::Digl);
+    let on_air = |audio_hz: f64| -> f64 {
+        if lsb_sense { dial_freq_hz as f64 - audio_hz } else { dial_freq_hz as f64 + audio_hz }
+    };
+    ui.horizontal(|ui| {
+        ui.label(format!(
+            "On-air: mark {:.6} MHz  space {:.6} MHz  center {:.6} MHz",
+            on_air(s.center_hz + s.shift_hz / 2.0) / 1e6,
+            on_air(s.center_hz - s.shift_hz / 2.0) / 1e6,
+            on_air(s.center_hz) / 1e6,
+        ));
+    });
 
     let st = rtty.rx_status();
     ui.horizontal(|ui| {
