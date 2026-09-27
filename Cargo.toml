@@ -168,11 +168,19 @@ winresource = "0.1"
 
 # `cargo deb` (https://crates.io/crates/cargo-deb) reads this to build a
 # .deb -- Linux only, hence no attempt to also cover Windows/macOS
-# packaging here. `depends` is left as the default "$auto": cargo-deb runs
-# dpkg-shlibdeps against the built binary to work out the real runtime
-# shared-lib dependencies (libfftw3-3, libasound2, libx11-6/libwayland,
-# etc.) rather than this list drifting out of sync by hand.
+# packaging here. `$auto` makes cargo-deb run dpkg-shlibdeps against the
+# built binary to work out the real runtime shared-lib dependencies
+# (libfftw3-3, libasound2, libx11-6/libwayland, etc.) rather than this
+# list drifting out of sync by hand. libxkbcommon-x11-0 is appended
+# explicitly alongside it: egui/winit load it at runtime via `dlopen`
+# rather than linking it directly, so dpkg-shlibdeps' binary scan never
+# sees it and can't add it on its own -- without this, a clean install
+# (nothing else ever having pulled it in as some other package's own
+# dependency) panics on startup with "Library libxkbcommon-x11-0.so
+# could not be loaded" (confirmed on a minimal Ubuntu/WSL2, see
+# README.md's WSL2 section).
 [package.metadata.deb]
+depends = "$auto, libxkbcommon-x11-0"
 maintainer = "John Melton <john.d.melton@googlemail.com>"
 copyright = "2026, John Melton <john.d.melton@googlemail.com>"
 license-file = ["LICENSE", "4"]
