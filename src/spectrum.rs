@@ -1711,6 +1711,12 @@ fn run(
     // filled each iteration.
     let mut last_mox = false;
     let mut txrx_silence_remaining: usize = 0;
+    // Separate, longer counter for the AUDIO demod path only -- see the
+    // doc comment where this is used, just after `chunk`'s own raw-IQ
+    // silencing block below. Reuses a scratch copy of `chunk` rather
+    // than the RadeWorker one to avoid re-zeroing the waterfall/TCI feed.
+    let mut txrx_audio_silence_remaining: usize = 0;
+    let mut demod_scratch: Vec<IqSample> = Vec::with_capacity(BUFFER_SIZE);
 
     while !stop.load(Ordering::Relaxed) {
         chunk.clear();
@@ -1726,26 +1732,39 @@ fn run(
             continue;
         }
 
-        // Zero the first ~30ms of RX IQ right after a TX->RX transition
-        // -- a direct port of piHPSDR's own fix (receiver.c's
-        // rx_add_iq_samples/radio.c's rxtx(): "silenced first RX samples
-        // after a TX/RX transition since they contain the own TX signal
-        // (from crosstalk at the T/R relay)"). Crosstalk into the RX
-        // front end doesn't need a mechanical relay to cause this --
-        // RF/PCB coupling on a relay-less low-power board is enough --
-        // and without this fix the AGC pumps hard trying to track that
-        // brief burst, audible as a click that takes a couple of
-        // seconds to settle back down (confirmed via a real report).
-        // Done here, at the very intake of the raw IQ (before the
-        // spectrum/waterfall tap, TCI's raw IQ tap, and the RXA/AGC
-        // feed below all see it), matching piHPSDR's own insertion
-        // point exactly -- silencing only the audio output tap (as a
-        // fade) would still let the AGC react to the contaminated
-        // samples.
-        const TXRX_SILENCE_SECS: f32 = 0.030;
+        // Zero the first few ms of RX IQ right after a TX->RX transition
+        // -- a direct, faithful port of deskHPSDR's own `rxtx()` (radio.c):
+        // "Set parameters for the silence first RXIQ samples after TX/RX
+        // transition feature ... Seeing 'tails' of the own TX signal
+        // (from crosstalk at the T/R relay) has been observed for
+        // RedPitayas ... and HermesLite2 devices". Their exact table (by
+        // TX mode): CW = 0 (no silence, fast CW turnaround matters more
+        // than a brief tail), AM/FMN = 31ms (`rate >> 5`), everything
+        // else (SSB/digital) = 16ms (`rate >> 6`). Two earlier attempts
+        // here guessed much longer windows (80ms, then 750ms) by trial
+        // and error against a real hardware report -- correct per THAT
+        // testing, but not what the reference actually does; the real
+        // fix for the report's main symptom (a red/yellow/green band
+        // spanning the ENTIRE spectrum) turned out to be unrelated --
+        // HermesLite's own RX Gain byte not dropping during TX at all
+        // (see p1_build_packet's own fix) -- and deskHPSDR's real
+        // equivalent to "don't show the overload" is removing the RX
+        // panel from its window entirely while transmitting (this
+        // project's closest equivalent: freezing waterfall_rows below
+        // while mox is active). With that in place, this window only
+        // needs to cover the brief tail right at unkey, matching the
+        // reference's own short durations.
+        let mode = demod_params.lock().unwrap().mode;
+        let txrx_silence_secs: f32 = match mode {
+            Mode::Cwl | Mode::Cwu => 0.0,
+            Mode::Am | Mode::Fmn => 0.031,
+            _ => 0.016,
+        };
         let mox_now = mox.load(Ordering::Relaxed);
         if last_mox && !mox_now {
-            txrx_silence_remaining = (sample_rate as f32 * TXRX_SILENCE_SECS) as usize;
+            let n = (sample_rate as f32 * txrx_silence_secs) as usize;
+            txrx_silence_remaining = n;
+            txrx_audio_silence_remaining = n;
         }
         last_mox = mox_now;
         if txrx_silence_remaining > 0 {
@@ -1800,22 +1819,72 @@ fn run(
                 }
                 d.spectrum = s;
             }
+            // ROOT CAUSE FIX for a real report: showing a live waterfall
+            // through TX (and the crosstalk decay right after unkeying)
+            // doesn't make sense for half duplex -- there's no real RX
+            // happening then, only your own transmitted/leaking signal,
+            // so a continuously updating waterfall there is misleading
+            // by construction, not just occasionally noisy. Matches
+            // deskHPSDR's own half-duplex behavior (confirmed via a real
+            // side-by-side: it shows no waterfall at all while
+            // transmitting). The spectrum LINE trace above is untouched
+            // -- it still updates (on the already-silenced `chunk`, see
+            // txrx_silence_remaining above, so it reads near the noise
+            // floor rather than a real crosstalk peak), matching
+            // deskHPSDR's "full window with spectrum" while transmitting.
+            // The waterfall simply stops accumulating new rows during
+            // mox and the post-unkey silence window, resuming cleanly
+            // (real data, no gap-filled/blank rows) once both clear.
             if let Some(mut w) = waterfall {
-                if cal != 0.0 {
-                    for v in &mut w {
-                        *v += cal;
+                if !mox_now && txrx_silence_remaining == 0 {
+                    if cal != 0.0 {
+                        for v in &mut w {
+                            *v += cal;
+                        }
                     }
-                }
-                d.waterfall_rows.push_front(w);
-                if d.waterfall_rows.len() > WATERFALL_HISTORY {
-                    d.waterfall_rows.pop_back();
+                    d.waterfall_rows.push_front(w);
+                    if d.waterfall_rows.len() > WATERFALL_HISTORY {
+                        d.waterfall_rows.pop_back();
+                    }
                 }
             }
             d.revision = d.revision.wrapping_add(1);
         }
 
         let passband = params.explicit_passband.unwrap_or_else(|| passband_for(params.mode, params.width_hz));
-        let audio = analyzer.demod(&chunk, params, passband);
+        // ROOT CAUSE FIX for a real report: the operator's own voice was
+        // still audible for ~0.5-0.75s after unkeying even with the
+        // short post-unkey silence window above (which only zeroes
+        // `demod_scratch`'s INPUT -- `analyzer.demod()` itself, and
+        // WDSP's own AGC inside it, still ran every chunk through the
+        // ENTIRE transmission, continuously reacting to whatever real
+        // crosstalk reached the front end for the full TX duration, not
+        // just the brief post-unkey tail). Confirmed against deskHPSDR's
+        // real source (`radio.c`'s `rxtx()`): it calls `rx_begin_off()`/
+        // `rx_wait_off()` (WDSP `SetChannelState(id, 0, ...)`) BEFORE TX
+        // starts and only `rx_on()` (`SetChannelState(id, 1, 0)`) at the
+        // TX->RX transition -- WDSP's RX channel, AGC included, does not
+        // run AT ALL during TX, so its state is exactly as it was the
+        // instant before keying, never pumped by crosstalk in the first
+        // place. `analyzer.demod()` is now skipped entirely while
+        // `mox_now` is true, matching that exactly; the short post-unkey
+        // window below still covers the brief IQ tail right at RX
+        // resume, same as deskHPSDR's own `txrxmax`.
+        let audio = if mox_now {
+            Vec::new()
+        } else if txrx_audio_silence_remaining > 0 {
+            demod_scratch.clear();
+            demod_scratch.extend_from_slice(&chunk);
+            let n = txrx_audio_silence_remaining.min(demod_scratch.len());
+            for s in demod_scratch.iter_mut().take(n) {
+                s.i = 0;
+                s.q = 0;
+            }
+            txrx_audio_silence_remaining -= n;
+            analyzer.demod(&demod_scratch, params, passband)
+        } else {
+            analyzer.demod(&chunk, params, passband)
+        };
         // See DemodParams::meter_calibration_db's own doc comment.
         let meter_db = analyzer.meter_db() + params.meter_calibration_db;
         display.lock().unwrap().meter_db = meter_db;
@@ -1882,37 +1951,36 @@ fn run(
             // comment -- read once per chunk, not per-sample, same as
             // mox_active above.
             let mute_local = mute_local_for_tci.load(Ordering::Relaxed);
-            for (l, r) in audio {
-                if mox_active {
-                    // Keep the local speaker's queue topped up with
-                    // explicit silence instead of starving it outright
-                    // (the previous behavior here) -- a real report:
-                    // AudioOutput's cpal callback drains this queue at a
-                    // hard real-time rate regardless of what's feeding
-                    // it, so letting it run completely empty throughout
-                    // TX meant the moment mox dropped, cpal was already
-                    // asking for samples before this thread had produced
-                    // any real ones yet, showing up as a genuine burst of
-                    // underruns (audible as the remaining "quick click"
-                    // right at the TX->RX edge, confirmed via the status
-                    // bar's own underrun-rate reading spiking exactly
-                    // then and nowhere else) -- not a bug in the
-                    // counting, a real gap. Pushing silence instead keeps
-                    // the queue's buffer level steady through the
-                    // transition, so there's nothing to "catch up" from
-                    // once real audio resumes. tci_out/radio_out/
-                    // waveform_out are untouched -- they don't feed a
-                    // hard-real-time consumer the way AudioOutput's cpal
-                    // callback does, so this specific failure mode
-                    // doesn't apply to them.
-                    if !mute_local {
-                        if out.len() >= AUDIO_BUFFER_CAPACITY {
-                            out.pop_front();
-                        }
-                        out.push_back((0.0, 0.0));
+            // Keep the local speaker's queue topped up with explicit
+            // silence during TX, now that `audio` (above) is genuinely
+            // EMPTY while mox_active -- analyzer.demod() itself is
+            // skipped entirely during TX now (see that code's own doc
+            // comment), so there's no per-sample loop over real output
+            // to piggyback this on any more. Pushed here instead, sized
+            // to roughly the same sample count demod() would have
+            // produced from one `chunk` at OUTPUT_RATE, so the queue's
+            // fill level stays steady through the transition -- a real
+            // report: AudioOutput's cpal callback drains this queue at a
+            // hard real-time rate regardless of what's feeding it, so
+            // letting it run completely empty throughout TX meant the
+            // moment mox dropped, cpal was already asking for samples
+            // before this thread had produced any real ones yet, showing
+            // up as a genuine burst of underruns (audible as a "quick
+            // click" right at the TX->RX edge). tci_out/radio_out/
+            // waveform_out are untouched (get nothing during TX, same as
+            // before) -- they don't feed a hard-real-time consumer the
+            // way AudioOutput's cpal callback does, so this specific
+            // failure mode doesn't apply to them.
+            if mox_active && !mute_local {
+                let n = ((BUFFER_SIZE as u64 * OUTPUT_RATE as u64) / sample_rate as u64) as usize;
+                for _ in 0..n {
+                    if out.len() >= AUDIO_BUFFER_CAPACITY {
+                        out.pop_front();
                     }
-                    continue;
+                    out.push_back((0.0, 0.0));
                 }
+            }
+            for (l, r) in audio {
                 // See DcBlocker's own doc comment -- strips the raw
                 // demod output's DC/near-DC pedestal before anything
                 // else (mono downmix, waveform tap, CW decoder, Audio
@@ -2034,8 +2102,14 @@ fn run(
             let mute_local = mute_local_for_tci.load(Ordering::Relaxed);
             let mut out = audio_out.lock().unwrap();
             let mut tci_out = tci_audio_out.lock().unwrap();
+            // ROOT CAUSE FIX for a real report: the Audio Gain slider had
+            // no effect on RADE's decoded speech (only Windows' own
+            // volume control did) -- this loop replaces the normal
+            // per-sample WDSP audio path above, which is the only place
+            // that applied `params.gain` (see `l * params.gain` a few
+            // lines up), so RADE's own speech never got it.
             for _ in 0..rade_scratch.len() {
-                let s = rade_jitter.pop_front().unwrap_or(0.0).clamp(-1.0, 1.0);
+                let s = (rade_jitter.pop_front().unwrap_or(0.0) * params.gain).clamp(-1.0, 1.0);
                 if !mute_local {
                     if out.len() >= AUDIO_BUFFER_CAPACITY {
                         out.pop_front();

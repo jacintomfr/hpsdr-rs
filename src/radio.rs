@@ -4028,8 +4028,25 @@ fn p1_build_packet(
             // this is meant to be a live, user-adjustable value, not a
             // constant, exactly mirroring the standard-board case just
             // above.
+            // ROOT CAUSE FIX for a real report: a red/yellow/green
+            // waterfall band spanning the ENTIRE displayed spectrum for
+            // the full duration of every transmission (not just a brief
+            // TX/RX transition), confirmed absent on deskHPSDR in full
+            // duplex on the same radio -- this HermesLite RX Gain byte
+            // was sent unconditionally from `rx_attenuation` regardless
+            // of `mox_on`, unlike the standard-board attenuator case
+            // just below (0x3F while transmitting, "to protect the
+            // second ADC from strong signals") and P2's own ADC0/ADC1
+            // TX-time attenuation. At a typical RX Gain setting (e.g.
+            // 27dB), the front end stays fully sensitive through your
+            // own TX, and the antenna-relay/RF coupling from your own
+            // signal overloads it for the whole key-down period -- a
+            // real, expected front-end overload, not a display glitch.
+            // Dropped to the minimum wire value (0, i.e. -12dB) while
+            // transmitting, same protective intent as the other boards'
+            // TX-time attenuation just mentioned.
             let c4: u8 = if is_hermes_lite {
-                0x40 | (rx_attenuation & 0x3F)
+                0x40 | (if mox_on { 0 } else { rx_attenuation & 0x3F })
             } else {
                 0x20 | (rx_attenuation & 0x1F)
             };

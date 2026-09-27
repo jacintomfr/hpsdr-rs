@@ -6268,7 +6268,21 @@ impl eframe::App for HpsdrApp {
                     // spectrum trace the FULL combined height instead of
                     // its ratio-based share -- no divider to drag against
                     // when there's nothing below it to divide.
-                    let spectrum_height = if connected.waterfall_enabled {
+                    // ROOT CAUSE FIX for a real report: matches
+                    // deskHPSDR's own half-duplex behavior exactly (see
+                    // spectrum.rs's run() -- WDSP's RX channel, including
+                    // AGC, is now skipped entirely while transmitting,
+                    // and the waterfall stops accumulating new rows) --
+                    // the spectrum pane takes the FULL combined height
+                    // while transmitting, same as when the user disables
+                    // the waterfall by hand, but only for the duration of
+                    // the transmission; connected.waterfall_enabled
+                    // itself (the persisted user setting) is untouched,
+                    // so it reverts to its normal share the instant mox
+                    // drops.
+                    let waterfall_effectively_enabled =
+                        connected.waterfall_enabled && !connected.session.mox_active();
+                    let spectrum_height = if waterfall_effectively_enabled {
                         (spectrum_waterfall_height * connected.spectrum_waterfall_ratio).max(80.0)
                     } else {
                         spectrum_waterfall_height
@@ -6883,7 +6897,7 @@ impl eframe::App for HpsdrApp {
                     // CW panel (below, runs either way) just uses the
                     // spectrum pane's own bottom edge instead of the
                     // waterfall's.
-                    let waterfall_bottom = if connected.waterfall_enabled {
+                    let waterfall_bottom = if waterfall_effectively_enabled {
                         if spectrum_waterfall_divider(
                             ui,
                             &mut connected.spectrum_waterfall_ratio,
@@ -11955,16 +11969,28 @@ impl eframe::App for HpsdrApp {
                         settings_changed = true;
                     }
                     if rade_fit_filter_clicked {
-                        // Same explicit_passband mechanism as RTTY/SSTV's
-                        // own Fit Filter -- RADE V1's band is fixed too
-                        // (~1060-1880 Hz, confirmed against SDRoxide's own
-                        // RADE panel hint text: "RADE V1 occupies roughly
-                        // 1060-1880 Hz of the passband"), not a
-                        // per-signal setting, so there is nothing from
-                        // rade_link.rs to read here either.
-                        let margin = 50.0;
-                        let low = 1060.0 - margin;
-                        let high = 1880.0 + margin;
+                        // ROOT CAUSE FIX for a real report: the filter
+                        // visibly cut into the real signal on the
+                        // waterfall by ~300-400Hz on each side (measured
+                        // via a real hardware capture: signal ~680-2180Hz
+                        // above the dial, this used to set only
+                        // 1010-1930Hz), and decoded audio quality was
+                        // measurably worse for it (confirmed via a real
+                        // A/B test once widened). Checked against two
+                        // real reference clients rather than guessing a
+                        // margin: SDRoxide's own `passband_for` (Rade =>
+                        // (300.0, 2700.0), sdroxide-types/src/mode.rs)
+                        // and deskHPSDR's own hardcoded "FreeDV/RADEV1"
+                        // filter preset (`{ 700, 2300, "FreeDV/RADEV1" }`,
+                        // `src/filter.c:162`, mirrored as
+                        // `{-2300, -700, ...}` on LSB/DIGL). Went with
+                        // deskHPSDR's narrower, exact figure here --
+                        // still comfortably wider than the old 1010-1930
+                        // band, same reasoning as SDRoxide's own (margin
+                        // for a signal/dial slightly off frequency), just
+                        // a tighter fit than SDRoxide's own choice.
+                        let low = 700.0;
+                        let high = 2300.0;
                         let passband = if matches!(mode, spectrum::Mode::Lsb | spectrum::Mode::Digl) {
                             (-high, -low)
                         } else {
