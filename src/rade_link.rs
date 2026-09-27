@@ -57,6 +57,8 @@ struct Inner {
     worker: Mutex<Option<RadeWorker>>,
     rx_enabled: AtomicBool,
     tx_armed: AtomicBool,
+    /// See RadeHandle::set_unkeying's own doc comment.
+    unkeying: AtomicBool,
     rx_log: Mutex<Vec<RadeTextRx>>,
 }
 
@@ -79,6 +81,7 @@ impl RadeHandle {
                 worker: Mutex::new(worker),
                 rx_enabled: AtomicBool::new(false),
                 tx_armed: AtomicBool::new(false),
+                unkeying: AtomicBool::new(false),
                 rx_log: Mutex::new(Vec::new()),
             }),
         }
@@ -109,6 +112,30 @@ impl RadeHandle {
 
     pub fn set_tx_armed(&self, on: bool) {
         self.inner.tx_armed.store(on, Ordering::Relaxed);
+    }
+
+    /// ROOT CAUSE FIX for a real deadlock: the real radio's own MOX and
+    /// "does RadeWorker think it's still transmitting" used to be the
+    /// SAME flag (`fill_tx`'s `mox_on` parameter, fed straight from the
+    /// session's real mox). Deferring the real mox=false until
+    /// `tx_drained()` (so RF stays up long enough for the End-of-Over
+    /// burst to actually leave the antenna -- see main.rs's
+    /// `rade_pending_unkey`) meant RadeWorker itself never saw a
+    /// keyed->unkeyed edge either, since fill_tx kept being called with
+    /// mox_on=true the whole time it was waiting -- it never started
+    /// generating the EOO burst in the first place, so tx_drained()
+    /// could never become true: a real hang the operator could only
+    /// escape by killing the app. This flag decouples the two: while
+    /// true, `fill_tx` tells RadeWorker mox is false (starting the EOO
+    /// flush) regardless of what the real radio's mox still reads,
+    /// while the caller is free to keep the real mox up until
+    /// `tx_drained()` actually reports the burst is out.
+    pub fn set_unkeying(&self, on: bool) {
+        self.inner.unkeying.store(on, Ordering::Relaxed);
+    }
+
+    fn is_unkeying(&self) -> bool {
+        self.inner.unkeying.load(Ordering::Relaxed)
     }
 
     /// Set the callsign transmitted in the End-of-Over frame -- see
@@ -160,10 +187,14 @@ impl RadeHandle {
     /// desync a receiver's demodulator. Never checked/logged before this
     /// -- see tx.rs's own rade-diag block for where the caller tracks it.
     pub fn fill_tx(&self, mox_on: bool, mic: &[f32], out: &mut [f32]) -> usize {
+        // See set_unkeying's own doc comment -- lets a caller flush the
+        // End-of-Over burst (RadeWorker sees mox go false, starts
+        // generating it) before actually dropping the real radio's mox.
+        let worker_mox_on = mox_on && !self.is_unkeying();
         let mut w = self.inner.worker.lock().unwrap();
         match w.as_mut() {
             Some(w) => {
-                w.set_tx(mox_on);
+                w.set_tx(worker_mox_on);
                 w.push_mic(mic);
                 w.pop_tx(out)
             }

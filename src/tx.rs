@@ -2467,6 +2467,30 @@ fn run(
             }
             let real_samples = rade.fill_tx(mox.load(Ordering::Relaxed), &mic_chunk, &mut chunk);
             rade_tx_underrun_samples += (chunk.len() - real_samples) as u64;
+            // ROOT CAUSE FIX for a real report: RADE TX averaged only ~1W
+            // on a 40W-configured HermesLite2, vs. the ~6W FreeDV's own
+            // reference gets from a 15-16W-PEP-rated radio (confirmed
+            // fixed: real hardware now reads ~6W in the same setup).
+            // `rade::TX_REAL_SCALE` (0.5, i.e. -6dB) is baked into every
+            // sample RadeWorker hands back -- the codec's own internal
+            // INT16 headroom convention (confirmed identical in
+            // SDRoxide's sdroxide-rade crate) -- and nothing downstream
+            // compensates for it, since Leveler/Compressor/CFC/ALC are
+            // all deliberately bypassed for RADE (they'd corrupt the
+            // modulated waveform, see the `rade.tx_armed()` branch
+            // below). SDRoxide's own equivalent stage (engine.rs's
+            // `digi_tx_gain`) does exactly this: `1.0 / tx_peak` (i.e.
+            // the same 2x here) followed by a hard per-sample magnitude
+            // clamp, "so the radio is handed a full-scale modulating
+            // signal and a full Drive is a full transmitter" (their own
+            // issue #131). Matches that exactly. (This alone wasn't
+            // sufficient on hpsdr-rs -- see the slew-limiter bypass
+            // further down in this same function for the other half of
+            // the real fix, which is what actually unblocked it.)
+            let rade_gain = 1.0 / crate::rade::TX_REAL_SCALE;
+            for s in chunk.iter_mut() {
+                *s = (*s * rade_gain).clamp(-1.0, 1.0);
+            }
             // See rade_mic_peak's own doc comment above.
             let mic_peak = mic_chunk.iter().fold(0.0f32, |a, &s| a.max(s.abs()));
             let out_peak = chunk.iter().fold(0.0f32, |a, &s| a.max(s.abs()));
@@ -2592,13 +2616,31 @@ fn run(
             tx_denoiser.process(&mut chunk);
         }
         }
-        // See tx_slew_current's doc comment above -- smooths over any
-        // underrun-silence step (or any other discontinuity) introduced
-        // by whichever source branch just ran, before it reaches either
-        // the monitor tap or WDSP.
-        for sample in chunk.iter_mut() {
-            tx_slew_current += (*sample - tx_slew_current).clamp(-tx_max_step, tx_max_step);
-            *sample = tx_slew_current;
+        // ROOT CAUSE FIX for a real RADE low-power report: this slew
+        // limiter was designed for mic-underrun clicks (see its own doc
+        // comment above -- "legitimate fast speech transients aren't
+        // audibly softened"), calibrated against VOICE's own much
+        // slower spectral content. The math: tx_max_step implies a
+        // trackable-at-full-amplitude frequency of tx_max_step*mic_rate
+        // /(2*pi) -- at TX_SLEW_RAMP_SECS=0.003 and mic_rate=48000, that
+        // is only ~106 Hz. RADE's modulated tones sit at ~1000-1900 Hz,
+        // roughly full scale after `rade_gain` above -- 10-20x past
+        // what this limiter can track, so it was silently acting as an
+        // aggressive ~106 Hz low-pass on the ENTIRE RADE waveform,
+        // regardless of the input amplitude reaching it (confirmed via
+        // real hardware: the `rade_gain`/clamp fix just above made
+        // provably zero difference to actual transmitted power, because
+        // this ran unconditionally right after it and undid it either
+        // way). RADE's own `rade.fill_tx()` output has no mic-underrun
+        // steps to smooth in the first place (its underrun policy is
+        // handled separately -- see rade_tx_underrun_samples above), so
+        // there is nothing here for RADE to lose by skipping this
+        // entirely instead of retuning it.
+        if !rade.tx_armed() {
+            for sample in chunk.iter_mut() {
+                tx_slew_current += (*sample - tx_slew_current).clamp(-tx_max_step, tx_max_step);
+                *sample = tx_slew_current;
+            }
         }
 
         // TX audio monitor tap -- the exact content about to be fed to

@@ -1899,6 +1899,53 @@ struct ConnectedState {
     /// the main-panel PTT block for why this needs edge tracking rather
     /// than just mirroring mox_active().
     ptt_held: bool,
+    /// ROOT CAUSE FIX for a real report: a receiving station's RADE
+    /// callsign log stayed empty forever, tested against multiple real
+    /// TX sources (SDRoxide and a second hpsdr-rs instance) -- ruling
+    /// out the far end's own callsign config or its TX implementation.
+    /// Root cause: RadeWorker::set_tx(false) generates and queues the
+    /// End-of-Over burst synchronously, but nothing ever waited for
+    /// RadeHandle::tx_drained() before dropping the real radio's MOX --
+    /// the very next outgoing P1 packet already carried mox_bit=0, so
+    /// the radio physically unkeyed and the correctly-generated EOO
+    /// audio, still sitting in RadeWorker's own tx_out ring, never
+    /// actually left the antenna.
+    ///
+    /// `Some(started_at)` from the moment the operator clicks MOX off
+    /// while RADE is armed; the main per-frame loop calls
+    /// `rade.set_unkeying(true)` at that same moment (see its own doc
+    /// comment -- this is what actually makes RadeWorker start
+    /// generating the EOO burst instead of just waiting on a real mox
+    /// edge it would never see), then polls RadeHandle::tx_drained()
+    /// each frame and only calls the real session.set_mox(false) once
+    /// it reports true, holding RF up for the ~120ms+ the burst needs.
+    ///
+    /// BUG FIX (round 2, a real hang -- the only way out was killing the
+    /// app): a first version of this held the real mox up without ever
+    /// telling RadeWorker to unkey, so tx_drained() could never become
+    /// true -- deadlock. Fixed by the set_unkeying split above. Also
+    /// timestamped here now so a stuck drain (worker gone, or some
+    /// future regression of the same kind) force-drops mox after
+    /// RADE_UNKEY_TIMEOUT instead of hanging the transmitter again --
+    /// belt and braces, not a substitute for the real fix.
+    ///
+    /// Only covers the main MOX button for now -- rigctl/TCI/CW's own
+    /// unkey paths still drop mox immediately, same as before this fix.
+    rade_pending_unkey: Option<Instant>,
+    /// ROOT CAUSE FIX for a real report, round 3: `rade.tx_drained()`
+    /// only reflects RadeWorker's own internal tx_out ring being empty
+    /// -- it says nothing about `chunk` after that point, which still
+    /// has to pass through WDSP's TXA chain (processor.process) and then
+    /// sit in tx_iq_out until the radio.rs sender thread actually puts
+    /// it on the wire, which the real radio then has to buffer and
+    /// modulate. tx_drained() going true does not mean the EOO burst has
+    /// physically left the antenna yet -- unkeying the instant it does
+    /// risks truncating exactly the tail of the burst the far end needs.
+    /// `Some(instant)` from the frame tx_drained() first reports true;
+    /// the real session.set_mox(false) is held back an extra
+    /// RADE_UNKEY_SETTLE past that instant (still bounded by the same
+    /// RADE_UNKEY_TIMEOUT safety net above).
+    rade_drained_at: Option<Instant>,
     /// Tracked here (not just on TxHandle) so it survives a
     /// disable/re-enable of TX within the same session, and so it's
     /// available to persist even while TX is currently disarmed.
@@ -3048,6 +3095,8 @@ fn connect_to_device(device: Device, cfg: &Config) -> Result<ConnectedState, Str
                 mic_input_device,
                 tx_handle,
                 ptt_held: false,
+                rade_pending_unkey: None,
+                rade_drained_at: None,
                 mic_gain,
                 tci_tx_gain,
                 ps_enabled,
@@ -3645,6 +3694,31 @@ impl eframe::App for HpsdrApp {
                 );
                 if !connected.show_digital_window || connected.digital_mode != DigitalMode::Rade {
                     connected.rade.set_tx_armed(false);
+                }
+                // See ConnectedState::rade_pending_unkey's own doc comment.
+                // Polled every frame so the real radio stays keyed exactly
+                // as long as the End-of-Over burst needs, no longer -- with
+                // a hard timeout so a stuck drain can never hang the
+                // transmitter the way it did before set_unkeying existed.
+                const RADE_UNKEY_TIMEOUT: Duration = Duration::from_secs(2);
+                // See ConnectedState::rade_drained_at's own doc comment:
+                // extra hold past tx_drained() so WDSP + the tx_iq_out
+                // queue + the network send actually get the EOO burst's
+                // tail out before the real PTT drops.
+                const RADE_UNKEY_SETTLE: Duration = Duration::from_millis(300);
+                if let Some(started) = connected.rade_pending_unkey {
+                    if connected.rade_drained_at.is_none() && connected.rade.tx_drained() {
+                        connected.rade_drained_at = Some(Instant::now());
+                    }
+                    let settled = connected
+                        .rade_drained_at
+                        .is_some_and(|t| t.elapsed() >= RADE_UNKEY_SETTLE);
+                    if settled || started.elapsed() > RADE_UNKEY_TIMEOUT {
+                        connected.session.set_mox(false);
+                        connected.rade.set_unkeying(false);
+                        connected.rade_pending_unkey = None;
+                        connected.rade_drained_at = None;
+                    }
                 }
                 // Zoom should keep the CTUN'd listen frequency (where the
                 // filter/passband actually is) centered, not the parked
@@ -5621,7 +5695,21 @@ impl eframe::App for HpsdrApp {
                                      bands\" in Settings -> TX to override"
                                 });
                             if mox_resp.clicked() {
-                                connected.session.set_mox(!mox_now);
+                                let want_on = !mox_now;
+                                // See ConnectedState::rade_pending_unkey's own
+                                // doc comment -- unkeying while RADE is armed
+                                // defers the real drop until its End-of-Over
+                                // burst has actually gone out, instead of
+                                // cutting RF the instant the operator clicks
+                                // off. set_unkeying(true) is what actually
+                                // makes RadeWorker start generating that
+                                // burst -- real mox stays up in the meantime.
+                                if !want_on && connected.rade.tx_armed() {
+                                    connected.rade.set_unkeying(true);
+                                    connected.rade_pending_unkey = Some(Instant::now());
+                                } else {
+                                    connected.session.set_mox(want_on);
+                                }
                             }
 
                             // Tune: WDSP PostGen tone at passband

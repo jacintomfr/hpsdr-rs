@@ -154,6 +154,12 @@ impl Rade {
         // `c_char` is signed on x86 and unsigned on ARM, so it is spelled out
         // rather than written as `0i8`.
         let mut model = [0 as std::os::raw::c_char; 1];
+        // NOTE: RADE_VERBOSE_TERSE was tried as a diagnostic for the
+        // "callsign never received" report and confirmed to hang the RX
+        // worker thread on this system (its native printf appears to
+        // conflict with the app's own stdout redirection, backing up the
+        // audio pipeline). Do not re-enable without a different capture
+        // strategy (e.g. a separate unredirected process).
         let r = unsafe { sys::rade_open(model.as_mut_ptr(), sys::RADE_VERBOSE_0 as i32) };
         if r.is_null() {
             OPEN.store(false, Ordering::Release);

@@ -462,12 +462,26 @@ impl Inner {
                 self.shared.eoo_count.fetch_add(1, Ordering::Relaxed);
                 // Tens of microseconds of belief propagation, once per over,
                 // on this thread -- never the audio callback.
-                if let Some(call) = super::text::decode(&self.eoo_rx) {
-                    eprintln!(
-                        "[rade] End-of-Over callsign {call} (snr_db={})",
-                        self.last_sync_snr
-                    );
-                    let _ = self.text_tx.send(RadeTextRx { call, snr_db: self.last_sync_snr });
+                match super::text::decode(&self.eoo_rx) {
+                    Some(call) => {
+                        eprintln!(
+                            "[rade] End-of-Over callsign {call} (snr_db={})",
+                            self.last_sync_snr
+                        );
+                        let _ = self.text_tx.send(RadeTextRx { call, snr_db: self.last_sync_snr });
+                    }
+                    // TEMPORARY DIAGNOSTIC for a real report ("callsign never
+                    // appears") -- distinguishes has_eoo never firing at all
+                    // (nothing logged here or above) from it firing but the
+                    // LDPC/CRC decode failing (this line). Remove once the
+                    // report is resolved.
+                    None => {
+                        eprintln!(
+                            "[rade] End-of-Over frame detected but text decode failed \
+                             (LDPC/CRC did not check out) -- eoo_rx len={}",
+                            self.eoo_rx.len()
+                        );
+                    }
                 }
             }
             if out.n_features == 0 {
