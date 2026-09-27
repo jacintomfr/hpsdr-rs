@@ -587,6 +587,8 @@ struct TxProcessor {
     iq_scratch: Vec<f64>,
     last_mode: Option<Mode>,
     last_gain: Option<f32>,
+    /// See the `alc_enabled` param of `process()` for why this exists.
+    last_alc: Option<bool>,
     last_passband: Option<(f64, f64)>,
     last_eq: Option<EqualizerParams>,
     /// See TxParams::leveler_enabled's doc comment.
@@ -998,6 +1000,11 @@ impl TxProcessor {
             iq_scratch: vec![0.0; out_iq_pairs * 2],
             last_mode: None,
             last_gain: None,
+            // open() left SetTXAALCSt enabled (true), so start the
+            // change-detector matching that, not None -- otherwise the
+            // first process() call with alc_enabled=true would issue a
+            // redundant (harmless but noisy) SetTXAALCSt(1) call.
+            last_alc: Some(true),
             last_passband: Some(default_passband),
             last_eq: None,
             last_leveler: None,
@@ -1055,6 +1062,7 @@ impl TxProcessor {
         compressor_enabled: bool,
         compressor_gain_db: f32,
         cfc_enabled: bool,
+        alc_enabled: bool,
     ) -> (Vec<f32>, c_int) {
         debug_assert_eq!(mic_samples.len(), TX_BUFFER_SIZE);
 
@@ -1196,6 +1204,27 @@ impl TxProcessor {
                 wdsp::SetTXAPanelGain1(self.channel, mic_gain as f64);
             }
             self.last_gain = Some(mic_gain);
+        }
+
+        // ALC bypass for RADE: same reasoning as leveler_enabled/
+        // compressor_enabled/cfc_enabled above -- ALC is a dynamics
+        // processor too (fast peak limiter, 1ms attack/10ms decay, see
+        // open()'s SetTXAALCAttack/Decay), and by the time `chunk`
+        // reaches this call for a RADE TX, it no longer holds voice: it
+        // holds RADE's already-modulated multi-tone/OFDM-like waveform,
+        // whose tone-to-tone amplitude relationships ARE the signal.
+        // MaxGain is fixed at 0.0 dB (open(), see its own comment) so
+        // this can only ever attenuate down to the target ceiling, never
+        // pump gain up on quiet gaps -- but that attenuation alone is
+        // still enough to clip/reshape whichever tone happens to peg the
+        // ceiling on a given chunk, unevenly across chunks, which is
+        // exactly the kind of envelope distortion the far-end neural
+        // decoder is sensitive to. Left enabled for every other mode.
+        if self.last_alc != Some(alc_enabled) {
+            unsafe {
+                wdsp::SetTXAALCSt(self.channel, if alc_enabled { 1 } else { 0 });
+            }
+            self.last_alc = Some(alc_enabled);
         }
 
         // Graphic EQ -- see spectrum::EqualizerParams's doc comment and
@@ -2061,6 +2090,15 @@ fn run(
     let mut rade_out_peak: f32 = 0.0;
     let mut rade_out_nonzero_chunks: u32 = 0;
     let mut rade_chunks_this_window: u32 = 0;
+    // See RadeHandle::fill_tx's own doc comment: how many samples of
+    // `chunk` were real modulated audio vs. silence-padded because the
+    // worker thread's tx_out ring was empty. Zero throughout a
+    // transmission is the expected/healthy case (only the very first
+    // chunk after keying should ever show a shortfall, from the ~120ms
+    // priming warm-up); a nonzero count on a LATER chunk means the
+    // worker fell behind real time and spliced real silence into the
+    // modem waveform mid-transmission.
+    let mut rade_tx_underrun_samples: u64 = 0;
     // Mic-side leveler/compressor for RADE TX -- see rade_mic_agc.rs's
     // own module doc comment. Persistent across the whole session (not
     // recreated per over) so the leveler's gain carries between
@@ -2427,7 +2465,8 @@ fn run(
             if rade_comp_on {
                 rade_compressor.process(&mut mic_chunk, mic_rate as f64);
             }
-            rade.fill_tx(mox.load(Ordering::Relaxed), &mic_chunk, &mut chunk);
+            let real_samples = rade.fill_tx(mox.load(Ordering::Relaxed), &mic_chunk, &mut chunk);
+            rade_tx_underrun_samples += (chunk.len() - real_samples) as u64;
             // See rade_mic_peak's own doc comment above.
             let mic_peak = mic_chunk.iter().fold(0.0f32, |a, &s| a.max(s.abs()));
             let out_peak = chunk.iter().fold(0.0f32, |a, &s| a.max(s.abs()));
@@ -2605,6 +2644,7 @@ fn run(
                 log_async(format!(
                     "[rade-diag] mic_peak={rade_mic_peak:.4} out_peak={rade_out_peak:.4} \
                      nonzero_out_chunks={rade_out_nonzero_chunks}/{rade_chunks_this_window} \
+                     tx_underrun_samples={rade_tx_underrun_samples} \
                      tx_armed={} tx_drained={} sync={} snr_db={:.1}",
                     rade.tx_armed(),
                     rade.tx_drained(),
@@ -2615,6 +2655,7 @@ fn run(
             rade_mic_peak = 0.0;
             rade_out_peak = 0.0;
             rade_out_nonzero_chunks = 0;
+            rade_tx_underrun_samples = 0;
             rade_chunks_this_window = 0;
             starve_window_start = Instant::now();
             starved_chunks_this_window = 0;
@@ -2654,6 +2695,12 @@ fn run(
             p.compressor_enabled = false;
             p.cfc_enabled = false;
         }
+        // ALC: same bypass, see process()'s own alc_enabled doc comment
+        // for the mechanism (fast peak limiter reshaping RADE's tone
+        // envelope) -- not a TxParams field like leveler/compressor/cfc
+        // above since there is no separate user-facing toggle for it in
+        // any mode; it is always on except while RADE is armed.
+        let alc_enabled = !rade.tx_armed();
         let (iq, exch_error) = processor.process(
             &chunk,
             p.mode,
@@ -2669,6 +2716,7 @@ fn run(
             p.compressor_enabled,
             p.compressor_gain_db,
             p.cfc_enabled,
+            alc_enabled,
         );
 
         if exch_error != 0 {

@@ -2041,6 +2041,17 @@ fn run(
                         out.pop_front();
                     }
                     out.push_back((s, s));
+                    // ROOT CAUSE FIX for a real report: Record/REC
+                    // captured nothing at all (an empty .wav, 0 data
+                    // bytes) while RADE was the active decoder -- this
+                    // loop replaces the normal per-sample WDSP audio
+                    // above, which is the only place that used to call
+                    // these, so RADE's own decoded speech never reached
+                    // either recorder. Same mute_local gating as that
+                    // normal path (recording follows what's actually
+                    // audible locally, not a separate always-on tap).
+                    recorder.write_frame(s, s);
+                    report_recorder.write_frame(s, s);
                 }
                 if tci_out.len() >= AUDIO_BUFFER_CAPACITY {
                     tci_out.pop_front();

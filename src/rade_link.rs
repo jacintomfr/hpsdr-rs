@@ -150,15 +150,27 @@ impl RadeHandle {
     /// microphone audio; `out` is filled with the RADE-modulated tone
     /// audio to inject into the TX chain in its place -- silence while no
     /// worker is available (see `available`).
-    pub fn fill_tx(&self, mox_on: bool, mic: &[f32], out: &mut [f32]) {
+    /// Returns how many of `out`'s samples were real modulated audio, per
+    /// `RadeWorker::pop_tx`'s own return value -- the rest were silence
+    /// zero-padded by an empty ring (normal only during the first ~120ms
+    /// priming warm-up right after keying; if it happens later, the
+    /// worker thread (service_tx, woken every POLL=5ms) is falling behind
+    /// real time, splicing real silence into the modulated tone waveform
+    /// mid-transmission -- exactly the kind of discontinuity that could
+    /// desync a receiver's demodulator. Never checked/logged before this
+    /// -- see tx.rs's own rade-diag block for where the caller tracks it.
+    pub fn fill_tx(&self, mox_on: bool, mic: &[f32], out: &mut [f32]) -> usize {
         let mut w = self.inner.worker.lock().unwrap();
         match w.as_mut() {
             Some(w) => {
                 w.set_tx(mox_on);
                 w.push_mic(mic);
-                w.pop_tx(out);
+                w.pop_tx(out)
             }
-            None => out.fill(0.0),
+            None => {
+                out.fill(0.0);
+                0
+            }
         }
     }
 

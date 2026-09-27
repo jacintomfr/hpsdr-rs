@@ -1770,7 +1770,25 @@ fn start_protocol1(
     diversity_main_raw_iq: Arc<Mutex<VecDeque<IqSample>>>,
     puresignal_enabled: Arc<AtomicBool>,
 ) -> io::Result<RadioSession> {
-    let socket = UdpSocket::bind(("0.0.0.0", 0))?;
+    // ROOT CAUSE FIX for a real report: binding the wildcard address here
+    // (as this used to) lets Windows pick which local interface to send
+    // from at connect() time -- and on a multi-homed box confirmed NOT to
+    // simply follow the routing table's most-specific-prefix match for a
+    // link-local (169.254.0.0/16) destination: a direct-cabled radio at
+    // 169.254.x.x with an unambiguous, lowest-metric on-link route out a
+    // second NIC still got connect()'d out the OTHER NIC (the one holding
+    // the default gateway) instead, silently sending every packet into
+    // the void -- confirmed with a raw UdpClient.Connect() repro (source
+    // endpoint came back as the gateway NIC's own address, wrong
+    // network entirely) while the identical packet, sent from a socket
+    // explicitly bound to the discovery reply's own local address, got a
+    // real reply. `device.my_address` is exactly that: the local address
+    // THIS discovery reply was actually received on (see discovery.rs's
+    // protocol1_discovery), so binding to it instead of "0.0.0.0" pins
+    // the data socket to the same interface discovery already proved
+    // reaches this radio, removing Windows' source-selection guess
+    // entirely rather than trying to out-guess it via route metrics.
+    let socket = UdpSocket::bind((device.my_address.ip(), 0))?;
     socket.set_read_timeout(Some(Duration::from_millis(500)))?;
     // device.address is the radio's IP, captured from its discovery reply;
     // confirmed streaming traffic stays on the same port 1024.
