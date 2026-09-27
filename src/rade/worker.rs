@@ -470,11 +470,12 @@ impl Inner {
                         );
                         let _ = self.text_tx.send(RadeTextRx { call, snr_db: self.last_sync_snr });
                     }
-                    // TEMPORARY DIAGNOSTIC for a real report ("callsign never
-                    // appears") -- distinguishes has_eoo never firing at all
-                    // (nothing logged here or above) from it firing but the
-                    // LDPC/CRC decode failing (this line). Remove once the
-                    // report is resolved.
+                    // Useful in the field, not just while chasing a bug:
+                    // distinguishes "no signal reached us at end of over"
+                    // (nothing logged here) from "a burst arrived but the
+                    // LDPC/CRC didn't check out" (this line) -- expected
+                    // occasionally on marginal signal, no different from an
+                    // ordinary dropped packet.
                     None => {
                         eprintln!(
                             "[rade] End-of-Over frame detected but text decode failed \
