@@ -1863,24 +1863,44 @@ fn run(
         // real source (`radio.c`'s `rxtx()`): it calls `rx_begin_off()`/
         // `rx_wait_off()` (WDSP `SetChannelState(id, 0, ...)`) BEFORE TX
         // starts and only `rx_on()` (`SetChannelState(id, 1, 0)`) at the
-        // TX->RX transition -- WDSP's RX channel, AGC included, does not
-        // run AT ALL during TX, so its state is exactly as it was the
-        // instant before keying, never pumped by crosstalk in the first
-        // place. `analyzer.demod()` is now skipped entirely while
-        // `mox_now` is true, matching that exactly; the short post-unkey
-        // window below still covers the brief IQ tail right at RX
-        // resume, same as deskHPSDR's own `txrxmax`.
-        let audio = if mox_now {
-            Vec::new()
-        } else if txrx_audio_silence_remaining > 0 {
+        // TX->RX transition.
+        //
+        // BUG FIX: an earlier version of this fix skipped calling
+        // `analyzer.demod()` ENTIRELY while `mox_now` was true, reasoning
+        // that this matched deskHPSDR's channel stop/start exactly. It
+        // doesn't: deskHPSDR's `SetChannelState` is a real WDSP API call
+        // that properly quiesces/resumes the RXA channel's own internal
+        // state; simply not calling our own `demod()` wrapper at all
+        // (while `analyzer.feed()` for the spectrum/waterfall, on the
+        // SAME underlying WDSP channel, keeps running every chunk) risks
+        // exactly the kind of internal sample-accounting desync between
+        // WDSP's two consumers of one channel that plain silence doesn't
+        // -- confirmed as the real cause of a regression report: RADE's
+        // own End-of-Over detection (very sample-timing-sensitive) went
+        // from working to never firing at all after this shipped, on a
+        // clean dummy-load bench test with no real RF noise to blame.
+        // `demod()` is now called on every chunk again, unconditionally,
+        // keeping WDSP's internal state ticking continuously exactly
+        // like before this whole fix -- only the INPUT is zeroed, now
+        // for the chunk's own `mox_now` in addition to the existing
+        // post-unkey tail window, so AGC still never reacts to real
+        // crosstalk without the risk of skipping WDSP calls outright.
+        let audio = if mox_now || txrx_audio_silence_remaining > 0 {
             demod_scratch.clear();
             demod_scratch.extend_from_slice(&chunk);
-            let n = txrx_audio_silence_remaining.min(demod_scratch.len());
-            for s in demod_scratch.iter_mut().take(n) {
-                s.i = 0;
-                s.q = 0;
+            if !mox_now {
+                let n = txrx_audio_silence_remaining.min(demod_scratch.len());
+                for s in demod_scratch.iter_mut().take(n) {
+                    s.i = 0;
+                    s.q = 0;
+                }
+                txrx_audio_silence_remaining -= n;
+            } else {
+                for s in demod_scratch.iter_mut() {
+                    s.i = 0;
+                    s.q = 0;
+                }
             }
-            txrx_audio_silence_remaining -= n;
             analyzer.demod(&demod_scratch, params, passband)
         } else {
             analyzer.demod(&chunk, params, passband)
@@ -1951,36 +1971,36 @@ fn run(
             // comment -- read once per chunk, not per-sample, same as
             // mox_active above.
             let mute_local = mute_local_for_tci.load(Ordering::Relaxed);
-            // Keep the local speaker's queue topped up with explicit
-            // silence during TX, now that `audio` (above) is genuinely
-            // EMPTY while mox_active -- analyzer.demod() itself is
-            // skipped entirely during TX now (see that code's own doc
-            // comment), so there's no per-sample loop over real output
-            // to piggyback this on any more. Pushed here instead, sized
-            // to roughly the same sample count demod() would have
-            // produced from one `chunk` at OUTPUT_RATE, so the queue's
-            // fill level stays steady through the transition -- a real
-            // report: AudioOutput's cpal callback drains this queue at a
-            // hard real-time rate regardless of what's feeding it, so
-            // letting it run completely empty throughout TX meant the
-            // moment mox dropped, cpal was already asking for samples
-            // before this thread had produced any real ones yet, showing
-            // up as a genuine burst of underruns (audible as a "quick
-            // click" right at the TX->RX edge). tci_out/radio_out/
-            // waveform_out are untouched (get nothing during TX, same as
-            // before) -- they don't feed a hard-real-time consumer the
-            // way AudioOutput's cpal callback does, so this specific
-            // failure mode doesn't apply to them.
-            if mox_active && !mute_local {
-                let n = ((BUFFER_SIZE as u64 * OUTPUT_RATE as u64) / sample_rate as u64) as usize;
-                for _ in 0..n {
-                    if out.len() >= AUDIO_BUFFER_CAPACITY {
-                        out.pop_front();
-                    }
-                    out.push_back((0.0, 0.0));
-                }
-            }
             for (l, r) in audio {
+                if mox_active {
+                    // Keep the local speaker's queue topped up with
+                    // explicit silence instead of starving it outright
+                    // -- a real report: AudioOutput's cpal callback
+                    // drains this queue at a hard real-time rate
+                    // regardless of what's feeding it, so letting it run
+                    // completely empty throughout TX meant the moment
+                    // mox dropped, cpal was already asking for samples
+                    // before this thread had produced any real ones yet,
+                    // showing up as a genuine burst of underruns (audible
+                    // as a "quick click" right at the TX->RX edge).
+                    // `(l, r)` here is WDSP's own output from the
+                    // zeroed-input `demod_scratch` above -- close to
+                    // silence already, but pushed as EXPLICIT (0.0, 0.0)
+                    // rather than passed through, so no residual AGC/
+                    // filter-state artifact from the zeroed input can
+                    // leak into what's actually heard. tci_out/
+                    // radio_out/waveform_out are untouched -- they don't
+                    // feed a hard-real-time consumer the way
+                    // AudioOutput's cpal callback does, so this specific
+                    // failure mode doesn't apply to them.
+                    if !mute_local {
+                        if out.len() >= AUDIO_BUFFER_CAPACITY {
+                            out.pop_front();
+                        }
+                        out.push_back((0.0, 0.0));
+                    }
+                    continue;
+                }
                 // See DcBlocker's own doc comment -- strips the raw
                 // demod output's DC/near-DC pedestal before anything
                 // else (mono downmix, waveform tap, CW decoder, Audio
