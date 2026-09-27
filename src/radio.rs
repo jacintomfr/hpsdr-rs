@@ -1088,6 +1088,28 @@ pub struct RadioSession {
     /// bytes 22-23 of the High-Priority status packet. Needed together
     /// with forward power to compute SWR.
     pub tx_reverse_power: Arc<AtomicU32>,
+    /// P1/HermesLite2 only: status address 1, bytes 1-2 -- on every other
+    /// board this field carries "exciter power", but HL2's own gateware
+    /// repurposes it as the PA's own temperature sensor reading (raw ADC
+    /// counts, 16-sample moving average). Confirmed against deskHPSDR's
+    /// rx_panadapter.c: `°C = 0.0795898 * raw - 50.0`, clamped at 0 --
+    /// added to investigate a real report of the T/R relay audibly
+    /// de-energizing/re-energizing mid-transmission (not a MOX-bit
+    /// glitch -- confirmed stable on the wire via tx_packet_debug_log)
+    /// on hpsdr-rs/SDRoxide but not on piHPSDR/deskHPSDR on the same
+    /// HL2 -- exposing this (and hl2_pa_current_raw below) in the UI
+    /// lets a real TX session be compared directly against the
+    /// reference clients instead of guessing at drive-level/duty-cycle
+    /// differences. Stays 0 forever on every non-P1-HermesLite2 board
+    /// (nothing ever writes it there); gate any UI display on
+    /// `Boards::HermesLite2`, matching deskHPSDR's own `switch(device)`.
+    pub hl2_pa_temp_raw: Arc<AtomicU32>,
+    /// P1/HermesLite2 only: status address 2, bytes 3-4 -- elsewhere
+    /// this is "ADC0" (front-end level), but HL2 repurposes it as PA
+    /// supply current (raw ADC counts, 16-sample moving average). See
+    /// hl2_pa_temp_raw's own doc comment for why this exists.
+    /// deskHPSDR's conversion: `mA = 0.505396 * raw`, clamped at 0.
+    pub hl2_pa_current_raw: Arc<AtomicU32>,
     /// ADC0/ADC1 front-end overload flags -- set when the radio's own
     /// status packet reports the front end clipping (P1: address 0/4's
     /// C1/C2 bit 0, confirmed against piHPSDR's old_protocol.c; P2:
@@ -1342,6 +1364,15 @@ impl RadioSession {
         let pa_gain_db = Arc::new(AtomicU32::new(DEFAULT_PA_GAIN_DB.to_bits()));
         let tx_forward_power = Arc::new(AtomicU32::new(0));
         let tx_reverse_power = Arc::new(AtomicU32::new(0));
+        // See RadioSession::hl2_pa_temp_raw/hl2_pa_current_raw's own doc
+        // comments -- created here and threaded through all four starters
+        // uniformly (matching tx_forward_power just above), even though
+        // only start_protocol1's receiver_loop ever actually writes to
+        // them (P1/HermesLite2-only data); the others just carry them
+        // through unused, staying 0 forever, which is fine since UI
+        // display gates on Boards::HermesLite2 anyway.
+        let hl2_pa_temp_raw = Arc::new(AtomicU32::new(0));
+        let hl2_pa_current_raw = Arc::new(AtomicU32::new(0));
         let ps_rx_feedback_iq = Arc::new(Mutex::new(VecDeque::with_capacity(PS_FEEDBACK_BUFFER_CAPACITY)));
         let ps_tx_feedback_iq = Arc::new(Mutex::new(VecDeque::with_capacity(PS_FEEDBACK_BUFFER_CAPACITY)));
         let rx_audio_to_radio = Arc::new(Mutex::new(VecDeque::with_capacity(RX_AUDIO_TO_RADIO_CAPACITY)));
@@ -1387,7 +1418,7 @@ impl RadioSession {
             start_protocol1_ozy_usb(
                 device, settings, frequency_hz, tx_frequency_hz, rx_frequency_hz, requested_frequency_hz, sample_rate, adc, rx_antenna, tx_antenna, rx_attenuation,
                 ps_tx_attenuation, mox, tx_iq, tci_tx_audio, tci_tx_gain, tx_power_watts, cw_keyer, cw_mode_active, pa_gain_db,
-                tx_forward_power, tx_reverse_power, adc0_overload, cw_ptt_active, cw_paddle_contacts, adc1_overload,
+                tx_forward_power, tx_reverse_power, hl2_pa_temp_raw, hl2_pa_current_raw, adc0_overload, cw_ptt_active, cw_paddle_contacts, adc1_overload,
                 tx_fifo_underrun, tx_fifo_overrun, rx_packets_total, rx_packets_lost, tx_packet_debug_log, ps_rx_feedback_iq, ps_tx_feedback_iq,
                 rx_audio_to_radio, send_rx_audio_to_radio, hl2_ak4951_codec, new_pa_board, radio_mic_audio, tx_audio_source,
                 tci_wants_mic, mic_ptt_enabled, mic_bias_enabled, mic_ptt_on_tip,
@@ -1398,7 +1429,7 @@ impl RadioSession {
             start_rx888_usb(
                 device, settings, frequency_hz, tx_frequency_hz, rx_frequency_hz, requested_frequency_hz, sample_rate, adc, rx_antenna, tx_antenna, rx_attenuation,
                 ps_tx_attenuation, mox, tx_iq, tci_tx_audio, tci_tx_gain, tx_power_watts, cw_keyer, cw_mode_active, pa_gain_db,
-                tx_forward_power, tx_reverse_power, adc0_overload, cw_ptt_active, cw_paddle_contacts, adc1_overload,
+                tx_forward_power, tx_reverse_power, hl2_pa_temp_raw, hl2_pa_current_raw, adc0_overload, cw_ptt_active, cw_paddle_contacts, adc1_overload,
                 tx_fifo_underrun, tx_fifo_overrun, ps_rx_feedback_iq, ps_tx_feedback_iq,
                 rx_audio_to_radio, send_rx_audio_to_radio, hl2_ak4951_codec, new_pa_board, radio_mic_audio, tx_audio_source,
                 tci_wants_mic, mic_ptt_enabled, mic_bias_enabled, mic_ptt_on_tip,
@@ -1413,7 +1444,7 @@ impl RadioSession {
                 preamp_enabled,
                 lna_tx_db,
                 ps_tx_attenuation, mox, tx_iq, tci_tx_audio, tci_tx_gain, tx_power_watts, cw_keyer, cw_mode_active, pa_gain_db,
-                tx_forward_power, tx_reverse_power, adc0_overload, cw_ptt_active, cw_paddle_contacts, adc1_overload,
+                tx_forward_power, tx_reverse_power, hl2_pa_temp_raw, hl2_pa_current_raw, adc0_overload, cw_ptt_active, cw_paddle_contacts, adc1_overload,
                 tx_fifo_underrun, tx_fifo_overrun, rx_packets_total, rx_packets_lost, tx_packet_debug_log, ps_rx_feedback_iq, ps_tx_feedback_iq,
                 rx_audio_to_radio, send_rx_audio_to_radio, hl2_ak4951_codec, new_pa_board, radio_mic_audio, tx_audio_source,
                 tci_wants_mic, mic_ptt_enabled, mic_bias_enabled, mic_ptt_on_tip,
@@ -1423,7 +1454,7 @@ impl RadioSession {
             2 => start_protocol2(
                 device, settings, frequency_hz, tx_frequency_hz, rx_frequency_hz, requested_frequency_hz, sample_rate, adc, rx_antenna, tx_antenna, rx_attenuation,
                 ps_tx_attenuation, mox, tx_iq, tci_tx_audio, tci_tx_gain, tx_power_watts, cw_keyer, cw_mode_active, pa_gain_db,
-                tx_forward_power, tx_reverse_power, adc0_overload, cw_ptt_active, cw_paddle_contacts, adc1_overload,
+                tx_forward_power, tx_reverse_power, hl2_pa_temp_raw, hl2_pa_current_raw, adc0_overload, cw_ptt_active, cw_paddle_contacts, adc1_overload,
                 tx_fifo_underrun, tx_fifo_overrun, rx_packets_total, rx_packets_lost, tx_packet_debug_log, ps_rx_feedback_iq, ps_tx_feedback_iq,
                 rx_audio_to_radio, send_rx_audio_to_radio, hl2_ak4951_codec, new_pa_board, radio_mic_audio, tx_audio_source,
                 tci_wants_mic, mic_ptt_enabled, mic_bias_enabled, mic_ptt_on_tip,
@@ -1741,6 +1772,8 @@ fn start_protocol1(
     pa_gain_db: Arc<AtomicU32>,
     tx_forward_power: Arc<AtomicU32>,
     tx_reverse_power: Arc<AtomicU32>,
+    hl2_pa_temp_raw: Arc<AtomicU32>,
+    hl2_pa_current_raw: Arc<AtomicU32>,
     adc0_overload: Arc<AtomicBool>,
     cw_ptt_active: Arc<AtomicBool>,
     cw_paddle_contacts: Arc<AtomicU8>,
@@ -2071,6 +2104,8 @@ fn start_protocol1(
     let receiver_active_receiver_count = Arc::clone(&active_receiver_count);
     let receiver_tx_forward_power = Arc::clone(&tx_forward_power);
     let receiver_tx_reverse_power = Arc::clone(&tx_reverse_power);
+    let receiver_hl2_pa_temp_raw = Arc::clone(&hl2_pa_temp_raw);
+    let receiver_hl2_pa_current_raw = Arc::clone(&hl2_pa_current_raw);
     let receiver_adc0_overload = Arc::clone(&adc0_overload);
     let receiver_adc1_overload = Arc::clone(&adc1_overload);
     let receiver_cw_ptt_active = Arc::clone(&cw_ptt_active);
@@ -2093,6 +2128,8 @@ fn start_protocol1(
             receiver_sample_rate,
             receiver_tx_forward_power,
             receiver_tx_reverse_power,
+            receiver_hl2_pa_temp_raw,
+            receiver_hl2_pa_current_raw,
             receiver_adc0_overload,
             receiver_cw_ptt_active,
             receiver_cw_paddle_contacts,
@@ -2170,6 +2207,8 @@ fn start_protocol1(
         pa_gain_db,
         tx_forward_power,
         tx_reverse_power,
+        hl2_pa_temp_raw,
+        hl2_pa_current_raw,
         adc0_overload,
         adc1_overload,
         cw_ptt_active,
@@ -2248,6 +2287,8 @@ fn start_protocol1_ozy_usb(
     pa_gain_db: Arc<AtomicU32>,
     tx_forward_power: Arc<AtomicU32>,
     tx_reverse_power: Arc<AtomicU32>,
+    hl2_pa_temp_raw: Arc<AtomicU32>,
+    hl2_pa_current_raw: Arc<AtomicU32>,
     adc0_overload: Arc<AtomicBool>,
     cw_ptt_active: Arc<AtomicBool>,
     cw_paddle_contacts: Arc<AtomicU8>,
@@ -2398,6 +2439,8 @@ fn start_protocol1_ozy_usb(
     let receiver_active_receiver_count = Arc::clone(&active_receiver_count);
     let receiver_tx_forward_power = Arc::clone(&tx_forward_power);
     let receiver_tx_reverse_power = Arc::clone(&tx_reverse_power);
+    let receiver_hl2_pa_temp_raw = Arc::clone(&hl2_pa_temp_raw);
+    let receiver_hl2_pa_current_raw = Arc::clone(&hl2_pa_current_raw);
     let receiver_adc0_overload = Arc::clone(&adc0_overload);
     let receiver_adc1_overload = Arc::clone(&adc1_overload);
     let receiver_cw_ptt_active = Arc::clone(&cw_ptt_active);
@@ -2411,6 +2454,8 @@ fn start_protocol1_ozy_usb(
             receiver_sample_rate,
             receiver_tx_forward_power,
             receiver_tx_reverse_power,
+            receiver_hl2_pa_temp_raw,
+            receiver_hl2_pa_current_raw,
             receiver_adc0_overload,
             receiver_cw_ptt_active,
             receiver_cw_paddle_contacts,
@@ -2492,6 +2537,8 @@ fn start_protocol1_ozy_usb(
         pa_gain_db,
         tx_forward_power,
         tx_reverse_power,
+        hl2_pa_temp_raw,
+        hl2_pa_current_raw,
         adc0_overload,
         adc1_overload,
         cw_ptt_active,
@@ -2566,6 +2613,8 @@ fn start_rx888_usb(
     pa_gain_db: Arc<AtomicU32>,
     tx_forward_power: Arc<AtomicU32>,
     tx_reverse_power: Arc<AtomicU32>,
+    hl2_pa_temp_raw: Arc<AtomicU32>,
+    hl2_pa_current_raw: Arc<AtomicU32>,
     adc0_overload: Arc<AtomicBool>,
     cw_ptt_active: Arc<AtomicBool>,
     cw_paddle_contacts: Arc<AtomicU8>,
@@ -2762,6 +2811,8 @@ fn start_rx888_usb(
         pa_gain_db,
         tx_forward_power,
         tx_reverse_power,
+        hl2_pa_temp_raw,
+        hl2_pa_current_raw,
         adc0_overload,
         adc1_overload,
         cw_ptt_active,
@@ -4883,6 +4934,8 @@ fn receiver_loop(
     sample_rate: Arc<AtomicU32>,
     tx_forward_power: Arc<AtomicU32>,
     tx_reverse_power: Arc<AtomicU32>,
+    hl2_pa_temp_raw: Arc<AtomicU32>,
+    hl2_pa_current_raw: Arc<AtomicU32>,
     adc0_overload: Arc<AtomicBool>,
     cw_ptt_active: Arc<AtomicBool>,
     cw_paddle_contacts: Arc<AtomicU8>,
@@ -4930,6 +4983,16 @@ fn receiver_loop(
     // SWR 1.1-1.9 while an external wattmeter read a steady 5.0W).
     let mut fwd_acc: u32 = 0;
     let mut rev_acc: u32 = 0;
+    // See RadioSession::hl2_pa_temp_raw/hl2_pa_current_raw's own doc
+    // comments -- deskHPSDR's own smoothing for these two (a plain
+    // 16-sample moving average, `(15*acc)/16 + val`, then `/16`) is
+    // simpler than fwd_acc/rev_acc's peak-hold-with-decay above:
+    // temperature and averaged supply current don't have that peak-
+    // detector-with-decay circuit's sawtooth artifact, so a plain
+    // average is the right tool here (matching old_protocol.c's own
+    // `ex_acc`/`adc0_acc` exactly).
+    let mut hl2_temp_acc: u32 = 0;
+    let mut hl2_current_acc: u32 = 0;
     // Network-quality tracking for the status bar (see RadioSession::
     // rx_packets_total/rx_packets_lost's own doc comment) -- the 4-byte
     // sequence number every Metis/P1 IQ-data packet header already
@@ -5011,6 +5074,10 @@ fn receiver_loop(
                         &diversity_main_raw_iq,
                         &mut fwd_acc,
                         &mut rev_acc,
+                        &hl2_pa_temp_raw,
+                        &hl2_pa_current_raw,
+                        &mut hl2_temp_acc,
+                        &mut hl2_current_acc,
                         &mut carry,
                         &mut frame_synced,
                     );
@@ -5181,6 +5248,8 @@ fn ozy_receiver_loop(
     sample_rate: Arc<AtomicU32>,
     tx_forward_power: Arc<AtomicU32>,
     tx_reverse_power: Arc<AtomicU32>,
+    hl2_pa_temp_raw: Arc<AtomicU32>,
+    hl2_pa_current_raw: Arc<AtomicU32>,
     adc0_overload: Arc<AtomicBool>,
     cw_ptt_active: Arc<AtomicBool>,
     cw_paddle_contacts: Arc<AtomicU8>,
@@ -5198,6 +5267,8 @@ fn ozy_receiver_loop(
     // SWR 1.1-1.9 while an external wattmeter read a steady 5.0W).
     let mut fwd_acc: u32 = 0;
     let mut rev_acc: u32 = 0;
+    let mut hl2_temp_acc: u32 = 0;
+    let mut hl2_current_acc: u32 = 0;
     // No PureSignal/diversity on Ozy (see start_protocol1_ozy_usb's doc
     // comment) -- parse_iq_stream needs somewhere to route samples it
     // WOULD send there, but ps_feedback_indices=None/diversity=false
@@ -5230,6 +5301,10 @@ fn ozy_receiver_loop(
                     &diversity_main_raw_iq,
                     &mut fwd_acc,
                     &mut rev_acc,
+                    &hl2_pa_temp_raw,
+                    &hl2_pa_current_raw,
+                    &mut hl2_temp_acc,
+                    &mut hl2_current_acc,
                     &mut carry,
                     &mut frame_synced,
                 );
@@ -5380,6 +5455,16 @@ fn parse_iq_stream(
     // 5.0W/1.45:1.
     fwd_acc: &mut u32,
     rev_acc: &mut u32,
+    // See RadioSession::hl2_pa_temp_raw/hl2_pa_current_raw's own doc
+    // comments. Threaded through here (shared with ozy_receiver_loop's
+    // own call, board type notwithstanding) purely for consistency with
+    // fwd_acc/rev_acc just above -- Ozy is never a HermesLite2, so these
+    // stay meaningless-but-harmless on that path (never read, since UI
+    // display gates on Boards::HermesLite2).
+    hl2_pa_temp_raw: &Arc<AtomicU32>,
+    hl2_pa_current_raw: &Arc<AtomicU32>,
+    hl2_temp_acc: &mut u32,
+    hl2_current_acc: &mut u32,
     // DIAGNOSTIC (Phase 1 -- protocol plumbing verification, see
     // receiver_loop's per-second summary): returns how many samples
     // this call routed into (ps_rx_feedback_iq, ps_tx_feedback_iq), so
@@ -5490,11 +5575,27 @@ fn parse_iq_stream(
             // bump here.
             *fwd_acc = if forward >= *fwd_acc { forward } else { *fwd_acc - (*fwd_acc - forward) / 256 };
             tx_forward_power.store(*fwd_acc, Ordering::Relaxed);
+            // See RadioSession::hl2_pa_temp_raw's own doc comment -- C1-C2
+            // (frame[4], frame[5]), a plain 16-sample moving average
+            // (deskHPSDR's old_protocol.c: `ex_acc = (15*ex_acc)/16 + val;
+            // exciter_power = ex_acc/16`), not peak-hold like fwd_acc
+            // above -- exciter_power/temperature has no peak-detector-
+            // with-decay circuit to compensate for.
+            let temp_raw = u16::from_be_bytes([frame[4], frame[5]]) as u32;
+            *hl2_temp_acc = (15 * *hl2_temp_acc) / 16 + temp_raw;
+            hl2_pa_temp_raw.store(*hl2_temp_acc / 16, Ordering::Relaxed);
         } else if address == 2 {
             let reverse = u16::from_be_bytes([frame[4], frame[5]]) as u32;
             // Same peak-hold reasoning as forward power just above.
             *rev_acc = if reverse >= *rev_acc { reverse } else { *rev_acc - (*rev_acc - reverse) / 256 };
             tx_reverse_power.store(*rev_acc, Ordering::Relaxed);
+            // See RadioSession::hl2_pa_current_raw's own doc comment --
+            // C3-C4 (frame[6], frame[7]), same plain moving average as
+            // hl2_temp_acc above (deskHPSDR: `adc0_acc = (15*adc0_acc)/16
+            // + val; ADC0 = adc0_acc/16`).
+            let current_raw = u16::from_be_bytes([frame[6], frame[7]]) as u32;
+            *hl2_current_acc = (15 * *hl2_current_acc) / 16 + current_raw;
+            hl2_pa_current_raw.store(*hl2_current_acc / 16, Ordering::Relaxed);
         } else if address == 0 {
             adc0_overload.store(frame[4] & 0x01 != 0, Ordering::Relaxed);
         } else if address == 4 {
@@ -5702,6 +5803,8 @@ fn start_protocol2(
     pa_gain_db: Arc<AtomicU32>,
     tx_forward_power: Arc<AtomicU32>,
     tx_reverse_power: Arc<AtomicU32>,
+    hl2_pa_temp_raw: Arc<AtomicU32>,
+    hl2_pa_current_raw: Arc<AtomicU32>,
     adc0_overload: Arc<AtomicBool>,
     cw_ptt_active: Arc<AtomicBool>,
     cw_paddle_contacts: Arc<AtomicU8>,
@@ -6051,6 +6154,8 @@ fn start_protocol2(
         pa_gain_db,
         tx_forward_power,
         tx_reverse_power,
+        hl2_pa_temp_raw,
+        hl2_pa_current_raw,
         adc0_overload,
         adc1_overload,
         cw_ptt_active,

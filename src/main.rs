@@ -7288,6 +7288,31 @@ impl eframe::App for HpsdrApp {
                             ui.visuals().weak_text_color()
                         };
                         ui.colored_label(rx_color, format!("RX jitter: {rx_gap_ms:.1}ms"));
+
+                        // HL2 PA temperature/supply current -- see
+                        // RadioSession::hl2_pa_temp_raw's own doc comment
+                        // for why this was added (comparing hpsdr-rs/
+                        // SDRoxide against piHPSDR/deskHPSDR on a real
+                        // report of the T/R relay de-energizing mid-TX,
+                        // confirmed NOT a MOX-bit glitch). Shown only
+                        // while transmitting, matching deskHPSDR's own
+                        // rx_panadapter.c gating (`radio_is_transmitting()`)
+                        // -- these readings are only meaningful with the
+                        // PA actually drawing current. Formulas confirmed
+                        // against deskHPSDR's rx_panadapter.c exactly:
+                        // °C = 0.0795898*raw - 50.0, mA = 0.505396*raw.
+                        if matches!(connected.device.board, Boards::HermesLite2)
+                            && connected.session.mox_active()
+                        {
+                            let temp_raw =
+                                connected.session.hl2_pa_temp_raw.load(Ordering::Relaxed) as f64;
+                            let temp_c = (0.0795898 * temp_raw - 50.0).max(0.0);
+                            let current_raw =
+                                connected.session.hl2_pa_current_raw.load(Ordering::Relaxed) as f64;
+                            let current_ma = (0.505396 * current_raw).max(0.0);
+                            ui.weak(format!("PA temp: {temp_c:.0}°C"));
+                            ui.weak(format!("PA current: {current_ma:.0}mA"));
+                        }
                     });
                 });
 
