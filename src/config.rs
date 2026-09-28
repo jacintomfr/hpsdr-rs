@@ -503,6 +503,17 @@ pub struct Config {
     /// this can't just be an initial hint.
     #[serde(default)]
     pub window_geometry: Option<WindowGeometry>,
+    /// The Digital Modes window's own position/size as last seen for
+    /// THIS radio -- a real request, same "reopen wherever it was last
+    /// used" reasoning as window_geometry just above, but for that
+    /// secondary window specifically (it currently always opens at a
+    /// fixed default position/size, see main.rs's ViewportBuilder call
+    /// site). Unlike the main window, this one's a fresh viewport each
+    /// time it opens, so it's a plain ViewportBuilder::with_position/
+    /// with_inner_size seed rather than needing a post-hoc
+    /// ViewportCommand.
+    #[serde(default)]
+    pub digital_window_geometry: Option<WindowGeometry>,
     /// CTUN ("Click to Tune") state for the main receiver -- see
     /// ConnectedState::ctun's doc comment (main.rs) for what this
     /// actually does. `ctun_frequency_hz` is only meaningful/restored

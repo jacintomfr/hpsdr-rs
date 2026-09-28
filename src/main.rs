@@ -1941,6 +1941,19 @@ struct ConnectedState {
     /// DIGU/DIGL, so there is nothing to revert. See
     /// digi_mode_for_band's own doc comment for the band convention.
     pre_digital_mode: Option<spectrum::Mode>,
+    /// A real request: the Digital Modes window should reopen wherever
+    /// the operator last left it, on both Linux and Windows -- same
+    /// "seed vs. live-tracked" split as ExtraReceiver::window_geometry/
+    /// initial_window_geometry (see that field's own doc comment for
+    /// why two fields, not one: feeding the LIVE-tracked value straight
+    /// back into the viewport's own ViewportBuilder every frame would
+    /// fight the operator dragging/resizing the window themselves).
+    /// `digital_window_geometry` is the live-tracked value, written to
+    /// Config on save; `digital_window_initial_geometry` is a one-time
+    /// snapshot taken at connect time, used only to seed the
+    /// ViewportBuilder the moment the window is first created.
+    digital_window_geometry: Option<WindowGeometry>,
+    digital_window_initial_geometry: Option<WindowGeometry>,
     /// ROOT CAUSE FIX for a real report, round 3: `rade.tx_drained()`
     /// only reflects RadeWorker's own internal tx_out ring being empty
     /// -- it says nothing about `chunk` after that point, which still
@@ -3106,6 +3119,8 @@ fn connect_to_device(device: Device, cfg: &Config) -> Result<ConnectedState, Str
                 ptt_held: false,
                 rade_pending_unkey: None,
                 pre_digital_mode: None,
+                digital_window_geometry: cfg.digital_window_geometry,
+                digital_window_initial_geometry: cfg.digital_window_geometry,
                 rade_drained_at: None,
                 mic_gain,
                 tci_tx_gain,
@@ -11907,6 +11922,15 @@ impl eframe::App for HpsdrApp {
                             .with_max_inner_size(size)
                             .with_resizable(false)
                             .with_decorations(false);
+                    } else if let Some(g) = connected.digital_window_initial_geometry {
+                        // See ConnectedState::digital_window_geometry's own
+                        // doc comment -- the STABLE one-time seed, not the
+                        // live-tracked value, so this doesn't fight the
+                        // operator dragging/resizing the window (this
+                        // ViewportBuilder is rebuilt every frame the window
+                        // is open, but digital_window_initial_geometry
+                        // itself never changes after connect).
+                        digital_viewport = digital_viewport.with_position([g.x, g.y]).with_inner_size([g.width, g.height]);
                     }
                     let rtty = connected.rtty.clone();
                     let sstv = connected.sstv.clone();
@@ -11928,10 +11952,30 @@ impl eframe::App for HpsdrApp {
                     // clicked this frame, applied after the closure below
                     // (needs full &mut connected, not available in here).
                     let mut digital_quick_tune_hz: Option<u32> = None;
+                    // See ConnectedState::digital_window_geometry's own
+                    // doc comment -- live-tracked every frame the window
+                    // is open (not just when Config save fires), same
+                    // reasoning as ExtraReceiver's own window_geometry:
+                    // closing the app right after moving the window
+                    // shouldn't lose that move.
+                    let mut digital_window_geometry_out: Option<WindowGeometry> = None;
                     ui.ctx().show_viewport_immediate(
                         egui::ViewportId::from_hash_of("digital_modes_window"),
                         digital_viewport,
                         |ui, _class| {
+                            if !digital_kiosk {
+                                if let (Some(outer), Some(inner)) = (
+                                    ui.input(|i| i.viewport().outer_rect),
+                                    ui.input(|i| i.viewport().inner_rect),
+                                ) {
+                                    digital_window_geometry_out = Some(WindowGeometry {
+                                        x: outer.min.x,
+                                        y: outer.min.y,
+                                        width: inner.width(),
+                                        height: inner.height(),
+                                    });
+                                }
+                            }
                             let escape_pressed = digital_kiosk
                                 && ui.input(|i| i.key_pressed(egui::Key::Escape));
                             if ui.input(|i| i.viewport().close_requested()) || escape_pressed {
@@ -12041,6 +12085,9 @@ impl eframe::App for HpsdrApp {
                         },
                     );
                     connected.digital_mode = digital_mode;
+                    if let Some(g) = digital_window_geometry_out {
+                        connected.digital_window_geometry = Some(g);
+                    }
                     if let Some(hz) = digital_quick_tune_hz {
                         // See SSTV_QUICK_TUNE_HZ/RADE_QUICK_TUNE_HZ's own
                         // doc comments. Same frequency/mode-setting shape
@@ -12410,6 +12457,7 @@ impl eframe::App for HpsdrApp {
                             connected.session.mic_ptt_on_tip.load(std::sync::atomic::Ordering::Relaxed),
                         ),
                         window_geometry: self.main_window_geometry,
+                        digital_window_geometry: connected.digital_window_geometry,
                         ctun: Some(connected.ctun),
                         ctun_frequency_hz: Some(connected.ctun_frequency_hz),
                         tune_step_hz: Some(connected.tune_step_hz),
