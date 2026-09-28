@@ -3558,6 +3558,37 @@ fn p1_send_preconfig_and_start(
     Ok(())
 }
 
+/// ROOT CAUSE FIX for a real report: the T/R relay audibly clicked
+/// (and, on HermesLite2, re-triggered) MULTIPLE times during a single
+/// SSB transmission on a direct-wired connection with clean RX -- not
+/// network packet loss (confirmed absent), and not RADE-specific
+/// (reproduced on plain SSB too). Per HermesLite2's own designer
+/// (Steve Haynal, Hermes-Lite Google Group, "Testing gateware
+/// ...relay click debug released"): the relay is not a latched bit --
+/// the gateware's PTTTX state machine keeps it engaged only as long as
+/// the TX IQ sample FIFO stays fed; if the host's own packet send loop
+/// has ANY gap (OS scheduling jitter, not necessarily real loss) longer
+/// than the configured PTT hang time, the FIFO runs dry, the relay
+/// disengages, then re-engages (audible click) once data resumes --
+/// can repeat several times per over. Both PTT hang time (C3, byte 3
+/// below) and TX latency/prebuffer depth (C4) are host-configurable
+/// HermesLite2 registers, sent as part of this project's own C0=0x2E
+/// round-robin filler command -- previously left at 4ms/21ms
+/// (essentially the gateware's own tight defaults), which several
+/// threads on that same Google Group confirm is marginal against
+/// ordinary host jitter. Matched to deskHPSDR's own real, shipped
+/// defaults instead of guessing new numbers (`old_protocol.c`'s
+/// `hl2_tx_latency_ms()`/the `output_buffer[C3] = 20` right above its
+/// call): 20ms PTT hang time, 40ms TX latency (deskHPSDR's own comment:
+/// "should be enough to prevent underflows and leave some head-room",
+/// measured against an HL2 TX FIFO capacity of ~75ms). deskHPSDR also
+/// has a lower 12ms latency for CW and a sticky 40ms fallback after a
+/// real reported FIFO underrun -- not ported here, since the report was
+/// SSB/digital, not CW, and this project has no equivalent underrun-
+/// status readback wired up yet to make the sticky fallback meaningful.
+const PTT_HANG_TIME_MS: u8 = 20;
+const TX_LATENCY_MS: u8 = 40;
+
 /// Builds one full P1 packet (general-control frame + whichever C&C
 /// register is currently up in the rotation), advancing `ozy_command`
 /// and `current_receiver` exactly as the confirmed reference does.
@@ -4370,10 +4401,10 @@ fn p1_build_packet(
                 let c3 = (((clamped + 12) as u8) & 0x3F) | 0xC0;
                 (0x1C, 0x00, 0x00, c3, 0x00)
             } else {
-                (0x2E, 0x00, 0x00, 0x04, 0x15) // same as the default catch-all below
+                (0x2E, 0x00, 0x00, PTT_HANG_TIME_MS, TX_LATENCY_MS) // same as the default catch-all below
             }
         }
-        _ => (0x2E, 0x00, 0x00, 0x04, 0x15),
+        _ => (0x2E, 0x00, 0x00, PTT_HANG_TIME_MS, TX_LATENCY_MS),
     };
     if *current_receiver == 0 {
         *ozy_command = if *ozy_command >= 12 { 1 } else { *ozy_command + 1 };
