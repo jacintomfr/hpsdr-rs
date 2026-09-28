@@ -3,23 +3,23 @@
     a library and not modified) and the rest of the app: one shared,
     cheap-to-Clone handle, same shape as rtty_link.rs's RttyHandle.
 
-    RX only for now -- see the "Digital" window's own mode switch in main.rs
-    (rtty_link.rs and this module are siblings there, selected one at a
-    time). sstv.rs's SstvTx is already ported and unit-tested, ready for a
-    future transmit feature (image picker, crop, FSK-ID-on-send), but
-    nothing here calls it yet.
-
     RX: spectrum.rs's run() hands feed_rx() the same pre-Audio-Gain mono
     demod downmix the RTTY/CW decoders read (48kHz), only while rx_enabled
     (i.e. while main.rs's Digital window is open AND SSTV is the selected
     mode -- decoding stops rather than running two DSPs' worth of FIR
     filtering in the background for no UI anyone is looking at).
+
+    TX: tx.rs's run() calls fill_tx() in place of the mic/TCI source
+    selection while tx_armed, exactly where rtty_link's own fill_tx is --
+    see this module's own doc comment on `tx` below for why this is
+    Mutex<Option<SstvTx>> (no idle tone the way RTTY's modem has one)
+    rather than RttyHandle's always-live RttyTx.
 */
 
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 
-use crate::sstv::{SstvEvent, SstvMode, SstvRx};
+use crate::sstv::{SstvEvent, SstvMode, SstvRx, SstvTx};
 
 /// The RX demod output (spectrum.rs's OUTPUT_RATE), same as rtty_link's
 /// SAMPLE_RATE_HZ.
@@ -96,6 +96,15 @@ struct Inner {
     level_bits: AtomicU32,
     /// SstvRx::sync_quality() as bits, same reasoning as level_bits.
     sync_quality_bits: AtomicU32,
+    /// `None` while idle; `Some` for the whole duration of one over,
+    /// cleared once SstvTx::done() (see fill_tx). Unlike RttyTx, which is
+    /// always live and sends an idle mark tone with nothing queued,
+    /// SstvTx's plan is fixed at construction (the whole picture is
+    /// pre-planned into tone runs, see sstv.rs's own doc comment) -- there
+    /// is no meaningful "idle" SSTV tone, so Option is the right shape:
+    /// fill_tx sends silence whenever this is None.
+    tx: Mutex<Option<SstvTx>>,
+    tx_armed: AtomicBool,
 }
 
 #[derive(Clone)]
@@ -115,6 +124,8 @@ impl SstvHandle {
                 snapshot: Mutex::new(SstvSnapshot::default()),
                 level_bits: AtomicU32::new(0),
                 sync_quality_bits: AtomicU32::new(0),
+                tx: Mutex::new(None),
+                tx_armed: AtomicBool::new(false),
             }),
         }
     }
@@ -221,6 +232,65 @@ impl SstvHandle {
         snap.level = f32::from_bits(self.inner.level_bits.load(Ordering::Relaxed));
         snap.sync_quality = f32::from_bits(self.inner.sync_quality_bits.load(Ordering::Relaxed));
         snap
+    }
+
+    pub fn tx_armed(&self) -> bool {
+        self.inner.tx_armed.load(Ordering::Relaxed)
+    }
+
+    pub fn set_tx_armed(&self, on: bool) {
+        self.inner.tx_armed.store(on, Ordering::Relaxed);
+    }
+
+    /// Starts a new over: `rgb` (interleaved, row-major, `3*w*h` bytes --
+    /// already resized/cropped to `mode.dimensions()`, see main.rs's own
+    /// image-picker code) is planned into tone runs immediately (see
+    /// sstv.rs's own doc comment on why that's cheap enough to do here,
+    /// not on the TX audio thread). Replaces whatever over was already in
+    /// progress, if any -- same "operator's own new click wins" reasoning
+    /// as RttyHandle::send_text overwriting a stale queue.
+    pub fn set_image(&self, mode: SstvMode, rgb: &[u8], w: u16, h: u16, fsk_id: &str) {
+        let tx = SstvTx::new(mode, rgb, w, h, SAMPLE_RATE_HZ, 0.0).with_fsk_id(fsk_id);
+        *self.inner.tx.lock().unwrap() = Some(tx);
+    }
+
+    /// Abandons whatever over is in progress -- the operator's own Abort
+    /// button. fill_tx sends silence from the next chunk on.
+    pub fn abort_tx(&self) {
+        *self.inner.tx.lock().unwrap() = None;
+    }
+
+    /// True while an over is queued or in progress (fill_tx has real
+    /// audio to send, not silence).
+    pub fn tx_active(&self) -> bool {
+        self.inner.tx.lock().unwrap().is_some()
+    }
+
+    /// (samples sent, total samples) for the over in progress, or (0, 0)
+    /// when idle -- for a progress bar. See sstv.rs's SstvTx::progress()
+    /// for the 0.0..=1.0 fraction this is built from.
+    pub fn tx_progress(&self) -> f32 {
+        self.inner.tx.lock().unwrap().as_ref().map(|t| t.progress()).unwrap_or(0.0)
+    }
+
+    /// TX mic-input tap -- see tx.rs's run(). Fills `out` with SSTV tones,
+    /// or silence once the picture is fully sent (unlike rtty_link's own
+    /// fill_tx, there is no idle tone to fall back to -- see this
+    /// module's own doc comment on `Inner::tx`). Clears the finished
+    /// transmission itself once done() so tx_active() reports false and a
+    /// fresh set_image() doesn't need an explicit clear first.
+    pub fn fill_tx(&self, out: &mut [f32]) {
+        let mut guard = self.inner.tx.lock().unwrap();
+        match guard.as_mut() {
+            Some(tx) => {
+                let written = tx.next_block(out);
+                if tx.done() {
+                    *guard = None;
+                }
+                let _ = written; // next_block already zero-pads the rest of `out`.
+            }
+            None => out.fill(0.0),
+        }
     }
 }
 

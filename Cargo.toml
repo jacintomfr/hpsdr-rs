@@ -68,6 +68,15 @@ pnet_datalink = "0.35.0"
 # project's existing GTK-avoidance elsewhere (see eframe's own feature list
 # above -- no GTK anywhere in this app), so no feature overrides needed.
 rfd = "0.17.2"
+# SSTV TX's own image loader (main.rs's "Load Picture..." button) --
+# decodes an arbitrary PNG/JPEG/etc. file into raw RGB8, and resizes it
+# to whatever exact (w,h) the selected SstvMode transmits at (see
+# sstv.rs's own SstvMode::dimensions()). Default features only (no
+# feature list needed): the handful of common formats an operator would
+# actually pick a photo in (PNG/JPEG/BMP/GIF) are all in by default,
+# and this project has no need for the more exotic ones (HDR, DDS,
+# ICO, ...) default-features=false would otherwise still pull in.
+image = "0.25"
 # USB I/O for the original Ozy/Metis-predecessor hardware (ozy.rs) --
 # the classic Ozy+Mercury+Penny board set talks Protocol 1 over raw USB
 # bulk transfers instead of UDP. Chosen over `rusb` (the libusb-1.0
@@ -209,7 +218,13 @@ assets = [
     ["docs/manual/*.md", "usr/share/doc/hpsdr-rs/manual/", "644"],
     ["docs/manual/images/*", "usr/share/doc/hpsdr-rs/manual/images/", "644"],
     ["assets/hpsdr-rs.desktop", "usr/share/applications/hpsdr-rs.desktop", "644"],
-    ["assets/hpsdr-rs-kiosk.desktop", "usr/share/applications/hpsdr-rs-kiosk.desktop", "644"],
+    # Kiosk mode's own launcher (assets/hpsdr-rs-kiosk.desktop) is
+    # deliberately NOT installed here -- a real request: it's only ever
+    # useful for a dedicated 1024x600 LCD panel, not a general-purpose
+    # desktop install, so most installs would just get a second icon
+    # they never use. Same binary either way -- HPSDR_LCD_1024X600=1
+    # env var still works manually for anyone who does want it (see
+    # main.rs's lcd_kiosk_mode()/README's own Kiosk section).
     ["assets/icons/hpsdr-rs.png", "usr/share/icons/hicolor/256x256/apps/hpsdr-rs.png", "644"],
     # Not auto-installed to /etc/udev/rules.d/ (a .deb shouldn't silently
     # install udev rules without the user's say-so) -- shipped as a

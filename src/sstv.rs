@@ -663,6 +663,139 @@ impl SstvTx {
     }
 }
 
+/// Resizes+crops `src` (any WxH RGB8) to `mode`'s own exact transmit
+/// dimensions (see SstvMode::dimensions()) -- a real need: the SSTV
+/// formats are all fixed-size, and an operator's own photo is essentially
+/// never already that exact size. Scales to COVER the target box (the
+/// larger of the two ratios), then centre-crops the overhang, so the
+/// picture fills the frame with no letterboxing and without stretching/
+/// distorting its aspect ratio -- the same "cover" behavior CSS's own
+/// `object-fit: cover` and SDRoxide's own `crop_scale` use.
+pub fn prepare_image_for_tx(mode: SstvMode, src: &image::RgbImage) -> Vec<u8> {
+    let (tw, th) = mode.dimensions();
+    let (sw, sh) = src.dimensions();
+    let scale = (tw as f64 / sw as f64).max(th as f64 / sh as f64);
+    let rw = ((sw as f64 * scale).round() as u32).max(1);
+    let rh = ((sh as f64 * scale).round() as u32).max(1);
+    let resized = image::imageops::resize(src, rw, rh, image::imageops::FilterType::Triangle);
+    let x0 = (rw.saturating_sub(tw as u32)) / 2;
+    let y0 = (rh.saturating_sub(th as u32)) / 2;
+    let cropped = image::imageops::crop_imm(&resized, x0, y0, tw as u32, th as u32).to_image();
+    cropped.into_raw()
+}
+
+/// A minimal built-in 5x7 dot-matrix font (uppercase letters, digits, `/`,
+/// `-`, space) -- just enough for a callsign, so draw_callsign_banner
+/// below needs no font file/external dependency (ab_glyph+a bundled TTF,
+/// SDRoxide's own approach for its much richer caption/banner feature --
+/// deliberately not replicated here, see that function's own doc comment
+/// for the narrower scope this project actually asked for). Each entry is
+/// 7 rows top-to-bottom, bit 4 (0x10) the leftmost of 5 columns.
+fn glyph_5x7(c: char) -> [u8; 7] {
+    match c.to_ascii_uppercase() {
+        '0' => [0x0E, 0x11, 0x13, 0x15, 0x19, 0x11, 0x0E],
+        '1' => [0x04, 0x0C, 0x04, 0x04, 0x04, 0x04, 0x0E],
+        '2' => [0x0E, 0x11, 0x01, 0x06, 0x08, 0x10, 0x1F],
+        '3' => [0x1F, 0x02, 0x04, 0x02, 0x01, 0x11, 0x0E],
+        '4' => [0x02, 0x06, 0x0A, 0x12, 0x1F, 0x02, 0x02],
+        '5' => [0x1F, 0x10, 0x1E, 0x01, 0x01, 0x11, 0x0E],
+        '6' => [0x06, 0x08, 0x10, 0x1E, 0x11, 0x11, 0x0E],
+        '7' => [0x1F, 0x01, 0x02, 0x04, 0x08, 0x08, 0x08],
+        '8' => [0x0E, 0x11, 0x11, 0x0E, 0x11, 0x11, 0x0E],
+        '9' => [0x0E, 0x11, 0x11, 0x0F, 0x01, 0x02, 0x0C],
+        'A' => [0x0E, 0x11, 0x11, 0x1F, 0x11, 0x11, 0x11],
+        'B' => [0x1E, 0x11, 0x11, 0x1E, 0x11, 0x11, 0x1E],
+        'C' => [0x0E, 0x11, 0x10, 0x10, 0x10, 0x11, 0x0E],
+        'D' => [0x1C, 0x12, 0x11, 0x11, 0x11, 0x12, 0x1C],
+        'E' => [0x1F, 0x10, 0x10, 0x1E, 0x10, 0x10, 0x1F],
+        'F' => [0x1F, 0x10, 0x10, 0x1E, 0x10, 0x10, 0x10],
+        'G' => [0x0E, 0x11, 0x10, 0x17, 0x11, 0x11, 0x0F],
+        'H' => [0x11, 0x11, 0x11, 0x1F, 0x11, 0x11, 0x11],
+        'I' => [0x0E, 0x04, 0x04, 0x04, 0x04, 0x04, 0x0E],
+        'J' => [0x01, 0x01, 0x01, 0x01, 0x01, 0x11, 0x0E],
+        'K' => [0x11, 0x12, 0x14, 0x18, 0x14, 0x12, 0x11],
+        'L' => [0x10, 0x10, 0x10, 0x10, 0x10, 0x10, 0x1F],
+        'M' => [0x11, 0x1B, 0x15, 0x15, 0x11, 0x11, 0x11],
+        'N' => [0x11, 0x19, 0x15, 0x13, 0x11, 0x11, 0x11],
+        'O' => [0x0E, 0x11, 0x11, 0x11, 0x11, 0x11, 0x0E],
+        'P' => [0x1E, 0x11, 0x11, 0x1E, 0x10, 0x10, 0x10],
+        'Q' => [0x0E, 0x11, 0x11, 0x11, 0x15, 0x12, 0x0D],
+        'R' => [0x1E, 0x11, 0x11, 0x1E, 0x14, 0x12, 0x11],
+        'S' => [0x0F, 0x10, 0x10, 0x0E, 0x01, 0x01, 0x1E],
+        'T' => [0x1F, 0x04, 0x04, 0x04, 0x04, 0x04, 0x04],
+        'U' => [0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x0E],
+        'V' => [0x11, 0x11, 0x11, 0x11, 0x11, 0x0A, 0x04],
+        'W' => [0x11, 0x11, 0x11, 0x15, 0x15, 0x15, 0x0A],
+        'X' => [0x11, 0x11, 0x0A, 0x04, 0x0A, 0x11, 0x11],
+        'Y' => [0x11, 0x11, 0x11, 0x0A, 0x04, 0x04, 0x04],
+        'Z' => [0x1F, 0x01, 0x02, 0x04, 0x08, 0x10, 0x1F],
+        '/' => [0x01, 0x01, 0x02, 0x04, 0x08, 0x10, 0x10],
+        '-' => [0x00, 0x00, 0x00, 0x1F, 0x00, 0x00, 0x00],
+        _ => [0x00; 7], // space, and anything else unrecognized
+    }
+}
+
+/// Draws `text` (a station callsign) into the top-left corner of `rgb`
+/// (interleaved RGB, `3*w*h` bytes, row-major) on a solid background box
+/// -- a real request: a small overlay, corner only, not a full-width
+/// banner the way some other SSTV programs' caption feature draws one.
+/// Uses glyph_5x7 above (no font file dependency). `text` is
+/// automatically clipped to whatever fits `w` at this fixed scale rather
+/// than overflowing off the edge or wrapping.
+pub fn draw_callsign_banner(rgb: &mut [u8], w: u16, h: u16, text: &str) {
+    if text.is_empty() {
+        return;
+    }
+    const SCALE: usize = 2; // each font pixel drawn as a SCALE x SCALE block
+    const GLYPH_W: usize = 5;
+    const GLYPH_H: usize = 7;
+    const PAD: usize = 3; // margin inside the background box, in real pixels
+    const GAP: usize = 1; // gap between glyphs, in font pixels (pre-scale)
+    let (w, h) = (w as usize, h as usize);
+    let advance = (GLYPH_W + GAP) * SCALE;
+    let max_chars = ((w.saturating_sub(2 * PAD)) / advance).max(1);
+    let text: Vec<char> = text.chars().take(max_chars).collect();
+    let box_w = (text.len() * advance).saturating_sub(GAP * SCALE) + 2 * PAD;
+    let box_h = GLYPH_H * SCALE + 2 * PAD;
+    let box_w = box_w.min(w);
+    let box_h = box_h.min(h);
+    let mut put = |x: usize, y: usize, r: u8, g: u8, b: u8| {
+        if x < w && y < h {
+            let i = (y * w + x) * 3;
+            rgb[i] = r;
+            rgb[i + 1] = g;
+            rgb[i + 2] = b;
+        }
+    };
+    // Solid black background box first, so every glyph (including thin
+    // strokes at the box's own edge) reads clearly over any picture
+    // content behind it.
+    for y in 0..box_h {
+        for x in 0..box_w {
+            put(x, y, 0, 0, 0);
+        }
+    }
+    // White glyphs on top.
+    for (ci, &c) in text.iter().enumerate() {
+        let bitmap = glyph_5x7(c);
+        let gx0 = PAD + ci * advance;
+        for (row, bits) in bitmap.iter().enumerate() {
+            for col in 0..GLYPH_W {
+                if bits & (1 << (GLYPH_W - 1 - col)) == 0 {
+                    continue;
+                }
+                let px0 = gx0 + col * SCALE;
+                let py0 = PAD + row * SCALE;
+                for dy in 0..SCALE {
+                    for dx in 0..SCALE {
+                        put(px0 + dx, py0 + dy, 255, 255, 255);
+                    }
+                }
+            }
+        }
+    }
+}
+
 // ─────────────────────────────── receive ───────────────────────────────
 
 /// A decoded output from the receiver.

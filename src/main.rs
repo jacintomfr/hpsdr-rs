@@ -1455,6 +1455,20 @@ enum DigitalMode {
     Rade,
 }
 
+/// Saved RX/TX voice-processing state to restore when leaving the
+/// Digital Modes window -- see ConnectedState::pre_digital_filters' own
+/// doc comment.
+#[derive(Copy, Clone)]
+struct PreDigitalFilters {
+    nb: spectrum::NoiseBlanker,
+    nr: spectrum::NoiseReduction,
+    snb: bool,
+    tx_leveler: bool,
+    tx_compressor: bool,
+    tx_cfc: bool,
+    tx_eq: bool,
+}
+
 struct ConnectedState {
     device: Device,
     /// The local network interface (e.g. "eth0") `device.my_address`
@@ -1749,6 +1763,28 @@ struct ConnectedState {
     /// egui::Image::from(...) called fresh with raw bytes every frame.
     sstv_texture: Option<egui::TextureHandle>,
     sstv_texture_image_id: u32,
+    /// The picture loaded via "Load Picture...", already resized/cropped
+    /// to the selected sstv_tx_mode's own exact dimensions (and with the
+    /// callsign banner burned in, if sstv_tx_banner is on) -- ready to
+    /// hand straight to sstv.set_image() the moment "Send" is clicked, so
+    /// the operator sees exactly what will be transmitted (WYSIWYG)
+    /// rather than a generic thumbnail. Re-prepared from
+    /// sstv_tx_source_rgb whenever the mode or banner toggle changes.
+    sstv_tx_prepared: Option<(u16, u16, Vec<u8>)>,
+    /// The as-loaded picture, before any resize/crop/banner -- kept
+    /// around so switching sstv_tx_mode (a different target size) or
+    /// toggling the banner can re-derive sstv_tx_prepared without asking
+    /// the operator to re-pick the file.
+    sstv_tx_source: Option<image::RgbImage>,
+    sstv_tx_mode: sstv::SstvMode,
+    sstv_tx_banner: bool,
+    sstv_tx_texture: Option<egui::TextureHandle>,
+    /// True exactly while THIS app raised session.mox itself for a
+    /// "Send" (see render_sstv_panel's own Send/Abort handling and the
+    /// auto-drop poll near cw_text_sending's own) -- same shape/reasoning
+    /// as cw_text_sending: never true (and so never touches mox) when
+    /// the operator armed SSTV TX and keyed PTT/MOX themselves.
+    sstv_tx_sending: bool,
     rade: rade_link::RadeHandle,
     /// The callsign RADE transmits in its End-of-Over frame -- see
     /// render_rade_panel and rade::text's own doc comment. Persisted in
@@ -1941,6 +1977,17 @@ struct ConnectedState {
     /// DIGU/DIGL, so there is nothing to revert. See
     /// digi_mode_for_band's own doc comment for the band convention.
     pre_digital_mode: Option<spectrum::Mode>,
+    /// A real request, same reasoning as `pre_digital_mode`: NB/NR/SNB
+    /// (RX) and Leveler/Compressor/CFC/TX Equalizer (TX) are dynamics/
+    /// spectral processing built for VOICE intelligibility -- applying
+    /// them to RTTY/SSTV/RADE tones reshapes the amplitude/timing
+    /// relationships the decoder depends on, exactly the reasoning
+    /// RADE's own TX bypass (tx.rs's `rade.tx_armed()` block) already
+    /// uses, just not previously extended to RTTY/SSTV or to the RX
+    /// side at all. `Some(...)` is what to restore on close; `None`
+    /// means the window was opened with all of these already off, so
+    /// there is nothing to revert.
+    pre_digital_filters: Option<PreDigitalFilters>,
     /// A real request: the Digital Modes window should reopen wherever
     /// the operator last left it, on both Linux and Windows -- same
     /// "seed vs. live-tracked" split as ExtraReceiver::window_geometry/
@@ -2863,6 +2910,7 @@ fn connect_to_device(device: Device, cfg: &Config) -> Result<ConnectedState, Str
                         Arc::clone(&session.tx_audio_source),
                         spectrum.report_recorder.clone(),
                         rtty.clone(),
+                        sstv.clone(),
                         rade.clone(),
                         Arc::clone(&session.tci_wants_mic),
                         Arc::clone(&session.tx_iq),
@@ -3081,6 +3129,12 @@ fn connect_to_device(device: Device, cfg: &Config) -> Result<ConnectedState, Str
                 sstv,
                 sstv_texture: None,
                 sstv_texture_image_id: 0,
+                sstv_tx_prepared: None,
+                sstv_tx_source: None,
+                sstv_tx_mode: sstv::SstvMode::ALL[0],
+                sstv_tx_banner: true,
+                sstv_tx_texture: None,
+                sstv_tx_sending: false,
                 rade,
                 rade_callsign,
                 rx_gain_calibration_db: cfg.rx_gain_calibration_db.unwrap_or(0),
@@ -3119,6 +3173,7 @@ fn connect_to_device(device: Device, cfg: &Config) -> Result<ConnectedState, Str
                 ptt_held: false,
                 rade_pending_unkey: None,
                 pre_digital_mode: None,
+                pre_digital_filters: None,
                 digital_window_geometry: cfg.digital_window_geometry,
                 digital_window_initial_geometry: cfg.digital_window_geometry,
                 rade_drained_at: None,
@@ -3713,6 +3768,11 @@ impl eframe::App for HpsdrApp {
                 connected.sstv.set_rx_enabled(
                     connected.show_digital_window && connected.digital_mode == DigitalMode::Sstv,
                 );
+                // Same "leaving the tab silently hijacks the next
+                // transmission" fix as RTTY's own above.
+                if !connected.show_digital_window || connected.digital_mode != DigitalMode::Sstv {
+                    connected.sstv.set_tx_armed(false);
+                }
                 connected.spectrum.set_rade(&connected.rade);
                 connected.rade.set_rx_enabled(
                     connected.show_digital_window && connected.digital_mode == DigitalMode::Rade,
@@ -4666,6 +4726,9 @@ impl eframe::App for HpsdrApp {
                                         if let Some(tx) = &connected.tx_handle {
                                             tx.set_explicit_passband(Some(passband));
                                         }
+                                        // See ConnectedState::pre_digital_filters'
+                                        // own doc comment.
+                                        enter_digital_mode_filters(connected);
                                         settings_changed = true;
                                     } else {
                                         // Same restore as the window's own
@@ -4680,6 +4743,7 @@ impl eframe::App for HpsdrApp {
                                         if let Some(prev) = connected.pre_digital_mode.take() {
                                             connected.spectrum.set_mode(prev);
                                         }
+                                        restore_pre_digital_filters(connected);
                                         settings_changed = true;
                                     }
                                 }
@@ -6105,6 +6169,36 @@ impl eframe::App for HpsdrApp {
                             // or remote), so it stays accurate either
                             // way.
                             connected.cw_remote_busy.store(connected.cw_text_sending, Ordering::Relaxed);
+
+                            // SSTV TX: same "auto-drop mox once done" idea
+                            // as cw_text_sending just above -- Send (see
+                            // render_sstv_panel) keys mox itself because a
+                            // picture can take minutes to send, so this is
+                            // what lets go of it again once sstv reports
+                            // the picture fully sent, OR if mox got
+                            // dropped by something else entirely (a real
+                            // report: without this, "Send" queued the
+                            // picture but never actually keyed MOX at all,
+                            // so tx.rs's own source-selection loop never
+                            // left its "not transmitting" idle branch and
+                            // no audio -- nor any TX spectrum signal, nor
+                            // any progress-bar movement -- ever reached
+                            // the radio). Placed OUTSIDE the Digital
+                            // Modes window's own gated block (unlike the
+                            // Send/Abort buttons themselves) so a picture
+                            // send already in progress finishes/drops mox
+                            // cleanly even if the window gets closed or
+                            // the tab switched away mid-transmission.
+                            // Never touches mox if the operator armed
+                            // SSTV TX and keyed PTT/MOX themselves --
+                            // sstv_tx_sending is only ever true when THIS
+                            // code raised it.
+                            if connected.sstv_tx_sending
+                                && (!connected.sstv.tx_active() || !connected.session.mox_active())
+                            {
+                                connected.session.set_mox(false);
+                                connected.sstv_tx_sending = false;
+                            }
 
                             // Spacebar: hold-to-talk, the traditional
                             // PTT gesture (mirrors a physical
@@ -10507,6 +10601,7 @@ impl eframe::App for HpsdrApp {
                                                         Arc::clone(&connected.session.tx_audio_source),
                                                         connected.spectrum.report_recorder.clone(),
                                                         connected.rtty.clone(),
+                                                        connected.sstv.clone(),
                                                         connected.rade.clone(),
                                                         Arc::clone(&connected.session.tci_wants_mic),
                                                         Arc::clone(&connected.session.tx_iq),
@@ -11941,6 +12036,11 @@ impl eframe::App for HpsdrApp {
                     let tx_input = &mut connected.rtty_tx_input;
                     let sstv_texture = &mut connected.sstv_texture;
                     let sstv_texture_image_id = &mut connected.sstv_texture_image_id;
+                    let sstv_tx_source = &mut connected.sstv_tx_source;
+                    let sstv_tx_mode = &mut connected.sstv_tx_mode;
+                    let sstv_tx_banner = &mut connected.sstv_tx_banner;
+                    let sstv_tx_prepared = &mut connected.sstv_tx_prepared;
+                    let sstv_tx_texture = &mut connected.sstv_tx_texture;
                     let rade_callsign = &mut connected.rade_callsign;
                     let tx_handle_ref = connected.tx_handle.as_ref();
                     let mut digital_mode = connected.digital_mode;
@@ -11952,6 +12052,11 @@ impl eframe::App for HpsdrApp {
                     // clicked this frame, applied after the closure below
                     // (needs full &mut connected, not available in here).
                     let mut digital_quick_tune_hz: Option<u32> = None;
+                    // See render_sstv_panel's own mox_request doc comment
+                    // -- Some(true)/Some(false) when Send/Abort was
+                    // clicked this frame, applied after the closure below
+                    // (needs connected.session, not available in here).
+                    let mut sstv_mox_request: Option<bool> = None;
                     // See ConnectedState::digital_window_geometry's own
                     // doc comment -- live-tracked every frame the window
                     // is open (not just when Config save fires), same
@@ -12060,14 +12165,23 @@ impl eframe::App for HpsdrApp {
                                             );
                                         }
                                         DigitalMode::Sstv => {
-                                            let (clicked, quick_tune) = render_sstv_panel(
+                                            let (clicked, quick_tune, mox_request) = render_sstv_panel(
                                                 ui,
                                                 &sstv,
                                                 sstv_texture,
                                                 sstv_texture_image_id,
+                                                sstv_tx_source,
+                                                sstv_tx_mode,
+                                                sstv_tx_banner,
+                                                sstv_tx_prepared,
+                                                sstv_tx_texture,
+                                                rade_callsign,
+                                                tx_available,
+                                                mox,
                                             );
                                             sstv_fit_filter_clicked |= clicked;
                                             digital_quick_tune_hz = digital_quick_tune_hz.or(quick_tune);
+                                            sstv_mox_request = sstv_mox_request.or(mox_request);
                                         }
                                         DigitalMode::Rade => {
                                             let (clicked, quick_tune) = render_rade_panel(
@@ -12087,6 +12201,18 @@ impl eframe::App for HpsdrApp {
                     connected.digital_mode = digital_mode;
                     if let Some(g) = digital_window_geometry_out {
                         connected.digital_window_geometry = Some(g);
+                    }
+                    if let Some(want) = sstv_mox_request {
+                        // See ConnectedState::sstv_tx_sending's own doc
+                        // comment -- Send/Abort key mox themselves here
+                        // (session isn't reachable from inside the
+                        // viewport closure above); the auto-drop-once-
+                        // done poll lives outside this whole digital-
+                        // window block (near cw_text_sending's own) so it
+                        // still runs even if the window gets closed or
+                        // the tab switched away mid-transmission.
+                        connected.session.set_mox(want);
+                        connected.sstv_tx_sending = want;
                     }
                     if let Some(hz) = digital_quick_tune_hz {
                         // See SSTV_QUICK_TUNE_HZ/RADE_QUICK_TUNE_HZ's own
@@ -12227,6 +12353,7 @@ impl eframe::App for HpsdrApp {
                         if let Some(prev) = connected.pre_digital_mode.take() {
                             connected.spectrum.set_mode(prev);
                         }
+                        restore_pre_digital_filters(connected);
                     }
                 }
 
@@ -13074,11 +13201,29 @@ fn render_sstv_panel(
     sstv: &sstv_link::SstvHandle,
     texture: &mut Option<egui::TextureHandle>,
     texture_image_id: &mut u32,
-) -> (bool, Option<u32>) {
+    tx_source: &mut Option<image::RgbImage>,
+    tx_mode: &mut sstv::SstvMode,
+    tx_banner: &mut bool,
+    tx_prepared: &mut Option<(u16, u16, Vec<u8>)>,
+    tx_texture: &mut Option<egui::TextureHandle>,
+    callsign: &mut String,
+    tx_available: bool,
+    mox: bool,
+) -> (bool, Option<u32>, Option<bool>) {
     let amber = egui::Color32::from_rgb(230, 150, 50);
+    let red = egui::Color32::from_rgb(220, 50, 50);
     let green = egui::Color32::from_rgb(40, 190, 70);
     let mut fit_filter_clicked = false;
     let mut quick_tune_hz = None;
+    // Some(true) the frame "Send" is clicked, Some(false) the frame
+    // "Abort TX" is clicked -- the caller (main.rs's call site) turns
+    // this into an actual connected.session.set_mox() call, since
+    // session isn't reachable from in here. See ConnectedState::
+    // sstv_tx_sending's own doc comment for why Send has to key mox
+    // itself rather than leaving that to the operator's own PTT/MOX the
+    // way RTTY/RADE's "armed" toggle does: a picture can take minutes to
+    // send, so holding a physical key down for that long isn't practical.
+    let mut mox_request: Option<bool> = None;
 
     // Mode picker: Auto (identify from the VIS header / sync cadence) or
     // pinned to one specific mode (matches sdroxide's own Auto + explicit
@@ -13191,6 +13336,154 @@ fn render_sstv_panel(
     }
     ui.separator();
 
+    // Transmit -- load a picture, pin the mode it will be sent in (SSTV
+    // has no "Auto" for TX the way RX does -- the mode has to be decided
+    // before the VIS header goes out), optionally burn in a callsign
+    // banner, then key MOX/PTT the same way RTTY/RADE's own "armed"
+    // toggle works: this only decides what the mic input gets replaced
+    // with while transmitting, the operator still does the actual keying.
+    if !tx_available {
+        ui.weak("TX unavailable (transmit disabled or no mic input device).");
+    }
+    ui.add_enabled_ui(tx_available, |ui| {
+        ui.horizontal(|ui| {
+            let armed = sstv.tx_armed();
+            if ui
+                .add(egui::Button::selectable(armed, "SSTV TX"))
+                .on_hover_text(
+                    "While on, keying MOX/PTT transmits the loaded picture (silence once \
+                     fully sent) instead of the microphone",
+                )
+                .clicked()
+            {
+                sstv.set_tx_armed(!armed);
+            }
+            if armed && mox && sstv.tx_active() {
+                ui.colored_label(red, "ON AIR");
+            }
+            ui.add_space(8.0);
+            ui.label("My Call:");
+            let callsign_changed = ui
+                .add(
+                    egui::TextEdit::singleline(callsign)
+                        .desired_width(90.0)
+                        .char_limit(12)
+                        .hint_text("(none)"),
+                )
+                .changed();
+            // Re-burn the banner with the edited text -- same invalidation
+            // as picking a new picture or changing mode/banner below.
+            if callsign_changed && *tx_banner && tx_source.is_some() {
+                *tx_prepared = None;
+            }
+        });
+        ui.horizontal(|ui| {
+            if ui.button("Load Picture...").clicked() {
+                if let Some(path) = rfd::FileDialog::new()
+                    .add_filter("Image", &["png", "jpg", "jpeg", "bmp", "gif"])
+                    .pick_file()
+                {
+                    match image::open(&path) {
+                        Ok(img) => {
+                            *tx_source = Some(img.to_rgb8());
+                            // A new picture invalidates whatever was
+                            // prepared from the OLD one -- without this,
+                            // is_none() below would keep showing/sending
+                            // the previous picture's prepared buffer.
+                            *tx_prepared = None;
+                        }
+                        Err(e) => {
+                            eprintln!("SSTV: failed to load {}: {e}", path.display());
+                        }
+                    }
+                }
+            }
+            ui.add_space(8.0);
+            ui.label("Mode:");
+            let mut mode_changed = false;
+            egui::ComboBox::from_id_salt("sstv_tx_mode")
+                .selected_text(tx_mode.label())
+                .show_ui(ui, |ui| {
+                    for m in sstv::SstvMode::ALL {
+                        if ui.selectable_label(*tx_mode == m, m.label()).clicked() {
+                            *tx_mode = m;
+                            mode_changed = true;
+                        }
+                    }
+                });
+            let banner_changed =
+                ui.checkbox(tx_banner, "Callsign banner").on_hover_text(
+                    "Burns \"My Call\" into the top-left corner of the picture before sending"
+                ).changed();
+            if (mode_changed || banner_changed) && tx_source.is_some() {
+                *tx_prepared = None; // Re-derived below from tx_source.
+            }
+        });
+        // Re-derive tx_prepared (resize/crop to tx_mode's own exact
+        // dimensions, then the callsign banner if enabled) whenever a new
+        // picture was just loaded or the mode/banner selection changed --
+        // NOT every frame (prepare_image_for_tx does a real image resize),
+        // hence the tx_prepared.is_none() guard.
+        if tx_prepared.is_none() {
+            if let Some(src) = tx_source.as_ref() {
+                let (w, h) = tx_mode.dimensions();
+                let mut rgb = sstv::prepare_image_for_tx(*tx_mode, src);
+                if *tx_banner {
+                    sstv::draw_callsign_banner(&mut rgb, w, h, callsign.as_str());
+                }
+                *tx_prepared = Some((w, h, rgb));
+                *tx_texture = None; // Rebuild the preview texture below.
+            }
+        }
+        if let Some((w, h, rgb)) = tx_prepared.as_ref() {
+            if tx_texture.is_none() {
+                let size = [*w as usize, *h as usize];
+                let pixels: Vec<egui::Color32> =
+                    rgb.chunks_exact(3).map(|p| egui::Color32::from_rgb(p[0], p[1], p[2])).collect();
+                let image = egui::ColorImage::new(size, pixels);
+                *tx_texture =
+                    Some(ui.ctx().load_texture("sstv_tx_image", image, egui::TextureOptions::LINEAR));
+            }
+            if let Some(tex) = tx_texture {
+                let max_w = 200.0_f32;
+                let scale = (max_w / *w as f32).min(1.0);
+                ui.image((tex.id(), egui::vec2(*w as f32 * scale, *h as f32 * scale)));
+            }
+        }
+        ui.horizontal(|ui| {
+            let ready = tx_prepared.is_some();
+            if ui
+                .add_enabled(ready && tx_available && !sstv.tx_active(), egui::Button::new("Send"))
+                .on_hover_text(
+                    "Queue the picture above and key MOX/PTT for the whole transmission -- \
+                     dropped automatically once the picture is fully sent",
+                )
+                .clicked()
+            {
+                if let Some((w, h, rgb)) = tx_prepared.as_ref() {
+                    sstv.set_image(*tx_mode, rgb, *w, *h, callsign.as_str());
+                    sstv.set_tx_armed(true);
+                    mox_request = Some(true);
+                }
+            }
+            if ui
+                .add_enabled(sstv.tx_active(), egui::Button::new("Abort TX"))
+                .clicked()
+            {
+                sstv.abort_tx();
+                mox_request = Some(false);
+            }
+            if sstv.tx_active() {
+                ui.add(
+                    egui::ProgressBar::new(sstv.tx_progress().clamp(0.0, 1.0))
+                        .desired_width(120.0)
+                        .text(format!("{:.0}%", sstv.tx_progress() * 100.0)),
+                );
+            }
+        });
+    });
+    ui.separator();
+
     if snap.w > 0 && snap.h > 0 && snap.rgb.len() == snap.w as usize * snap.h as usize * 3 {
         let size = [snap.w as usize, snap.h as usize];
         let pixels: Vec<egui::Color32> = snap
@@ -13226,7 +13519,7 @@ fn render_sstv_panel(
     // many seconds to arrive, so a few redraws a second is still a smooth
     // progressive fill, not a stepping one.
     ui.ctx().request_repaint_after(Duration::from_millis(300));
-    (fit_filter_clicked, quick_tune_hz)
+    (fit_filter_clicked, quick_tune_hz, mox_request)
 }
 
 /// RADE V1 (FreeDV neural digital voice) panel. RX/TX both live -- see
@@ -16221,6 +16514,60 @@ fn digital_fit_passband(
         DigitalMode::Rade => (700.0, 2_300.0),
     };
     if lsb { (-high, -low) } else { (low, high) }
+}
+
+/// Force NB/NR/SNB (RX) and TX Leveler/Compressor/CFC/Equalizer off,
+/// saving whatever they were so leaving the Digital Modes window can put
+/// them back -- see ConnectedState::pre_digital_filters' own doc comment
+/// for why (voice-tuned processing distorting digital tones). A no-op
+/// (does not overwrite an existing save) if called twice without an
+/// intervening restore, so switching digital sub-modes never clobbers
+/// the ORIGINAL pre-digital values with "everything already off".
+fn enter_digital_mode_filters(connected: &mut ConnectedState) {
+    if connected.pre_digital_filters.is_some() {
+        return;
+    }
+    let tx_eq_enabled = connected.tx_handle.as_ref().map(|tx| tx.eq().enabled).unwrap_or(false);
+    connected.pre_digital_filters = Some(PreDigitalFilters {
+        nb: connected.spectrum.noise_blanker(),
+        nr: connected.spectrum.noise_reduction(),
+        snb: connected.spectrum.snb(),
+        tx_leveler: connected.tx_handle.as_ref().map(|tx| tx.leveler_enabled()).unwrap_or(false),
+        tx_compressor: connected.tx_handle.as_ref().map(|tx| tx.compressor_enabled()).unwrap_or(false),
+        tx_cfc: connected.tx_handle.as_ref().map(|tx| tx.cfc_enabled()).unwrap_or(false),
+        tx_eq: tx_eq_enabled,
+    });
+    connected.spectrum.set_noise_blanker(spectrum::NoiseBlanker::Off);
+    connected.spectrum.set_noise_reduction(spectrum::NoiseReduction::Off);
+    connected.spectrum.set_snb(false);
+    if let Some(tx) = &connected.tx_handle {
+        tx.set_leveler_enabled(false);
+        tx.set_compressor_enabled(false);
+        tx.set_cfc_enabled(false);
+        let mut eq = tx.eq();
+        eq.enabled = false;
+        tx.set_eq(eq);
+    }
+}
+
+/// Undo `enter_digital_mode_filters` -- see that function's and
+/// ConnectedState::pre_digital_filters' own doc comments. A no-op if
+/// nothing was saved (e.g. the Digital Modes window closing a second
+/// time, or it was opened with everything already off).
+fn restore_pre_digital_filters(connected: &mut ConnectedState) {
+    if let Some(f) = connected.pre_digital_filters.take() {
+        connected.spectrum.set_noise_blanker(f.nb);
+        connected.spectrum.set_noise_reduction(f.nr);
+        connected.spectrum.set_snb(f.snb);
+        if let Some(tx) = &connected.tx_handle {
+            tx.set_leveler_enabled(f.tx_leveler);
+            tx.set_compressor_enabled(f.tx_compressor);
+            tx.set_cfc_enabled(f.tx_cfc);
+            let mut eq = tx.eq();
+            eq.enabled = f.tx_eq;
+            tx.set_eq(eq);
+        }
+    }
 }
 
 fn digi_mode_for_band(dial_hz: u32) -> spectrum::Mode {

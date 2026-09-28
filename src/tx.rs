@@ -68,6 +68,7 @@ use crate::rade_link::RadeHandle;
 use crate::rade_denoiser::RadeDenoiser;
 use crate::rade_mic_agc::{RadeCompressor, RadeLeveler};
 use crate::rtty_link::RttyHandle;
+use crate::sstv_link::SstvHandle;
 use crate::radio::{
     CwKeyerAtomics, IqSample, TX_AUDIO_SOURCE_LOCAL_MIC, TX_AUDIO_SOURCE_RADIO_MIC,
 };
@@ -1989,6 +1990,10 @@ fn run(
     // the normal source selection (checked right after REC/PLAY's
     // playback, same injection point and reasoning).
     rtty: RttyHandle,
+    // SSTV "virtual mic" -- see sstv_link.rs. Same shape as rtty above
+    // (synthesizes its own tones, no mic dependency), checked right
+    // after it in the same priority chain.
+    sstv: SstvHandle,
     // RADE "virtual mic" -- see rade_link.rs. Unlike rtty above (which
     // synthesizes its own tones from typed text, no mic dependency),
     // RADE modulates the REAL microphone through its neural codec+modem,
@@ -2433,6 +2438,24 @@ fn run(
             // See rtty_link.rs -- AFSK tones (idle mark when nothing is
             // queued) in place of mic/TCI audio.
             rtty.fill_tx(&mut chunk);
+            // Same headroom-correction reasoning as rade_gain further
+            // down (see that comment, and SDRoxide's own digi_tx_gain):
+            // RttyTx's own tone generator writes at 0.5 (6dB headroom
+            // that belongs to the generator's own arithmetic, not the
+            // transmitter), confirmed via rtty.rs's own `* 0.5`.
+            for s in chunk.iter_mut() {
+                *s = (*s * 2.0).clamp(-1.0, 1.0);
+            }
+        } else if sstv.tx_armed() {
+            // See sstv_link.rs -- SSTV tones (silence once the picture is
+            // fully sent) in place of mic/TCI audio.
+            sstv.fill_tx(&mut chunk);
+            // Same headroom correction as the RTTY branch just above --
+            // SstvTx::next_block also writes at 0.5 (see sstv.rs's own
+            // `* 0.5`).
+            for s in chunk.iter_mut() {
+                *s = (*s * 2.0).clamp(-1.0, 1.0);
+            }
         } else if rade.tx_armed() {
             // See rade_link.rs/rade's own field doc comment above --
             // real mic audio in, RADE-modulated tone audio out. Reads
@@ -2630,27 +2653,36 @@ fn run(
             tx_denoiser.process(&mut chunk);
         }
         }
-        // ROOT CAUSE FIX for a real RADE low-power report: this slew
-        // limiter was designed for mic-underrun clicks (see its own doc
-        // comment above -- "legitimate fast speech transients aren't
-        // audibly softened"), calibrated against VOICE's own much
-        // slower spectral content. The math: tx_max_step implies a
-        // trackable-at-full-amplitude frequency of tx_max_step*mic_rate
-        // /(2*pi) -- at TX_SLEW_RAMP_SECS=0.003 and mic_rate=48000, that
-        // is only ~106 Hz. RADE's modulated tones sit at ~1000-1900 Hz,
-        // roughly full scale after `rade_gain` above -- 10-20x past
-        // what this limiter can track, so it was silently acting as an
-        // aggressive ~106 Hz low-pass on the ENTIRE RADE waveform,
-        // regardless of the input amplitude reaching it (confirmed via
-        // real hardware: the `rade_gain`/clamp fix just above made
-        // provably zero difference to actual transmitted power, because
-        // this ran unconditionally right after it and undid it either
-        // way). RADE's own `rade.fill_tx()` output has no mic-underrun
-        // steps to smooth in the first place (its underrun policy is
-        // handled separately -- see rade_tx_underrun_samples above), so
-        // there is nothing here for RADE to lose by skipping this
-        // entirely instead of retuning it.
-        if !rade.tx_armed() {
+        // ROOT CAUSE FIX for a real RADE low-power report, extended to
+        // RTTY/SSTV after a matching real report there (external power
+        // meter: ~0W, despite healthy-looking Mic/ALC/TX-spectrum
+        // activity -- this filter passes what's left of the signal
+        // AFTER crushing nearly all of it, which is exactly what a
+        // downstream meter/display would still show *something* for):
+        // this slew limiter was designed for mic-underrun clicks (see
+        // its own doc comment above -- "legitimate fast speech
+        // transients aren't audibly softened"), calibrated against
+        // VOICE's own much slower spectral content. The math:
+        // tx_max_step implies a trackable-at-full-amplitude frequency of
+        // tx_max_step*mic_rate/(2*pi) -- at TX_SLEW_RAMP_SECS=0.003 and
+        // mic_rate=48000, that is only ~106 Hz. RADE's modulated tones
+        // sit at ~1000-1900 Hz, RTTY's mark/space and SSTV's tone plan
+        // both in a similar ~1000-2300 Hz range -- 10-20x past what this
+        // limiter can track, so it was silently acting as an aggressive
+        // ~106 Hz low-pass on the ENTIRE waveform, regardless of the
+        // input amplitude reaching it (confirmed via real hardware for
+        // RADE: the `rade_gain`/clamp fix alone made provably zero
+        // difference to actual transmitted power, because this ran
+        // unconditionally right after it and undid it either way --
+        // exactly why the RTTY/SSTV `* 2.0` headroom fixes just added
+        // above were, on their own, never going to be sufficient
+        // either). None of RTTY/SSTV/RADE's own fill_tx() outputs have
+        // mic-underrun steps to smooth in the first place (that policy
+        // is handled separately per mode -- see e.g.
+        // rade_tx_underrun_samples above), so there is nothing for any
+        // of them to lose by skipping this entirely instead of retuning
+        // it.
+        if !(rtty.tx_armed() || sstv.tx_armed() || rade.tx_armed()) {
             for sample in chunk.iter_mut() {
                 tx_slew_current += (*sample - tx_slew_current).clamp(-tx_max_step, tx_max_step);
                 *sample = tx_slew_current;
@@ -2730,7 +2762,24 @@ fn run(
         }
 
         let mut p = *params.lock().unwrap();
-        if rade.tx_armed() {
+        // ROOT CAUSE FIX for a real report: RTTY/SSTV TX measured
+        // ~0W real RF (confirmed on an external power meter) despite
+        // healthy-looking Mic/TX-spectrum activity -- the ALC meter
+        // told the actual story: RTTY read -136.6dB, SSTV -21.5dB of
+        // gain REDUCTION. Both are continuous-duty-cycle single/dual-
+        // tone waveforms (RTTY's own idle "mark" tone sits at 100% duty
+        // cycle even between characters; SSTV's tone plan is similarly
+        // near-continuous) -- far higher AVERAGE power, at the same
+        // PEAK amplitude, than the intermittent voice WDSP's ALC is
+        // tuned for, so it clamped down far harder than intended,
+        // crushing real output almost to nothing. This is the exact
+        // same reasoning already applied to RADE below (see that
+        // block's own comment, which already named "every other
+        // digital mode (RTTY, PSK31, FT8, ...)" as needing this same
+        // barefoot treatment) -- just never actually extended to
+        // RTTY/SSTV's own tx_armed() until now.
+        let digital_tx_armed = rtty.tx_armed() || sstv.tx_armed() || rade.tx_armed();
+        if digital_tx_armed {
             // ROOT CAUSE FIX for a real report: with Leveler/Compressor/
             // CFC on, the carrier intermittently "oscillated" and broke
             // RX at the far end; removing all three made it rock solid
@@ -2738,47 +2787,50 @@ fn run(
             // a bug, see below). Those three are dynamics processors
             // built for VOICE -- they track and reshape an audio
             // envelope for intelligibility, which is exactly what must
-            // NOT happen to RADE's "audio": it is not speech, it is a
-            // multi-tone/OFDM-like modem waveform whose amplitude
-            // relationships between tones ARE the signal, encoding what
-            // the receiver's neural decoder is trying to recover. Any
-            // nonlinear reshaping of that envelope is exactly the kind
-            // of distortion that breaks lock at the far end -- the same
-            // reason every other digital mode (RTTY, PSK31, FT8, ...) is
-            // operated barefoot, no audio processing, on any radio.
-            // Forced here rather than left as an operator reminder: RADE
-            // is armed from its own dedicated button, a natural place to
-            // also guarantee the audio chain it modulates through is
-            // clean, the same way rtty.tx_armed() above already bypasses
-            // the mic/TCI source selection entirely for its own tones.
+            // NOT happen to a digital mode's own tones: amplitude
+            // relationships between/within tones ARE the signal (RTTY's
+            // mark/space, SSTV's sync timing, RADE's multi-tone/OFDM-
+            // like waveform). Any nonlinear reshaping of that envelope
+            // is exactly the kind of distortion that breaks decode at
+            // the far end -- the same reason every other digital mode
+            // (RTTY, PSK31, FT8, ...) is operated barefoot, no audio
+            // processing, on any radio.
+            // Forced here rather than left as an operator reminder:
+            // each mode is armed from its own dedicated button, a
+            // natural place to also guarantee the audio chain it
+            // modulates through is clean, the same way rtty.tx_armed()
+            // above already bypasses the mic/TCI source selection
+            // entirely for its own tones.
             // The resulting lower average power (a compressor's whole
             // point is raising average level within the same peak/ALC
             // ceiling a raw high-crest-factor waveform can't reach) is
-            // correct behavior, not a regression -- RADE's own AGC/
-            // sync tracking at the far end is built around a clean,
-            // unprocessed signal at whatever power that leaves.
+            // correct behavior, not a regression -- a receiving
+            // station's own AGC/decode at the far end is built around a
+            // clean, unprocessed signal at whatever power that leaves.
             p.leveler_enabled = false;
             p.compressor_enabled = false;
             p.cfc_enabled = false;
             // ROOT CAUSE FIX for a real report: the TX Equalizer (the
             // same SSB one, boosting/cutting fixed bands) was left
-            // running over RADE's own tones -- same problem as Leveler/
+            // running over these tones -- same problem as Leveler/
             // Compressor/CFC just above, and the same fix: any nonlinear
             // reshaping (here, per-band gain rather than a dynamics
-            // envelope) distorts the amplitude relationships between
-            // RADE's tones that the neural decoder depends on. An
-            // operator's own SSB EQ setting (e.g. a bass cut, a presence
-            // boost) has no meaning for a modem waveform and was
-            // silently degrading the far end's decode exactly where its
-            // bands happened to overlap RADE's own tone range.
+            // envelope) distorts the amplitude relationships a digital
+            // decoder depends on. An operator's own SSB EQ setting (e.g.
+            // a bass cut, a presence boost) has no meaning for a modem
+            // waveform and was silently degrading the far end's decode
+            // exactly where its bands happened to overlap the tone
+            // range in use.
             p.eq.enabled = false;
         }
         // ALC: same bypass, see process()'s own alc_enabled doc comment
-        // for the mechanism (fast peak limiter reshaping RADE's tone
-        // envelope) -- not a TxParams field like leveler/compressor/cfc
-        // above since there is no separate user-facing toggle for it in
-        // any mode; it is always on except while RADE is armed.
-        let alc_enabled = !rade.tx_armed();
+        // for the mechanism (fast peak limiter reshaping a digital
+        // mode's own tone envelope -- see digital_tx_armed's own doc
+        // comment above for the real-hardware report this fixes) -- not
+        // a TxParams field like leveler/compressor/cfc above since there
+        // is no separate user-facing toggle for it in any mode; it is
+        // always on except while a digital mode is armed.
+        let alc_enabled = !digital_tx_armed;
         let (iq, exch_error) = processor.process(
             &chunk,
             p.mode,
@@ -2956,6 +3008,8 @@ impl TxHandle {
         // See run()'s doc comment on the parameter of the same name.
         rtty: RttyHandle,
         // See run()'s doc comment on the parameter of the same name.
+        sstv: SstvHandle,
+        // See run()'s doc comment on the parameter of the same name.
         rade: RadeHandle,
         // See run()'s doc comment on the parameter of the same name.
         tci_wants_mic: Arc<AtomicBool>,
@@ -3006,7 +3060,7 @@ impl TxHandle {
             let cw_text_busy = Arc::clone(&cw_text_busy);
             thread::spawn(move || {
                 run(
-                    mic_buffer, tci_tx_audio, radio_mic_audio, tx_audio_source, report_recorder, rtty, rade, tci_wants_mic,
+                    mic_buffer, tci_tx_audio, radio_mic_audio, tx_audio_source, report_recorder, rtty, sstv, rade, tci_wants_mic,
                     tx_iq_out, tx_spectrum_iq, tx_audio_monitor, waveform_tap, mox, params, display, channel,
                     protocol, mic_rate, duc_rate, puresignal_enabled, ps_rx_feedback_iq, ps_tx_feedback_iq,
                     ps_params, ps_status, ps_corr_path, cw_keyer, cw_text_elements, cw_text_active, cw_text_busy, stop,
