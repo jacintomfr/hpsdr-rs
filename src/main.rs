@@ -9094,10 +9094,19 @@ impl eframe::App for HpsdrApp {
                                     ui.add_space(16.0);
                                     ui.separator();
                                     ui.add_space(8.0);
-                                    // CARGO_PKG_VERSION is baked in at compile time from
-                                    // Cargo.toml's own [package] version -- always in sync,
-                                    // no separate version constant to keep updated by hand.
-                                    ui.label(format!("hpsdr-rs {}", env!("CARGO_PKG_VERSION")));
+                                    // ROOT CAUSE FIX for a real report: this used to show
+                                    // CARGO_PKG_VERSION (Cargo.toml's own version), which
+                                    // tracks THIS FORK's own, independently-bumped version
+                                    // number, not the original upstream project's -- wrongly
+                                    // implying the credit line just below is for whatever
+                                    // version this fork happens to be at. Hardcoded to the
+                                    // last known real upstream release instead (g0orx/
+                                    // hpsdr-rs's own v0.7.0, github.com/g0orx/hpsdr-rs/
+                                    // releases) -- a real request, accepting that it goes
+                                    // stale whenever upstream cuts a new release, since
+                                    // there's no live way to track that without a network
+                                    // call this About screen shouldn't be making.
+                                    ui.label("hpsdr-rs v0.7.0");
                                     ui.label("John Melton G0ORX");
                                     ui.hyperlink_to(
                                         "john.d.melton@googlemail.com",
