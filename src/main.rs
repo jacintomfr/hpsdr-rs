@@ -9103,6 +9103,29 @@ impl eframe::App for HpsdrApp {
                                         "john.d.melton@googlemail.com",
                                         "mailto:john.d.melton@googlemail.com",
                                     );
+                                    // Personal fork attribution -- a real
+                                    // request, kept separate from (below)
+                                    // the original project's own credit
+                                    // just above, not replacing it. The
+                                    // build-note line is compiled in from
+                                    // HPSDR_RS_BUILD_NOTE (option_env!, so
+                                    // it's absent -- no blank line -- on a
+                                    // normal build that doesn't set it),
+                                    // meant for a one-line label on a
+                                    // special build, e.g. "Ubuntu 24.04
+                                    // LTS" or "Windows without AVX2", set
+                                    // like:
+                                    //   HPSDR_RS_BUILD_NOTE="Windows without AVX2" cargo build --release
+                                    // -- same one-off-env-var pattern as
+                                    // HPSDR_RS_NO_MARCH_NATIVE, meant to be
+                                    // reused this same way going forward.
+                                    ui.add_space(8.0);
+                                    ui.label(format!("hpsdr-rs {}", env!("CARGO_PKG_VERSION")));
+                                    ui.label("mods by Jacinto Rebelo CU2ED");
+                                    ui.label("This is just for personal use");
+                                    if let Some(note) = option_env!("HPSDR_RS_BUILD_NOTE") {
+                                        ui.label(note);
+                                    }
                                 }
 
                                 SettingsTab::Audio => {
@@ -11960,9 +11983,20 @@ impl eframe::App for HpsdrApp {
                                         }
                                     });
                                     ui.separator();
+                                    // ROOT CAUSE FIX for a real report: switching tabs
+                                    // (RADE <-> SSTV, etc.) set the corresponding
+                                    // *_fit_filter_clicked flag above to auto-apply
+                                    // that tab's passband, but this match ran in the
+                                    // SAME frame and unconditionally overwrote it with
+                                    // the panel's own "Fit Filter" button state (false,
+                                    // since the operator didn't also click that this
+                                    // frame) -- clobbering the auto-apply back to
+                                    // false before it was ever read below. OR'd in now
+                                    // instead of assigned, so a tab-switch's own true
+                                    // survives regardless of what the panel returns.
                                     match digital_mode {
                                         DigitalMode::Rtty => {
-                                            fit_filter_clicked = render_digital_panel(
+                                            fit_filter_clicked |= render_digital_panel(
                                                 ui,
                                                 &rtty,
                                                 tx_input,
@@ -11979,7 +12013,7 @@ impl eframe::App for HpsdrApp {
                                                 sstv_texture,
                                                 sstv_texture_image_id,
                                             );
-                                            sstv_fit_filter_clicked = clicked;
+                                            sstv_fit_filter_clicked |= clicked;
                                             digital_quick_tune_hz = digital_quick_tune_hz.or(quick_tune);
                                         }
                                         DigitalMode::Rade => {
@@ -11990,7 +12024,7 @@ impl eframe::App for HpsdrApp {
                                                 mox,
                                                 tx_handle_ref,
                                             );
-                                            rade_fit_filter_clicked = clicked;
+                                            rade_fit_filter_clicked |= clicked;
                                             digital_quick_tune_hz = digital_quick_tune_hz.or(quick_tune);
                                         }
                                     }
