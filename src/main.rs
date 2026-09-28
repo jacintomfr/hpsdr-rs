@@ -7665,7 +7665,7 @@ impl eframe::App for HpsdrApp {
                             let (watts, reverse_watts, swr) = power_watts_and_swr(
                                 connected.smoothed_fwd_power as u32,
                                 connected.smoothed_rev_power as u32,
-                                connected.device.board,
+                                power_meter_board(connected.device.board, connected.device.mac),
                             );
                             // SWR protection: cut drive to a safe 10W the
                             // moment SWR reaches/exceeds Max SWR while
@@ -14559,6 +14559,33 @@ fn default_max_tx_power_watts(board: Boards) -> u32 {
 /// automatically correct for a DIFFERENT specific unit/revision --
 /// prefer a same-hardware, same-session comparison over reference
 /// authority when the two actually disagree.
+/// One specific HermesLite2 (identified by its own MAC, not a general
+/// HL2 rule) that doesn't carry the usual "JIM" filter/ADC board --
+/// instead a JI1UDD HL2-PA30 (30W PA + LPF, github.com/ji1udd/HL2-PA30)
+/// with different resistors feeding the forward/reverse power detector's
+/// ADC input, which is exactly what power_watts_and_swr's per-board
+/// (c1, c2) pair calibrates. A real report from the owner of this
+/// specific radio: Boards::HermesLite2's own constants read ~0W/SWR
+/// pegged at max on this board (confirmed via an external wattmeter
+/// showing real, normal power), while piHPSDR's own Hermes (not
+/// HermesLite2) meter routine -- confirmed by the owner against
+/// piHPSDR's source directly, the same fix they'd already made there --
+/// reads correctly, since its ADC scaling happens to match this board's
+/// actual resistor values. This is a hardware fact about this one
+/// physical unit, not a general HermesLite2 correction -- every other
+/// real HermesLite2 (the standard JIM board) keeps using
+/// Boards::HermesLite2's own constants unchanged.
+const HL2_PA30_MAC: [u8; 6] = [0x00, 0x1C, 0xC0, 0xA2, 0x13, 0xDD];
+
+/// See HL2_PA30_MAC's own doc comment -- the (c1, c2) pair
+/// power_watts_and_swr actually uses for this one radio's power meter,
+/// substituting Boards::Hermes for its own Boards::HermesLite2 whenever
+/// the connected MAC matches. Every other radio (including every other
+/// real HermesLite2) passes `board` through unchanged.
+fn power_meter_board(board: Boards, mac: [u8; 6]) -> Boards {
+    if board == Boards::HermesLite2 && mac == HL2_PA30_MAC { Boards::Hermes } else { board }
+}
+
 fn power_watts_and_swr(raw_forward: u32, raw_reverse: u32, board: Boards) -> (f32, f32, f32) {
     let (c1, c2): (f32, f32) = match board {
         Boards::Metis => (3.3, 0.09),
