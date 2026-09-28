@@ -2126,6 +2126,17 @@ fn run(
     const TX_SLEW_RAMP_SECS: f32 = 0.003;
     let tx_max_step = 2.0 / (TX_SLEW_RAMP_SECS * mic_rate as f32);
     let mut tx_slew_current: f32 = 0.0;
+    // ROOT CAUSE FIX for a real report: the waveform display, while RADE
+    // is armed, showed `chunk` -- by that point in the pipeline, RADE's
+    // own MODULATED tone waveform (the RF about to be transmitted), not
+    // anything resembling the operator's actual speech. Stashed here,
+    // right after mic-side conditioning (RNNoise/leveler/compressor) and
+    // before `rade.fill_tx()` overwrites `chunk` with the modulated
+    // output, so the tap below can show the real conditioned mic audio
+    // instead while RADE is active -- matching what an operator actually
+    // expects a "waveform" display to mean (their own voice), the same
+    // as it already shows for every other TX source.
+    let mut rade_mic_waveform: Vec<f32> = Vec::new();
 
     // Second diagnostic, added after the mic-buffer one above didn't
     // reproduce anything (no underruns logged, yet power/ALC still
@@ -2465,6 +2476,9 @@ fn run(
             if rade_comp_on {
                 rade_compressor.process(&mut mic_chunk, mic_rate as f64);
             }
+            // See rade_mic_waveform's own doc comment above.
+            rade_mic_waveform.clear();
+            rade_mic_waveform.extend_from_slice(&mic_chunk);
             let real_samples = rade.fill_tx(mox.load(Ordering::Relaxed), &mic_chunk, &mut chunk);
             rade_tx_underrun_samples += (chunk.len() - real_samples) as u64;
             // ROOT CAUSE FIX for a real report: RADE TX averaged only ~1W
@@ -2647,10 +2661,13 @@ fn run(
         // WDSP's fexchange0 (post source-selection, pre-processing), so
         // listening to this queue reveals whether a problem is already
         // present in the source audio or introduced downstream. See
-        // TxHandle::tx_audio_monitor's doc comment.
+        // TxHandle::tx_audio_monitor's doc comment. Kept on `chunk` even
+        // while RADE is armed -- this tap is about what's actually about
+        // to be transmitted (useful for confirming the modulated tones
+        // themselves are healthy), unlike waveform_tap just below, which
+        // is about what the OPERATOR is saying.
         {
             let mut mon = tx_audio_monitor.lock().unwrap();
-            let mut wave = waveform_tap.lock().unwrap();
             for &sample in chunk.iter() {
                 if mon.len() >= TX_AUDIO_MONITOR_CAPACITY {
                     mon.pop_front();
@@ -2661,6 +2678,13 @@ fn run(
                 // both channels, same as this project's own RX audio
                 // used to do before it gained real binaural support.
                 mon.push_back((sample, sample));
+            }
+        }
+        // See rade_mic_waveform's own doc comment above.
+        {
+            let mut wave = waveform_tap.lock().unwrap();
+            let source: &[f32] = if rade.tx_armed() { &rade_mic_waveform } else { &chunk };
+            for &sample in source.iter() {
                 if wave.len() >= WAVEFORM_TAP_CAPACITY {
                     wave.pop_front();
                 }

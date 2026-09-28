@@ -2020,10 +2020,21 @@ fn run(
                 // flat line and only cranking Audio Gain to an
                 // uncomfortably loud level made anything visible.
                 let mono = (l + r) * 0.5;
-                if waveform_out.len() >= WAVEFORM_TAP_CAPACITY {
-                    waveform_out.pop_front();
+                // ROOT CAUSE FIX for a real report: while RADE is the
+                // active RX decoder, this pushed the ordinary WDSP-
+                // demodulated audio -- which, tuned to a RADE signal, is
+                // just the raw OFDM tone waveform (harsh modem noise),
+                // not anything resembling the remote operator's actual
+                // voice. Skipped here when rade_rx is active; the RADE
+                // speech loop further down pushes the real DECODED
+                // speech instead, matching what an operator actually
+                // expects a "waveform" display to mean.
+                if rade_rx.is_none() {
+                    if waveform_out.len() >= WAVEFORM_TAP_CAPACITY {
+                        waveform_out.pop_front();
+                    }
+                    waveform_out.push_back(mono.clamp(-1.0, 1.0));
                 }
-                waveform_out.push_back(mono.clamp(-1.0, 1.0));
                 if cw_active {
                     cw_decoder.process_sample(mono);
                 }
@@ -2122,6 +2133,10 @@ fn run(
             let mute_local = mute_local_for_tci.load(Ordering::Relaxed);
             let mut out = audio_out.lock().unwrap();
             let mut tci_out = tci_audio_out.lock().unwrap();
+            // See the raw-demod push site's own doc comment above (why
+            // it's skipped for RADE) -- this is the real decoded speech
+            // that takes its place on the waveform display instead.
+            let mut wave = waveform_out.lock().unwrap();
             // ROOT CAUSE FIX for a real report: the Audio Gain slider had
             // no effect on RADE's decoded speech (only Windows' own
             // volume control did) -- this loop replaces the normal
@@ -2151,6 +2166,10 @@ fn run(
                     tci_out.pop_front();
                 }
                 tci_out.push_back((s, s));
+                if wave.len() >= WAVEFORM_TAP_CAPACITY {
+                    wave.pop_front();
+                }
+                wave.push_back(s);
             }
         }
     }
