@@ -139,6 +139,16 @@ thiserror = "2"
 # coarser than the ~10.67ms TX chunk pacing interval needs).
 windows-sys = { version = "0.59", features = ["Win32_Foundation", "Win32_Media", "Win32_System_Console", "Win32_System_Threading"] }
 
+[target.'cfg(unix)'.dependencies]
+# dup2, used by main.rs's redirect_stdio_to_log_file_if_requested() --
+# the Unix equivalent of the Windows block just above's SetStdHandle,
+# opt-in via HPSDR_RS_LOG_FILE=1 (unlike Windows, a normal Linux/macOS
+# launch already has a console, so this isn't unconditional -- a real
+# request: a real-hardware Linux report needed a startup log captured to
+# a file the reporting user could actually find and send back, without
+# needing to know shell redirection syntax themselves).
+libc = "0.2"
+
 # NOTE: I could not compile-check this in the sandbox this was written in
 # (no Rust toolchain available), so treat these version numbers as a
 # starting point -- run `cargo update` / `cargo check` locally and adjust
@@ -211,7 +221,7 @@ priority = "optional"
 # treats a new package as an upgrade if ITS version string (crate
 # version + this revision) actually differs from what's installed, so
 # reusing the same version+revision needs a manual `dpkg -r` first.
-revision = "2"
+revision = "3"
 assets = [
     ["target/release/hpsdr-rs", "usr/bin/", "755"],
     ["README.md", "usr/share/doc/hpsdr-rs/README.md", "644"],

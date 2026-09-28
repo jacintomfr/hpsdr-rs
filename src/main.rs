@@ -17399,6 +17399,47 @@ fn redirect_stdio_to_log_file() {
     }
 }
 
+/// Unix equivalent of redirect_stdio_to_log_file above, but opt-in
+/// (`HPSDR_RS_LOG_FILE=1`) rather than unconditional: unlike Windows
+/// release builds, a normal Linux/macOS launch already has a console
+/// attached and showing this output there is the expected/useful
+/// default. A real request: getting a startup log out of a real-
+/// hardware Linux report (a HermesLite2 rediscover/network issue) meant
+/// asking the reporting user to run from a terminal and paste the
+/// output back by hand -- workable, but error-prone for anyone not
+/// comfortable with shell redirection syntax. This does the same job
+/// as `hpsdr-rs > file 2>&1` would, but from inside the app itself, and
+/// prints the resulting path to the ORIGINAL stdout first (so it shows
+/// up once in whatever terminal launched it, before that terminal goes
+/// quiet) so the file is easy to find afterward.
+///
+/// `dup2` (not `SetStdHandle` -- that's Windows-only) repoints file
+/// descriptors 1/2 at the log file; `std::mem::forget` (Rust's
+/// equivalent of `into_raw_handle()`'s "keep it open" role above) skips
+/// the `File`'s own `Drop`/close so the descriptor stays valid for the
+/// rest of the process's lifetime.
+#[cfg(unix)]
+fn redirect_stdio_to_log_file_if_requested() {
+    use std::os::unix::io::AsRawFd;
+
+    if std::env::var_os("HPSDR_RS_LOG_FILE").is_none() {
+        return;
+    }
+    let Some(path) = debug_log::log_path("hpsdr-rs.log") else {
+        return;
+    };
+    let Ok(file) = std::fs::File::create(&path) else {
+        return;
+    };
+    println!("hpsdr-rs: HPSDR_RS_LOG_FILE set -- sending stdout/stderr to {}", path.display());
+    let fd = file.as_raw_fd();
+    unsafe {
+        libc::dup2(fd, libc::STDOUT_FILENO);
+        libc::dup2(fd, libc::STDERR_FILENO);
+    }
+    std::mem::forget(file);
+}
+
 /// Fixed 1024x600 fullscreen kiosk mode for a small LCD panel (e.g. a
 /// Raspberry Pi shack touchscreen) -- see main()'s NativeOptions setup
 /// for the main window itself. Checked from several places (the main
@@ -17430,6 +17471,9 @@ fn main() -> eframe::Result<()> {
     // builds, println!/eprintln! output would otherwise go nowhere.
     #[cfg(all(windows, not(debug_assertions)))]
     redirect_stdio_to_log_file();
+    // See that function's own doc comment -- opt-in via HPSDR_RS_LOG_FILE=1.
+    #[cfg(unix)]
+    redirect_stdio_to_log_file_if_requested();
 
     // Force winit's X11 backend (via XWayland) rather than native Wayland.
     // Confirmed via `perf record`/`strace -p` on a running session: winit's
