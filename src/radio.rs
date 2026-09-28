@@ -3099,6 +3099,17 @@ fn fill_tx_payload(
     // 16-step hardware attenuator -- see hl2_drive_level_and_scale's
     // doc comment. 1.0 (no-op) for every other board.
     drive_scale: f32,
+    // ROOT CAUSE FIX for a real report: on a genuine HermesLite2 with a
+    // hardware CW key/paddle wired into its own KEY/PTT jack, MOX never
+    // dropped back to RX on its own after unkeying -- confirmed NOT a
+    // network/bridge issue (real HL2, not a Radioberry/Juice bridge),
+    // and confirmed absent on deskHPSDR/Quisk on the same radio. Checked
+    // deskHPSDR's own old_protocol.c: "The 'CWX' method in the HL2
+    // firmware behaves erroneously if the CW input from the KEY/PTT jack
+    // is activated. To make deskHPSDR immune to this problem, the least
+    // significant bit of the I (and Q) samples are cleared." This
+    // project never did that -- see is_hermes_lite's own use below.
+    is_hermes_lite: bool,
 ) {
     let mut buf = tx_iq.lock().unwrap();
     let mut b = HEADER_SIZE;
@@ -3118,9 +3129,13 @@ fn fill_tx_payload(
         let i_sample = pacer.held_i;
         let q_sample = pacer.held_q;
         frame[b + 4] = (i_sample >> 8) as u8;
-        frame[b + 5] = i_sample as u8;
         frame[b + 6] = (q_sample >> 8) as u8;
-        frame[b + 7] = q_sample as u8;
+        // See is_hermes_lite's own doc comment just above -- clearing
+        // this bit costs one LSB of resolution (16 -> 15 bits), harmless
+        // since the HL2's own DAC is 12-bit anyway (deskHPSDR's own
+        // reasoning, matched exactly).
+        frame[b + 5] = if is_hermes_lite { (i_sample as u8) & 0xFE } else { i_sample as u8 };
+        frame[b + 7] = if is_hermes_lite { (q_sample as u8) & 0xFE } else { q_sample as u8 };
         b += 8;
     }
 }
@@ -4418,8 +4433,8 @@ fn p1_build_packet(
     // under-full or garbage payload going out while the
     // transmitter is actually keyed is worse than silence.
     if mox_on {
-        fill_tx_payload(&mut frame0, tx_iq, tx_iq_pacer, tx_iq_slots_per_sample, tx_drive_scale);
-        fill_tx_payload(&mut frame1, tx_iq, tx_iq_pacer, tx_iq_slots_per_sample, tx_drive_scale);
+        fill_tx_payload(&mut frame0, tx_iq, tx_iq_pacer, tx_iq_slots_per_sample, tx_drive_scale, is_hermes_lite);
+        fill_tx_payload(&mut frame1, tx_iq, tx_iq_pacer, tx_iq_slots_per_sample, tx_drive_scale, is_hermes_lite);
     } else if send_rx_audio {
         // Same 8-byte-per-sample slot fill_tx_payload uses while
         // transmitting, but for the receive side: local audio in
