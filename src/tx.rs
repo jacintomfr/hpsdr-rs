@@ -2736,6 +2736,18 @@ fn run(
             p.leveler_enabled = false;
             p.compressor_enabled = false;
             p.cfc_enabled = false;
+            // ROOT CAUSE FIX for a real report: the TX Equalizer (the
+            // same SSB one, boosting/cutting fixed bands) was left
+            // running over RADE's own tones -- same problem as Leveler/
+            // Compressor/CFC just above, and the same fix: any nonlinear
+            // reshaping (here, per-band gain rather than a dynamics
+            // envelope) distorts the amplitude relationships between
+            // RADE's tones that the neural decoder depends on. An
+            // operator's own SSB EQ setting (e.g. a bass cut, a presence
+            // boost) has no meaning for a modem waveform and was
+            // silently degrading the far end's decode exactly where its
+            // bands happened to overlap RADE's own tone range.
+            p.eq.enabled = false;
         }
         // ALC: same bypass, see process()'s own alc_enabled doc comment
         // for the mechanism (fast peak limiter reshaping RADE's tone

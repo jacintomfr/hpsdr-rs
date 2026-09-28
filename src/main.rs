@@ -1932,6 +1932,15 @@ struct ConnectedState {
     /// Only covers the main MOX button for now -- rigctl/TCI/CW's own
     /// unkey paths still drop mox immediately, same as before this fix.
     rade_pending_unkey: Option<Instant>,
+    /// A real request: opening the Digital Modes window while in SSB (or
+    /// any other non-digital mode) should switch to DIGU/DIGL for the
+    /// current band automatically, then switch back to whatever mode was
+    /// active before on close -- rather than leaving the operator to
+    /// remember to flip modes by hand every time. `Some(mode)` is what to
+    /// restore; `None` means the window was opened while already in
+    /// DIGU/DIGL, so there is nothing to revert. See
+    /// digi_mode_for_band's own doc comment for the band convention.
+    pre_digital_mode: Option<spectrum::Mode>,
     /// ROOT CAUSE FIX for a real report, round 3: `rade.tx_drained()`
     /// only reflects RadeWorker's own internal tx_out ring being empty
     /// -- it says nothing about `chunk` after that point, which still
@@ -3096,6 +3105,7 @@ fn connect_to_device(device: Device, cfg: &Config) -> Result<ConnectedState, Str
                 tx_handle,
                 ptt_held: false,
                 rade_pending_unkey: None,
+                pre_digital_mode: None,
                 rade_drained_at: None,
                 mic_gain,
                 tci_tx_gain,
@@ -4604,7 +4614,59 @@ impl eframe::App for HpsdrApp {
                                     .on_hover_text("Digital modes: RTTY decoder/encoder")
                                     .clicked()
                                 {
-                                    connected.show_digital_window = !connected.show_digital_window;
+                                    let opening = !connected.show_digital_window;
+                                    connected.show_digital_window = opening;
+                                    // See ConnectedState::pre_digital_mode's
+                                    // own doc comment -- auto-switch to
+                                    // DIGU/DIGL on open, restore on close,
+                                    // via this same button (the window's
+                                    // own X/close-requested path does the
+                                    // restore half too, for the case the
+                                    // operator closes it that way instead).
+                                    if opening {
+                                        let current = connected.spectrum.mode();
+                                        if !matches!(current, spectrum::Mode::Digu | spectrum::Mode::Digl) {
+                                            let dial_hz = if connected.ctun {
+                                                connected.ctun_frequency_hz
+                                            } else {
+                                                connected.session.frequency_hz.load(Ordering::Relaxed)
+                                            };
+                                            connected.pre_digital_mode = Some(current);
+                                            connected.spectrum.set_mode(digi_mode_for_band(dial_hz));
+                                            settings_changed = true;
+                                        }
+                                        // See digital_fit_passband's own doc
+                                        // comment -- applies automatically on
+                                        // entry, whichever tab was last
+                                        // selected, instead of requiring a
+                                        // manual Fit Filter click first.
+                                        let s = connected.rtty.settings();
+                                        let passband = digital_fit_passband(
+                                            connected.digital_mode,
+                                            connected.spectrum.mode(),
+                                            s.center_hz,
+                                            s.shift_hz,
+                                        );
+                                        connected.spectrum.set_explicit_passband(Some(passband));
+                                        if let Some(tx) = &connected.tx_handle {
+                                            tx.set_explicit_passband(Some(passband));
+                                        }
+                                        settings_changed = true;
+                                    } else {
+                                        // Same restore as the window's own
+                                        // X/close-requested path -- needed
+                                        // here too since this button is
+                                        // itself a second way to close the
+                                        // window, not just open it.
+                                        connected.spectrum.set_explicit_passband(None);
+                                        if let Some(tx) = &connected.tx_handle {
+                                            tx.set_explicit_passband(None);
+                                        }
+                                        if let Some(prev) = connected.pre_digital_mode.take() {
+                                            connected.spectrum.set_mode(prev);
+                                        }
+                                        settings_changed = true;
+                                    }
                                 }
                             });
 
@@ -11819,7 +11881,7 @@ impl eframe::App for HpsdrApp {
                     let rade = connected.rade.clone();
                     let tx_available = connected.tx_enabled && connected.tx_handle.is_some();
                     let mox = connected.session.mox.load(Ordering::Relaxed);
-                    let mode = connected.spectrum.mode();
+                    let mut mode = connected.spectrum.mode();
                     let tx_input = &mut connected.rtty_tx_input;
                     let sstv_texture = &mut connected.sstv_texture;
                     let sstv_texture_image_id = &mut connected.sstv_texture_image_id;
@@ -11829,6 +11891,11 @@ impl eframe::App for HpsdrApp {
                     let mut fit_filter_clicked = false;
                     let mut sstv_fit_filter_clicked = false;
                     let mut rade_fit_filter_clicked = false;
+                    // See SSTV_QUICK_TUNE_HZ/RADE_QUICK_TUNE_HZ's own doc
+                    // comments -- Some(hz) when a Quick Tune button was
+                    // clicked this frame, applied after the closure below
+                    // (needs full &mut connected, not available in here).
+                    let mut digital_quick_tune_hz: Option<u32> = None;
                     ui.ctx().show_viewport_immediate(
                         egui::ViewportId::from_hash_of("digital_modes_window"),
                         digital_viewport,
@@ -11862,6 +11929,14 @@ impl eframe::App for HpsdrApp {
                                             .clicked()
                                         {
                                             digital_mode = DigitalMode::Rtty;
+                                            // See digital_fit_passband's own
+                                            // doc comment -- auto-applies on
+                                            // switching to this tab too, not
+                                            // just on first opening the
+                                            // window, by piggybacking on the
+                                            // same flag the manual button
+                                            // sets.
+                                            fit_filter_clicked = true;
                                         }
                                         if ui
                                             .add(egui::Button::selectable(
@@ -11871,6 +11946,7 @@ impl eframe::App for HpsdrApp {
                                             .clicked()
                                         {
                                             digital_mode = DigitalMode::Sstv;
+                                            sstv_fit_filter_clicked = true;
                                         }
                                         if ui
                                             .add(egui::Button::selectable(
@@ -11880,6 +11956,7 @@ impl eframe::App for HpsdrApp {
                                             .clicked()
                                         {
                                             digital_mode = DigitalMode::Rade;
+                                            rade_fit_filter_clicked = true;
                                         }
                                     });
                                     ui.separator();
@@ -11896,27 +11973,67 @@ impl eframe::App for HpsdrApp {
                                             );
                                         }
                                         DigitalMode::Sstv => {
-                                            sstv_fit_filter_clicked = render_sstv_panel(
+                                            let (clicked, quick_tune) = render_sstv_panel(
                                                 ui,
                                                 &sstv,
                                                 sstv_texture,
                                                 sstv_texture_image_id,
                                             );
+                                            sstv_fit_filter_clicked = clicked;
+                                            digital_quick_tune_hz = digital_quick_tune_hz.or(quick_tune);
                                         }
                                         DigitalMode::Rade => {
-                                            rade_fit_filter_clicked = render_rade_panel(
+                                            let (clicked, quick_tune) = render_rade_panel(
                                                 ui,
                                                 &rade,
                                                 rade_callsign,
                                                 mox,
                                                 tx_handle_ref,
                                             );
+                                            rade_fit_filter_clicked = clicked;
+                                            digital_quick_tune_hz = digital_quick_tune_hz.or(quick_tune);
                                         }
                                     }
                                 });
                         },
                     );
                     connected.digital_mode = digital_mode;
+                    if let Some(hz) = digital_quick_tune_hz {
+                        // See SSTV_QUICK_TUNE_HZ/RADE_QUICK_TUNE_HZ's own
+                        // doc comments. Same frequency/mode-setting shape
+                        // as apply_band, minus the band-memory bookkeeping
+                        // (this isn't "switching band" in that persistent
+                        // sense, just a one-off jump to a known calling
+                        // frequency) -- and DIGU/DIGL for the new band
+                        // instead of the band's own default_mode, same
+                        // convention digi_mode_for_band already uses for
+                        // opening the Digital window itself.
+                        connected.active_xvtr = None;
+                        connected.session.set_frequency(hz);
+                        connected.ctun_frequency_hz = hz;
+                        let new_mode = digi_mode_for_band(hz);
+                        connected.spectrum.set_mode(new_mode);
+                        if let Some(tx) = &connected.tx_handle {
+                            tx.set_mode(new_mode);
+                        }
+                        // The fit_filter_clicked/sstv_.../rade_... blocks
+                        // just below read this SAME local (captured
+                        // before the window closure ran) to pick the
+                        // passband's sign -- update it here so a Quick
+                        // Tune that just crossed into/out of an LSB band
+                        // gets the right sign this same frame, not one
+                        // frame stale.
+                        mode = new_mode;
+                        // Force the filter to refit for the new band/
+                        // mode too, same as if Fit Filter had also just
+                        // been clicked for whichever tab is active.
+                        match digital_mode {
+                            DigitalMode::Rtty => fit_filter_clicked = true,
+                            DigitalMode::Sstv => sstv_fit_filter_clicked = true,
+                            DigitalMode::Rade => rade_fit_filter_clicked = true,
+                        }
+                        settings_changed = true;
+                    }
                     if fit_filter_clicked {
                         // NARROW band bracketing just the tone pair, like
                         // deskHPSDR's own independent Low/High cut --
@@ -12012,6 +12129,14 @@ impl eframe::App for HpsdrApp {
                             tx.set_explicit_passband(None);
                         }
                         connected.show_digital_window = false;
+                        // See ConnectedState::pre_digital_mode's own doc
+                        // comment -- same restore the "Digital..." button
+                        // does, needed here too since the window can also
+                        // be closed via its own X/Escape instead of that
+                        // button.
+                        if let Some(prev) = connected.pre_digital_mode.take() {
+                            connected.spectrum.set_mode(prev);
+                        }
                     }
                 }
 
@@ -12841,15 +12966,28 @@ fn render_digital_panel(
 /// is created once per picture (on `image_id` change) and updated in place
 /// (`TextureHandle::set`) for every line after that, rather than a fresh
 /// `load_texture` call every single frame.
+/// Community-adopted HF calling frequencies for SSTV -- not a protocol
+/// standard (SSTV has no fixed-frequency scheme the way FT8's slotted
+/// protocol does), just where activity actually concentrates in
+/// practice. Sourced from amateur-radio-wiki.net's own SSTV frequency
+/// list and cqsstv.com; a real request for a quick-tune shortcut,
+/// explicitly NOT meant to be authoritative -- band plans and activity
+/// centers do shift over time and vary a little by region, hence the
+/// button's own hover text saying "starting point" rather than "the"
+/// frequency.
+const SSTV_QUICK_TUNE_HZ: [(&str, u32); 5] =
+    [("80m", 3_730_000), ("40m", 7_033_000), ("30m", 10_132_000), ("20m", 14_230_000), ("15m", 21_340_000)];
+
 fn render_sstv_panel(
     ui: &mut egui::Ui,
     sstv: &sstv_link::SstvHandle,
     texture: &mut Option<egui::TextureHandle>,
     texture_image_id: &mut u32,
-) -> bool {
+) -> (bool, Option<u32>) {
     let amber = egui::Color32::from_rgb(230, 150, 50);
     let green = egui::Color32::from_rgb(40, 190, 70);
     let mut fit_filter_clicked = false;
+    let mut quick_tune_hz = None;
 
     // Mode picker: Auto (identify from the VIS header / sync cadence) or
     // pinned to one specific mode (matches sdroxide's own Auto + explicit
@@ -12892,6 +13030,22 @@ fn render_sstv_panel(
             .clicked()
         {
             fit_filter_clicked = true;
+        }
+    });
+    ui.horizontal(|ui| {
+        ui.label("Quick Tune:");
+        for &(label, hz) in &SSTV_QUICK_TUNE_HZ {
+            if ui
+                .button(label)
+                .on_hover_text(format!(
+                    "{:.3} MHz -- a community-adopted SSTV calling frequency, a starting \
+                     point to listen/call on, not a protocol standard",
+                    hz as f64 / 1_000_000.0
+                ))
+                .clicked()
+            {
+                quick_tune_hz = Some(hz);
+            }
         }
     });
     sstv.set_expected(expected);
@@ -12981,7 +13135,7 @@ fn render_sstv_panel(
     // many seconds to arrive, so a few redraws a second is still a smooth
     // progressive fill, not a stepping one.
     ui.ctx().request_repaint_after(Duration::from_millis(300));
-    fit_filter_clicked
+    (fit_filter_clicked, quick_tune_hz)
 }
 
 /// RADE V1 (FreeDV neural digital voice) panel. RX/TX both live -- see
@@ -12990,14 +13144,22 @@ fn render_sstv_panel(
 /// normal demodulated audio in the speaker/TCI output while this mode is
 /// selected (spectrum.rs's own rade_rx-gated block), and its TX modulates
 /// the real microphone rather than typed text.
+/// Community-adopted HF calling frequencies for FreeDV/RADE -- same
+/// "starting point, not a standard" caveat as SSTV_QUICK_TUNE_HZ.
+/// Sourced from evoham.com's own FreeDV frequency list and FreeDV
+/// Reporter's documented activity centers.
+const RADE_QUICK_TUNE_HZ: [(&str, u32); 5] =
+    [("80m", 3_630_000), ("40m", 7_180_000), ("20m", 14_236_000), ("15m", 21_180_000), ("10m", 28_330_000)];
+
 fn render_rade_panel(
     ui: &mut egui::Ui,
     rade: &rade_link::RadeHandle,
     callsign: &mut String,
     mox: bool,
     tx_handle: Option<&TxHandle>,
-) -> bool {
+) -> (bool, Option<u32>) {
     let mut fit_filter_clicked = false;
+    let mut quick_tune_hz = None;
     let amber = egui::Color32::from_rgb(230, 150, 50);
     let red = egui::Color32::from_rgb(220, 50, 50);
     let green = egui::Color32::from_rgb(40, 190, 70);
@@ -13007,7 +13169,7 @@ fn render_rade_panel(
             red,
             "RADE failed to start this session (see the log) -- this mode is unavailable until the app is restarted.",
         );
-        return false;
+        return (false, None);
     }
 
     ui.horizontal(|ui| {
@@ -13030,6 +13192,22 @@ fn render_rade_panel(
             .clicked()
         {
             fit_filter_clicked = true;
+        }
+    });
+    ui.horizontal(|ui| {
+        ui.label("Quick Tune:");
+        for &(label, hz) in &RADE_QUICK_TUNE_HZ {
+            if ui
+                .button(label)
+                .on_hover_text(format!(
+                    "{:.3} MHz -- a community-adopted FreeDV/RADE calling frequency, a \
+                     starting point to listen/call on, not a protocol standard",
+                    hz as f64 / 1_000_000.0
+                ))
+                .clicked()
+            {
+                quick_tune_hz = Some(hz);
+            }
         }
     });
 
@@ -13136,7 +13314,7 @@ fn render_rade_panel(
         });
 
     ui.ctx().request_repaint_after(Duration::from_millis(300));
-    fit_filter_clicked
+    (fit_filter_clicked, quick_tune_hz)
 }
 
 /// Draws the CW decoder panel pinned to exactly `rect` (the caller
@@ -15907,6 +16085,62 @@ fn main_hover_scroll_step_hz(base_step_hz: i64, cw_mode: bool, shift: bool, ctrl
 /// so CW's own two arms use `clicked_freq_hz` (now the EXACT frequency
 /// under the cursor -- see freq_at_x's own doc comment) directly,
 /// un-rounded, before applying the pitch offset.
+/// DIGU or DIGL for `dial_hz`, for the Digital Modes window's own
+/// auto-switch (see ConnectedState::pre_digital_mode's own doc
+/// comment). Same band convention SDRoxide uses for its own phone-
+/// practice modes (SSTV/RADE, `sideband_follows_band`/`PHONE_LSB_BANDS`
+/// in sdroxide-types/src/mode.rs): 160/80/40m ride the lower sideband,
+/// everything else the upper -- the widest regional band edges on
+/// purpose, so a station near an edge (e.g. 3.845 from Region 1) still
+/// reads as the right band for this purpose regardless of region.
+/// The explicit passband a Digital Modes tab needs, applied
+/// automatically on entering it -- a real observation: SSTV and RADE
+/// each have exactly one correct passband (fixed by the standard/the
+/// modem, not a per-signal choice), so making the operator click "Fit
+/// Filter" by hand every single time is a pointless extra step, not a
+/// real choice the way it would be if there were several filters to
+/// pick from. Confirmed against SDRoxide's own design: its
+/// `default_filter_at()` is applied automatically at every mode switch
+/// (sdroxide-radio/src/engine.rs, many call sites, e.g. line 8922/
+/// 13370), no separate manual "apply" step for any mode at all. RTTY's
+/// own center/shift ARE a real per-signal choice, so its own passband
+/// still depends on `connected.rtty.settings()` here -- same numbers
+/// its own Fit Filter button already computed, just also applied the
+/// instant the tab is selected instead of requiring a click; the
+/// button itself stays, to re-apply by hand after changing RTTY's
+/// center/shift for a different signal.
+fn digital_fit_passband(
+    digital_mode: DigitalMode,
+    mode: spectrum::Mode,
+    rtty_center_hz: f64,
+    rtty_shift_hz: f64,
+) -> (f64, f64) {
+    let lsb = matches!(mode, spectrum::Mode::Lsb | spectrum::Mode::Digl);
+    let (low, high) = match digital_mode {
+        DigitalMode::Rtty => {
+            let margin = 100.0;
+            (rtty_center_hz - rtty_shift_hz / 2.0 - margin, rtty_center_hz + rtty_shift_hz / 2.0 + margin)
+        }
+        // Same fixed SYNC_HZ/BLACK_HZ/WHITE_HZ-derived band as
+        // render_sstv_panel's own Fit Filter button.
+        DigitalMode::Sstv => (1_200.0 - 100.0, 2_300.0 + 100.0),
+        // Same deskHPSDR "FreeDV/RADEV1" figure as render_rade_panel's
+        // own Fit Filter button -- see rade_fit_filter_clicked's doc
+        // comment for the full sourcing.
+        DigitalMode::Rade => (700.0, 2_300.0),
+    };
+    if lsb { (-high, -low) } else { (low, high) }
+}
+
+fn digi_mode_for_band(dial_hz: u32) -> spectrum::Mode {
+    const LSB_BANDS: [(u32, u32); 3] = [(1_800_000, 2_000_000), (3_500_000, 4_000_000), (7_000_000, 7_300_000)];
+    if LSB_BANDS.iter().any(|&(lo, hi)| dial_hz >= lo && dial_hz <= hi) {
+        spectrum::Mode::Digl
+    } else {
+        spectrum::Mode::Digu
+    }
+}
+
 fn cw_center_click_freq(mode: spectrum::Mode, clicked_freq_hz: u32) -> u32 {
     let pitch = spectrum::cw_pitch_hz() as i64;
     match mode {
