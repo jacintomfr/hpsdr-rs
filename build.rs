@@ -291,7 +291,16 @@ fn main() {
     build.flag_if_supported("-pthread");
     build.flag_if_supported("-D_GNU_SOURCE");
     build.flag_if_supported("-Wno-parentheses");
-    build.flag_if_supported("-march=native");
+    // A real request: a portable distribution build for a different,
+    // possibly older/different-CPU machine than the one it's built on
+    // -- -march=native bakes in whatever instruction set extensions
+    // (AVX2, etc.) THIS build machine happens to have, which can crash
+    // with "illegal instruction" on a machine that lacks them. Set
+    // HPSDR_RS_NO_MARCH_NATIVE=1 to skip it for one build without
+    // touching the normal (fastest-for-this-machine) default.
+    if std::env::var_os("HPSDR_RS_NO_MARCH_NATIVE").is_none() {
+        build.flag_if_supported("-march=native");
+    }
     // BUG FIX (MinGW-w64 only): analyzer.c calls the Win32 Interlocked*
     // intrinsics (InterlockedAnd, InterlockedBitTestAndSet, etc.) with a
     // `volatile int *`, but MinGW-w64's own <psdk_inc/intrin-impl.h>
