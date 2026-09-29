@@ -2083,6 +2083,27 @@ fn run(
                         out.push_back((l, r));
                         recorder.write_frame(l, r);
                         report_recorder.write_frame(l, r);
+                    } else {
+                        // ROOT CAUSE FIX for a real report: same
+                        // "Audio glitches" false-positive as
+                        // rade_pass_raw's own fix just below, same
+                        // mechanism, different trigger -- Settings ->
+                        // Network's "Mute local audio during TCI"
+                        // deliberately empties `out` (the local speaker
+                        // never gets fed) for as long as a TCI server is
+                        // running, which the underrun counter has no way
+                        // to tell apart from a real glitch since it only
+                        // ever checks session.mox. Confirmed against a
+                        // real report: TCI running + this mute on read
+                        // ~48000/min (essentially every single sample)
+                        // with genuinely no local audio playing either,
+                        // and dropped to 0/min the moment TCI was turned
+                        // off. Explicit silence, not skipping the push
+                        // entirely, keeps the queue legitimately "fed".
+                        if out.len() >= AUDIO_BUFFER_CAPACITY {
+                            out.pop_front();
+                        }
+                        out.push_back((0.0, 0.0));
                     }
                     if tci_out.len() >= AUDIO_BUFFER_CAPACITY {
                         tci_out.pop_front();
@@ -2096,6 +2117,30 @@ fn run(
                         }
                         radio_out.push_back(filtered);
                     }
+                } else if !mute_local {
+                    // ROOT CAUSE FIX for a real report: "Audio glitches"
+                    // read in the millions/min while just sitting on the
+                    // RADE tab, not yet synced (mute_analog on, or off
+                    // but still hunting -- either way rade_pass_raw is
+                    // false and, before this fix, NOTHING was ever
+                    // pushed to `out` here). AudioOutput's own underrun
+                    // counter only skips counting while `expect_silence`
+                    // (session.mox) reads true -- it has no way to know
+                    // "RADE is deliberately quiet right now", so every
+                    // single cpal callback finding this queue genuinely
+                    // empty, for however long the operator spends
+                    // listening/hunting on this tab, counted as a real
+                    // glitch. Pushing EXPLICIT silence here (same pattern
+                    // already used a few lines up for the TX-edge mute
+                    // case) keeps the queue legitimately "fed" so the
+                    // counter never has anything to complain about --
+                    // the decoded-speech push further down (once RADE
+                    // syncs) still overwrites this with the real audio,
+                    // unaffected either way.
+                    if out.len() >= AUDIO_BUFFER_CAPACITY {
+                        out.pop_front();
+                    }
+                    out.push_back((0.0, 0.0));
                 }
             }
         }
