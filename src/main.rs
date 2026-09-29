@@ -7208,8 +7208,29 @@ impl eframe::App for HpsdrApp {
                         // red -- closer to a real S9-above-noise-floor
                         // separation (~50dB by the ham S-unit convention:
                         // 9 units * ~6dB) than the arbitrary first guess.
+                        // RX: real absolute S9 threshold, matching
+                        // deskHPSDR's own rx_panadapter.c EXACTLY now --
+                        // -73dBm below 30MHz, -93dBm above (their same
+                        // literal thresholds), ramping green (at db_low,
+                        // their pattern's own 0.0 offset) up to solid red
+                        // at S9. This only reads real dBm, not an
+                        // approximation, once Settings -> Radio's "RX
+                        // Gain Cal" is set correctly for the actual
+                        // board (see that field's own doc comment,
+                        // Config::rx_gain_calibration_db -- already
+                        // applied to spectrum_row itself further up, so
+                        // db_low/db_high/every dB value here is already
+                        // in calibrated dBm terms, not just relative dB,
+                        // once that's set) -- e.g. 14dB for a
+                        // HermesLite2, deskHPSDR's own known-good
+                        // constant for that board. Left at the previous
+                        // noise-floor-anchored approximation for TX,
+                        // unchanged -- already reported as fine there,
+                        // and TX's Low/High is sized around the signal
+                        // itself rather than a noise floor anyway.
                         let (gradient_floor_db, gradient_red_span_db) = if !transmitting {
-                            (connected.db_low_auto_smoothed.unwrap_or(db_low), 50.0)
+                            let s9_dbm: f32 = if freq_hz > 30_000_000 { -93.0 } else { -73.0 };
+                            (db_low, s9_dbm - db_low)
                         } else {
                             (db_low, 0.55 * range)
                         };
@@ -7255,21 +7276,58 @@ impl eframe::App for HpsdrApp {
                             // ramp within each column, matching
                             // deskHPSDR's screenshot: green base, colour
                             // only right at/near the signal peaks.
-                            let baseline_color = color_at(plot_bottom);
+                            // BUG FIX for a real report ("faixas verticais
+                            // em vez de camadas horizontais" -- compared
+                            // directly against a deskHPSDR screenshot):
+                            // with only 2 vertices per column (baseline,
+                            // trace top), Gouraud interpolation blends
+                            // LINEARLY between those two colours across
+                            // the column's own height. That's only
+                            // correct if color_at() is itself linear in
+                            // y -- it isn't (a 4-stop piecewise green/
+                            // orange/yellow/red curve, see
+                            // spectrum_gradient_color) -- so a SHORT
+                            // column compresses that whole 4-stop curve
+                            // into a small span while a TALL column
+                            // stretches the exact same curve over a much
+                            // bigger one. At any fixed absolute screen
+                            // height, a short nearby column and a tall
+                            // one therefore showed DIFFERENT colours even
+                            // though color_at(y) says they should match
+                            // -- exactly the "vertical streaks instead of
+                            // horizontal layers" reported, since deskHPSDR
+                            // fills from one continuous cairo pattern in
+                            // absolute device space, not a per-column
+                            // 2-point blend. Fix: subdivide each column
+                            // into BANDS vertices, each colour evaluated
+                            // at ITS OWN true absolute y (still
+                            // proportional to that column's own height,
+                            // so it still follows the trace's diagonal
+                            // edge between p0/p1) -- interpolation error
+                            // is now confined to the much shorter span
+                            // between adjacent bands instead of the
+                            // column's whole height, so two neighbouring
+                            // columns agree much more closely at any
+                            // given absolute y, reading as proper
+                            // horizontal layers.
+                            const BANDS: usize = 12;
                             for w in trace_points.windows(2) {
                                 let (p0, p1) = (w[0], w[1]);
-                                let b0 = egui::pos2(p0.x, plot_bottom);
-                                let b1 = egui::pos2(p1.x, plot_bottom);
-                                let (c0, c1) = (color_at(p0.y), color_at(p1.y));
                                 let base = mesh.vertices.len() as u32;
-                                mesh.colored_vertex(p0, c0);
-                                mesh.colored_vertex(p1, c1);
-                                mesh.colored_vertex(b1, baseline_color);
-                                mesh.colored_vertex(b0, baseline_color);
-                                mesh.indices.extend_from_slice(&[
-                                    base, base + 1, base + 2,
-                                    base, base + 2, base + 3,
-                                ]);
+                                for k in 0..=BANDS {
+                                    let f = k as f32 / BANDS as f32;
+                                    let y0 = plot_bottom + (p0.y - plot_bottom) * f;
+                                    let y1 = plot_bottom + (p1.y - plot_bottom) * f;
+                                    mesh.colored_vertex(egui::pos2(p0.x, y0), color_at(y0));
+                                    mesh.colored_vertex(egui::pos2(p1.x, y1), color_at(y1));
+                                }
+                                for k in 0..BANDS as u32 {
+                                    let row = base + k * 2;
+                                    mesh.indices.extend_from_slice(&[
+                                        row, row + 1, row + 3,
+                                        row, row + 3, row + 2,
+                                    ]);
+                                }
                             }
                             ui.painter().add(egui::Shape::mesh(mesh));
                             // Thin outline on top of the fill, matching
