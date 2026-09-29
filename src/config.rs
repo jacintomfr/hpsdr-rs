@@ -376,6 +376,14 @@ pub struct Config {
     pub spectrum_fps: Option<u32>,
     #[serde(default)]
     pub tx_spectrum_fps: Option<u32>,
+    /// Spectrum trace style (Settings -> Spectrum) -- see main.rs's
+    /// ConnectedState::spectrum_filled/spectrum_gradient doc comment.
+    /// `#[serde(default)]` so a config saved before this existed keeps
+    /// the previous plain-line look (both default to `false`).
+    #[serde(default)]
+    pub spectrum_filled: Option<bool>,
+    #[serde(default)]
+    pub spectrum_gradient: Option<bool>,
     #[serde(default)]
     pub band_settings: std::collections::HashMap<String, BandSettings>,
     /// Last filter width used per mode, keyed by Mode::label() (e.g.

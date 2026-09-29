@@ -1083,9 +1083,25 @@ impl SpectrumAnalyzer {
 
             wdsp::SetDisplayDetectorMode(channel, 0, wdsp::DETECTOR_MODE_AVERAGE as c_int);
             wdsp::SetDisplayAverageMode(channel, 0, wdsp::AVERAGE_MODE_LOG_RECURSIVE as c_int);
-            wdsp::SetDisplayDetectorMode(channel, 1, wdsp::DETECTOR_MODE_AVERAGE as c_int);
-            wdsp::SetDisplayAverageMode(channel, 1, wdsp::AVERAGE_MODE_LOG_RECURSIVE as c_int);
+            // Pixout 1 (waterfall) deliberately left at WDSP's raw/no-average
+            // default -- confirmed from deskHPSDR's own rx_set_average()
+            // (src/receiver.c), which only ever calls SetDisplayAverageMode/
+            // SetDisplayDetectorMode with pixout index 0 (the panadapter),
+            // never 1. We previously applied the same LOG_RECURSIVE IIR
+            // smoothing to the waterfall as the spectrum line, which blends
+            // each new row with prior ones -- exactly the "memory effect"
+            // (ghosting/lag in color transitions) the user reported. The
+            // waterfall should show each frame's own value, unsmoothed.
             wdsp::SetDisplayNormOneHz(channel, 0, 1);
+            // BUG FIX for a real report: only pixout 0 (spectrum trace)
+            // was ever bandwidth-normalized, never pixout 1 (waterfall).
+            // NormOneHz compensates each pixout's level for its FFT
+            // bin width (equivalent noise bandwidth) -- and a_fft_size
+            // above changes with zoom (min_for_rate), so without this
+            // the waterfall's displayed brightness drifted brighter as
+            // zoom increased while the (correctly normalized) spectrum
+            // trace stayed put right beside it.
+            wdsp::SetDisplayNormOneHz(channel, 1, 1);
             wdsp::SetDisplaySampleRate(channel, pixels); // matches confirmed source verbatim
 
             // WDSP's RXA output frame count shrinks with the decimation
@@ -1239,9 +1255,13 @@ impl SpectrumAnalyzer {
             );
             wdsp::SetDisplayDetectorMode(self.channel, 0, wdsp::DETECTOR_MODE_AVERAGE as c_int);
             wdsp::SetDisplayAverageMode(self.channel, 0, wdsp::AVERAGE_MODE_LOG_RECURSIVE as c_int);
-            wdsp::SetDisplayDetectorMode(self.channel, 1, wdsp::DETECTOR_MODE_AVERAGE as c_int);
-            wdsp::SetDisplayAverageMode(self.channel, 1, wdsp::AVERAGE_MODE_LOG_RECURSIVE as c_int);
+            // Pixout 1 (waterfall) deliberately left unset here, same
+            // reasoning as open()'s own identical comment -- re-applying
+            // LOG_RECURSIVE on every zoom/pan change (as this function
+            // used to) reintroduced the "memory effect" ghosting the
+            // moment the user touched zoom, undoing that fix.
             wdsp::SetDisplayNormOneHz(self.channel, 0, 1);
+            wdsp::SetDisplayNormOneHz(self.channel, 1, 1);
             // width*zoom (the UNSNAPPED value, not a_fft_size) -- matches
             // piHPSDR's SetDisplaySampleRate(rx->id, rx->width*rx->zoom)
             // exactly; this normalizes for the per-pixel resolution
@@ -2117,31 +2137,34 @@ fn run(
                         }
                         radio_out.push_back(filtered);
                     }
-                } else if !mute_local {
-                    // ROOT CAUSE FIX for a real report: "Audio glitches"
-                    // read in the millions/min while just sitting on the
-                    // RADE tab, not yet synced (mute_analog on, or off
-                    // but still hunting -- either way rade_pass_raw is
-                    // false and, before this fix, NOTHING was ever
-                    // pushed to `out` here). AudioOutput's own underrun
-                    // counter only skips counting while `expect_silence`
-                    // (session.mox) reads true -- it has no way to know
-                    // "RADE is deliberately quiet right now", so every
-                    // single cpal callback finding this queue genuinely
-                    // empty, for however long the operator spends
-                    // listening/hunting on this tab, counted as a real
-                    // glitch. Pushing EXPLICIT silence here (same pattern
-                    // already used a few lines up for the TX-edge mute
-                    // case) keeps the queue legitimately "fed" so the
-                    // counter never has anything to complain about --
-                    // the decoded-speech push further down (once RADE
-                    // syncs) still overwrites this with the real audio,
-                    // unaffected either way.
-                    if out.len() >= AUDIO_BUFFER_CAPACITY {
-                        out.pop_front();
-                    }
-                    out.push_back((0.0, 0.0));
                 }
+                // No `else` branch here for the rade_pass_raw==false,
+                // not-yet-synced case -- ROOT CAUSE FIX for a real
+                // report (RX "cheio de ruído com a voz muito ao fundo",
+                // i.e. garbled/gated audio once RADE was actively
+                // decoding real speech): an earlier version of this
+                // pushed one EXPLICIT (0.0, 0.0) silence sample to `out`
+                // right here for every such sample, meant to keep
+                // AudioOutput's underrun counter fed while hunting
+                // (unsynced). But its own doc comment's claim that the
+                // decoded-speech push further down (below, once this
+                // lock scope ends) "overwrites" those silence samples
+                // was simply wrong -- `out` is a VecDeque/FIFO queue,
+                // pushing more entries APPENDS, it never overwrites.
+                // That block ALREADY pushes exactly one entry per input
+                // sample whenever rade_rx.is_some() (rade_scratch.len()
+                // iterations, one per sample fed into rade_scratch just
+                // above regardless of rade_pass_raw) -- real decoded
+                // speech once synced, or silence via
+                // rade_jitter.pop_front().unwrap_or(0.0) while still
+                // hunting. So `out` was ALREADY correctly and
+                // continuously fed either way; this branch just quietly
+                // appended a second, redundant entry per sample on top,
+                // doubling how fast `out` filled for the ENTIRE time
+                // RADE was active (not just while hunting -- rade_pass_
+                // raw is also false once synced) -- interleaving blocks
+                // of silence ahead of blocks of real decoded speech in
+                // the same queue and badly disrupting playback timing.
             }
         }
         // After the audio queues' locks are released above, so the

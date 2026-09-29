@@ -1660,6 +1660,17 @@ struct ConnectedState {
     /// instead of the previous fixed ~30Hz (33ms).
     spectrum_fps: u32,
     tx_spectrum_fps: u32,
+    /// Spectrum trace style (Settings -> Spectrum) -- ported from
+    /// deskHPSDR's own rx_panadapter.c (`display_filled`/`display_gradient`,
+    /// two INDEPENDENT toggles, not mutually exclusive): `spectrum_filled`
+    /// closes the trace down to the bottom and fills the area under it
+    /// (thin outline stroke on top) instead of just stroking a thick bare
+    /// line; `spectrum_gradient` swaps the flat trace colour for a
+    /// vertical gradient (cairo linear pattern in the reference, four
+    /// colour stops keyed to S9) instead of one solid colour. Both are off
+    /// by default, preserving this app's prior plain-line look.
+    spectrum_filled: bool,
+    spectrum_gradient: bool,
     waterfall_palette: Palette,
     /// S-meter style (Settings -> Meter) -- see MeterStyle's own doc
     /// comment.
@@ -3129,6 +3140,8 @@ fn connect_to_device(device: Device, cfg: &Config) -> Result<ConnectedState, Str
                 tx_panadapter_step_db: cfg.tx_panadapter_step_db.unwrap_or(10.0),
                 spectrum_fps: cfg.spectrum_fps.unwrap_or(30),
                 tx_spectrum_fps: cfg.tx_spectrum_fps.unwrap_or(30),
+                spectrum_filled: cfg.spectrum_filled.unwrap_or(false),
+                spectrum_gradient: cfg.spectrum_gradient.unwrap_or(false),
                 waterfall_palette: cfg.waterfall_palette.unwrap_or(Palette::Ocean),
                 meter_style: cfg.meter_style.unwrap_or(MeterStyle::Analog),
                 spectrum_waterfall_ratio: cfg
@@ -4205,15 +4218,48 @@ impl eframe::App for HpsdrApp {
                                 connected.db_low = smoothed.clamp(-180.0, connected.db_high - 1.0);
                             }
                             if connected.waterfall_db_low_auto {
-                                // See AUTO_WATERFALL_ZOOM_REFERENCE/
-                                // AUTO_WATERFALL_ZOOM_COMPENSATION_STRENGTH's own doc comments --
-                                // renormalises the physically-correct (but zoom-dependent)
-                                // reading to a consistent look across zoom levels.
-                                let zoom_compensation_db = AUTO_WATERFALL_ZOOM_COMPENSATION_STRENGTH
-                                    * (10.0 * (connected.spectrum_zoom.max(1) as f32).log10()
-                                        - 10.0 * AUTO_WATERFALL_ZOOM_REFERENCE.log10());
+                                // No zoom-dependent correction here anymore --
+                                // this used to add an empirical
+                                // AUTO_WATERFALL_ZOOM_COMPENSATION_STRENGTH-scaled
+                                // offset to work around the waterfall
+                                // pixout's level genuinely drifting with
+                                // zoom (WDSP's per-pixel RBW grows/shrinks
+                                // with the FFT size zoom uses). That drift
+                                // is now fixed at the actual source --
+                                // spectrum.rs's open()/set_zoom_pan() call
+                                // SetDisplayNormOneHz on pixout 1 (the
+                                // waterfall) the same as pixout 0 already
+                                // did -- so `smoothed` (from pixout 0,
+                                // already zoom-consistent) applies to the
+                                // waterfall unchanged too. Re-applying the
+                                // old empirical offset on top of the real
+                                // fix double-corrected and reintroduced
+                                // the exact same zoom-dependent colour
+                                // shift it was meant to remove, just in
+                                // the other direction -- a real report.
+                                //
+                                // BUG FIX for a real report ("auto fica
+                                // demasiado brilhante" -- Auto tracked
+                                // -131, the user's own preferred manual
+                                // value was -121, 10dB higher): `smoothed`
+                                // is the literal tracked MINIMUM bin
+                                // value, i.e. sits right at/below the true
+                                // noise floor -- using it as-is for the
+                                // waterfall's black point means ordinary
+                                // noise fluctuation (which is almost
+                                // always a few dB ABOVE the instantaneous
+                                // minimum) already reads as some colour
+                                // instead of staying black/blue, giving
+                                // exactly the "too bright, washed out"
+                                // look reported. A good manual choice
+                                // (like the user's own -121) sets the
+                                // black point a bit ABOVE the floor on
+                                // purpose, so only genuinely
+                                // stronger-than-average bins show colour.
+                                // Adding a fixed margin reproduces that
+                                // same headroom automatically.
                                 connected.waterfall_db_low =
-                                    (smoothed + zoom_compensation_db).clamp(-180.0, connected.waterfall_db_high - 1.0);
+                                    (smoothed + AUTO_WATERFALL_LOW_MARGIN_DB).clamp(-180.0, connected.waterfall_db_high - 1.0);
                             }
                         }
                     }
@@ -6580,6 +6626,44 @@ impl eframe::App for HpsdrApp {
                     );
                     let spectrum_top = rect.top();
                     let spectrum_right = rect.right();
+
+                    // Audio-waveform scope -- painted directly, AFTER
+                    // `rect` is known, into the space just ABOVE the
+                    // spectrum plot's own top edge -- BUG FIX for a real
+                    // report: an earlier version used allocate_exact_size
+                    // for this (a new row ahead of the spectrum), which
+                    // reserved genuinely new vertical space and pushed
+                    // everything below it down/grew the window -- not
+                    // wanted ("não era para aumentar zona"). Using the
+                    // painter directly instead, like the box's original
+                    // in-spectrum overlay did, draws into whatever space
+                    // is already there above the plot without affecting
+                    // layout at all. Same X placement as that original
+                    // overlay (right-aligned, inset from rect's own right
+                    // edge) -- only Y moved, up and out of the plot.
+                    let waveform_samples = if transmitting {
+                        connected
+                            .tx_handle
+                            .as_ref()
+                            .map(|tx| peek_recent_samples(&tx.waveform_tap, WAVEFORM_WINDOW_SAMPLES))
+                    } else {
+                        Some(peek_recent_samples(&connected.spectrum.waveform_out, WAVEFORM_WINDOW_SAMPLES))
+                    };
+                    if let Some(samples) = waveform_samples {
+                        const WF_WIDTH: f32 = 160.0;
+                        const WF_HEIGHT: f32 = 50.0;
+                        const WF_MARGIN: f32 = 8.0;
+                        let above_rect = egui::Rect::from_min_size(
+                            egui::pos2(rect.right() - WF_MARGIN - WF_WIDTH, rect.top() - WF_MARGIN - WF_HEIGHT),
+                            egui::vec2(WF_WIDTH, WF_HEIGHT),
+                        );
+                        // draw_audio_waveform insets its own panel by
+                        // WF_MARGIN from whatever rect it's given, so
+                        // pass it one WF_MARGIN bigger on every side to
+                        // get the intended WF_WIDTHxWF_HEIGHT box back.
+                        let outer_rect = above_rect.expand(WF_MARGIN);
+                        draw_audio_waveform(ui.painter(), outer_rect, &samples);
+                    }
                     // Used as the CW panel's bottom edge when the
                     // waterfall is disabled (see waterfall_enabled below)
                     // -- otherwise the waterfall rect's own bottom is used
@@ -7059,7 +7143,7 @@ impl eframe::App for HpsdrApp {
                         // happens upstream, in WDSP's own FFT size, not
                         // here.
                         let n = spectrum_row.len().saturating_sub(1).max(1);
-                        let smoothed_row = smooth_spectrum_values(&spectrum_row);
+                        let smoothed_row = smooth_spectrum_values(&spectrum_row, connected.spectrum_zoom);
                         let points: Vec<egui::Pos2> = smoothed_row
                             .iter()
                             .enumerate()
@@ -7070,10 +7154,165 @@ impl eframe::App for HpsdrApp {
                                 egui::pos2(x, y)
                             })
                             .collect();
-                        ui.painter().add(egui::Shape::line(
-                            smooth_trace(&points),
-                            egui::Stroke::new(1.5, egui::Color32::LIGHT_GREEN),
-                        ));
+                        let trace_points = smooth_trace(&points);
+
+                        // Trace style -- Settings -> Spectrum -- ported
+                        // from deskHPSDR's rx_panadapter.c
+                        // (draw_panadapter): display_filled/
+                        // display_gradient are two INDEPENDENT toggles
+                        // there (not mutually exclusive), both false by
+                        // default to preserve this app's prior plain-line
+                        // look.
+                        //
+                        // Colour-at-height keys off distance ABOVE THE
+                        // NOISE FLOOR, not a fraction of the whole
+                        // configured Low/High span -- BUG FIX for a real
+                        // report: the first version (0..1 across the full
+                        // db_low..db_high range, even compressed into
+                        // its bottom ~55%) still painted ordinary RX
+                        // noise-floor wobble yellow/orange rather than
+                        // green, because typical Low/High headroom
+                        // (e.g. -140..-100) puts the real noise floor
+                        // well above db_low itself. deskHPSDR doesn't
+                        // have this problem because its stops key off an
+                        // absolute S9 threshold in calibrated dBm, which
+                        // sits far above a real noise floor -- we have
+                        // no such calibration, but we DO already track
+                        // the RX noise floor continuously for db_low_auto
+                        // (db_low_auto_smoothed, always maintained once
+                        // it's kicked in, whether or not Auto is actually
+                        // toggled -- see that field's own update site).
+                        // RX only: while transmitting there is no
+                        // meaningful "noise floor" (the TX range is
+                        // sized around one big signal, not weak-signal
+                        // headroom), so TX keeps the previous db_low-
+                        // anchored behaviour (55% of the TX Low/High
+                        // span) unchanged -- already reported as fine,
+                        // and TX's Low/High is sized around the signal
+                        // itself rather than a noise floor, so the old
+                        // whole-range-fraction approach doesn't have the
+                        // same problem there that it had for RX.
+                        // BUG FIX for a real report ("faixas verticais"
+                        // deskHPSDR doesn't have): 30dB was too narrow --
+                        // ordinary noise-floor bumps (routinely 10-20dB
+                        // above the tracked average floor, just from
+                        // normal per-bin variance, more so now that high
+                        // zoom means less spatial averaging -- see
+                        // smooth_spectrum_values's own doc comment)
+                        // already reached yellow/orange, so nearly every
+                        // little noise spike painted its own vertical
+                        // "flame" up the fill instead of staying green
+                        // like deskHPSDR's real screenshot. Widening the
+                        // span means it now takes a genuinely strong
+                        // signal, not routine noise variance, to reach
+                        // red -- closer to a real S9-above-noise-floor
+                        // separation (~50dB by the ham S-unit convention:
+                        // 9 units * ~6dB) than the arbitrary first guess.
+                        let (gradient_floor_db, gradient_red_span_db) = if !transmitting {
+                            (connected.db_low_auto_smoothed.unwrap_or(db_low), 50.0)
+                        } else {
+                            (db_low, 0.55 * range)
+                        };
+                        if connected.spectrum_filled {
+                            // Gouraud-shaded quad strip from the trace
+                            // down to the plot baseline, matching
+                            // deskHPSDR's cairo_fill_preserve under the
+                            // traced path -- a flat convex_polygon can't
+                            // vary its fill colour top-to-bottom for the
+                            // Gradient toggle, so this is a Mesh instead;
+                            // per-vertex colours Gouraud-interpolate
+                            // across each quad, giving the same smooth
+                            // vertical blend cairo's own linear pattern
+                            // produces.
+                            let mut mesh = egui::Mesh::default();
+                            // Recovers the dB value a screen y-coordinate
+                            // represents (inverse of the db->y mapping
+                            // used to build `points` above) so the
+                            // gradient can key off real dB distance from
+                            // the noise floor instead of screen fraction.
+                            let db_at = |y: f32| db_low + ((plot_bottom - y) / plot_height.max(1.0)) * range;
+                            let color_at = |y: f32| -> egui::Color32 {
+                                if connected.spectrum_gradient {
+                                    let t = ((db_at(y) - gradient_floor_db) / gradient_red_span_db).clamp(0.0, 1.0);
+                                    spectrum_gradient_color(t, 190)
+                                } else {
+                                    egui::Color32::from_rgba_unmultiplied(0, 200, 0, 110)
+                                }
+                            };
+                            // BUG FIX for a real report ("tudo laranja",
+                            // screenshot showed almost no green at all):
+                            // this used to colour BOTH the top (trace)
+                            // AND bottom (baseline) vertices of each quad
+                            // with the SAME colour (the one keyed to the
+                            // trace's own height) -- so a whole column
+                            // painted flat orange/yellow the instant the
+                            // trace itself sat that high, instead of
+                            // blending green-at-the-floor up to that
+                            // colour only right at the peak. The baseline
+                            // vertices must use color_at(plot_bottom)
+                            // (t=0, always green) so Gouraud
+                            // interpolation actually produces a vertical
+                            // ramp within each column, matching
+                            // deskHPSDR's screenshot: green base, colour
+                            // only right at/near the signal peaks.
+                            let baseline_color = color_at(plot_bottom);
+                            for w in trace_points.windows(2) {
+                                let (p0, p1) = (w[0], w[1]);
+                                let b0 = egui::pos2(p0.x, plot_bottom);
+                                let b1 = egui::pos2(p1.x, plot_bottom);
+                                let (c0, c1) = (color_at(p0.y), color_at(p1.y));
+                                let base = mesh.vertices.len() as u32;
+                                mesh.colored_vertex(p0, c0);
+                                mesh.colored_vertex(p1, c1);
+                                mesh.colored_vertex(b1, baseline_color);
+                                mesh.colored_vertex(b0, baseline_color);
+                                mesh.indices.extend_from_slice(&[
+                                    base, base + 1, base + 2,
+                                    base, base + 2, base + 3,
+                                ]);
+                            }
+                            ui.painter().add(egui::Shape::mesh(mesh));
+                            // Thin outline on top of the fill, matching
+                            // deskHPSDR's PAN_LINE_THIN (it uses a
+                            // thicker bare line only when NOT filled).
+                            if connected.spectrum_gradient {
+                                for w in trace_points.windows(2) {
+                                    let mid_y = 0.5 * (w[0].y + w[1].y);
+                                    let t = ((db_at(mid_y) - gradient_floor_db) / gradient_red_span_db)
+                                        .clamp(0.0, 1.0);
+                                    ui.painter().line_segment(
+                                        [w[0], w[1]],
+                                        egui::Stroke::new(1.0, spectrum_gradient_color(t, 255)),
+                                    );
+                                }
+                            } else {
+                                ui.painter().add(egui::Shape::line(
+                                    trace_points,
+                                    egui::Stroke::new(1.0, egui::Color32::LIGHT_GREEN),
+                                ));
+                            }
+                        } else if connected.spectrum_gradient {
+                            // Gradient without fill: deskHPSDR still
+                            // sources the (thicker, unfilled) stroke from
+                            // the same gradient pattern -- egui's Stroke
+                            // is one flat colour, so approximate with a
+                            // gradient-coloured line segment per point
+                            // pair instead of one Shape::line call.
+                            for w in trace_points.windows(2) {
+                                let mid_y = 0.5 * (w[0].y + w[1].y);
+                                let db = db_low + ((plot_bottom - mid_y) / plot_height.max(1.0)) * range;
+                                let t = ((db - gradient_floor_db) / gradient_red_span_db).clamp(0.0, 1.0);
+                                ui.painter().line_segment(
+                                    [w[0], w[1]],
+                                    egui::Stroke::new(1.5, spectrum_gradient_color(t, 255)),
+                                );
+                            }
+                        } else {
+                            ui.painter().add(egui::Shape::line(
+                                trace_points,
+                                egui::Stroke::new(1.5, egui::Color32::LIGHT_GREEN),
+                            ));
+                        }
                     }
 
                     // External DL1BZ-style "RX200" SWR/power meter overlay
@@ -7135,23 +7374,6 @@ impl eframe::App for HpsdrApp {
                         egui::Stroke::new(2.0, egui::Color32::RED),
                     );
 
-                    // Small audio-waveform overlay -- output audio while
-                    // receiving, whatever's actually feeding TX while
-                    // transmitting (see TxHandle::waveform_tap's doc
-                    // comment: fed at the same point as tx_audio_monitor,
-                    // post source selection, so this reflects mic/TCI/
-                    // radio-mic alike regardless of which is in use).
-                    let waveform_samples = if transmitting {
-                        connected
-                            .tx_handle
-                            .as_ref()
-                            .map(|tx| peek_recent_samples(&tx.waveform_tap, WAVEFORM_WINDOW_SAMPLES))
-                    } else {
-                        Some(peek_recent_samples(&connected.spectrum.waveform_out, WAVEFORM_WINDOW_SAMPLES))
-                    };
-                    if let Some(samples) = waveform_samples {
-                        draw_audio_waveform(ui.painter(), rect, &samples);
-                    }
 
                     if let Some(pos) = spectrum_resp.hover_pos() {
                         let hover_freq = round_to_step_hz(freq_at_x(pos.x, rect, freq_hz, sample_rate, connected.spectrum_zoom, pan_offset_hz), main_hover_scroll_step_hz(connected.tune_step_hz, cw_mode, ui.input(|i| i.modifiers.shift), ui.input(|i| i.modifiers.ctrl)));
@@ -7934,6 +8156,7 @@ impl eframe::App for HpsdrApp {
                             }
                         }
                     });
+
 
                 // One native OS window per extra receiver. Must be called
                 // every frame to stay open (egui's viewport convention) --
@@ -10158,6 +10381,33 @@ impl eframe::App for HpsdrApp {
                                             "",
                                         ) {
                                             connected.spectrum_fps = fps as u32;
+                                            settings_changed = true;
+                                        }
+                                    });
+                                    // Ported from deskHPSDR's rx_panadapter.c
+                                    // (display_filled/display_gradient) --
+                                    // two independent toggles, combinable.
+                                    ui.horizontal(|ui| {
+                                        ui.label("Spectrum trace:");
+                                        if ui
+                                            .checkbox(&mut connected.spectrum_filled, "Filled")
+                                            .on_hover_text(
+                                                "Fill the area under the spectrum trace \
+                                                 instead of drawing a bare line.",
+                                            )
+                                            .changed()
+                                        {
+                                            settings_changed = true;
+                                        }
+                                        if ui
+                                            .checkbox(&mut connected.spectrum_gradient, "Gradient")
+                                            .on_hover_text(
+                                                "Colour the trace/fill with a vertical \
+                                                 gradient (weak signals dim, strong signals \
+                                                 bright) instead of one flat colour.",
+                                            )
+                                            .changed()
+                                        {
                                             settings_changed = true;
                                         }
                                     });
@@ -12635,6 +12885,8 @@ impl eframe::App for HpsdrApp {
                         tx_panadapter_step_db: Some(connected.tx_panadapter_step_db),
                         spectrum_fps: Some(connected.spectrum_fps),
                         tx_spectrum_fps: Some(connected.tx_spectrum_fps),
+                        spectrum_filled: Some(connected.spectrum_filled),
+                        spectrum_gradient: Some(connected.spectrum_gradient),
                         waterfall_palette: Some(connected.waterfall_palette),
                         meter_style: Some(connected.meter_style),
                         spectrum_waterfall_ratio: Some(connected.spectrum_waterfall_ratio),
@@ -12994,43 +13246,12 @@ const AUTO_DB_LOW_MIN_EDGE_EXCLUDE: usize = 4;
 /// visibly moving".
 const AUTO_DB_LOW_SMOOTHING_ALPHA: f32 = 0.01;
 
-/// Zoom compensation for waterfall_db_low_auto only (not db_low_auto/
-/// the spectrum trace, which keeps the physically-correct reading) --
-/// see that field's own doc comment for the full reasoning. Zooming in
-/// by a factor Z narrows WDSP's per-pixel resolution bandwidth by the
-/// same factor Z (see Analyzer::set_zoom_pan's doc comment: zoom grows
-/// the underlying FFT size while keeping pixel count fixed), and
-/// thermal noise power scales with bandwidth -- so at a wider (lower-
-/// zoom) view, each pixel genuinely integrates more noise power, and
-/// the true noise floor reads roughly 10*log10(Z) dB higher there than
-/// at a narrower (higher-zoom) view. That's correct physics, not a
-/// display bug -- but it does mean an operator who picked a favourite
-/// waterfall "look" at one zoom level sees it change at another,
-/// purely from the RBW difference, not from anything actually
-/// different in the band. This is a deliberately requested cosmetic
-/// override: it renormalises whatever zoom is active back to how
-/// AUTO_WATERFALL_ZOOM_REFERENCE's zoom level would look, using the
-/// same 10*log10(ratio) relationship, so the waterfall's appearance
-/// stays consistent across zoom levels instead of tracking the real
-/// RBW-driven noise floor shift.
-const AUTO_WATERFALL_ZOOM_REFERENCE: f32 = 2.0;
-
-/// Extra multiplier on top of the plain 10*log10(ratio) RBW physics
-/// above -- a real report found the plain physics-only prediction
-/// under-corrected in practice. Likely cause: WDSP's own averaging
-/// (SetDisplayAverageMode's AVERAGE_MODE_LOG_RECURSIVE, confirmed in
-/// spectrum.rs's open()) runs in the LOG (dB) domain, not linear
-/// power -- averaging noise in dB is a well-known biased estimator
-/// (log of a mean isn't the mean of the log; for typical noise power
-/// distributions the log-domain average reads a couple dB lower than
-/// the true linear-power average), stacking an extra, harder-to-
-/// derive-exactly bias on top of the clean RBW relationship. Rather
-/// than chase that bias analytically, this is left as a plain tunable
-/// multiplier: 1.0 would be the physics-only prediction; raise it if
-/// the waterfall still looks too bright/shallow at lower zoom than at
-/// AUTO_WATERFALL_ZOOM_REFERENCE, lower it if low zoom overshoots
-/// (looks darker/deeper than the reference instead of matching it).
-const AUTO_WATERFALL_ZOOM_COMPENSATION_STRENGTH: f32 = 2.0;
+/// Headroom added above the tracked noise floor for the waterfall's Auto
+/// Low (Settings -> Spectrum) -- see its own call site's doc comment for
+/// the reasoning. Tuned to a real report comparing Auto (which tracked
+/// -131) against that user's own preferred manual value (-121) on the
+/// same signal -- 10dB matched.
+const AUTO_WATERFALL_LOW_MARGIN_DB: f32 = 10.0;
 
 /// Draggable divider between the spectrum and waterfall displays.
 /// Updates `ratio` (spectrum's share of their combined height, see
@@ -16096,7 +16317,7 @@ fn render_extra_receiver_ui(ui: &mut egui::Ui, rx: &Arc<Mutex<ExtraReceiver>>) {
         // here (WDSP's own analyzer already returns just the visible
         // window's data).
         let n = spectrum_row.len().saturating_sub(1).max(1);
-        let smoothed_row = smooth_spectrum_values(&spectrum_row);
+        let smoothed_row = smooth_spectrum_values(&spectrum_row, rx.spectrum_zoom);
         let points: Vec<egui::Pos2> = smoothed_row
             .iter()
             .enumerate()
@@ -17478,24 +17699,54 @@ fn wisdom_status_text() -> String {
 /// evenly spaced across the visible window regardless of zoom (see
 /// set_zoom_pan's doc comment), so this is a plain fixed-width kernel, not
 /// one that needs to scale with span.
-fn smooth_spectrum_values(row: &[f32]) -> Vec<f32> {
+fn smooth_spectrum_values(row: &[f32], zoom: i32) -> Vec<f32> {
     const KERNEL: [f32; 5] = [0.06, 0.24, 0.40, 0.24, 0.06];
     let n = row.len();
-    (0..n)
-        .map(|i| {
-            let mut sum = 0.0f32;
-            let mut wsum = 0.0f32;
-            for (k, &w) in KERNEL.iter().enumerate() {
-                let offset = k as isize - 2;
-                let idx = i as isize + offset;
-                if idx >= 0 && (idx as usize) < n {
-                    sum += row[idx as usize] * w;
-                    wsum += w;
+    let pass = |input: &[f32]| -> Vec<f32> {
+        (0..n)
+            .map(|i| {
+                let mut sum = 0.0f32;
+                let mut wsum = 0.0f32;
+                for (k, &w) in KERNEL.iter().enumerate() {
+                    let offset = k as isize - 2;
+                    let idx = i as isize + offset;
+                    if idx >= 0 && (idx as usize) < n {
+                        sum += input[idx as usize] * w;
+                        wsum += w;
+                    }
                 }
-            }
-            sum / wsum
-        })
-        .collect()
+                sum / wsum
+            })
+            .collect()
+    };
+    // Extra passes at higher zoom -- ROOT CAUSE FIX for a real report:
+    // set_zoom_pan grows WDSP's own FFT size with zoom (see its doc
+    // comment), but always rebins the result down to the SAME fixed
+    // SPECTRUM_WIDTH output pixel count, and this app's own zoom range
+    // (1-16x, Settings -> Spectrum) tops out at exactly the point where
+    // that growth saturates the smallest FFT-size tier (1024*16 ==
+    // 16384, the floor tier) -- so real spatial bin-averaging per
+    // output pixel shrinks continuously from ~16 raw bins/pixel at 1x
+    // down to just 1 raw bin/pixel (no averaging left at all) at 16x.
+    // That lost averaging is exactly what smoothed the trace out at low
+    // zoom -- without it, each pixel shows its own raw FFT bin's full
+    // frame-to-frame noise variance, reading as progressively more
+    // jagged/"esticado" the further in you zoom, even though the
+    // underlying signal hasn't changed. A single fixed 5-tap pass (this
+    // function's original form) was tuned for the well-averaged 1x
+    // case and doesn't scale to compensate. Repeating the same small
+    // kernel approximates a wider one (effective width grows roughly
+    // with sqrt(passes)) cheaply, without touching WDSP's own buffers
+    // (see set_zoom_pan's doc comment on why growing the real output
+    // pixel count instead would need every fixed-size pixel buffer
+    // resized -- real memory-safety risk in this FFI code, not
+    // attempted here).
+    let passes = 1 + (zoom.max(1) - 1) / 4;
+    let mut result = pass(row);
+    for _ in 1..passes {
+        result = pass(&result);
+    }
+    result
 }
 
 /// Smooths a spectrum trace polyline for display: replaces the plain
@@ -17512,6 +17763,44 @@ fn smooth_spectrum_values(row: &[f32]) -> Vec<f32> {
 /// underlying dB values and bin positions) are unchanged, only how the
 /// line between them is drawn. Passes `points` straight through below 3 of
 /// them, where a spline has nothing to interpolate.
+/// Vertical spectrum-trace gradient (Settings -> Spectrum's "Gradient"
+/// toggle) -- takes an already-normalized `t` (0.0 at the caller's chosen
+/// "green" reference, 1.0 at its "red" reference, pre-clamped). Colour
+/// stops match deskHPSDR's own COLOUR_GRAD1..4 (rx_panadapter.c/
+/// appearance.h) -- green -> orange -> yellow -> red.
+///
+/// deskHPSDR keys its 4 stops off an absolute S9 dBm threshold -- this
+/// app's analyzer isn't calibrated to dBm (see the gridline draw site's
+/// own comment), so the caller computes `t` from dB DISTANCE ABOVE THE
+/// TRACKED NOISE FLOOR instead (see the call site's own
+/// gradient_floor_db/GRADIENT_RED_SPAN_DB) -- compression that used to
+/// live in here (a flat fraction of the whole Low/High span) painted
+/// ordinary RX noise-floor wobble yellow/orange instead of green,
+/// because typical Low/High headroom sits the real noise floor well
+/// above db_low itself; anchoring to the actual tracked floor instead
+/// fixed that, so this function is now just the flat 4-stop lerp.
+fn spectrum_gradient_color(t: f32, alpha: u8) -> egui::Color32 {
+    let t = t.clamp(0.0, 1.0);
+    const STOPS: [(f32, u8, u8, u8); 4] = [
+        (0.0, 0, 255, 0),
+        (1.0 / 3.0, 255, 168, 0),
+        (2.0 / 3.0, 255, 255, 0),
+        (1.0, 255, 0, 0),
+    ];
+    let mut lo = STOPS[0];
+    let mut hi = STOPS[STOPS.len() - 1];
+    for w in STOPS.windows(2) {
+        if t >= w[0].0 && t <= w[1].0 {
+            lo = w[0];
+            hi = w[1];
+        }
+    }
+    let span = (hi.0 - lo.0).max(1e-6);
+    let f = ((t - lo.0) / span).clamp(0.0, 1.0);
+    let lerp = |a: u8, b: u8| (a as f32 + (b as f32 - a as f32) * f).round() as u8;
+    egui::Color32::from_rgba_unmultiplied(lerp(lo.1, hi.1), lerp(lo.2, hi.2), lerp(lo.3, hi.3), alpha)
+}
+
 fn smooth_trace(points: &[egui::Pos2]) -> Vec<egui::Pos2> {
     let n = points.len();
     if n < 3 {
