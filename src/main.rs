@@ -1757,6 +1757,22 @@ struct ConnectedState {
     digital_mode: DigitalMode,
     rtty: rtty_link::RttyHandle,
     rtty_tx_input: String,
+    /// Return in the TX text box sends the line and keys PTT -- see
+    /// render_digital_panel's own "Send on Return" checkbox. On by
+    /// default (matches this panel's own prior behavior, before CALL
+    /// CQ/CLEAR/direct-PTT existed, where Enter already sent).
+    rtty_send_on_return: bool,
+    /// Whether the CURRENT over (since mox last went active) has sent any
+    /// REAL characters yet -- see the auto-drop poll near
+    /// cw_text_sending's own for the full mechanism, ported directly from
+    /// SDRoxide's own `TextModemController::over_had_text`
+    /// (crates/sdroxide-digi/src/text_modem.rs's own fill_tx_block).
+    /// Needed so the auto-drop check (`sent >= total`) doesn't misfire
+    /// the INSTANT TX turns on with an empty queue (sent=0, total=0
+    /// already satisfies `sent >= total`) -- only once real text has
+    /// actually been queued and then fully drained does this arm the
+    /// drop.
+    rtty_over_had_text: bool,
     sstv: sstv_link::SstvHandle,
     /// Rebuilt from `sstv`'s snapshot whenever its `image_id` changes --
     /// see render_sstv_panel's own doc comment for why a GPU texture, not
@@ -3126,6 +3142,8 @@ fn connect_to_device(device: Device, cfg: &Config) -> Result<ConnectedState, Str
                 digital_mode: DigitalMode::Rtty,
                 rtty,
                 rtty_tx_input: String::new(),
+                rtty_send_on_return: true,
+                rtty_over_had_text: false,
                 sstv,
                 sstv_texture: None,
                 sstv_texture_image_id: 0,
@@ -3758,27 +3776,78 @@ impl eframe::App for HpsdrApp {
                 // of its own once-a-second diagnostic log lines showed up
                 // during a real TX test).
                 connected.spectrum.set_rtty(&connected.rtty);
-                connected.rtty.set_rx_enabled(
-                    connected.show_digital_window && connected.digital_mode == DigitalMode::Rtty,
-                );
-                if !connected.show_digital_window || connected.digital_mode != DigitalMode::Rtty {
-                    connected.rtty.set_tx_armed(false);
+                let rtty_tab_active =
+                    connected.show_digital_window && connected.digital_mode == DigitalMode::Rtty;
+                connected.rtty.set_rx_enabled(rtty_tab_active);
+                // Direct-PTT redesign (a real request, matching
+                // SDRoxide's own text_modem_panel): armed automatically
+                // whenever this tab is the one showing, same as
+                // rx_enabled just above -- there's no separate manual
+                // arm button anymore, the TX/CALL CQ/Send row keys real
+                // mox itself (see render_digital_panel's own
+                // mox_request). Leaving the tab while RTTY itself is the
+                // one holding mox still needs to let it go, same "don't
+                // strand a transmission" reasoning as the old disarm-
+                // only-on-leave fix below -- checked BEFORE re-arming,
+                // while rtty.tx_armed() still reads the OLD (pre-switch)
+                // value.
+                if !rtty_tab_active && connected.rtty.tx_armed() && connected.session.mox_active() {
+                    connected.session.set_mox(false);
                 }
+                connected.rtty.set_tx_armed(rtty_tab_active);
                 connected.spectrum.set_sstv(&connected.sstv);
                 connected.sstv.set_rx_enabled(
                     connected.show_digital_window && connected.digital_mode == DigitalMode::Sstv,
                 );
                 // Same "leaving the tab silently hijacks the next
-                // transmission" fix as RTTY's own above.
+                // transmission" fix as RTTY's own above. SSTV keeps its
+                // own explicit Send-button arming (a picture has to be
+                // prepared first, unlike RTTY/RADE), so this stays
+                // disarm-only rather than auto-arming on tab entry.
                 if !connected.show_digital_window || connected.digital_mode != DigitalMode::Sstv {
                     connected.sstv.set_tx_armed(false);
                 }
                 connected.spectrum.set_rade(&connected.rade);
-                connected.rade.set_rx_enabled(
-                    connected.show_digital_window && connected.digital_mode == DigitalMode::Rade,
-                );
-                if !connected.show_digital_window || connected.digital_mode != DigitalMode::Rade {
-                    connected.rade.set_tx_armed(false);
+                let rade_tab_active =
+                    connected.show_digital_window && connected.digital_mode == DigitalMode::Rade;
+                connected.rade.set_rx_enabled(rade_tab_active);
+                // Same direct-PTT redesign as RTTY above -- TALK (PTT)
+                // keys real mox itself now (see render_rade_panel's own
+                // mox_request). Leaving the tab mid-over still needs the
+                // SAME graceful EOO-aware unkey TALK's own release does,
+                // not an abrupt RF cut -- checked BEFORE re-arming below,
+                // while rade.tx_armed() still reads the OLD (pre-tab-
+                // switch) value set_rade_aware_mox needs to decide that.
+                //
+                // ROOT CAUSE FIX for a real report: this condition used
+                // to be missing its own `connected.rade.tx_armed()`
+                // check (present on RTTY's own identical guard just
+                // above, but dropped here by mistake) -- this whole
+                // block runs every frame regardless of whether the
+                // Digital Modes window is even open, and `rade_tab_active`
+                // is false whenever it's closed (the normal state for
+                // ordinary operation), so it was forcing mox off on
+                // EVERY frame during ANY transmission at all -- plain
+                // SSB via the main MOX button, RTTY, SSTV -- the instant
+                // mox went true, regardless of whether RADE had
+                // anything to do with it. Confirmed exactly matching a
+                // real report of RTTY/SSTV both keying then immediately
+                // unkeying themselves.
+                if !rade_tab_active && connected.rade.tx_armed() && connected.session.mox_active() {
+                    set_rade_aware_mox(connected, false);
+                }
+                // Held off while a graceful unkey from the block above
+                // (or from TALK's own release, or from the main MOX
+                // button while RADE was armed) is still draining --
+                // disarming here first would make tx.rs's own source-
+                // selection chain skip the RADE branch entirely (see
+                // that chain's own rtty.tx_armed()/rade.tx_armed()
+                // ordering comment above) while real mox is STILL up
+                // waiting for the End-of-Over burst, stranding the
+                // transmitter keyed with mic/TCI audio instead of
+                // finishing the burst it already promised the far end.
+                if connected.rade_pending_unkey.is_none() {
+                    connected.rade.set_tx_armed(rade_tab_active);
                 }
                 // See ConnectedState::rade_pending_unkey's own doc comment.
                 // Polled every frame so the real radio stays keyed exactly
@@ -5837,20 +5906,13 @@ impl eframe::App for HpsdrApp {
                                 });
                             if mox_resp.clicked() {
                                 let want_on = !mox_now;
-                                // See ConnectedState::rade_pending_unkey's own
-                                // doc comment -- unkeying while RADE is armed
-                                // defers the real drop until its End-of-Over
-                                // burst has actually gone out, instead of
-                                // cutting RF the instant the operator clicks
-                                // off. set_unkeying(true) is what actually
-                                // makes RadeWorker start generating that
-                                // burst -- real mox stays up in the meantime.
-                                if !want_on && connected.rade.tx_armed() {
-                                    connected.rade.set_unkeying(true);
-                                    connected.rade_pending_unkey = Some(Instant::now());
-                                } else {
-                                    connected.session.set_mox(want_on);
-                                }
+                                // See set_rade_aware_mox's own doc
+                                // comment -- unkeying while RADE is armed
+                                // defers the real drop until its
+                                // End-of-Over burst has actually gone
+                                // out, instead of cutting RF the instant
+                                // the operator clicks off.
+                                set_rade_aware_mox(connected, want_on);
                             }
 
                             // Tune: WDSP PostGen tone at passband
@@ -6169,6 +6231,37 @@ impl eframe::App for HpsdrApp {
                             // or remote), so it stays accurate either
                             // way.
                             connected.cw_remote_busy.store(connected.cw_text_sending, Ordering::Relaxed);
+
+                            // RTTY TX: ported directly from SDRoxide's own
+                            // TextModemController::fill_tx_block
+                            // (crates/sdroxide-digi/src/text_modem.rs) --
+                            // "A committed line is a whole over, and it
+                            // ends when the line does. Holding the
+                            // carrier past that is what type-ahead
+                            // wants... but under send_on_enter the
+                            // operator is composing off the air, so the
+                            // hold would be idle reversals for as long as
+                            // they take to type." So: with Send on Return
+                            // ON, PTT auto-releases the instant the
+                            // queued text finishes draining (matches a
+                            // real report -- CALL CQ/a committed line are
+                            // each their own over, not a standing key-
+                            // down); with it OFF (streaming/type-ahead),
+                            // the TX button stays a plain manual hold,
+                            // same as before. rtty_over_had_text (see its
+                            // own doc comment) guards against firing the
+                            // instant TX turns on with nothing queued yet.
+                            if !connected.session.mox_active() {
+                                connected.rtty_over_had_text = false;
+                            } else if connected.rtty_send_on_return && connected.rtty.tx_armed() {
+                                let (sent, total) = connected.rtty.tx_progress();
+                                if sent < total {
+                                    connected.rtty_over_had_text = true;
+                                } else if connected.rtty_over_had_text {
+                                    connected.session.set_mox(false);
+                                    connected.rtty_over_had_text = false;
+                                }
+                            }
 
                             // SSTV TX: same "auto-drop mox once done" idea
                             // as cw_text_sending just above -- Send (see
@@ -12002,7 +12095,14 @@ impl eframe::App for HpsdrApp {
                     let light_style = egui::Style { visuals: light_visuals.clone(), ..Default::default() };
                     let mut close_requested = false;
                     let digital_kiosk = lcd_kiosk_mode();
-                    let size = [640.0, 480.0];
+                    // Height bumped from 480 -- the RTTY tab's TX box went
+                    // multiline (a real request), so the default first-run
+                    // size needs a little more room too; returning users
+                    // with an already-saved window size are unaffected by
+                    // this constant (see digital_window_initial_geometry
+                    // below) -- their layout instead self-adjusts via
+                    // render_digital_panel's own rx_height calculation.
+                    let size = [640.0, 540.0];
                     let mut digital_viewport = egui::ViewportBuilder::default()
                         .with_title("Digital Modes")
                         .with_inner_size(size)
@@ -12042,6 +12142,7 @@ impl eframe::App for HpsdrApp {
                     let sstv_tx_prepared = &mut connected.sstv_tx_prepared;
                     let sstv_tx_texture = &mut connected.sstv_tx_texture;
                     let rade_callsign = &mut connected.rade_callsign;
+                    let rtty_send_on_return = &mut connected.rtty_send_on_return;
                     let tx_handle_ref = connected.tx_handle.as_ref();
                     let mut digital_mode = connected.digital_mode;
                     let mut fit_filter_clicked = false;
@@ -12057,6 +12158,17 @@ impl eframe::App for HpsdrApp {
                     // clicked this frame, applied after the closure below
                     // (needs connected.session, not available in here).
                     let mut sstv_mox_request: Option<bool> = None;
+                    // See render_digital_panel's own mox_request doc
+                    // comment -- Some(bool) when CALL CQ/Send/CLEAR was
+                    // clicked this frame, applied after the closure below
+                    // (needs connected.session, not available in here).
+                    let mut rtty_mox_request: Option<bool> = None;
+                    // See render_rade_panel's own mox_request doc comment
+                    // -- Some(bool) when TALK (PTT) was clicked this
+                    // frame, applied after the closure below via
+                    // set_rade_aware_mox (needs connected, not available
+                    // in here).
+                    let mut rade_mox_request: Option<bool> = None;
                     // See ConnectedState::digital_window_geometry's own
                     // doc comment -- live-tracked every frame the window
                     // is open (not just when Config save fires), same
@@ -12154,15 +12266,19 @@ impl eframe::App for HpsdrApp {
                                     // survives regardless of what the panel returns.
                                     match digital_mode {
                                         DigitalMode::Rtty => {
-                                            fit_filter_clicked |= render_digital_panel(
+                                            let (clicked, mox_request) = render_digital_panel(
                                                 ui,
                                                 &rtty,
                                                 tx_input,
+                                                rade_callsign,
+                                                rtty_send_on_return,
                                                 tx_available,
                                                 mox,
                                                 mode,
                                                 dial_freq_hz,
                                             );
+                                            fit_filter_clicked |= clicked;
+                                            rtty_mox_request = rtty_mox_request.or(mox_request);
                                         }
                                         DigitalMode::Sstv => {
                                             let (clicked, quick_tune, mox_request) = render_sstv_panel(
@@ -12184,7 +12300,7 @@ impl eframe::App for HpsdrApp {
                                             sstv_mox_request = sstv_mox_request.or(mox_request);
                                         }
                                         DigitalMode::Rade => {
-                                            let (clicked, quick_tune) = render_rade_panel(
+                                            let (clicked, quick_tune, mox_request) = render_rade_panel(
                                                 ui,
                                                 &rade,
                                                 rade_callsign,
@@ -12193,6 +12309,7 @@ impl eframe::App for HpsdrApp {
                                             );
                                             rade_fit_filter_clicked |= clicked;
                                             digital_quick_tune_hz = digital_quick_tune_hz.or(quick_tune);
+                                            rade_mox_request = rade_mox_request.or(mox_request);
                                         }
                                     }
                                 });
@@ -12213,6 +12330,19 @@ impl eframe::App for HpsdrApp {
                         // the tab switched away mid-transmission.
                         connected.session.set_mox(want);
                         connected.sstv_tx_sending = want;
+                    }
+                    if let Some(want) = rtty_mox_request {
+                        // See render_digital_panel's own TX row doc
+                        // comment -- a persistent hold the operator
+                        // controls directly, no auto-drop.
+                        connected.session.set_mox(want);
+                    }
+                    if let Some(want) = rade_mox_request {
+                        // See set_rade_aware_mox's own doc comment --
+                        // TALK (PTT) needs the same EOO-aware deferred
+                        // unkey the main MOX button's own click handler
+                        // uses, not a plain set_mox(false).
+                        set_rade_aware_mox(connected, want);
                     }
                     if let Some(hz) = digital_quick_tune_hz {
                         // See SSTV_QUICK_TUNE_HZ/RADE_QUICK_TUNE_HZ's own
@@ -13011,12 +13141,22 @@ fn render_digital_panel(
     ui: &mut egui::Ui,
     rtty: &rtty_link::RttyHandle,
     tx_input: &mut String,
+    callsign: &mut String,
+    send_on_return: &mut bool,
     tx_available: bool,
     mox: bool,
     mode: spectrum::Mode,
     dial_freq_hz: u32,
-) -> bool {
+) -> (bool, Option<bool>) {
     let mut fit_filter_clicked = false;
+    // Some(true)/Some(false) the frame CALL CQ/Send or CLEAR is clicked
+    // -- the caller (main.rs's call site) turns this into an actual
+    // connected.session.set_mox() call, since session isn't reachable
+    // from in here. Same "direct PTT control, no separate MOX step"
+    // shape as render_sstv_panel's own mox_request -- a real request,
+    // matching SDRoxide's own text_modem_panel (CALL CQ/CLEAR key PTT
+    // directly there too, no separate arm/MOX step for the operator).
+    let mut mox_request: Option<bool> = None;
     let amber = egui::Color32::from_rgb(230, 150, 50);
     let red = egui::Color32::from_rgb(220, 50, 50);
     let green = egui::Color32::from_rgb(40, 190, 70);
@@ -13113,7 +13253,14 @@ fn render_digital_panel(
         ui.colored_label(amber, "RTTY needs USB/DIGU (or LSB/DIGL with Reverse) selected.");
     }
 
-    let rx_height = (ui.available_height() - 90.0).max(80.0);
+    // ROOT CAUSE FIX for a real report: bumped from 90.0 -- that figure
+    // predated the TX box going multiline (a real request, ~56px tall
+    // plus its own frame padding, replacing what was a single ~20px-tall
+    // line), so the fixed row of controls below this RX scroll area
+    // needed more reserved height than before or the bottom of it
+    // (the Send button) got pushed outside the window's own visible
+    // area instead of the RX area simply shrinking to make room.
+    let rx_height = (ui.available_height() - 140.0).max(80.0);
     egui::ScrollArea::vertical()
         .id_salt("rtty_rx_text")
         .max_height(rx_height)
@@ -13129,36 +13276,122 @@ fn render_digital_panel(
     }
     ui.add_enabled_ui(tx_available, |ui| {
         ui.horizontal(|ui| {
-            let armed = rtty.tx_armed();
-            if ui
-                .add(egui::Button::selectable(armed, "RTTY TX"))
-                .on_hover_text(
-                    "While on, keying MOX/PTT transmits RTTY tones (idle mark when \
-                     nothing is queued) instead of the microphone",
-                )
-                .clicked()
-            {
-                rtty.set_tx_armed(!armed);
-            }
+            ui.label("My Call:");
+            ui.add(
+                egui::TextEdit::singleline(callsign)
+                    .desired_width(90.0)
+                    .char_limit(12)
+                    .hint_text("(none)"),
+            );
+            ui.add_space(8.0);
             let (sent, total) = rtty.tx_progress();
             ui.label(format!("Sent {sent}/{total}"));
-            if armed && mox {
-                ui.colored_label(red, "ON AIR");
-            }
-            if ui.button("Clear TX").clicked() {
-                rtty.clear_tx();
-            }
         });
         ui.horizontal(|ui| {
-            let resp = ui.add(
-                egui::TextEdit::singleline(tx_input)
-                    .desired_width((ui.available_width() - 60.0).max(80.0))
-                    .hint_text("Text to send"),
+            // Persistent hold, not a per-send auto-key: the operator's
+            // own click keys/unkeys real PTT directly (no separate arm
+            // step -- "não vou precisar de fazer MOX", a real request)
+            // and STAYS on through a whole back-and-forth exchange,
+            // matching SDRoxide's own TX ON/TX toggle exactly (its
+            // DigiTxActive). ROOT CAUSE FIX for a real report: an
+            // earlier version of this row had no such toggle and instead
+            // auto-dropped mox the instant CALL CQ/Send's own queued
+            // text finished draining -- at 45 baud a short test message
+            // drains in well under a second, so the relay keyed for a
+            // moment and dropped again before the operator could react,
+            // looking exactly like "nothing transmitted". SDRoxide's own
+            // CALL CQ/CLEAR don't touch TX state either (confirmed by
+            // reading text_modem_panel directly) -- only this button
+            // does.
+            let label = if mox { "  TX ON  " } else { "   TX   " };
+            if ui
+                .add(egui::Button::selectable(mox, label))
+                .on_hover_text("Click to key/unkey PTT directly")
+                .clicked()
+            {
+                mox_request = Some(!mox);
+            }
+            if mox {
+                ui.colored_label(red, "ON AIR");
+            }
+            if ui
+                .button("CALL CQ")
+                .on_hover_text("Queue \"CQ CQ CQ DE <call>\" and key PTT if not already on")
+                .clicked()
+            {
+                let call = if callsign.trim().is_empty() { "NOCALL".to_string() } else { callsign.clone() };
+                let cq = format!("CQ CQ CQ DE {call} {call} {call} PSE K\n");
+                rtty.clear_tx();
+                rtty.send_text(&cq);
+                // Own the CQ text so it's visible in the box (same as
+                // SDRoxide's own CALL CQ, which sets self.text_tx too) --
+                // without this the operator has no way to see what was
+                // actually queued/sent.
+                *tx_input = cq;
+                mox_request = Some(true);
+            }
+            if ui
+                .button("CLEAR")
+                .on_hover_text("Drop whatever is still queued -- TX itself stays as it was")
+                .clicked()
+            {
+                rtty.clear_tx();
+                tx_input.clear();
+            }
+            ui.add_space(8.0);
+            ui.checkbox(send_on_return, "Send on Return").on_hover_text(
+                "Return in the text box below sends the line and keys PTT if not already \
+                 on -- turn off to require the Send button instead, e.g. to proofread a \
+                 line first",
             );
-            let enter = resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+        });
+        ui.horizontal(|ui| {
+            // Multiline, not singleline -- a real request: a single line
+            // couldn't show a whole CQ call (or anything much longer)
+            // without scrolling sideways out of view, unlike SDRoxide's
+            // own text_modem_panel, which gives the TX box a real
+            // multi-line, internally-scrolling area (~4 lines).
+            //
+            // Send on Return has to consume the Enter keypress BEFORE
+            // the TextEdit widget below is built, or the edit turns it
+            // into a literal newline first instead of committing the
+            // line -- same reasoning/mechanism as SDRoxide's own
+            // `take_return` (crate::chrome::take_return).
+            let tx_id = ui.id().with("rtty_tx_edit");
+            let enter = *send_on_return
+                && ui.memory(|m| m.has_focus(tx_id))
+                && ui.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Enter));
+            egui::Frame::new()
+                .stroke(egui::Stroke::new(1.0, ui.visuals().widgets.inactive.bg_stroke.color))
+                .inner_margin(egui::Margin::symmetric(4, 3))
+                .show(ui, |ui| {
+                    ui.set_width((ui.available_width() - 60.0).max(80.0));
+                    egui::ScrollArea::vertical()
+                        .id_salt("rtty_tx_scroll")
+                        .max_height(56.0)
+                        .auto_shrink([false, false])
+                        .stick_to_bottom(true)
+                        .show(ui, |ui| {
+                            ui.add(
+                                egui::TextEdit::multiline(tx_input)
+                                    .id(tx_id)
+                                    .desired_width(f32::INFINITY)
+                                    .hint_text(if *send_on_return {
+                                        "Type a line, Return sends it..."
+                                    } else {
+                                        "Text to send"
+                                    }),
+                            );
+                        });
+                });
             if (ui.button("Send").clicked() || enter) && !tx_input.is_empty() {
                 rtty.send_text(tx_input);
                 tx_input.clear();
+                // Starts the over if it is not already running, same as
+                // SDRoxide's own commit_tx_line -- one key both finishes
+                // the thought and sends it. A no-op (set_mox(true) while
+                // already true) if TX is already held on.
+                mox_request = Some(true);
             }
         });
     });
@@ -13169,7 +13402,7 @@ fn render_digital_panel(
     // Console's 300ms is still plenty responsive for reading decoded
     // text while asking for less CPU.
     ui.ctx().request_repaint_after(Duration::from_millis(300));
-    fit_filter_clicked
+    (fit_filter_clicked, mox_request)
 }
 
 /// SSTV panel -- RX only for now (see sstv_link.rs's own module doc
@@ -13419,6 +13652,55 @@ fn render_sstv_panel(
                 *tx_prepared = None; // Re-derived below from tx_source.
             }
         });
+        ui.horizontal(|ui| {
+            // A real request, matching SDRoxide's own SSTV panel (TX
+            // slant/FSK ID/TX lead) -- see sstv_link.rs's own doc
+            // comments on tx_ppm/tx_fsk_id_enabled/tx_lead_ms for the
+            // full reasoning behind each.
+            ui.label("TX Slant:");
+            let mut ppm = sstv.tx_ppm();
+            if ui
+                .add(egui::Slider::new(&mut ppm, -5000.0..=5000.0).suffix(" ppm"))
+                .on_hover_text(
+                    "Transmit clock trim to remove slant on the far-end decoder -- a \
+                     receiving sound card's clock a little off from this station's \
+                     stretches every line by a tiny, cumulative amount.",
+                )
+                .changed()
+            {
+                sstv.set_tx_ppm(ppm);
+            }
+            if ui.small_button("0").on_hover_text("Reset to 0 ppm").clicked() {
+                sstv.set_tx_ppm(0.0);
+            }
+            ui.add_space(8.0);
+            let mut fsk_id = sstv.tx_fsk_id_enabled();
+            if ui
+                .checkbox(&mut fsk_id, "FSK ID")
+                .on_hover_text(
+                    "Send \"My Call\" in tones after each picture -- the identification \
+                     SSTV repeaters and other programs read. Adds ~2.5 seconds, and \
+                     sends nothing until you've set a callsign.",
+                )
+                .changed()
+            {
+                sstv.set_tx_fsk_id_enabled(fsk_id);
+            }
+            ui.add_space(8.0);
+            ui.label("TX Lead:");
+            let mut lead_ms = sstv.tx_lead_ms();
+            if ui
+                .add(egui::DragValue::new(&mut lead_ms).range(0..=3000).speed(10.0).suffix(" ms"))
+                .on_hover_text(
+                    "Silence sent after keying and before the picture's leader/VIS code \
+                     -- covers the gap between asking the rig for PTT and it really \
+                     being on the air. 0 for an SDR that keys instantly.",
+                )
+                .changed()
+            {
+                sstv.set_tx_lead_ms(lead_ms);
+            }
+        });
         // Re-derive tx_prepared (resize/crop to tx_mode's own exact
         // dimensions, then the callsign banner if enabled) whenever a new
         // picture was just loaded or the mode/banner selection changed --
@@ -13541,9 +13823,17 @@ fn render_rade_panel(
     callsign: &mut String,
     mox: bool,
     tx_handle: Option<&TxHandle>,
-) -> (bool, Option<u32>) {
+) -> (bool, Option<u32>, Option<bool>) {
     let mut fit_filter_clicked = false;
     let mut quick_tune_hz = None;
+    // Some(bool) the frame TALK (PTT) is clicked -- the caller (main.rs's
+    // call site) turns this into a real connected.session.set_mox() call
+    // via set_rade_aware_mox (session isn't reachable from in here, and
+    // turning OFF needs the same EOO-aware deferred-unkey handling the
+    // main MOX button's own click handler already has). A real request,
+    // matching SDRoxide's own rade_panel: direct PTT control, no
+    // separate arm step for the operator.
+    let mut mox_request: Option<bool> = None;
     let amber = egui::Color32::from_rgb(230, 150, 50);
     let red = egui::Color32::from_rgb(220, 50, 50);
     let green = egui::Color32::from_rgb(40, 190, 70);
@@ -13553,7 +13843,7 @@ fn render_rade_panel(
             red,
             "RADE failed to start this session (see the log) -- this mode is unavailable until the app is restarted.",
         );
-        return (false, None);
+        return (false, None, None);
     }
 
     ui.horizontal(|ui| {
@@ -13658,19 +13948,36 @@ fn render_rade_panel(
     });
 
     ui.horizontal(|ui| {
-        let armed = rade.tx_armed();
+        // Direct PTT control -- no separate arm step, matching
+        // SDRoxide's own rade_panel (TALK (PTT)/STOP TALKING).
+        let transmitting = mox && rade.tx_armed();
+        let label = if transmitting { "STOP TALKING" } else { "TALK (PTT)" };
         if ui
-            .add(egui::Button::selectable(armed, "RADE TX"))
+            .add(egui::Button::selectable(transmitting, label))
             .on_hover_text(
-                "While on, keying MOX/PTT transmits the microphone through the RADE V1 \
-                 modem instead of ordinary SSB",
+                "Click to open/close a RADE over -- keys PTT directly. The modem needs \
+                 ~120ms before the first frame goes out, and sends an End-of-Over frame \
+                 when you stop, so transmit runs on a little past the click.",
             )
             .clicked()
         {
-            rade.set_tx_armed(!armed);
+            mox_request = Some(!transmitting);
         }
-        if armed && mox {
+        if transmitting {
             ui.colored_label(red, "ON AIR");
+        }
+        ui.add_space(8.0);
+        let mut muted = rade.mute_analog();
+        if ui
+            .checkbox(&mut muted, "Mute Analog")
+            .on_hover_text(
+                "Mute the demodulated audio so only decoded speech is heard. Otherwise \
+                 the raw signal passes through while not yet synced -- that hiss is how \
+                 you find an over before it locks, so leave this off while tuning.",
+            )
+            .changed()
+        {
+            rade.set_mute_analog(muted);
         }
         if ui.button("Reset RX").on_hover_text("Drop sync and start hunting again").clicked() {
             rade.reset_rx();
@@ -13698,7 +14005,7 @@ fn render_rade_panel(
         });
 
     ui.ctx().request_repaint_after(Duration::from_millis(300));
-    (fit_filter_clicked, quick_tune_hz)
+    (fit_filter_clicked, quick_tune_hz, mox_request)
 }
 
 /// Draws the CW decoder panel pinned to exactly `rect` (the caller
@@ -16541,6 +16848,20 @@ fn digital_fit_passband(
         DigitalMode::Rade => (700.0, 2_300.0),
     };
     if lsb { (-high, -low) } else { (low, high) }
+}
+
+/// Sets real mox, but EOO-aware when turning it off while RADE is armed
+/// -- see ConnectedState::rade_pending_unkey's own doc comment. Shared
+/// by the main MOX button's own click handler and the RADE panel's
+/// TALK (PTT) button, so both take the transmitter down the same
+/// graceful path rather than one of them cutting RF mid-burst.
+fn set_rade_aware_mox(connected: &mut ConnectedState, want_on: bool) {
+    if !want_on && connected.rade.tx_armed() {
+        connected.rade.set_unkeying(true);
+        connected.rade_pending_unkey = Some(Instant::now());
+    } else {
+        connected.session.set_mox(want_on);
+    }
 }
 
 /// Force NB/NR/SNB (RX) and TX Leveler/Compressor/CFC/Equalizer off,

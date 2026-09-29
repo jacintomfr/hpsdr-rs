@@ -1919,6 +1919,17 @@ fn run(
         sstv_scratch.clear();
         let rade_rx = rade.lock().unwrap().clone().filter(|r| r.rx_enabled());
         rade_scratch.clear();
+        // See RadeHandle::mute_analog's own doc comment -- with it off,
+        // the ordinary demodulated audio is allowed through the waveform-
+        // tap/speaker-mute gate below while RADE hasn't synced yet (a
+        // tuning aid), same as it would be with RADE not selected at all;
+        // once synced, decoded speech takes over either way (this only
+        // ever widens when raw audio is ALSO allowed through, never
+        // narrows RADE's own decoded-speech path).
+        let rade_pass_raw = match &rade_rx {
+            None => true,
+            Some(r) => !r.mute_analog() && !r.stats().sync,
+        };
         {
             let mut out = audio_out.lock().unwrap();
             // Dedicated tap for TCI's audio_start streaming -- same
@@ -2028,8 +2039,10 @@ fn run(
                 // voice. Skipped here when rade_rx is active; the RADE
                 // speech loop further down pushes the real DECODED
                 // speech instead, matching what an operator actually
-                // expects a "waveform" display to mean.
-                if rade_rx.is_none() {
+                // expects a "waveform" display to mean. rade_pass_raw,
+                // not rade_rx.is_none() -- see that variable's own doc
+                // comment (RadeHandle::mute_analog).
+                if rade_pass_raw {
                     if waveform_out.len() >= WAVEFORM_TAP_CAPACITY {
                         waveform_out.pop_front();
                     }
@@ -2059,8 +2072,10 @@ fn run(
                 // unlike RTTY/SSTV (which only ever ADD a text/image
                 // side-channel), what WDSP demodulated from a RADE
                 // signal is modem tones, not something worth sending to
-                // a speaker.
-                if rade_rx.is_none() {
+                // a speaker. rade_pass_raw, not rade_rx.is_none() -- see
+                // that variable's own doc comment (RadeHandle::
+                // mute_analog).
+                if rade_pass_raw {
                     if !mute_local {
                         if out.len() >= AUDIO_BUFFER_CAPACITY {
                             out.pop_front();

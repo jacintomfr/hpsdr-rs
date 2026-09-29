@@ -105,6 +105,19 @@ struct Inner {
     /// fill_tx sends silence whenever this is None.
     tx: Mutex<Option<SstvTx>>,
     tx_armed: AtomicBool,
+    /// See SstvHandle::tx_ppm's own doc comment. Stored as bits (f32 has
+    /// no atomic type) -- same convention as level_bits/sync_quality_bits
+    /// above.
+    tx_ppm_bits: AtomicU32,
+    /// See SstvHandle::set_tx_fsk_id_enabled's own doc comment.
+    tx_fsk_id_enabled: AtomicBool,
+    /// See SstvHandle::tx_lead_ms's own doc comment.
+    tx_lead_ms: AtomicU32,
+    /// Silent samples still owed before the current over's VIS header --
+    /// see fill_tx's own doc comment. Reset from tx_lead_ms at the start
+    /// of every set_image() call, drained to 0 before the plan itself
+    /// ever produces a sample.
+    tx_lead_remaining: Mutex<u64>,
 }
 
 #[derive(Clone)]
@@ -126,6 +139,15 @@ impl SstvHandle {
                 sync_quality_bits: AtomicU32::new(0),
                 tx: Mutex::new(None),
                 tx_armed: AtomicBool::new(false),
+                tx_ppm_bits: AtomicU32::new(0.0f32.to_bits()),
+                // Matches SDRoxide's own DigiConfig::sstv_fsk_id default
+                // (on) -- see set_tx_fsk_id_enabled's own doc comment.
+                tx_fsk_id_enabled: AtomicBool::new(true),
+                // Matches SDRoxide's own default_sstv_txdelay_ms (500ms)
+                // -- "enough for every rig measured and invisible against
+                // a transmission that runs for minutes."
+                tx_lead_ms: AtomicU32::new(500),
+                tx_lead_remaining: Mutex::new(0),
             }),
         }
     }
@@ -242,28 +264,87 @@ impl SstvHandle {
         self.inner.tx_armed.store(on, Ordering::Relaxed);
     }
 
+    /// Transmit clock trim, parts-per-million -- stretches (+) or
+    /// compresses (-) the image's own time-scale to null out slant on
+    /// the far-end decoder (a sound-card clock a little off from this
+    /// station's stretches every line by a tiny, cumulative amount,
+    /// which shows up as the picture slanting more the further down it
+    /// goes). 0 = no correction. A real request, matching SDRoxide's own
+    /// "TX slant" control (`DigiConfig::sstv_tx_ppm`) -- sstv.rs's own
+    /// `SstvTx::new` already took this parameter, just never had a
+    /// caller pass anything but a hardcoded 0.0.
+    pub fn tx_ppm(&self) -> f32 {
+        f32::from_bits(self.inner.tx_ppm_bits.load(Ordering::Relaxed))
+    }
+
+    pub fn set_tx_ppm(&self, ppm: f32) {
+        self.inner.tx_ppm_bits.store(ppm.to_bits(), Ordering::Relaxed);
+    }
+
+    /// Whether set_image appends an FSK ID (the station's callsign, in
+    /// tones, after the picture) -- see sstv.rs's own
+    /// `SstvTx::with_fsk_id` for the mechanism. A real request, matching
+    /// SDRoxide's own "FSK ID" checkbox: on by default, but toggleable
+    /// since it adds ~2.5 seconds to every over and not every operator
+    /// wants that on every single picture.
+    pub fn tx_fsk_id_enabled(&self) -> bool {
+        self.inner.tx_fsk_id_enabled.load(Ordering::Relaxed)
+    }
+
+    pub fn set_tx_fsk_id_enabled(&self, on: bool) {
+        self.inner.tx_fsk_id_enabled.store(on, Ordering::Relaxed);
+    }
+
+    /// Dead air sent after keying and before the picture's own leader/VIS
+    /// code -- see fill_tx's own doc comment for the mechanism. A real
+    /// request, matching SDRoxide's own "TX lead" control
+    /// (`DigiConfig::sstv_txdelay_ms`): covers the gap between asking a
+    /// rig for PTT and it really being on the air (relay/PLL/PA
+    /// settling) -- a decoder that misses any of the leader/VIS shows no
+    /// picture at all, so a signal that starts before the rig is truly
+    /// transmitting loses the whole over, not just its first fraction of
+    /// a second.
+    pub fn tx_lead_ms(&self) -> u32 {
+        self.inner.tx_lead_ms.load(Ordering::Relaxed)
+    }
+
+    pub fn set_tx_lead_ms(&self, ms: u32) {
+        self.inner.tx_lead_ms.store(ms, Ordering::Relaxed);
+    }
+
     /// Starts a new over: `rgb` (interleaved, row-major, `3*w*h` bytes --
     /// already resized/cropped to `mode.dimensions()`, see main.rs's own
     /// image-picker code) is planned into tone runs immediately (see
     /// sstv.rs's own doc comment on why that's cheap enough to do here,
     /// not on the TX audio thread). Replaces whatever over was already in
     /// progress, if any -- same "operator's own new click wins" reasoning
-    /// as RttyHandle::send_text overwriting a stale queue.
+    /// as RttyHandle::send_text overwriting a stale queue. `fsk_id` is
+    /// only actually appended when tx_fsk_id_enabled() is on; tx_ppm()
+    /// and tx_lead_ms() are read fresh here too, so a setting changed
+    /// between overs takes effect on the NEXT Send, not retroactively on
+    /// one already queued.
     pub fn set_image(&self, mode: SstvMode, rgb: &[u8], w: u16, h: u16, fsk_id: &str) {
-        let tx = SstvTx::new(mode, rgb, w, h, SAMPLE_RATE_HZ, 0.0).with_fsk_id(fsk_id);
+        let mut tx = SstvTx::new(mode, rgb, w, h, SAMPLE_RATE_HZ, self.tx_ppm());
+        if self.tx_fsk_id_enabled() {
+            tx = tx.with_fsk_id(fsk_id);
+        }
         *self.inner.tx.lock().unwrap() = Some(tx);
+        let lead_samples = (SAMPLE_RATE_HZ * self.tx_lead_ms() as f64 / 1000.0).round() as u64;
+        *self.inner.tx_lead_remaining.lock().unwrap() = lead_samples;
     }
 
     /// Abandons whatever over is in progress -- the operator's own Abort
     /// button. fill_tx sends silence from the next chunk on.
     pub fn abort_tx(&self) {
         *self.inner.tx.lock().unwrap() = None;
+        *self.inner.tx_lead_remaining.lock().unwrap() = 0;
     }
 
     /// True while an over is queued or in progress (fill_tx has real
-    /// audio to send, not silence).
+    /// audio -- lead-in silence or the picture itself -- to send, not
+    /// idle silence).
     pub fn tx_active(&self) -> bool {
-        self.inner.tx.lock().unwrap().is_some()
+        *self.inner.tx_lead_remaining.lock().unwrap() > 0 || self.inner.tx.lock().unwrap().is_some()
     }
 
     /// (samples sent, total samples) for the over in progress, or (0, 0)
@@ -279,7 +360,26 @@ impl SstvHandle {
     /// module's own doc comment on `Inner::tx`). Clears the finished
     /// transmission itself once done() so tx_active() reports false and a
     /// fresh set_image() doesn't need an explicit clear first.
+    ///
+    /// Drains tx_lead_remaining (see set_image's own doc comment) FIRST,
+    /// silence sent while the real rig's PTT/relay/PLL/PA are still
+    /// settling -- only once that's exhausted does the plan itself (the
+    /// leader/VIS/picture) ever produce a sample, so a chunk straddling
+    /// the boundary correctly plays out the rest of the lead-in before
+    /// falling straight through to real tone content in the SAME call,
+    /// rather than losing up to one chunk's worth of either.
     pub fn fill_tx(&self, out: &mut [f32]) {
+        let mut lead = self.inner.tx_lead_remaining.lock().unwrap();
+        let lead_here = (*lead as usize).min(out.len());
+        if lead_here > 0 {
+            out[..lead_here].fill(0.0);
+            *lead -= lead_here as u64;
+        }
+        drop(lead);
+        let out = &mut out[lead_here..];
+        if out.is_empty() {
+            return;
+        }
         let mut guard = self.inner.tx.lock().unwrap();
         match guard.as_mut() {
             Some(tx) => {

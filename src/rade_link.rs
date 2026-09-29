@@ -60,6 +60,8 @@ struct Inner {
     /// See RadeHandle::set_unkeying's own doc comment.
     unkeying: AtomicBool,
     rx_log: Mutex<Vec<RadeTextRx>>,
+    /// See RadeHandle::mute_analog's own doc comment.
+    mute_analog: AtomicBool,
 }
 
 #[derive(Clone)]
@@ -83,6 +85,10 @@ impl RadeHandle {
                 tx_armed: AtomicBool::new(false),
                 unkeying: AtomicBool::new(false),
                 rx_log: Mutex::new(Vec::new()),
+                // Preserves this app's own prior (unconfigurable)
+                // behavior by default -- see the getter's own doc
+                // comment for what turning it off changes.
+                mute_analog: AtomicBool::new(true),
             }),
         }
     }
@@ -112,6 +118,23 @@ impl RadeHandle {
 
     pub fn set_tx_armed(&self, on: bool) {
         self.inner.tx_armed.store(on, Ordering::Relaxed);
+    }
+
+    /// Whether the ordinary demodulated audio stays muted while RADE is
+    /// the active decoder but not yet synced -- a real request, matching
+    /// SDRoxide's own "MUTE ANALOG" toggle. On (this app's own prior,
+    /// unconfigurable behavior): only decoded speech is ever heard.
+    /// Off: the raw signal passes through while hunting (no sync yet),
+    /// same as SDRoxide's own hover text -- "that hiss is how you find
+    /// an over before it syncs" -- and decoded speech still takes over
+    /// the moment sync is achieved either way. See spectrum.rs's own
+    /// rade_rx-gated audio block for where this is actually read.
+    pub fn mute_analog(&self) -> bool {
+        self.inner.mute_analog.load(Ordering::Relaxed)
+    }
+
+    pub fn set_mute_analog(&self, on: bool) {
+        self.inner.mute_analog.store(on, Ordering::Relaxed);
     }
 
     /// ROOT CAUSE FIX for a real deadlock: the real radio's own MOX and
