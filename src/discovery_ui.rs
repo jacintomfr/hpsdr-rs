@@ -234,7 +234,12 @@ impl DiscoveryWindow {
             interface_names: Arc::new(Mutex::new(HashMap::new())),
             discovering: Arc::new(Mutex::new(false)),
             selected: None,
-            manual_ip: String::new(),
+            // See config::load_last_manual_ip's own doc comment -- pre-
+            // fills instead of leaving this blank every launch, for
+            // setups where broadcast discovery never finds the radio
+            // (e.g. a direct USB3-LAN link with no proper switched LAN
+            // segment for the discovery broadcast to reach).
+            manual_ip: crate::config::load_last_manual_ip().unwrap_or_default(),
             manual_error: None,
             focus_deadline: Some(Instant::now() + std::time::Duration::from_millis(1500)),
             firmware_update: None,
@@ -630,6 +635,14 @@ impl DiscoveryWindow {
                         match self.manual_ip.trim().parse::<IpAddr>() {
                             Ok(ip) => {
                                 self.manual_error = None;
+                                // See config::save_last_manual_ip's own
+                                // doc comment -- remembered regardless of
+                                // whether the radio actually answers
+                                // below, since a real address that's just
+                                // slow to respond (or momentarily
+                                // rebooting) is still the one worth
+                                // pre-filling next launch.
+                                crate::config::save_last_manual_ip(&ip.to_string());
                                 self.spawn_manual(ui.ctx().clone(), ip);
                             }
                             Err(_) => {

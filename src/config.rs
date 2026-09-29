@@ -90,6 +90,12 @@ pub struct Config {
     /// off, not on, so nobody's waterfall behaviour changes on upgrade
     /// without them opting in.
     pub waterfall_db_low_auto: Option<bool>,
+    /// "AGC Auto" -- see ConnectedState::agc_auto's own doc comment.
+    /// Missing defaults to off, matching deskHPSDR's own default.
+    #[serde(default)]
+    pub agc_auto: Option<bool>,
+    #[serde(default)]
+    pub agc_auto_offset_db: Option<f32>,
     pub waterfall_palette: Option<Palette>,
     /// See ConnectedState::meter_style's own doc comment (main.rs).
     /// Missing (a config saved before this existed) falls back to
@@ -848,6 +854,36 @@ pub fn save_kiosk_ui_scale(scale: f32) {
 /// Screen tab to build its picker from, rather than duplicating the list.
 pub fn kiosk_ui_scale_presets() -> &'static [f32] {
     &KIOSK_SCALE_PRESETS
+}
+
+fn last_manual_ip_path() -> Option<PathBuf> {
+    let mut path = settings_dir()?;
+    path.push("last_manual_ip.txt");
+    Some(path)
+}
+
+/// The last IP address successfully used via the Discovery window's own
+/// "Manual IP" field -- same "own small machine-level file, not the
+/// per-radio Config" reasoning as kiosk_scale.json above, since this
+/// isn't a setting FOR a particular radio, it's about how to FIND one in
+/// the first place (a real report: a HermesLite2 reachable only via a
+/// direct USB3-LAN link, not a router, never answers this app's UDP
+/// discovery broadcast on some setups -- likely a routing/ARP quirk of a
+/// point-to-point link rather than a proper switched LAN segment -- so
+/// the operator has to fall back to Manual IP every single launch, and
+/// re-typing the same address by hand each time is exactly the kind of
+/// friction a remembered default removes). Pre-fills the field rather
+/// than auto-connecting outright, so a genuinely different radio at a
+/// new address (or the same one having moved) is still just one click
+/// away, not a forced retype.
+pub fn load_last_manual_ip() -> Option<String> {
+    last_manual_ip_path().and_then(|p| std::fs::read_to_string(p).ok()).map(|s| s.trim().to_string())
+}
+
+pub fn save_last_manual_ip(ip: &str) {
+    if let Some(path) = last_manual_ip_path() {
+        let _ = std::fs::write(path, ip);
+    }
 }
 
 /// A window's on-screen position and content size, in egui points

@@ -1641,6 +1641,25 @@ struct ConnectedState {
     /// goal -- not needing to manually re-tune the waterfall levels
     /// after adjusting gain -- is the same one this mirrors).
     waterfall_db_low_auto: bool,
+    /// "AGC Auto" (Settings -> RX, next to AGC Gain) -- ported from
+    /// deskHPSDR's own rx->agc_auto/agc_auto_offset (receiver.h/
+    /// rx_panadapter.c): continuously re-targets AGC Top (agc_top_db)
+    /// from the SAME tracked noise floor db_low_auto already computes
+    /// (reusing it rather than measuring a second one -- deskHPSDR's
+    /// own version measures its own noise floor independently via a
+    /// percentile sort of the visible spectrum every ~1s, but our
+    /// db_low_auto_smoothed already tracks essentially the same thing
+    /// continuously), so AGC Gain no longer needs re-tuning by hand
+    /// after every band/antenna change. Formula: `agc_top_db = -floor +
+    /// agc_auto_offset_db`, deskHPSDR's own exact expression (see the
+    /// per-frame update site's own doc comment for the reasoning).
+    agc_auto: bool,
+    /// deskHPSDR's own default (-25.0) and UI spin range (-35.0..-15.0,
+    /// agc_menu.c's agc_auto_offset_spin) -- how far below the point
+    /// where the tracked noise floor would exactly hit AGC Top's ceiling
+    /// to actually target, leaving headroom for real signal peaks above
+    /// the floor instead of AGC constantly re-triggering right at it.
+    agc_auto_offset_db: f32,
     /// Spectrum/waterfall display range while transmitting -- see
     /// Config's field docs for why these are separate from the RX
     /// ones above rather than a fixed offset applied at render time.
@@ -3128,6 +3147,8 @@ fn connect_to_device(device: Device, cfg: &Config) -> Result<ConnectedState, Str
                 waterfall_db_low: cfg.waterfall_db_low.unwrap_or(-140.0),
                 waterfall_db_high: cfg.waterfall_db_high.unwrap_or(-60.0),
                 waterfall_db_low_auto: cfg.waterfall_db_low_auto.unwrap_or(false),
+                agc_auto: cfg.agc_auto.unwrap_or(false),
+                agc_auto_offset_db: cfg.agc_auto_offset_db.unwrap_or(-25.0),
                 tx_db_low: cfg.tx_db_low.unwrap_or(cfg.db_low.unwrap_or(-140.0)),
                 tx_db_high: cfg.tx_db_high.unwrap_or(cfg.db_high.unwrap_or(-40.0) + 60.0),
                 tx_waterfall_db_low: cfg
@@ -4205,7 +4226,7 @@ impl eframe::App for HpsdrApp {
                 // tracked minimum -- see waterfall_db_low_auto's own doc
                 // comment for why they share it rather than each
                 // computing their own copy of the same thing.
-                if (connected.db_low_auto || connected.waterfall_db_low_auto) && !transmitting {
+                if (connected.db_low_auto || connected.waterfall_db_low_auto || connected.agc_auto) && !transmitting {
                     let n = spectrum_row.len();
                     let edge = (n / AUTO_DB_LOW_EDGE_EXCLUDE_FRACTION).max(AUTO_DB_LOW_MIN_EDGE_EXCLUDE);
                     if n > edge * 2 {
@@ -4260,6 +4281,31 @@ impl eframe::App for HpsdrApp {
                                 // same headroom automatically.
                                 connected.waterfall_db_low =
                                     (smoothed + AUTO_WATERFALL_LOW_MARGIN_DB).clamp(-180.0, connected.waterfall_db_high - 1.0);
+                            }
+                            if connected.agc_auto {
+                                // Ported from deskHPSDR's rx_panadapter.c
+                                // (the block right after its own noise-
+                                // floor measurement): `target_agc =
+                                // -smoothed_noise_floor + agc_auto_offset`
+                                // -- as the tracked floor gets deeper
+                                // (more negative, a weaker band), -floor
+                                // grows, asking AGC Top for more gain;
+                                // as it gets shallower (a noisier/busier
+                                // band), less. agc_auto_offset (default
+                                // -25dB, their own UI range -35..-15)
+                                // keeps the target a bit below where the
+                                // floor itself would just touch AGC Top,
+                                // so genuine signal peaks above the floor
+                                // still have headroom instead of AGC
+                                // constantly re-triggering right at the
+                                // noise. Clamped to this app's own AGC
+                                // Top slider range (0..140, Settings ->
+                                // RX/toolbar) rather than deskHPSDR's
+                                // own -20..120 -- same idea, matches our
+                                // own control's actual valid range
+                                // instead of theirs.
+                                let target = (-smoothed + connected.agc_auto_offset_db).clamp(0.0, 140.0);
+                                connected.spectrum.set_agc_top_db(target as f64);
                             }
                         }
                     }
@@ -10190,6 +10236,43 @@ impl eframe::App for HpsdrApp {
                                         ui.separator();
                                     }
 
+                                    // Ported from deskHPSDR's own rx->agc_auto/
+                                    // agc_auto_offset (agc_menu.c/rx_panadapter.c):
+                                    // continuously re-targets AGC Top from the
+                                    // tracked noise floor instead of needing it
+                                    // set by hand -- see ConnectedState::agc_auto's
+                                    // own doc comment and the per-frame update
+                                    // site for the exact formula.
+                                    ui.horizontal(|ui| {
+                                        if ui
+                                            .checkbox(&mut connected.agc_auto, "AGC Auto")
+                                            .on_hover_text(
+                                                "Continuously re-target AGC Gain from the tracked \
+                                                 noise floor instead of a fixed value -- matches \
+                                                 deskHPSDR's own \"AGC Automatic\". AGC Gain above \
+                                                 becomes read-only while this is on.",
+                                            )
+                                            .changed()
+                                        {
+                                            settings_changed = true;
+                                        }
+                                        ui.add_enabled_ui(connected.agc_auto, |ui| {
+                                            ui.label("Offset:");
+                                            let mut offset = connected.agc_auto_offset_db;
+                                            if scroll_slider_f32(
+                                                ui,
+                                                &mut connected.slider_scroll_accum,
+                                                &mut offset,
+                                                -35.0..=-15.0,
+                                                1.0,
+                                            ) {
+                                                connected.agc_auto_offset_db = offset;
+                                                settings_changed = true;
+                                            }
+                                        });
+                                    });
+                                    ui.separator();
+
                                     ui.horizontal_wrapped(|ui| {
                                         let mut attack = agc_params.agc_attack_ms;
                                         ui.label("Attack:");
@@ -12936,6 +13019,8 @@ impl eframe::App for HpsdrApp {
                         waterfall_db_low: Some(connected.waterfall_db_low),
                         waterfall_db_high: Some(connected.waterfall_db_high),
                         waterfall_db_low_auto: Some(connected.waterfall_db_low_auto),
+                        agc_auto: Some(connected.agc_auto),
+                        agc_auto_offset_db: Some(connected.agc_auto_offset_db),
                         tx_db_low: Some(connected.tx_db_low),
                         tx_db_high: Some(connected.tx_db_high),
                         tx_waterfall_db_low: Some(connected.tx_waterfall_db_low),
@@ -18108,11 +18193,33 @@ fn redirect_stdio_to_log_file_if_requested() {
     if std::env::var_os("HPSDR_RS_LOG_FILE").is_none() {
         return;
     }
+    // BUG FIX for a real report: a colleague set HPSDR_RS_LOG_FILE=1 and
+    // saw completely normal console output (no redirect happened) but
+    // couldn't find any log file afterward -- every failure path here
+    // used to return silently (`let ... else { return; }`), so there
+    // was no way to tell from the output alone WHY it didn't work (no
+    // HOME env var? settings_dir() unwritable? File::create denied?).
+    // Printing the actual reason to the terminal the user is already
+    // looking at turns "the log file doesn't exist, no idea why" into
+    // something they can immediately read and report back.
     let Some(path) = debug_log::log_path("hpsdr-rs.log") else {
+        eprintln!(
+            "hpsdr-rs: HPSDR_RS_LOG_FILE set, but could not determine a settings \
+             directory to put hpsdr-rs.log in (see config::settings_dir -- likely \
+             $HOME is unset) -- continuing without file logging"
+        );
         return;
     };
-    let Ok(file) = std::fs::File::create(&path) else {
-        return;
+    let file = match std::fs::File::create(&path) {
+        Ok(f) => f,
+        Err(e) => {
+            eprintln!(
+                "hpsdr-rs: HPSDR_RS_LOG_FILE set, but could not create {}: {e} -- \
+                 continuing without file logging",
+                path.display()
+            );
+            return;
+        }
     };
     println!("hpsdr-rs: HPSDR_RS_LOG_FILE set -- sending stdout/stderr to {}", path.display());
     let fd = file.as_raw_fd();
