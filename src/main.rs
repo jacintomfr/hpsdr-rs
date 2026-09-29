@@ -1467,6 +1467,14 @@ struct PreDigitalFilters {
     tx_compressor: bool,
     tx_cfc: bool,
     tx_eq: bool,
+    /// See enter_digital_mode_filters' own doc comment -- a real
+    /// request: digital signals are narrow and often faint on a wide
+    /// panadapter, so entering the Digital Modes window zooms in (x8,
+    /// centered) to make one easier to find/tune, restoring whatever
+    /// zoom/pan the operator actually had on close, same "save then put
+    /// back" shape as everything else this struct already covers.
+    zoom: i32,
+    pan: f32,
 }
 
 struct ConnectedState {
@@ -16884,6 +16892,8 @@ fn enter_digital_mode_filters(connected: &mut ConnectedState) {
         tx_compressor: connected.tx_handle.as_ref().map(|tx| tx.compressor_enabled()).unwrap_or(false),
         tx_cfc: connected.tx_handle.as_ref().map(|tx| tx.cfc_enabled()).unwrap_or(false),
         tx_eq: tx_eq_enabled,
+        zoom: connected.spectrum_zoom,
+        pan: connected.spectrum_pan,
     });
     connected.spectrum.set_noise_blanker(spectrum::NoiseBlanker::Off);
     connected.spectrum.set_noise_reduction(spectrum::NoiseReduction::Off);
@@ -16896,6 +16906,8 @@ fn enter_digital_mode_filters(connected: &mut ConnectedState) {
         eq.enabled = false;
         tx.set_eq(eq);
     }
+    connected.spectrum_zoom = 8;
+    connected.spectrum_pan = 0.0;
 }
 
 /// Undo `enter_digital_mode_filters` -- see that function's and
@@ -16915,6 +16927,8 @@ fn restore_pre_digital_filters(connected: &mut ConnectedState) {
             eq.enabled = f.tx_eq;
             tx.set_eq(eq);
         }
+        connected.spectrum_zoom = f.zoom;
+        connected.spectrum_pan = f.pan;
     }
 }
 
