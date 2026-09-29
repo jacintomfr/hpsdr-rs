@@ -7333,38 +7333,39 @@ impl eframe::App for HpsdrApp {
                             // Thin outline on top of the fill, matching
                             // deskHPSDR's PAN_LINE_THIN (it uses a
                             // thicker bare line only when NOT filled).
-                            if connected.spectrum_gradient {
-                                for w in trace_points.windows(2) {
-                                    let mid_y = 0.5 * (w[0].y + w[1].y);
-                                    let t = ((db_at(mid_y) - gradient_floor_db) / gradient_red_span_db)
-                                        .clamp(0.0, 1.0);
-                                    ui.painter().line_segment(
-                                        [w[0], w[1]],
-                                        egui::Stroke::new(1.0, spectrum_gradient_color(t, 255)),
-                                    );
-                                }
-                            } else {
-                                ui.painter().add(egui::Shape::line(
-                                    trace_points,
-                                    egui::Stroke::new(1.0, egui::Color32::LIGHT_GREEN),
-                                ));
-                            }
+                            //
+                            // BUG FIX for a real report ("linha verde
+                            // picotada", TX mode): the Gradient case used
+                            // to draw this as many SEPARATE
+                            // painter().line_segment() calls, one per
+                            // point pair, each its own colour -- but each
+                            // call is antialiased independently, and a
+                            // near-perfectly-horizontal thin stroke (e.g.
+                            // a flat quiet noise floor either side of the
+                            // TX passband) is exactly the case where
+                            // adjacent segments' antialiasing doesn't
+                            // agree pixel-for-pixel, reading as a broken/
+                            // dotted line instead of one continuous one.
+                            // A single Shape::line call (one continuous
+                            // path, egui's own line-join/antialiasing)
+                            // has no such seam -- it just can't vary its
+                            // colour per point, so this now matches the
+                            // non-gradient outline exactly instead of
+                            // trying to rainbow the stroke too (the fill
+                            // underneath already carries the gradient).
+                            ui.painter().add(egui::Shape::line(
+                                trace_points,
+                                egui::Stroke::new(1.0, egui::Color32::LIGHT_GREEN),
+                            ));
                         } else if connected.spectrum_gradient {
-                            // Gradient without fill: deskHPSDR still
-                            // sources the (thicker, unfilled) stroke from
-                            // the same gradient pattern -- egui's Stroke
-                            // is one flat colour, so approximate with a
-                            // gradient-coloured line segment per point
-                            // pair instead of one Shape::line call.
-                            for w in trace_points.windows(2) {
-                                let mid_y = 0.5 * (w[0].y + w[1].y);
-                                let db = db_low + ((plot_bottom - mid_y) / plot_height.max(1.0)) * range;
-                                let t = ((db - gradient_floor_db) / gradient_red_span_db).clamp(0.0, 1.0);
-                                ui.painter().line_segment(
-                                    [w[0], w[1]],
-                                    egui::Stroke::new(1.5, spectrum_gradient_color(t, 255)),
-                                );
-                            }
+                            // Gradient without fill -- same seam issue
+                            // and same fix as the filled case just above:
+                            // one continuous Shape::line instead of many
+                            // separately-antialiased line_segment calls.
+                            ui.painter().add(egui::Shape::line(
+                                trace_points,
+                                egui::Stroke::new(1.5, egui::Color32::LIGHT_GREEN),
+                            ));
                         } else {
                             ui.painter().add(egui::Shape::line(
                                 trace_points,
