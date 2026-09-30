@@ -325,7 +325,7 @@ fn xvtr_for_rf_freq(xvtrs: &[Xvtr], rf_freq_hz: u32) -> Option<&Xvtr> {
 /// receiving on that band, `tx` while transmitting (see
 /// ConnectedState::oc_tune's doc comment for the global TUNE override
 /// ORed into `tx`).
-#[derive(Clone, Copy, Default, serde::Serialize, serde::Deserialize)]
+#[derive(Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
 pub struct OcMask {
     pub rx: u8,
     pub tx: u8,
@@ -347,6 +347,89 @@ pub enum FilterBoard {
     None,
     N2adr,
     N2adrTxOnly,
+}
+
+/// Same decimal OC values as deskHPSDR's own table, band for band --
+/// confirmed against its real source rather than reconstructed from the
+/// antenna switching logic. Module-level (not local to the Filter Board
+/// UI block) so detect_filter_board below can share it exactly -- two
+/// separate copies of this table drifting apart would silently break
+/// detection.
+const N2ADR_BANDS: [(&str, u8); 10] = [
+    ("160m", 1),
+    ("80m", 66),
+    ("60m", 68),
+    ("40m", 68),
+    ("30m", 72),
+    ("20m", 72),
+    ("17m", 80),
+    ("15m", 80),
+    ("12m", 96),
+    ("10m", 96),
+];
+
+/// What oc_settings would look like for a given Filter Board preset --
+/// shared by both detect_filter_board (below) and the Filter Board UI's
+/// own apply-on-click/checkbox-change logic, so there's exactly one
+/// place that encodes "what each preset actually means" in OC bits.
+fn filter_board_oc_settings(board: FilterBoard, hpf_enabled: bool) -> std::collections::HashMap<String, OcMask> {
+    let mut settings = std::collections::HashMap::new();
+    match board {
+        FilterBoard::None => {
+            for (name, _) in N2ADR_BANDS {
+                settings.insert(name.to_string(), OcMask::default());
+            }
+        }
+        FilterBoard::N2adr => {
+            for (name, val) in N2ADR_BANDS {
+                settings.insert(name.to_string(), OcMask { rx: val, tx: val });
+            }
+        }
+        FilterBoard::N2adrTxOnly => {
+            // Bit 6 (decimal 64) is the N2ADR board's own 3MHz HPF --
+            // deskHPSDR only ever sets it on Rx, never 160m (already
+            // below where it would help).
+            let hpf_rx = if hpf_enabled { 64 } else { 0 };
+            for (name, tx_val) in N2ADR_BANDS {
+                let rx_val = if name == "160m" { 0 } else { hpf_rx };
+                settings.insert(name.to_string(), OcMask { rx: rx_val, tx: tx_val });
+            }
+        }
+    }
+    settings
+}
+
+/// Reads back which Filter Board preset (if any) the CURRENT oc_settings
+/// actually matches -- a real request: with only a separately-stored
+/// "last clicked" flag, hand-editing the OC1-OC7 grid below (or loading
+/// an older config saved before this field existed) left the Filter
+/// Board buttons showing a highlight that no longer reflected reality.
+/// Comparing against the real oc_settings instead means the highlight
+/// (or lack of one, for an operator who wouldn't know how to read raw
+/// OC1-OC7 bits) is always trustworthy: orange only when oc_settings for
+/// every N2ADR_BANDS band exactly matches that preset, grey/no
+/// highlight (`None` return) when it matches none of the 3 -- including
+/// FilterBoard::None itself, which is just "OC1-OC7 all zero for these
+/// bands", so it's reported here like any other preset rather than
+/// being the default fallback.
+fn detect_filter_board(
+    oc_settings: &std::collections::HashMap<String, OcMask>,
+) -> Option<(FilterBoard, bool)> {
+    for (board, hpf) in [
+        (FilterBoard::None, false),
+        (FilterBoard::N2adr, false),
+        (FilterBoard::N2adrTxOnly, false),
+        (FilterBoard::N2adrTxOnly, true),
+    ] {
+        let expected = filter_board_oc_settings(board, hpf);
+        let matches = N2ADR_BANDS.iter().all(|(name, _)| {
+            oc_settings.get(*name).copied().unwrap_or_default() == expected[*name]
+        });
+        if matches {
+            return Some((board, hpf));
+        }
+    }
+    None
 }
 
 /// How often step_autogain (below) actually acts -- matches deskHPSDR's
@@ -2359,12 +2442,6 @@ struct ConnectedState {
     /// keep this a plain "fill in oc_settings" action rather than a new
     /// persistent mode fighting with the OC grid's own free-form editing.
     n2adr_hpf_enabled: bool,
-    /// Which "Filter Board" preset button is currently the active
-    /// selection -- see FilterBoard's own doc comment. Only gates
-    /// whether the "+Rx: N2ADR HPF 3MHz" checkbox is interactive right
-    /// now; the oc_settings grid stays the single source of truth for
-    /// what's actually applied, same as before.
-    filter_board: FilterBoard,
     /// "HL2 ADC Auto Gain RxPGA" -- ported from deskHPSDR's own
     /// autogain_enabled (rigctl.c's autogain_thread_function/rx_menu.c's
     /// add_hl2_autogain_controls, HermesLite2 only): while on, RX Gain
@@ -3507,8 +3584,12 @@ fn connect_to_device(device: Device, cfg: &Config) -> Result<ConnectedState, Str
                 // active_xvtr itself exists to avoid.
                 active_xvtr: cfg.active_xvtr.clone(),
                 oc_settings: cfg.oc_settings.clone(),
-                n2adr_hpf_enabled: false,
-                filter_board: FilterBoard::default(),
+                // Derived from oc_settings itself (already persisted)
+                // rather than a separate stored flag -- see
+                // detect_filter_board's own doc comment for why that's
+                // the more trustworthy source of truth. `None` (no match)
+                // falls back to HPF off, same as a fresh config.
+                n2adr_hpf_enabled: detect_filter_board(&cfg.oc_settings).map(|(_, hpf)| hpf).unwrap_or(false),
                 autogain_enabled: cfg.autogain_enabled.unwrap_or(false),
                 autogain_time_enabled: cfg.autogain_time_enabled.unwrap_or(false),
                 autogain_state: None,
@@ -11868,69 +11949,27 @@ impl eframe::App for HpsdrApp {
                                     // value there.
                                     ui.horizontal(|ui| {
                                         ui.label("Filter Board:");
-                                        // Same decimal OC values as
-                                        // deskHPSDR's own table, band for
-                                        // band -- confirmed against its
-                                        // real source rather than
-                                        // reconstructed from the antenna
-                                        // switching logic.
-                                        const N2ADR_BANDS: [(&str, u8); 10] = [
-                                            ("160m", 1),
-                                            ("80m", 66),
-                                            ("60m", 68),
-                                            ("40m", 68),
-                                            ("30m", 72),
-                                            ("20m", 72),
-                                            ("17m", 80),
-                                            ("15m", 80),
-                                            ("12m", 96),
-                                            ("10m", 96),
-                                        ];
-                                        // Fills oc_settings for the given
-                                        // selection -- shared by both the
-                                        // preset buttons below AND the HPF
-                                        // checkbox (a real report: with the
-                                        // old one-shot buttons, ticking the
-                                        // checkbox did nothing on its own,
-                                        // you had to click "N2ADR (LPF TX
-                                        // only)" again to see it take
-                                        // effect). Now a persistent
-                                        // selection, so any change to
-                                        // either just re-applies live.
-                                        let apply = |board: FilterBoard, hpf_enabled: bool| {
-                                            let mut settings = std::collections::HashMap::new();
-                                            match board {
-                                                FilterBoard::None => {
-                                                    for (name, _) in N2ADR_BANDS {
-                                                        settings.insert(name.to_string(), OcMask::default());
-                                                    }
-                                                }
-                                                FilterBoard::N2adr => {
-                                                    for (name, val) in N2ADR_BANDS {
-                                                        settings.insert(name.to_string(), OcMask { rx: val, tx: val });
-                                                    }
-                                                }
-                                                FilterBoard::N2adrTxOnly => {
-                                                    // Bit 6 (decimal 64) is
-                                                    // the N2ADR board's own
-                                                    // 3MHz HPF -- deskHPSDR
-                                                    // only ever sets it on
-                                                    // Rx, never 160m
-                                                    // (already below where
-                                                    // it would help).
-                                                    let hpf_rx = if hpf_enabled { 64 } else { 0 };
-                                                    for (name, tx_val) in N2ADR_BANDS {
-                                                        let rx_val = if name == "160m" { 0 } else { hpf_rx };
-                                                        settings.insert(name.to_string(), OcMask { rx: rx_val, tx: tx_val });
-                                                    }
-                                                }
-                                            }
-                                            settings
-                                        };
-                                        let mut apply_now = false;
+                                        // Read back which preset (if any)
+                                        // the REAL oc_settings currently
+                                        // match -- see
+                                        // detect_filter_board's own doc
+                                        // comment. A real request: this
+                                        // is what actually lets an
+                                        // operator who wouldn't know how
+                                        // to read raw OC1-OC7 bits still
+                                        // see, at a glance, which preset
+                                        // (orange) or none of them (all 3
+                                        // grey -- e.g. after hand-editing
+                                        // the grid below) is active right
+                                        // now, and it's automatically
+                                        // "remembered" across a restart
+                                        // for free since oc_settings
+                                        // itself is already persisted.
+                                        let detected = detect_filter_board(&connected.oc_settings);
+                                        let mut apply_now = None;
                                         if ui
                                             .add(egui::Button::selectable(
-                                                connected.filter_board == FilterBoard::N2adr,
+                                                detected.is_some_and(|(b, _)| b == FilterBoard::N2adr),
                                                 "N2ADR (LPF RX + TX + HPF)",
                                             ))
                                             .on_hover_text(
@@ -11939,12 +11978,11 @@ impl eframe::App for HpsdrApp {
                                             )
                                             .clicked()
                                         {
-                                            connected.filter_board = FilterBoard::N2adr;
-                                            apply_now = true;
+                                            apply_now = Some(FilterBoard::N2adr);
                                         }
                                         if ui
                                             .add(egui::Button::selectable(
-                                                connected.filter_board == FilterBoard::N2adrTxOnly,
+                                                detected.is_some_and(|(b, _)| b == FilterBoard::N2adrTxOnly),
                                                 "N2ADR (LPF TX only)",
                                             ))
                                             .on_hover_text(
@@ -11955,8 +11993,7 @@ impl eframe::App for HpsdrApp {
                                             )
                                             .clicked()
                                         {
-                                            connected.filter_board = FilterBoard::N2adrTxOnly;
-                                            apply_now = true;
+                                            apply_now = Some(FilterBoard::N2adrTxOnly);
                                         }
                                         // Only meaningful (and only
                                         // interactive) while "N2ADR (LPF TX
@@ -11964,7 +12001,7 @@ impl eframe::App for HpsdrApp {
                                         // a real report: this used to stay
                                         // clickable no matter which (if
                                         // any) preset was last applied.
-                                        ui.add_enabled_ui(connected.filter_board == FilterBoard::N2adrTxOnly, |ui| {
+                                        ui.add_enabled_ui(detected.is_some_and(|(b, _)| b == FilterBoard::N2adrTxOnly), |ui| {
                                             if ui
                                                 .checkbox(&mut connected.n2adr_hpf_enabled, "+Rx: N2ADR HPF 3MHz")
                                                 .on_hover_text(
@@ -11973,22 +12010,21 @@ impl eframe::App for HpsdrApp {
                                                 )
                                                 .changed()
                                             {
-                                                apply_now = true;
+                                                apply_now = Some(FilterBoard::N2adrTxOnly);
                                             }
                                         });
                                         if ui
                                             .add(egui::Button::selectable(
-                                                connected.filter_board == FilterBoard::None,
+                                                detected.is_some_and(|(b, _)| b == FilterBoard::None),
                                                 "None",
                                             ))
                                             .on_hover_text("Clears OC1-OC7 to 0 for every band.")
                                             .clicked()
                                         {
-                                            connected.filter_board = FilterBoard::None;
-                                            apply_now = true;
+                                            apply_now = Some(FilterBoard::None);
                                         }
-                                        if apply_now {
-                                            for (name, mask) in apply(connected.filter_board, connected.n2adr_hpf_enabled) {
+                                        if let Some(board) = apply_now {
+                                            for (name, mask) in filter_board_oc_settings(board, connected.n2adr_hpf_enabled) {
                                                 connected.oc_settings.insert(name, mask);
                                             }
                                             settings_changed = true;
