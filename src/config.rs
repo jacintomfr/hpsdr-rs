@@ -602,6 +602,12 @@ pub struct Config {
     /// doc comment.
     #[serde(default)]
     pub oc_tune: u8,
+    /// See main.rs's FilterBoard/ConnectedState::n2adr_hpf_enabled own
+    /// doc comments.
+    #[serde(default)]
+    pub filter_board: Option<crate::FilterBoard>,
+    #[serde(default)]
+    pub n2adr_hpf_enabled: Option<bool>,
     /// Per-band (or XVTR) RX/TX antenna port selection -- see main.rs's
     /// AntennaMask struct doc comment. Keyed by band/XVTR name, same
     /// pattern as oc_settings above. `#[serde(default)]` so configs saved
