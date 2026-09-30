@@ -221,7 +221,7 @@ priority = "optional"
 # treats a new package as an upgrade if ITS version string (crate
 # version + this revision) actually differs from what's installed, so
 # reusing the same version+revision needs a manual `dpkg -r` first.
-revision = "15"
+revision = "16"
 assets = [
     ["target/release/hpsdr-rs", "usr/bin/", "755"],
     ["README.md", "usr/share/doc/hpsdr-rs/README.md", "644"],

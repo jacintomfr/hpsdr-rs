@@ -5765,14 +5765,43 @@ impl eframe::App for HpsdrApp {
                             // conversion happens at this UI boundary only.
                             let mut gain_db =
                                 connected.session.rx_attenuation.load(Ordering::Relaxed) as i32 - 12;
-                            ui.label("RX Gain:");
+                            // On HermesLite2, the "RX Gain:" label itself
+                            // becomes a clickable "RxPGA" toggle for "HL2
+                            // ADC Auto Gain RxPGA" (deskHPSDR's own
+                            // rx_menu.c control, same algorithm -- see
+                            // step_autogain's doc comment) -- grey when
+                            // off, the same highlighted colour every
+                            // other selectable button in this toolbar
+                            // uses (Split/CTUN/band buttons) when on.
+                            // REAL BUG FIX: an earlier version added this
+                            // as two full checkbox rows instead, which
+                            // broke this toolbar's carefully-tuned
+                            // layout -- reusing the existing label's own
+                            // space instead adds no new rows at all. The
+                            // secondary "HL2 Auto Gain time-regulated"
+                            // option lives in Settings -> RX now, not
+                            // here, for the same reason.
+                            if connected.device.board == Boards::HermesLite2 {
+                                if ui
+                                    .add(egui::Button::selectable(connected.autogain_enabled, "RxPGA"))
+                                    .on_hover_text(
+                                        "HL2 ADC Auto Gain RxPGA -- Activate RF Gain Automatic:\nControl \
+                                         and set the ADC to max. 75% level\nfor protect ADC against \
+                                         overflows. See Settings -> RX for the time-regulated re-probe \
+                                         option.",
+                                    )
+                                    .clicked()
+                                {
+                                    connected.autogain_enabled = !connected.autogain_enabled;
+                                    settings_changed = true;
+                                }
+                            } else {
+                                ui.label("RX Gain:");
+                            }
                             // Read-only while autogain is driving it --
-                            // same reasoning as any other automatic
-                            // control overriding a manual one (e.g. AGC
-                            // Auto's own Gain slider, added earlier this
-                            // session) -- dragging it while autogain is
-                            // also writing to it every 0.5s would just
-                            // fight the automation.
+                            // dragging it while autogain is also writing
+                            // to it every 0.5s would just fight the
+                            // automation.
                             ui.add_enabled_ui(!connected.autogain_enabled, |ui| {
                                 if stable_i32_slider(
                                     ui,
@@ -5789,40 +5818,6 @@ impl eframe::App for HpsdrApp {
                                     settings_changed = true;
                                 }
                             });
-                            // "HL2 ADC Auto Gain RxPGA"/"HL2 Auto Gain
-                            // time-regulated" -- ported from deskHPSDR's
-                            // own rx_menu.c (add_hl2_autogain_controls),
-                            // same two checkboxes, same wording/
-                            // tooltips, same HermesLite2-only gating
-                            // (their __AUTOG__ feature; unlike a build-
-                            // time #ifdef, this app doesn't need one --
-                            // it's just hidden when the board doesn't
-                            // match). See step_autogain's own doc
-                            // comment for the algorithm this drives.
-                            if connected.device.board == Boards::HermesLite2 {
-                                if ui
-                                    .checkbox(&mut connected.autogain_enabled, "HL2 ADC Auto Gain RxPGA")
-                                    .on_hover_text(
-                                        "Activate RF Gain Automatic:\nControl and set the ADC to max. \
-                                         75% level\nfor protect ADC against overflows",
-                                    )
-                                    .changed()
-                                {
-                                    settings_changed = true;
-                                }
-                                ui.add_enabled_ui(connected.autogain_enabled, |ui| {
-                                    if ui
-                                        .checkbox(&mut connected.autogain_time_enabled, "HL2 Auto Gain time-regulated")
-                                        .on_hover_text(
-                                            "Re-adjust RF Gain Automatic every 30s\nIf OFF, RF Gain \
-                                             Automatic adjust only one-time\nif band was changed",
-                                        )
-                                        .changed()
-                                    {
-                                        settings_changed = true;
-                                    }
-                                });
-                            }
                         } else {
                             if has_alex_att {
                                 let mut alex_atten =
@@ -10547,6 +10542,34 @@ impl eframe::App for HpsdrApp {
                                         });
                                     });
                                     ui.separator();
+
+                                    // "HL2 Auto Gain time-regulated" --
+                                    // ported from deskHPSDR's own
+                                    // rx_menu.c (add_hl2_autogain_
+                                    // controls) -- see the toolbar's own
+                                    // RxPGA toggle for the main "HL2 ADC
+                                    // Auto Gain RxPGA" switch and
+                                    // step_autogain's doc comment for the
+                                    // algorithm this affects.
+                                    if connected.device.board == Boards::HermesLite2 {
+                                        ui.add_enabled_ui(connected.autogain_enabled, |ui| {
+                                            if ui
+                                                .checkbox(
+                                                    &mut connected.autogain_time_enabled,
+                                                    "HL2 Auto Gain time-regulated",
+                                                )
+                                                .on_hover_text(
+                                                    "Re-adjust RF Gain Automatic every 30s\nIf OFF, RF \
+                                                     Gain Automatic adjust only one-time\nif band was \
+                                                     changed",
+                                                )
+                                                .changed()
+                                            {
+                                                settings_changed = true;
+                                            }
+                                        });
+                                        ui.separator();
+                                    }
 
                                     ui.horizontal_wrapped(|ui| {
                                         let mut attack = agc_params.agc_attack_ms;
