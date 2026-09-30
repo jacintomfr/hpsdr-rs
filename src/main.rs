@@ -331,6 +331,24 @@ pub struct OcMask {
     pub tx: u8,
 }
 
+/// Which "Filter Board" preset is currently selected -- see the
+/// SettingsTab::OpenCollector block's own comment for the full story.
+/// A real report: the original 3 buttons were one-shot actions with no
+/// memory of which was last applied, so the "+Rx: N2ADR HPF 3MHz"
+/// checkbox stayed clickable even when nothing N2ADR-related was
+/// selected, and toggling it didn't do anything until a preset button
+/// was clicked again. Making the selection persistent (mutually
+/// exclusive, egui::Button::selectable like Split/CTUN/RxPGA elsewhere
+/// in this UI) lets the checkbox's own enabled state reflect whether it
+/// actually means anything right now.
+#[derive(Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
+pub enum FilterBoard {
+    #[default]
+    None,
+    N2adr,
+    N2adrTxOnly,
+}
+
 /// How often step_autogain (below) actually acts -- matches deskHPSDR's
 /// own inner adjustment loops, which both step once per 0.5s
 /// (`g_usleep(500000)`) while ramping.
@@ -2341,6 +2359,12 @@ struct ConnectedState {
     /// keep this a plain "fill in oc_settings" action rather than a new
     /// persistent mode fighting with the OC grid's own free-form editing.
     n2adr_hpf_enabled: bool,
+    /// Which "Filter Board" preset button is currently the active
+    /// selection -- see FilterBoard's own doc comment. Only gates
+    /// whether the "+Rx: N2ADR HPF 3MHz" checkbox is interactive right
+    /// now; the oc_settings grid stays the single source of truth for
+    /// what's actually applied, same as before.
+    filter_board: FilterBoard,
     /// "HL2 ADC Auto Gain RxPGA" -- ported from deskHPSDR's own
     /// autogain_enabled (rigctl.c's autogain_thread_function/rx_menu.c's
     /// add_hl2_autogain_controls, HermesLite2 only): while on, RX Gain
@@ -3484,6 +3508,7 @@ fn connect_to_device(device: Device, cfg: &Config) -> Result<ConnectedState, Str
                 active_xvtr: cfg.active_xvtr.clone(),
                 oc_settings: cfg.oc_settings.clone(),
                 n2adr_hpf_enabled: false,
+                filter_board: FilterBoard::default(),
                 autogain_enabled: cfg.autogain_enabled.unwrap_or(false),
                 autogain_time_enabled: cfg.autogain_time_enabled.unwrap_or(false),
                 autogain_state: None,
@@ -5782,8 +5807,21 @@ impl eframe::App for HpsdrApp {
                             // option lives in Settings -> RX now, not
                             // here, for the same reason.
                             if connected.device.board == Boards::HermesLite2 {
+                                // REAL BUG FIX (a real report): egui::Grid sizes
+                                // column 0 to the widest cell across BOTH rows --
+                                // the framed/padded selectable Button is wider
+                                // than plain text, so leaving it unsized here
+                                // widened column 0 past "Audio gain:"'s own
+                                // width and shoved that row's slider/value box
+                                // to the right. Sizing it explicitly to
+                                // audio_gain_label_width (this row's own
+                                // column-0 label, measured just above) keeps
+                                // column 0 exactly as wide as before.
                                 if ui
-                                    .add(egui::Button::selectable(connected.autogain_enabled, "RxPGA"))
+                                    .add_sized(
+                                        [audio_gain_label_width, ui.spacing().interact_size.y],
+                                        egui::Button::selectable(connected.autogain_enabled, "RxPGA:"),
+                                    )
                                     .on_hover_text(
                                         "HL2 ADC Auto Gain RxPGA -- Activate RF Gain Automatic:\nControl \
                                          and set the ADC to max. 75% level\nfor protect ADC against \
@@ -11844,23 +11882,67 @@ impl eframe::App for HpsdrApp {
                                             ("12m", 96),
                                             ("10m", 96),
                                         ];
+                                        // Fills oc_settings for the given
+                                        // selection -- shared by both the
+                                        // preset buttons below AND the HPF
+                                        // checkbox (a real report: with the
+                                        // old one-shot buttons, ticking the
+                                        // checkbox did nothing on its own,
+                                        // you had to click "N2ADR (LPF TX
+                                        // only)" again to see it take
+                                        // effect). Now a persistent
+                                        // selection, so any change to
+                                        // either just re-applies live.
+                                        let apply = |board: FilterBoard, hpf_enabled: bool| {
+                                            let mut settings = std::collections::HashMap::new();
+                                            match board {
+                                                FilterBoard::None => {
+                                                    for (name, _) in N2ADR_BANDS {
+                                                        settings.insert(name.to_string(), OcMask::default());
+                                                    }
+                                                }
+                                                FilterBoard::N2adr => {
+                                                    for (name, val) in N2ADR_BANDS {
+                                                        settings.insert(name.to_string(), OcMask { rx: val, tx: val });
+                                                    }
+                                                }
+                                                FilterBoard::N2adrTxOnly => {
+                                                    // Bit 6 (decimal 64) is
+                                                    // the N2ADR board's own
+                                                    // 3MHz HPF -- deskHPSDR
+                                                    // only ever sets it on
+                                                    // Rx, never 160m
+                                                    // (already below where
+                                                    // it would help).
+                                                    let hpf_rx = if hpf_enabled { 64 } else { 0 };
+                                                    for (name, tx_val) in N2ADR_BANDS {
+                                                        let rx_val = if name == "160m" { 0 } else { hpf_rx };
+                                                        settings.insert(name.to_string(), OcMask { rx: rx_val, tx: tx_val });
+                                                    }
+                                                }
+                                            }
+                                            settings
+                                        };
+                                        let mut apply_now = false;
                                         if ui
-                                            .button("N2ADR (LPF RX+TX+HPF)")
+                                            .add(egui::Button::selectable(
+                                                connected.filter_board == FilterBoard::N2adr,
+                                                "N2ADR (LPF RX + TX + HPF)",
+                                            ))
                                             .on_hover_text(
                                                 "Fills in OC1-OC7 for every band to switch the \
                                                  N2ADR board's low-pass filter on both Rx and Tx.",
                                             )
                                             .clicked()
                                         {
-                                            for (name, val) in N2ADR_BANDS {
-                                                connected
-                                                    .oc_settings
-                                                    .insert(name.to_string(), OcMask { rx: val, tx: val });
-                                            }
-                                            settings_changed = true;
+                                            connected.filter_board = FilterBoard::N2adr;
+                                            apply_now = true;
                                         }
                                         if ui
-                                            .button("N2ADR (LPF TX only)")
+                                            .add(egui::Button::selectable(
+                                                connected.filter_board == FilterBoard::N2adrTxOnly,
+                                                "N2ADR (LPF TX only)",
+                                            ))
                                             .on_hover_text(
                                                 "Fills in OC1-OC7 to switch the N2ADR board's \
                                                  low-pass filter on Tx only -- Rx stays off (or \
@@ -11869,37 +11951,41 @@ impl eframe::App for HpsdrApp {
                                             )
                                             .clicked()
                                         {
-                                            // Bit 6 (decimal 64) is the
-                                            // N2ADR board's own 3MHz HPF --
-                                            // deskHPSDR only ever sets it
-                                            // on Rx, never 160m (already
-                                            // below where it would help).
-                                            let hpf_rx = if connected.n2adr_hpf_enabled { 64 } else { 0 };
-                                            for (name, tx_val) in N2ADR_BANDS {
-                                                let rx_val = if name == "160m" { 0 } else { hpf_rx };
-                                                connected
-                                                    .oc_settings
-                                                    .insert(name.to_string(), OcMask { rx: rx_val, tx: tx_val });
+                                            connected.filter_board = FilterBoard::N2adrTxOnly;
+                                            apply_now = true;
+                                        }
+                                        // Only meaningful (and only
+                                        // interactive) while "N2ADR (LPF TX
+                                        // only)" is the active selection --
+                                        // a real report: this used to stay
+                                        // clickable no matter which (if
+                                        // any) preset was last applied.
+                                        ui.add_enabled_ui(connected.filter_board == FilterBoard::N2adrTxOnly, |ui| {
+                                            if ui
+                                                .checkbox(&mut connected.n2adr_hpf_enabled, "+Rx: N2ADR HPF 3MHz")
+                                                .on_hover_text(
+                                                    "Only used by \"N2ADR (LPF TX only)\" -- takes \
+                                                     effect immediately.",
+                                                )
+                                                .changed()
+                                            {
+                                                apply_now = true;
                                             }
-                                            settings_changed = true;
-                                        }
+                                        });
                                         if ui
-                                            .checkbox(&mut connected.n2adr_hpf_enabled, "+Rx: N2ADR HPF 3MHz")
-                                            .on_hover_text(
-                                                "Only used by \"N2ADR (LPF TX only)\" above -- click \
-                                                 that button again after changing this to apply it.",
-                                            )
-                                            .changed()
-                                        {
-                                            settings_changed = true;
-                                        }
-                                        if ui
-                                            .button("None")
+                                            .add(egui::Button::selectable(
+                                                connected.filter_board == FilterBoard::None,
+                                                "None",
+                                            ))
                                             .on_hover_text("Clears OC1-OC7 to 0 for every band.")
                                             .clicked()
                                         {
-                                            for (name, _) in N2ADR_BANDS {
-                                                connected.oc_settings.insert(name.to_string(), OcMask::default());
+                                            connected.filter_board = FilterBoard::None;
+                                            apply_now = true;
+                                        }
+                                        if apply_now {
+                                            for (name, mask) in apply(connected.filter_board, connected.n2adr_hpf_enabled) {
+                                                connected.oc_settings.insert(name, mask);
                                             }
                                             settings_changed = true;
                                         }
