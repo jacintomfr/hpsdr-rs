@@ -349,6 +349,24 @@ pub enum FilterBoard {
     N2adrTxOnly,
 }
 
+impl FilterBoard {
+    /// Same order/wording as deskHPSDR's own filter_combo (radio_menu.c)
+    /// -- only its N2ADR-related entries; ALEX/APOLLO/CHARLY25 compute
+    /// no OC values there at all (they only reapply Alex antenna
+    /// settings, which this app already handles separately), so aren't
+    /// reproduced here. Ordered so a future preset can just be appended
+    /// without renumbering these.
+    const ALL: [FilterBoard; 3] = [FilterBoard::None, FilterBoard::N2adr, FilterBoard::N2adrTxOnly];
+
+    fn label(self) -> &'static str {
+        match self {
+            FilterBoard::None => "None",
+            FilterBoard::N2adr => "N2ADR (LPF RX + TX + HPF)",
+            FilterBoard::N2adrTxOnly => "N2ADR (LPF TX only)",
+        }
+    }
+}
+
 /// Same decimal OC values as deskHPSDR's own table, band for band --
 /// confirmed against its real source rather than reconstructed from the
 /// antenna switching logic. Module-level (not local to the Filter Board
@@ -11965,42 +11983,48 @@ impl eframe::App for HpsdrApp {
                                         // "remembered" across a restart
                                         // for free since oc_settings
                                         // itself is already persisted.
+                                        // Dropdown (a real request) instead
+                                        // of 3 side-by-side buttons -- matches
+                                        // deskHPSDR's own filter_combo
+                                        // (radio_menu.c) layout, and leaves
+                                        // room to append a future preset
+                                        // without the row growing wider
+                                        // every time (see FilterBoard::ALL's
+                                        // own doc comment).
                                         let detected = detect_filter_board(&connected.oc_settings);
+                                        let current = detected.map(|(b, _)| b).unwrap_or_default();
                                         let mut apply_now = None;
-                                        if ui
-                                            .add(egui::Button::selectable(
-                                                detected.is_some_and(|(b, _)| b == FilterBoard::N2adr),
-                                                "N2ADR (LPF RX + TX + HPF)",
-                                            ))
-                                            .on_hover_text(
-                                                "Fills in OC1-OC7 for every band to switch the \
-                                                 N2ADR board's low-pass filter on both Rx and Tx.",
-                                            )
-                                            .clicked()
-                                        {
-                                            apply_now = Some(FilterBoard::N2adr);
-                                        }
-                                        if ui
-                                            .add(egui::Button::selectable(
-                                                detected.is_some_and(|(b, _)| b == FilterBoard::N2adrTxOnly),
-                                                "N2ADR (LPF TX only)",
-                                            ))
-                                            .on_hover_text(
-                                                "Fills in OC1-OC7 to switch the N2ADR board's \
-                                                 low-pass filter on Tx only -- Rx stays off (or \
-                                                 the 3MHz HPF only, see the checkbox) so the \
-                                                 board's LPF doesn't narrow the receiver.",
-                                            )
-                                            .clicked()
-                                        {
-                                            apply_now = Some(FilterBoard::N2adrTxOnly);
-                                        }
+                                        egui::ComboBox::from_id_salt("filter_board")
+                                            .width(200.0)
+                                            .selected_text(match detected {
+                                                Some((b, _)) => b.label(),
+                                                // No known preset matches --
+                                                // same "grey"/non-committal
+                                                // idea as the button version's
+                                                // all-grey state, just spelled
+                                                // out since a ComboBox always
+                                                // shows exactly one label.
+                                                None => "(custom OC1-OC7)",
+                                            })
+                                            .show_ui(ui, |ui| {
+                                                for board in FilterBoard::ALL {
+                                                    if ui.selectable_label(current == board && detected.is_some(), board.label()).clicked() {
+                                                        apply_now = Some(board);
+                                                    }
+                                                }
+                                            });
                                         // Only meaningful (and only
                                         // interactive) while "N2ADR (LPF TX
                                         // only)" is the active selection --
-                                        // a real report: this used to stay
-                                        // clickable no matter which (if
-                                        // any) preset was last applied.
+                                        // matches deskHPSDR's own
+                                        // n2adr_hpf_btn sensitivity exactly
+                                        // (radio_menu.c: gtk_widget_set_
+                                        // sensitive(n2adr_hpf_btn, TRUE) only
+                                        // in the N2ADR_TX case, FALSE
+                                        // everywhere else) -- a real report:
+                                        // this used to stay clickable no
+                                        // matter which (if any) preset was
+                                        // last applied.
                                         ui.add_enabled_ui(detected.is_some_and(|(b, _)| b == FilterBoard::N2adrTxOnly), |ui| {
                                             if ui
                                                 .checkbox(&mut connected.n2adr_hpf_enabled, "+Rx: N2ADR HPF 3MHz")
@@ -12013,16 +12037,6 @@ impl eframe::App for HpsdrApp {
                                                 apply_now = Some(FilterBoard::N2adrTxOnly);
                                             }
                                         });
-                                        if ui
-                                            .add(egui::Button::selectable(
-                                                detected.is_some_and(|(b, _)| b == FilterBoard::None),
-                                                "None",
-                                            ))
-                                            .on_hover_text("Clears OC1-OC7 to 0 for every band.")
-                                            .clicked()
-                                        {
-                                            apply_now = Some(FilterBoard::None);
-                                        }
                                         if let Some(board) = apply_now {
                                             for (name, mask) in filter_board_oc_settings(board, connected.n2adr_hpf_enabled) {
                                                 connected.oc_settings.insert(name, mask);
