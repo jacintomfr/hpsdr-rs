@@ -1,6 +1,7 @@
 [submodule "vendor/rade_c"]
 	path = vendor/rade_c
-	url = https://github.com/freedv/rade_c
+	url = https://github.com/jacintomfr/rade_c
+	branch = hpsdr-rs-local
 [submodule "vendor/rnnoise"]
 	path = vendor/rnnoise
 	url = https://github.com/xiph/rnnoise
