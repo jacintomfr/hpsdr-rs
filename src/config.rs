@@ -886,6 +886,33 @@ pub fn save_last_manual_ip(ip: &str) {
     }
 }
 
+/// Where an auto-saved SSTV RX picture goes -- same directory/naming
+/// convention as audio_recorder::recording_path (own subdirectory under
+/// settings_dir, epoch-seconds + a label in the filename so two images
+/// completing in the same second can't collide) -- a real request:
+/// "faz gravação das imagens que recebe... os programas de SSTV tipo
+/// QSSTV fazem isso", matching that reference app's own default
+/// behaviour of saving every decoded picture without the operator
+/// having to manually export it.
+pub fn sstv_image_path(mode_label: &str) -> Option<PathBuf> {
+    let mut dir = sstv_image_dir()?;
+    std::fs::create_dir_all(&dir).ok()?;
+    let epoch_secs =
+        std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).ok()?.as_secs();
+    dir.push(format!("hpsdr-rs_{epoch_secs}_{mode_label}.png"));
+    Some(dir)
+}
+
+/// Just the folder, no filename/directory-creation side effect -- for
+/// showing the operator where auto-saved pictures go (a hover tooltip)
+/// without generating a throwaway filename/touching the filesystem on
+/// every frame it's shown.
+pub fn sstv_image_dir() -> Option<PathBuf> {
+    let mut dir = settings_dir()?;
+    dir.push("sstv_images");
+    Some(dir)
+}
+
 /// A window's on-screen position and content size, in egui points
 /// (matches `egui::ViewportBuilder::with_position`/`with_inner_size`'s
 /// units -- see Config::window_geometry/ExtraReceiverConfig::window_geometry).

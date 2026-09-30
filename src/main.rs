@@ -1660,6 +1660,14 @@ struct ConnectedState {
     /// to actually target, leaving headroom for real signal peaks above
     /// the floor instead of AGC constantly re-triggering right at it.
     agc_auto_offset_db: f32,
+    /// Which of the two RADE RX/TX filter widths render_rade_panel's own
+    /// Fit Filter button last left active -- see that click handler's own
+    /// doc comment (rotates deskHPSDR's 700-2300Hz figure and SDRoxide's
+    /// wider 300-2700Hz one on every click, a real request to A/B the
+    /// two on real hardware). `false` (deskHPSDR's figure) is the
+    /// starting point, matching this app's own prior behaviour before
+    /// this toggle existed.
+    rade_filter_wide: bool,
     /// Spectrum/waterfall display range while transmitting -- see
     /// Config's field docs for why these are separate from the RX
     /// ones above rather than a fixed offset applied at render time.
@@ -3149,6 +3157,7 @@ fn connect_to_device(device: Device, cfg: &Config) -> Result<ConnectedState, Str
                 waterfall_db_low_auto: cfg.waterfall_db_low_auto.unwrap_or(false),
                 agc_auto: cfg.agc_auto.unwrap_or(false),
                 agc_auto_offset_db: cfg.agc_auto_offset_db.unwrap_or(-25.0),
+                rade_filter_wide: false,
                 tx_db_low: cfg.tx_db_low.unwrap_or(cfg.db_low.unwrap_or(-140.0)),
                 tx_db_high: cfg.tx_db_high.unwrap_or(cfg.db_high.unwrap_or(-40.0) + 60.0),
                 tx_waterfall_db_low: cfg
@@ -12548,6 +12557,19 @@ impl eframe::App for HpsdrApp {
                     let mut fit_filter_clicked = false;
                     let mut sstv_fit_filter_clicked = false;
                     let mut rade_fit_filter_clicked = false;
+                    // BUG FIX for a real report: rade_fit_filter_clicked
+                    // above also fires on plain tab-switches/Quick-Tune
+                    // sign corrections (see its own several set sites),
+                    // not just a real "Fit Filter" button press -- and
+                    // the RX width rotation (rade_filter_wide, see its
+                    // own doc comment) must ONLY happen on an actual
+                    // press, or just switching to the RADE tab silently
+                    // rotates the width before the operator ever touches
+                    // the button (confirmed: reported default RX width
+                    // was already SDRoxide's on a fresh connect). This
+                    // stays false except when render_rade_panel's own
+                    // Fit Filter button itself reports `clicked`.
+                    let mut rade_filter_rotate_clicked = false;
                     // See SSTV_QUICK_TUNE_HZ/RADE_QUICK_TUNE_HZ's own doc
                     // comments -- Some(hz) when a Quick Tune button was
                     // clicked this frame, applied after the closure below
@@ -12706,8 +12728,10 @@ impl eframe::App for HpsdrApp {
                                                 rade_callsign,
                                                 mox,
                                                 tx_handle_ref,
+                                                connected.rade_filter_wide,
                                             );
                                             rade_fit_filter_clicked |= clicked;
+                                            rade_filter_rotate_clicked |= clicked;
                                             digital_quick_tune_hz = digital_quick_tune_hz.or(quick_tune);
                                             rade_mox_request = rade_mox_request.or(mox_request);
                                         }
@@ -12847,22 +12871,46 @@ impl eframe::App for HpsdrApp {
                         // filter preset (`{ 700, 2300, "FreeDV/RADEV1" }`,
                         // `src/filter.c:162`, mirrored as
                         // `{-2300, -700, ...}` on LSB/DIGL). Went with
-                        // deskHPSDR's narrower, exact figure here --
+                        // deskHPSDR's narrower, exact figure by default --
                         // still comfortably wider than the old 1010-1930
                         // band, same reasoning as SDRoxide's own (margin
                         // for a signal/dial slightly off frequency), just
                         // a tighter fit than SDRoxide's own choice.
-                        let low = 700.0;
-                        let high = 2300.0;
-                        let passband = if matches!(mode, spectrum::Mode::Lsb | spectrum::Mode::Digl) {
+                        //
+                        // RX only, on a real request: TX keeps this exact
+                        // figure fixed as before (already tuned/confirmed
+                        // over real air tests earlier), only the RX
+                        // passband -- the weak-signal decode-quality
+                        // correction Fit Filter is actually being used to
+                        // A/B here -- rotates between that figure and
+                        // SDRoxide's own wider one on every click, to
+                        // compare the two on real hardware across a test
+                        // session instead of needing a separate control
+                        // to remember to flip.
+                        let tx_passband = if matches!(mode, spectrum::Mode::Lsb | spectrum::Mode::Digl) {
+                            (-2300.0, -700.0)
+                        } else {
+                            (700.0, 2300.0)
+                        };
+                        if let Some(tx) = &connected.tx_handle {
+                            tx.set_explicit_passband(Some(tx_passband));
+                        }
+                        // Only an actual Fit Filter button press rotates
+                        // the width -- a tab-switch or Quick-Tune sign
+                        // correction (this block's other trigger sites)
+                        // just reapplies whichever width was already
+                        // active, unchanged. See
+                        // rade_filter_rotate_clicked's own doc comment.
+                        if rade_filter_rotate_clicked {
+                            connected.rade_filter_wide = !connected.rade_filter_wide;
+                        }
+                        let (low, high) = if connected.rade_filter_wide { (300.0, 2700.0) } else { (700.0, 2300.0) };
+                        let rx_passband = if matches!(mode, spectrum::Mode::Lsb | spectrum::Mode::Digl) {
                             (-high, -low)
                         } else {
                             (low, high)
                         };
-                        connected.spectrum.set_explicit_passband(Some(passband));
-                        if let Some(tx) = &connected.tx_handle {
-                            tx.set_explicit_passband(Some(passband));
-                        }
+                        connected.spectrum.set_explicit_passband(Some(rx_passband));
                         settings_changed = true;
                     }
                     if close_requested {
@@ -13873,6 +13921,23 @@ fn render_sstv_panel(
         {
             fit_filter_clicked = true;
         }
+        ui.add_space(8.0);
+        // A real request: "faz gravação das imagens que recebe...
+        // programas de SSTV tipo QSSTV fazem isso" -- see
+        // SstvHandle::rx_auto_save's own doc comment (on by default,
+        // matching QSSTV) and config::sstv_image_path for the save
+        // location.
+        let mut auto_save = sstv.rx_auto_save();
+        if ui
+            .checkbox(&mut auto_save, "Auto-save")
+            .on_hover_text(format!(
+                "Save every completed picture as a PNG, like QSSTV does -- {}",
+                config::sstv_image_dir().map(|p| p.display().to_string()).unwrap_or_default()
+            ))
+            .changed()
+        {
+            sstv.set_rx_auto_save(auto_save);
+        }
     });
     ui.horizontal(|ui| {
         ui.label("Quick Tune:");
@@ -14196,6 +14261,7 @@ fn render_rade_panel(
     callsign: &mut String,
     mox: bool,
     tx_handle: Option<&TxHandle>,
+    filter_wide: bool,
 ) -> (bool, Option<u32>, Option<bool>) {
     let mut fit_filter_clicked = false;
     let mut quick_tune_hz = None;
@@ -14232,13 +14298,38 @@ fn render_rade_panel(
         }
         ui.add_space(8.0);
         // Same explicit_passband mechanism as RTTY/SSTV's own Fit Filter
-        // -- see this panel's own call site for the fixed band this sets.
-        if ui
-            .button("Fit Filter")
-            .on_hover_text("Narrow the RX/TX filter to RADE V1's own tone band (~1060-1880 Hz)")
-            .clicked()
-        {
-            fit_filter_clicked = true;
+        // -- see this panel's own call site for the two widths this
+        // rotates between on every click (deskHPSDR's 700-2300Hz figure
+        // and SDRoxide's own wider 300-2700Hz one).
+        // Hidden entirely while transmitting -- a real report/request:
+        // simplest way to guarantee TX's own filter can never be touched
+        // by this button (it's RX-only now, see the call site's own doc
+        // comment) is for it not to be there to click in the first
+        // place while on the air, rather than relying on the button's
+        // own logic to leave TX alone.
+        if !mox {
+            if ui
+                .button("Fit Filter")
+                .on_hover_text(
+                    "Narrow the RX filter to RADE V1's tone band. Rotates between \
+                     deskHPSDR's own figure (700-2300 Hz) and SDRoxide's wider one \
+                     (300-2700 Hz) on every click, to A/B the two on real hardware \
+                     -- see the indicator to the right for which is currently \
+                     active. TX's own filter is fixed at 700-2300 Hz and unaffected.",
+                )
+                .clicked()
+            {
+                fit_filter_clicked = true;
+            }
+            // See ConnectedState::rade_filter_wide's own doc comment --
+            // shows which of the two RX widths Fit Filter's own rotation
+            // (just above) left active, so a real A/B test on the air can
+            // tell them apart afterward instead of guessing from memory.
+            if filter_wide {
+                ui.colored_label(amber, "RX filter: 300-2700 Hz (SDRoxide)");
+            } else {
+                ui.weak("RX filter: 700-2300 Hz (deskHPSDR)");
+            }
         }
     });
     ui.horizontal(|ui| {
@@ -14302,10 +14393,51 @@ fn render_rade_panel(
     }
 
     let st = rade.stats();
+    // Real report: occasional "DMR-like" robotic/glitchy audio, random,
+    // even at otherwise good SNR -- matches a known, documented RADE V1
+    // acquisition characteristic (see rade_c's own commit history, an
+    // OTA test note from the author: a brief "false-sync-then-reacquire
+    // transient" can report `sync` before the decoder has really locked
+    // well, producing a few garbled-sounding frames before it settles).
+    // Purely a VISUAL flag, on request -- no audio behaviour changes
+    // here at all -- so the operator can correlate what they hear
+    // against this indicator and confirm/rule out that explanation,
+    // rather than the app silently deciding to mute or otherwise act on
+    // it. RADE V1's own usable floor is documented around -2dB SNR, so a
+    // few dB of margin above that (rather than 0dB) catches a real dip
+    // approaching the danger zone without flagging every ordinary few-dB
+    // wobble on a strong signal.
+    const RADE_SYNC_MARGINAL_SNR_DB: f32 = 4.0;
+    let marginal = st.sync && st.snr_db < RADE_SYNC_MARGINAL_SNR_DB;
     ui.horizontal(|ui| {
         let (rect, _) = ui.allocate_exact_size(egui::vec2(14.0, 14.0), egui::Sense::hover());
-        ui.painter().circle_filled(rect.center(), 6.0, if st.sync { green } else { amber });
-        ui.label(if st.sync { "SYNC" } else { "no sync" });
+        let dot_color = if !st.sync {
+            amber
+        } else if marginal {
+            egui::Color32::from_rgb(230, 200, 40) // yellow
+        } else {
+            green
+        };
+        ui.painter().circle_filled(rect.center(), 6.0, dot_color);
+        let sync_label = if !st.sync {
+            "no sync"
+        } else if marginal {
+            "SYNC (marginal)"
+        } else {
+            "SYNC"
+        };
+        if marginal {
+            ui.colored_label(dot_color, sync_label).on_hover_text(
+                "SNR is close to RADE V1's usable floor (~-2dB) -- a real, \
+                 documented acquisition characteristic of this mode can \
+                 briefly report sync before it has really settled here, \
+                 sometimes audible as a few garbled/robotic-sounding \
+                 frames before it locks properly. Not this app changing \
+                 anything -- just flagging when conditions match.",
+            );
+        } else {
+            ui.label(sync_label);
+        }
         if st.sync {
             ui.label(format!("SNR {:.0} dB", st.snr_db));
             ui.label(format!("offset {:+.0} Hz", st.freq_offset_hz));

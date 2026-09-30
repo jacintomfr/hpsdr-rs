@@ -54,6 +54,8 @@ enum Ctl {
     /// Drop receive state -- used when re-entering the mode or after a big
     /// discontinuity.
     Reset,
+    /// See RadeWorker::set_tx_bpf's own doc comment.
+    SetTxBpf(bool),
     Stop,
 }
 
@@ -277,6 +279,17 @@ impl RadeWorker {
         let _ = self.ctl.send(Ctl::Reset);
     }
 
+    /// Live on/off for the C library's own Tx bandpass filter -- see
+    /// Rade::set_tx_bpf's own doc comment for what it is and why it's a
+    /// real toggle (a request to A/B it on real hardware against this
+    /// app's own external WDSP Tx filter, which stays on unchanged
+    /// either way -- this only adds/removes the RADE-specific one on
+    /// top of it). Off by default, same as the library's own reference
+    /// caller.
+    pub fn set_tx_bpf(&self, enable: bool) {
+        let _ = self.ctl.send(Ctl::SetTxBpf(enable));
+    }
+
     /// Current receive state, for the UI.
     pub fn stats(&self) -> RadeStats {
         let s = &self.shared;
@@ -363,6 +376,7 @@ impl Inner {
                 Ok(Ctl::SetTx(on)) => self.set_tx(on),
                 Ok(Ctl::SetCallsign(c)) => super::text::encode(&c, &mut self.eoo_tx),
                 Ok(Ctl::Reset) => self.reset_rx(),
+                Ok(Ctl::SetTxBpf(on)) => self.rade.set_tx_bpf(on),
                 Err(crossbeam_channel::RecvTimeoutError::Timeout) => {}
             }
             if self.transmitting {

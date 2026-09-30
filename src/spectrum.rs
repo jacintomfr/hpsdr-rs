@@ -1726,6 +1726,23 @@ fn run(
     let mut dc_block_l = DcBlocker::new();
     let mut dc_block_r = DcBlocker::new();
 
+    // Slow leveler standing in for WDSP's own (bypassed) AGC while a
+    // digital-mode decoder is active -- see the `digital_rx_active` block
+    // above for why. Same formula as SDRoxide's own `tap_gain_for`
+    // (engine.rs): a one-pole filter on the level in DECIBELS (not on
+    // power directly -- a pole on linear power answers a real order-of-
+    // magnitude fade with only a fraction of the needed gain change,
+    // since it's measuring a ratio quantity on a linear scale), tracking
+    // mean-square level with a multi-second time constant so the applied
+    // gain only ever moves slowly, matching a real background noise/
+    // propagation change rather than a fast fade or a loud syllable.
+    let mut rade_leveler_db: Option<f32> = None;
+    let mut rade_leveler_gain: f32 = 1.0;
+    const DIGITAL_TAP_TARGET_RMS: f32 = 0.08;
+    const DIGITAL_TAP_LEVEL_TC_S: f32 = 6.0;
+    const DIGITAL_TAP_GAIN_MIN: f32 = 0.01;
+    const DIGITAL_TAP_GAIN_MAX: f32 = 1_000.0;
+
     // TX/RX crosstalk silencing -- see the two locals' own doc comments
     // just below, and the block that uses them right after chunk is
     // filled each iteration.
@@ -1817,7 +1834,42 @@ fn run(
         // where this used to be read) so set_zoom_pan can reconfigure
         // the analyzer -- a rare, edge-detected event, see its own doc
         // comment -- ahead of this iteration's Spectrum0/GetPixels call.
-        let params = *demod_params.lock().unwrap();
+        let mut params = *demod_params.lock().unwrap();
+        // BYPASS FIX for weak-signal RADE decode quality -- ported from a
+        // real, measured finding in SDRoxide's own engine.rs (its
+        // RxChain::process, tap_gain_for's own doc comment, issue #307):
+        // WDSP's AGC attack is a fixed ~2ms regardless of mode (deskHPSDR's
+        // rx_set_agc confirms this -- every AGC mode calls
+        // SetRXAAGCAttack(id, 2), only decay/hang differ), and multiplying
+        // a signal by a gain that moves that fast is convolving it with
+        // that gain's own spectrum -- i.e. smearing energy across nearby
+        // frequencies. RADE's OFDM carriers are close together (30
+        // carriers over ~1.5kHz) and its neural demodulator depends on
+        // each one's own amplitude/phase staying where the channel put it,
+        // so AGC pumping on fading/noise smears exactly the fine structure
+        // the decoder needs -- SDRoxide's own equivalent measurement, on
+        // FT8 (also narrow multi-tone), found this cost most of a signal
+        // set's decodes and biased every reported SNR ~16dB low. Their fix
+        // was a dedicated PRE-AGC tap with its own much slower (6s time
+        // constant) leveler for their digital-mode decoders -- WDSP has no
+        // such tap (fexchange0 is one opaque call, AGC included, no hook
+        // to read the signal before it), so the equivalent available here
+        // is to skip WDSP's AGC entirely while a digital-mode decoder is
+        // active and apply our own slow leveler instead, in the per-sample
+        // loop below (see `rade_leveler`) -- same end result (a gain that
+        // only moves over seconds, not milliseconds) reached the only way
+        // this architecture allows it. Applies to RTTY/SSTV too, not just
+        // RADE -- the same physics (a fast gain multiply smears a narrow-
+        // tone signal's spectrum) applies to their own mark/space and
+        // sync/colour tones just as much, and this mirrors the TX-side
+        // digital_tx_armed bypass (tx.rs) already covering all three modes
+        // there for the same reason.
+        let digital_rx_active = rade.lock().unwrap().as_ref().is_some_and(|r| r.rx_enabled())
+            || rtty.lock().unwrap().as_ref().is_some_and(|r| r.rx_enabled())
+            || sstv.lock().unwrap().as_ref().is_some_and(|s| s.rx_enabled());
+        if digital_rx_active {
+            params.agc = Agc::Off;
+        }
         analyzer.set_zoom_pan(params.zoom, params.pan, sample_rate);
 
         let (spectrum, waterfall) = analyzer.feed(&chunk);
@@ -1924,6 +1976,36 @@ fn run(
             analyzer.demod(&demod_scratch, params, passband)
         } else {
             analyzer.demod(&chunk, params, passband)
+        };
+        // Recompute the slow leveler's gain once per chunk (matching
+        // SDRoxide's own `tap_gain_for`, one pole per BLOCK at the
+        // block's own length -- see this loop's own declaration of
+        // `rade_leveler_db`/`rade_leveler_gain` for the full reasoning).
+        // Only while it will actually be used (`digital_rx_active`,
+        // AGC bypassed above) -- otherwise WDSP's own AGC already did
+        // this job and the state is left to decay back toward silence
+        // (`rade_leveler_db = None`) so the next digital-mode session
+        // starts from the real level rather than a stale one.
+        let digital_leveler_gain = if digital_rx_active {
+            let ms = audio.iter().map(|&(l, r)| { let m = (l + r) * 0.5; m * m }).sum::<f32>()
+                / audio.len().max(1) as f32;
+            if ms.is_finite() {
+                let block_db = 10.0 * (ms + 1e-20).log10();
+                let block_s = audio.len() as f32 / OUTPUT_RATE as f32;
+                let alpha = 1.0 - (-block_s / DIGITAL_TAP_LEVEL_TC_S).exp();
+                rade_leveler_db = Some(match rade_leveler_db {
+                    Some(prev) => prev + (block_db - prev) * alpha,
+                    None => block_db,
+                });
+                let want_db = 20.0 * DIGITAL_TAP_TARGET_RMS.log10();
+                rade_leveler_gain = 10f32
+                    .powf((want_db - rade_leveler_db.unwrap()) / 20.0)
+                    .clamp(DIGITAL_TAP_GAIN_MIN, DIGITAL_TAP_GAIN_MAX);
+            }
+            rade_leveler_gain
+        } else {
+            rade_leveler_db = None;
+            1.0
         };
         // See DemodParams::meter_calibration_db's own doc comment.
         let meter_db = analyzer.meter_db() + params.meter_calibration_db;
@@ -2037,6 +2119,14 @@ fn run(
                 // else (mono downmix, waveform tap, CW decoder, Audio
                 // Gain, the clamp below, every output tap) sees it.
                 let (l, r) = (dc_block_l.feed(l), dc_block_r.feed(r));
+                // Slow leveler standing in for WDSP's own AGC (bypassed
+                // above via `digital_rx_active`) -- a no-op multiply by
+                // 1.0 whenever no digital-mode RX is active. Applied here
+                // (before every consumer: waveform, RTTY/SSTV/RADE
+                // scratch, and the speaker/TCI/radio-audio taps further
+                // down) so the operator's ears and the decoders see the
+                // exact same signal, same as WDSP's own AGC always did.
+                let (l, r) = (l * digital_leveler_gain, r * digital_leveler_gain);
                 // Waveform tap and radio-audio-to-radio both stay a
                 // plain mono downmix regardless of DemodParams::binaural
                 // -- see that field's own doc comment: neither is a

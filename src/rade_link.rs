@@ -62,6 +62,8 @@ struct Inner {
     rx_log: Mutex<Vec<RadeTextRx>>,
     /// See RadeHandle::mute_analog's own doc comment.
     mute_analog: AtomicBool,
+    /// See RadeHandle::tx_bpf_enabled's own doc comment.
+    tx_bpf_enabled: AtomicBool,
 }
 
 #[derive(Clone)]
@@ -89,6 +91,10 @@ impl RadeHandle {
                 // behavior by default -- see the getter's own doc
                 // comment for what turning it off changes.
                 mute_analog: AtomicBool::new(true),
+                // Off by default -- matches the C library's own
+                // rade_open() default AND freedv-gui itself (confirmed
+                // against its source, it never enables this either).
+                tx_bpf_enabled: AtomicBool::new(false),
             }),
         }
     }
@@ -135,6 +141,28 @@ impl RadeHandle {
 
     pub fn set_mute_analog(&self, on: bool) {
         self.inner.mute_analog.store(on, Ordering::Relaxed);
+    }
+
+    /// Live on/off for the C library's own Tx bandpass filter -- see
+    /// rade::Rade::set_tx_bpf's own doc comment for the full story: it's
+    /// off by default (matching the library's own reference caller,
+    /// freedv-gui, which never turns it on for V1 either), sits ON TOP
+    /// of this app's own external WDSP Tx filter (that one is untouched
+    /// either way), and exists here purely so the two can be A/B'd live
+    /// on real hardware -- a real request, not a claim that either one
+    /// is definitively better. See render_rade_panel's own Fit Filter
+    /// button, which toggles this on every click alongside its usual
+    /// passband-fit job so both filters get exercised across a test
+    /// session without a separate control to remember.
+    pub fn tx_bpf_enabled(&self) -> bool {
+        self.inner.tx_bpf_enabled.load(Ordering::Relaxed)
+    }
+
+    pub fn set_tx_bpf_enabled(&self, on: bool) {
+        self.inner.tx_bpf_enabled.store(on, Ordering::Relaxed);
+        if let Some(w) = self.inner.worker.lock().unwrap().as_ref() {
+            w.set_tx_bpf(on);
+        }
     }
 
     /// ROOT CAUSE FIX for a real deadlock: the real radio's own MOX and

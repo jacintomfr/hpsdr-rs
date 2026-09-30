@@ -118,6 +118,11 @@ struct Inner {
     /// of every set_image() call, drained to 0 before the plan itself
     /// ever produces a sample.
     tx_lead_remaining: Mutex<u64>,
+    /// See SstvHandle::rx_auto_save's own doc comment. On by default,
+    /// matching QSSTV's own out-of-the-box behaviour (a real request:
+    /// "faz gravação das imagens que recebe... os programas de SSTV
+    /// tipo QSSTV fazem isso").
+    rx_auto_save: AtomicBool,
 }
 
 #[derive(Clone)]
@@ -148,6 +153,7 @@ impl SstvHandle {
                 // a transmission that runs for minutes."
                 tx_lead_ms: AtomicU32::new(500),
                 tx_lead_remaining: Mutex::new(0),
+                rx_auto_save: AtomicBool::new(true),
             }),
         }
     }
@@ -158,6 +164,17 @@ impl SstvHandle {
 
     pub fn rx_enabled(&self) -> bool {
         self.inner.rx_enabled.load(Ordering::Relaxed)
+    }
+
+    /// Whether a completed RX picture is automatically saved as a PNG
+    /// (Settings -> Spectrum -- SSTV panel -- own doc comment on
+    /// rx_auto_save's field). See config::sstv_image_path for where.
+    pub fn rx_auto_save(&self) -> bool {
+        self.inner.rx_auto_save.load(Ordering::Relaxed)
+    }
+
+    pub fn set_rx_auto_save(&self, on: bool) {
+        self.inner.rx_auto_save.store(on, Ordering::Relaxed);
     }
 
     pub fn set_rx_enabled(&self, on: bool) {
@@ -233,7 +250,27 @@ impl SstvHandle {
                         snap.rgb[row..row + rgb.len()].copy_from_slice(&rgb);
                     }
                 }
-                SstvEvent::ImageComplete => {}
+                SstvEvent::ImageComplete => {
+                    if self.inner.rx_auto_save.load(Ordering::Relaxed) {
+                        // Real report: "faz gravação das imagens que
+                        // recebe... QSSTV faz isso" -- saved right here
+                        // (still holding the snapshot lock, snap.rgb/w/h
+                        // are exactly the just-finished picture) rather
+                        // than deferred to the UI thread, since this
+                        // handle -- not main.rs -- is the one place that
+                        // actually sees the ImageComplete event.
+                        let label = snap.detected.map(|m| m.label()).unwrap_or("Unknown");
+                        if let Some(path) = crate::config::sstv_image_path(label) {
+                            if let Some(img) =
+                                image::RgbImage::from_raw(snap.w as u32, snap.h as u32, snap.rgb.clone())
+                            {
+                                if let Err(e) = img.save(&path) {
+                                    eprintln!("sstv: failed to save {}: {e}", path.display());
+                                }
+                            }
+                        }
+                    }
+                }
                 SstvEvent::FskId(id) => {
                     snap.rx_id = Some(id);
                 }

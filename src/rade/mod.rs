@@ -277,6 +277,19 @@ impl Rade {
     /// library's own initial value), which carries no callsign *and* denies the
     /// far end the known sequence it estimates its noise variance from. Set it
     /// on every over, even for an empty callsign.
+    /// V1 only -- live on/off for the C library's own Tx bandpass filter,
+    /// built from the real OFDM carrier geometry (see rade_tx.c's own
+    /// comment: bandwidth/centre computed from the actual carrier span,
+    /// 1.2x margin). Off by default (rade_open() passes bpf_en=0), same
+    /// as freedv-gui itself -- confirmed against its own source, which
+    /// never enables this either and relies entirely on the radio's own
+    /// external SSB Tx filter. Exposed here so the two can be A/B'd live
+    /// against each other on real hardware (a real request) instead of
+    /// needing a fresh rade_open() to change it.
+    pub fn set_tx_bpf(&mut self, enable: bool) {
+        unsafe { sys::rade_set_tx_bpf(self.r, enable as i32) };
+    }
+
     pub fn set_tx_eoo_bits(&mut self, bits: &[f32]) -> Result<(), RadeError> {
         if bits.len() != self.n_eoo_bits {
             return Err(RadeError::BadLength { want: self.n_eoo_bits, got: bits.len() });
