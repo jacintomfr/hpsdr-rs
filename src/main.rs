@@ -331,6 +331,163 @@ pub struct OcMask {
     pub tx: u8,
 }
 
+/// How often step_autogain (below) actually acts -- matches deskHPSDR's
+/// own inner adjustment loops, which both step once per 0.5s
+/// (`g_usleep(500000)`) while ramping.
+const AUTOGAIN_STEP_INTERVAL: Duration = Duration::from_millis(500);
+/// How long after enabling before autogain does anything -- deskHPSDR's
+/// own 10s startup delay (rigctl.c: "only if deskHPSDR starts we get
+/// sometimes wrong ADC OVL states, we add a delay"), same reasoning
+/// applies to a freshly (re)connected receiver here.
+const AUTOGAIN_STARTUP_DELAY: Duration = Duration::from_secs(10);
+/// Consecutive overloaded checks before autogain reacts -- deskHPSDR's
+/// own adc_count_limit=4, a small hysteresis so one transient spike
+/// doesn't yank gain down.
+const AUTOGAIN_OVERLOAD_HYSTERESIS: u32 = 4;
+/// deskHPSDR's own gain_step (down) / +1.0 (up, hardcoded separately
+/// there) / re_adjustment_time.
+const AUTOGAIN_STEP_DOWN_DB: i32 = 3;
+const AUTOGAIN_STEP_UP_DB: i32 = 1;
+const AUTOGAIN_BACKOFF_DB: i32 = 3;
+const AUTOGAIN_REPROBE_INTERVAL: Duration = Duration::from_secs(30);
+
+/// Running state for ConnectedState::autogain_enabled -- see that
+/// field's own doc comment for the full algorithm this drives
+/// (step_autogain, below). Exists only while autogain is on; dropped
+/// and recreated fresh each time it's (re)enabled.
+struct AutogainState {
+    /// autogain doesn't act until this instant passes -- see
+    /// AUTOGAIN_STARTUP_DELAY.
+    active_at: Instant,
+    /// Next instant a step (up or down) is allowed to happen -- see
+    /// AUTOGAIN_STEP_INTERVAL.
+    next_step_at: Instant,
+    adc0_overload_count: u32,
+    adc1_overload_count: u32,
+    /// False while actively probing upward for more gain; true once
+    /// settled (backed off after finding the overload edge, or the top
+    /// of the range) -- deskHPSDR's own autogain_is_adjusted.
+    adjusted: bool,
+    /// When `adjusted` last became true -- see
+    /// ConnectedState::autogain_time_enabled's own doc comment for the
+    /// AUTOGAIN_REPROBE_INTERVAL re-check this feeds.
+    adjusted_at: Instant,
+    /// True while actively stepping gain down in response to sustained
+    /// overload -- see step_autogain's own doc comment for why this is
+    /// tracked separately from `adjusted`.
+    ramping_down: bool,
+}
+
+impl AutogainState {
+    fn new() -> Self {
+        let now = Instant::now();
+        AutogainState {
+            active_at: now + AUTOGAIN_STARTUP_DELAY,
+            next_step_at: now,
+            adc0_overload_count: 0,
+            adc1_overload_count: 0,
+            adjusted: false,
+            adjusted_at: now,
+            ramping_down: false,
+        }
+    }
+}
+
+/// Drives ConnectedState::autogain_enabled -- ported from deskHPSDR's own
+/// autogain_thread_function (rigctl.c). Call once per frame; internally
+/// rate-limits its own actual steps to AUTOGAIN_STEP_INTERVAL (deskHPSDR
+/// steps once per 0.5s too), so calling this more often is harmless.
+///
+/// Two paths, matching deskHPSDR's own two inner loops exactly:
+/// - "ramping down": entered once AUTOGAIN_OVERLOAD_HYSTERESIS
+///   consecutive ticks see an overloaded ADC while settled. Steps -3dB
+///   every tick for as long as the overload persists (no hysteresis
+///   here -- deskHPSDR's own inner while loop reacts to the raw flag
+///   every 0.5s once it's already ramping), then falls through to
+///   probing back up once it clears.
+/// - "probing up": the default once not settled and not actively
+///   ramping down. Steps +1dB every tick while clear; the INSTANT
+///   overload reappears (or the range's top is reached), backs off
+///   AUTOGAIN_BACKOFF_DB in that same step and settles (`adjusted =
+///   true`) -- deskHPSDR's own while-loop-then-unconditional -3dB.
+fn step_autogain(connected: &mut ConnectedState, transmitting: bool) {
+    if !connected.autogain_enabled || connected.device.board != Boards::HermesLite2 || transmitting {
+        connected.autogain_state = None;
+        return;
+    }
+    let state = connected.autogain_state.get_or_insert_with(AutogainState::new);
+    let now = Instant::now();
+    if now < state.active_at || now < state.next_step_at {
+        return;
+    }
+    state.next_step_at = now + AUTOGAIN_STEP_INTERVAL;
+
+    let overloaded = connected.session.adc0_overload.load(Ordering::Relaxed)
+        || connected.session.adc1_overload.load(Ordering::Relaxed);
+    // See RadioSession::rx_attenuation's own doc comment -- the wire
+    // value is gain_db+12, same conversion as the RX Gain slider uses.
+    let gain_db = connected.session.rx_attenuation.load(Ordering::Relaxed) as i32 - 12;
+    let set_gain = |db: i32| {
+        connected.session.rx_attenuation.store((db + 12).clamp(0, 60) as u32, Ordering::Relaxed);
+    };
+
+    if state.ramping_down {
+        if overloaded && gain_db > -12 {
+            set_gain((gain_db - AUTOGAIN_STEP_DOWN_DB).max(-12));
+        } else {
+            // Overload cleared (or already at the floor) -- stop the
+            // down-ramp; still not "adjusted", so the next tick(s) fall
+            // into the probe-up path below to fine-tune back toward the
+            // edge instead of staying pinned low.
+            state.ramping_down = false;
+        }
+        return;
+    }
+
+    if connected.autogain_time_enabled
+        && state.adjusted
+        && now.duration_since(state.adjusted_at) > AUTOGAIN_REPROBE_INTERVAL
+    {
+        state.adjusted = false;
+    }
+
+    if state.adjusted {
+        state.adc0_overload_count = if connected.session.adc0_overload.load(Ordering::Relaxed) {
+            state.adc0_overload_count + 1
+        } else {
+            0
+        };
+        state.adc1_overload_count = if connected.session.adc1_overload.load(Ordering::Relaxed) {
+            state.adc1_overload_count + 1
+        } else {
+            0
+        };
+        if state.adc0_overload_count >= AUTOGAIN_OVERLOAD_HYSTERESIS
+            || state.adc1_overload_count >= AUTOGAIN_OVERLOAD_HYSTERESIS
+        {
+            state.adjusted = false;
+            state.ramping_down = true;
+            state.adc0_overload_count = 0;
+            state.adc1_overload_count = 0;
+            set_gain((gain_db - AUTOGAIN_STEP_DOWN_DB).max(-12));
+        }
+        return;
+    }
+
+    // Probing up (not adjusted, not ramping down).
+    if overloaded {
+        set_gain((gain_db - AUTOGAIN_BACKOFF_DB).max(-12));
+        state.adjusted = true;
+        state.adjusted_at = now;
+    } else if gain_db < 48 {
+        set_gain((gain_db + AUTOGAIN_STEP_UP_DB).min(48));
+    } else {
+        // Reached the top of the range without ever overloading.
+        state.adjusted = true;
+        state.adjusted_at = now;
+    }
+}
+
 /// Per-band Alex antenna port selection (0=ANT1, 1=ANT2, 2=ANT3), RX and
 /// TX independently -- same HashMap-by-name pattern as OcMask above,
 /// keyed by band/XVTR name in ConnectedState::antenna_settings. Resolved
@@ -2184,6 +2341,34 @@ struct ConnectedState {
     /// keep this a plain "fill in oc_settings" action rather than a new
     /// persistent mode fighting with the OC grid's own free-form editing.
     n2adr_hpf_enabled: bool,
+    /// "HL2 ADC Auto Gain RxPGA" -- ported from deskHPSDR's own
+    /// autogain_enabled (rigctl.c's autogain_thread_function/rx_menu.c's
+    /// add_hl2_autogain_controls, HermesLite2 only): while on, RX Gain
+    /// is driven automatically instead of by hand, backing off 3dB
+    /// steps whenever the ADC reports overload (session.adc0_overload/
+    /// adc1_overload) for AUTOGAIN_OVERLOAD_HYSTERESIS consecutive
+    /// checks, and otherwise probing 1dB at a time toward the top of
+    /// the range before settling 3dB below wherever overload first
+    /// reappeared -- same algorithm, same step sizes/timing, just
+    /// driven from this app's own per-frame loop (AutogainState below)
+    /// instead of a dedicated thread, since there's no thread here to
+    /// give it.
+    autogain_enabled: bool,
+    /// "HL2 Auto Gain time-regulated" -- deskHPSDR's own
+    /// autogain_time_enabled: with this on, a settled ("adjusted")
+    /// autogain state is deliberately unsettled again every 30s so it
+    /// re-probes for more headroom (e.g. the band having gone quiet
+    /// since it last backed off) instead of adjusting once and then
+    /// never revisiting it until an overload forces a step down.
+    /// Sensitive only while autogain_enabled is also on, same as
+    /// deskHPSDR's own checkbox.
+    autogain_time_enabled: bool,
+    /// Running state for the autogain_enabled loop above -- see
+    /// AutogainState's own doc comment. `None` whenever autogain_enabled
+    /// is off (dropped, not just paused, so re-enabling always starts
+    /// clean with a fresh startup delay -- same as deskHPSDR launching
+    /// its thread fresh each time the checkbox goes from off to on).
+    autogain_state: Option<AutogainState>,
     /// Global Open Collector mask ORed into the current band's `tx`
     /// mask while tune_active -- matches piHPSDR's OCtune (see
     /// oc_menu.c), not per-band since it's meant to apply regardless
@@ -3299,6 +3484,9 @@ fn connect_to_device(device: Device, cfg: &Config) -> Result<ConnectedState, Str
                 active_xvtr: cfg.active_xvtr.clone(),
                 oc_settings: cfg.oc_settings.clone(),
                 n2adr_hpf_enabled: false,
+                autogain_enabled: cfg.autogain_enabled.unwrap_or(false),
+                autogain_time_enabled: cfg.autogain_time_enabled.unwrap_or(false),
+                autogain_state: None,
                 oc_tune: cfg.oc_tune,
                 // One-time migration: a config saved before per-band
                 // RX/TX antenna existed had a single flat `antenna`
@@ -4113,6 +4301,10 @@ impl eframe::App for HpsdrApp {
                 // applied to tx_spectrum -- it's raw generated baseband,
                 // not a wideband capture that needs retuning within.
                 let transmitting = connected.session.mox_active();
+                // See step_autogain's own doc comment -- rate-limits its
+                // own real actions internally, cheap/harmless to call
+                // every frame.
+                step_autogain(connected, transmitting);
                 if transmitting && !connected.tx_spectrum_mox_was_active {
                     // Fresh PTT -- see SpectrumHandle::clear_display's
                     // doc comment for why this can't just be left to
@@ -5574,12 +5766,62 @@ impl eframe::App for HpsdrApp {
                             let mut gain_db =
                                 connected.session.rx_attenuation.load(Ordering::Relaxed) as i32 - 12;
                             ui.label("RX Gain:");
-                            if stable_i32_slider(ui, &mut connected.slider_scroll_accum, &mut gain_db, -12..=48, 1, " dB") {
-                                connected
-                                    .session
-                                    .rx_attenuation
-                                    .store((gain_db + 12).clamp(0, 60) as u32, Ordering::Relaxed);
-                                settings_changed = true;
+                            // Read-only while autogain is driving it --
+                            // same reasoning as any other automatic
+                            // control overriding a manual one (e.g. AGC
+                            // Auto's own Gain slider, added earlier this
+                            // session) -- dragging it while autogain is
+                            // also writing to it every 0.5s would just
+                            // fight the automation.
+                            ui.add_enabled_ui(!connected.autogain_enabled, |ui| {
+                                if stable_i32_slider(
+                                    ui,
+                                    &mut connected.slider_scroll_accum,
+                                    &mut gain_db,
+                                    -12..=48,
+                                    1,
+                                    " dB",
+                                ) {
+                                    connected
+                                        .session
+                                        .rx_attenuation
+                                        .store((gain_db + 12).clamp(0, 60) as u32, Ordering::Relaxed);
+                                    settings_changed = true;
+                                }
+                            });
+                            // "HL2 ADC Auto Gain RxPGA"/"HL2 Auto Gain
+                            // time-regulated" -- ported from deskHPSDR's
+                            // own rx_menu.c (add_hl2_autogain_controls),
+                            // same two checkboxes, same wording/
+                            // tooltips, same HermesLite2-only gating
+                            // (their __AUTOG__ feature; unlike a build-
+                            // time #ifdef, this app doesn't need one --
+                            // it's just hidden when the board doesn't
+                            // match). See step_autogain's own doc
+                            // comment for the algorithm this drives.
+                            if connected.device.board == Boards::HermesLite2 {
+                                if ui
+                                    .checkbox(&mut connected.autogain_enabled, "HL2 ADC Auto Gain RxPGA")
+                                    .on_hover_text(
+                                        "Activate RF Gain Automatic:\nControl and set the ADC to max. \
+                                         75% level\nfor protect ADC against overflows",
+                                    )
+                                    .changed()
+                                {
+                                    settings_changed = true;
+                                }
+                                ui.add_enabled_ui(connected.autogain_enabled, |ui| {
+                                    if ui
+                                        .checkbox(&mut connected.autogain_time_enabled, "HL2 Auto Gain time-regulated")
+                                        .on_hover_text(
+                                            "Re-adjust RF Gain Automatic every 30s\nIf OFF, RF Gain \
+                                             Automatic adjust only one-time\nif band was changed",
+                                        )
+                                        .changed()
+                                    {
+                                        settings_changed = true;
+                                    }
+                                });
                             }
                         } else {
                             if has_alex_att {
@@ -13306,6 +13548,8 @@ impl eframe::App for HpsdrApp {
                         active_xvtr: connected.active_xvtr.clone(),
                         oc_settings: connected.oc_settings.clone(),
                         oc_tune: connected.oc_tune,
+                        autogain_enabled: Some(connected.autogain_enabled),
+                        autogain_time_enabled: Some(connected.autogain_time_enabled),
                         antenna_settings: connected.antenna_settings.clone(),
                         midi_enabled: Some(connected.midi.enabled.load(Ordering::Relaxed)),
                         // Explicitly cleared (not just "no longer set"),

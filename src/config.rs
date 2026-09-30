@@ -602,6 +602,13 @@ pub struct Config {
     /// doc comment.
     #[serde(default)]
     pub oc_tune: u8,
+    /// "HL2 ADC Auto Gain RxPGA" -- see main.rs's
+    /// ConnectedState::autogain_enabled/autogain_time_enabled own doc
+    /// comments.
+    #[serde(default)]
+    pub autogain_enabled: Option<bool>,
+    #[serde(default)]
+    pub autogain_time_enabled: Option<bool>,
     /// Per-band (or XVTR) RX/TX antenna port selection -- see main.rs's
     /// AntennaMask struct doc comment. Keyed by band/XVTR name, same
     /// pattern as oc_settings above. `#[serde(default)]` so configs saved
