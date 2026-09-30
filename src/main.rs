@@ -2174,6 +2174,16 @@ struct ConnectedState {
     /// above, resolved to the current band and pushed into
     /// session.oc_rx/oc_tx once per frame alongside pa_gain_db.
     oc_settings: std::collections::HashMap<String, OcMask>,
+    /// See the "Filter Board" preset buttons in SettingsTab::OpenCollector
+    /// for the full story -- ported from deskHPSDR's own filter_board/
+    /// n2adr_hpf_enable (radio_menu.c): whether the "N2ADR (LPF TX only)"
+    /// preset also switches in the N2ADR board's 3MHz HPF (bit 6, decimal
+    /// 64) on Rx for every band except 160m. Only read when that preset
+    /// button is (re-)clicked -- unlike deskHPSDR's live GTK toggle, this
+    /// doesn't auto-reapply on its own while the checkbox is ticked, to
+    /// keep this a plain "fill in oc_settings" action rather than a new
+    /// persistent mode fighting with the OC grid's own free-form editing.
+    n2adr_hpf_enabled: bool,
     /// Global Open Collector mask ORed into the current band's `tx`
     /// mask while tune_active -- matches piHPSDR's OCtune (see
     /// oc_menu.c), not per-band since it's meant to apply regardless
@@ -3275,6 +3285,7 @@ fn connect_to_device(device: Device, cfg: &Config) -> Result<ConnectedState, Str
                 // active_xvtr itself exists to avoid.
                 active_xvtr: cfg.active_xvtr.clone(),
                 oc_settings: cfg.oc_settings.clone(),
+                n2adr_hpf_enabled: false,
                 oc_tune: cfg.oc_tune,
                 // One-time migration: a config saved before per-band
                 // RX/TX antenna existed had a single flat `antenna`
@@ -11514,6 +11525,107 @@ impl eframe::App for HpsdrApp {
                                          is OR'd into the current band's Tx outputs while the Tune \
                                          button is engaged.",
                                     );
+                                    ui.add_space(6.0);
+                                    // "Filter Board" presets -- ported from
+                                    // deskHPSDR's own filter_board combo
+                                    // (radio_menu.c: n2adr_oc_settings/
+                                    // n2adr_oc_settings_tx) for the N2ADR
+                                    // filter board add-on some HermesLite2
+                                    // units use. A real request: without
+                                    // this, getting an N2ADR board working
+                                    // meant computing and hand-entering
+                                    // every band's OC bits into the grid
+                                    // below one at a time. Unlike
+                                    // deskHPSDR's persistent mode (re-
+                                    // applied at several points whenever
+                                    // the band changes), these just fill
+                                    // in oc_settings once per click -- the
+                                    // grid below is the single source of
+                                    // truth either way, so a preset is
+                                    // just a fast way to populate it, and
+                                    // the operator can still hand-edit
+                                    // afterward exactly like any other
+                                    // value there.
+                                    ui.horizontal(|ui| {
+                                        ui.label("Filter Board:");
+                                        // Same decimal OC values as
+                                        // deskHPSDR's own table, band for
+                                        // band -- confirmed against its
+                                        // real source rather than
+                                        // reconstructed from the antenna
+                                        // switching logic.
+                                        const N2ADR_BANDS: [(&str, u8); 10] = [
+                                            ("160m", 1),
+                                            ("80m", 66),
+                                            ("60m", 68),
+                                            ("40m", 68),
+                                            ("30m", 72),
+                                            ("20m", 72),
+                                            ("17m", 80),
+                                            ("15m", 80),
+                                            ("12m", 96),
+                                            ("10m", 96),
+                                        ];
+                                        if ui
+                                            .button("N2ADR (LPF RX+TX+HPF)")
+                                            .on_hover_text(
+                                                "Fills in OC1-OC7 for every band to switch the \
+                                                 N2ADR board's low-pass filter on both Rx and Tx.",
+                                            )
+                                            .clicked()
+                                        {
+                                            for (name, val) in N2ADR_BANDS {
+                                                connected
+                                                    .oc_settings
+                                                    .insert(name.to_string(), OcMask { rx: val, tx: val });
+                                            }
+                                            settings_changed = true;
+                                        }
+                                        if ui
+                                            .button("N2ADR (LPF TX only)")
+                                            .on_hover_text(
+                                                "Fills in OC1-OC7 to switch the N2ADR board's \
+                                                 low-pass filter on Tx only -- Rx stays off (or \
+                                                 the 3MHz HPF only, see the checkbox) so the \
+                                                 board's LPF doesn't narrow the receiver.",
+                                            )
+                                            .clicked()
+                                        {
+                                            // Bit 6 (decimal 64) is the
+                                            // N2ADR board's own 3MHz HPF --
+                                            // deskHPSDR only ever sets it
+                                            // on Rx, never 160m (already
+                                            // below where it would help).
+                                            let hpf_rx = if connected.n2adr_hpf_enabled { 64 } else { 0 };
+                                            for (name, tx_val) in N2ADR_BANDS {
+                                                let rx_val = if name == "160m" { 0 } else { hpf_rx };
+                                                connected
+                                                    .oc_settings
+                                                    .insert(name.to_string(), OcMask { rx: rx_val, tx: tx_val });
+                                            }
+                                            settings_changed = true;
+                                        }
+                                        if ui
+                                            .checkbox(&mut connected.n2adr_hpf_enabled, "+Rx: N2ADR HPF 3MHz")
+                                            .on_hover_text(
+                                                "Only used by \"N2ADR (LPF TX only)\" above -- click \
+                                                 that button again after changing this to apply it.",
+                                            )
+                                            .changed()
+                                        {
+                                            settings_changed = true;
+                                        }
+                                        if ui
+                                            .button("None")
+                                            .on_hover_text("Clears OC1-OC7 to 0 for every band.")
+                                            .clicked()
+                                        {
+                                            for (name, _) in N2ADR_BANDS {
+                                                connected.oc_settings.insert(name.to_string(), OcMask::default());
+                                            }
+                                            settings_changed = true;
+                                        }
+                                    });
                                     ui.add_space(6.0);
                                     // Every row emits exactly the same 15
                                     // cells (Band + 7 Rx + 7 Tx) so the
