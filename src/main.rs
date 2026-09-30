@@ -3216,7 +3216,20 @@ fn connect_to_device(device: Device, cfg: &Config) -> Result<ConnectedState, Str
                 sstv_tx_sending: false,
                 rade,
                 rade_callsign,
-                rx_gain_calibration_db: cfg.rx_gain_calibration_db.unwrap_or(0),
+                // Matches deskHPSDR's own rx_gain_calibration default
+                // (radio.c: `case DEVICE_HERMES_LITE: case
+                // DEVICE_HERMES_LITE2: ... rx_gain_calibration = 14;`,
+                // the only board it defaults non-zero for) -- only when
+                // nothing was ever saved (a fresh Config, not
+                // overriding a value the operator already set/tuned).
+                // Covers Radioberry too with no extra case needed: it
+                // reports as Boards::HermesLite2 at the protocol level
+                // (see Device::is_radioberry's own doc comment -- same
+                // gateware derivation, same AD9866 front end), so this
+                // board match already includes it.
+                rx_gain_calibration_db: cfg.rx_gain_calibration_db.unwrap_or_else(|| {
+                    if matches!(device.board, Boards::HermesLite | Boards::HermesLite2) { 14 } else { 0 }
+                }),
                 extra_receivers,
                 settings_dirty,
                 band_memory: cfg.band_settings.clone(),
