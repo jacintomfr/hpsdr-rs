@@ -5839,23 +5839,27 @@ impl eframe::App for HpsdrApp {
                             // Read-only while autogain is driving it --
                             // dragging it while autogain is also writing
                             // to it every 0.5s would just fight the
-                            // automation.
-                            ui.add_enabled_ui(!connected.autogain_enabled, |ui| {
-                                if stable_i32_slider(
-                                    ui,
-                                    &mut connected.slider_scroll_accum,
-                                    &mut gain_db,
-                                    -12..=48,
-                                    1,
-                                    " dB",
-                                ) {
-                                    connected
-                                        .session
-                                        .rx_attenuation
-                                        .store((gain_db + 12).clamp(0, 60) as u32, Ordering::Relaxed);
-                                    settings_changed = true;
-                                }
-                            });
+                            // automation. REAL BUG FIX (a real report):
+                            // this used to be ui.add_enabled_ui(...)
+                            // wrapping the slider -- see
+                            // stable_i32_slider_enabled's own doc comment
+                            // for why that broke this row's Grid column
+                            // alignment.
+                            if stable_i32_slider_enabled(
+                                ui,
+                                &mut connected.slider_scroll_accum,
+                                &mut gain_db,
+                                -12..=48,
+                                1,
+                                " dB",
+                                !connected.autogain_enabled,
+                            ) {
+                                connected
+                                    .session
+                                    .rx_attenuation
+                                    .store((gain_db + 12).clamp(0, 60) as u32, Ordering::Relaxed);
+                                settings_changed = true;
+                            }
                         } else {
                             if has_alex_att {
                                 let mut alex_atten =
@@ -15463,12 +15467,34 @@ fn stable_i32_slider(
     step: i32,
     suffix: &str,
 ) -> bool {
+    stable_i32_slider_enabled(ui, scroll_accum, value, range, step, suffix, true)
+}
+
+/// Same as stable_i32_slider, but lets the caller grey out/disable the
+/// slider itself (e.g. RX Gain while HL2 autogain is driving it) without
+/// wrapping the call in ui.add_enabled_ui -- REAL BUG FIX (a real
+/// report): that wrapper puts the slider AND its value box inside one
+/// child Ui, which egui::Grid then counts as a single cell instead of
+/// the usual two (slider, box), shifting every column after it in that
+/// row out of alignment with the other rows sharing this same Grid.
+/// Disabling just the Slider widget itself (still added directly to the
+/// Grid's own `ui`, so cell count stays the normal two) keeps the
+/// column layout identical whether or not it's enabled.
+fn stable_i32_slider_enabled(
+    ui: &mut egui::Ui,
+    scroll_accum: &mut f32,
+    value: &mut i32,
+    range: std::ops::RangeInclusive<i32>,
+    step: i32,
+    suffix: &str,
+    enabled: bool,
+) -> bool {
     let prev_slider_width = ui.spacing().slider_width;
     ui.spacing_mut().slider_width = STABLE_SLIDER_TRACK_WIDTH;
-    let resp = ui.add(egui::Slider::new(value, range.clone()).show_value(false));
+    let resp = ui.add_enabled(enabled, egui::Slider::new(value, range.clone()).show_value(false));
     ui.spacing_mut().slider_width = prev_slider_width;
     let mut changed = resp.changed();
-    if resp.hovered() {
+    if enabled && resp.hovered() {
         let scroll_delta = ui.input(|i| i.smooth_scroll_delta);
         let delta = if scroll_delta.y.abs() >= scroll_delta.x.abs() { scroll_delta.y } else { scroll_delta.x };
         if delta != 0.0 {
