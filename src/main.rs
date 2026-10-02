@@ -7074,31 +7074,6 @@ impl eframe::App for HpsdrApp {
                             // VFO-B boxes' own RX/TX badge, which already
                             // shows the same state right where the eye
                             // is -- see freq_a_color's doc comment).
-
-                            // RADE status -- see draw_rade_status_row's
-                            // own doc comment. Shown here, at the right
-                            // of this same MOX/TUNE/TWO TONE/Record row,
-                            // only while RADE is active but the Digital
-                            // window is hidden (a per-user request,
-                            // replacing an earlier attempt that painted
-                            // this on the spectrum itself instead --
-                            // this spot has more room for the row's full
-                            // content and sits right next to MOX, where
-                            // the eye already is while operating). Same
-                            // condition as render_rade_panel's own
-                            // "Hide" button and the per-frame
-                            // `rade_engine_active` enable check: gone
-                            // the instant Mode leaves DIGU/DIGL by hand.
-                            if connected.digital_mode == DigitalMode::Rade
-                                && !connected.show_digital_window
-                                && matches!(
-                                    connected.spectrum.mode(),
-                                    spectrum::Mode::Digu | spectrum::Mode::Digl
-                                )
-                            {
-                                ui.add_space(12.0);
-                                draw_rade_status_row(ui, &connected.rade, true);
-                            }
                         });
                     }
 
@@ -7191,26 +7166,8 @@ impl eframe::App for HpsdrApp {
                         const WF_WIDTH: f32 = 160.0;
                         const WF_HEIGHT: f32 = 50.0;
                         const WF_MARGIN: f32 = 8.0;
-                        // Lifted an extra row's worth when the RADE
-                        // status row (draw_rade_status_row, MOX/TUNE row
-                        // above) is showing -- a per-user report: that
-                        // row runs right up against this box's own
-                        // fixed position otherwise, since this box is
-                        // painted directly at a screen coordinate (not
-                        // part of the normal layout flow that would
-                        // otherwise push it down to make room). Same
-                        // condition as that row's own -- see its call
-                        // site just above.
-                        let rade_status_row_showing = connected.digital_mode == DigitalMode::Rade
-                            && !connected.show_digital_window
-                            && matches!(connected.spectrum.mode(), spectrum::Mode::Digu | spectrum::Mode::Digl);
-                        const RADE_STATUS_ROW_LIFT: f32 = 26.0;
-                        let extra_lift = if rade_status_row_showing { RADE_STATUS_ROW_LIFT } else { 0.0 };
                         let above_rect = egui::Rect::from_min_size(
-                            egui::pos2(
-                                rect.right() - WF_MARGIN - WF_WIDTH,
-                                rect.top() - WF_MARGIN - WF_HEIGHT - extra_lift,
-                            ),
+                            egui::pos2(rect.right() - WF_MARGIN - WF_WIDTH, rect.top() - WF_MARGIN - WF_HEIGHT),
                             egui::vec2(WF_WIDTH, WF_HEIGHT),
                         );
                         // draw_audio_waveform insets its own panel by
@@ -8680,13 +8637,22 @@ impl eframe::App for HpsdrApp {
                                 } else {
                                     ui.visuals().weak_text_color()
                                 };
+                                // Fixed-width fields (monospace, each value
+                                // right-aligned in 6 chars = up to "-100.0"
+                                // with sign) in the same fixed 180px slot,
+                                // so the readout stays centered and never
+                                // changes width as the values move -- a
+                                // per-user report: the old 3-decimal Mic
+                                // value ("-0.501") pushed the text past
+                                // the slot's edge while keyed.
                                 ui.add_sized(
                                     [180.0, mic_line_height],
                                     egui::Label::new(
                                         egui::RichText::new(format!(
-                                            "Mic: {:.3}  ALC: {:.1}",
+                                            "MIC {:>6.1}  ALC {:>6.1}",
                                             disp.mic_pk, disp.alc_av
                                         ))
+                                        .font(egui::FontId::monospace(13.0))
                                         .color(mic_color),
                                     ),
                                 );
@@ -15630,6 +15596,20 @@ fn render_status_row(
             None => (egui::Color32::GRAY, "PureSignal: enabled".to_string()),
         };
         ui.colored_label(color, "PS").on_hover_text(hover);
+    }
+
+    // RADE status -- see draw_rade_status_row's own doc comment. Right
+    // after CAT (a per-user request; it used to sit at the right end of
+    // the MOX/TUNE row), only while RADE is active but the Digital
+    // window is hidden. Same condition as render_rade_panel's own "Hide"
+    // button and the per-frame `rade_engine_active` enable check: gone
+    // the instant Mode leaves DIGU/DIGL by hand.
+    if connected.digital_mode == DigitalMode::Rade
+        && !connected.show_digital_window
+        && matches!(connected.spectrum.mode(), spectrum::Mode::Digu | spectrum::Mode::Digl)
+    {
+        ui.add_space(12.0);
+        draw_rade_status_row(ui, &connected.rade, true);
     }
 
     // Record used to live at the end of this row -- moved to the
