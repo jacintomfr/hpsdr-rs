@@ -489,12 +489,21 @@ impl Inner {
                     // (nothing logged here) from "a burst arrived but the
                     // LDPC/CRC didn't check out" (this line) -- expected
                     // occasionally on marginal signal, no different from an
-                    // ordinary dropped packet.
+                    // ordinary dropped packet. snr_db added after a real
+                    // report of failures far more frequent than expected:
+                    // this tells apart "failed at genuinely marginal SNR"
+                    // (the weak EOO code's own known limit, nothing to fix)
+                    // from "failed at healthy SNR" (would point at
+                    // something upstream of text::decode instead, since
+                    // that path is otherwise verified bit-identical to
+                    // freedv-backend's own reference, HRA_56_56 matrix
+                    // included).
                     None => {
                         eprintln!(
                             "[rade] End-of-Over frame detected but text decode failed \
-                             (LDPC/CRC did not check out) -- eoo_rx len={}",
-                            self.eoo_rx.len()
+                             (LDPC/CRC did not check out) -- eoo_rx len={} snr_db={}",
+                            self.eoo_rx.len(),
+                            self.last_sync_snr
                         );
                     }
                 }

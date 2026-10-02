@@ -66,7 +66,7 @@
 use crate::report_recorder::ReportRecorder;
 use crate::rade_link::RadeHandle;
 use crate::rade_denoiser::RadeDenoiser;
-use crate::rade_mic_agc::{RadeCompressor, RadeLeveler};
+use crate::rade_mic_agc::{RadeCompressor, RadeEqParams, RadeEqualizer, RadeLeveler};
 use crate::rtty_link::RttyHandle;
 use crate::sstv_link::SstvHandle;
 use crate::radio::{
@@ -498,6 +498,17 @@ pub struct TxParams {
     /// leveler/compressor actually run.
     pub rade_leveler_enabled: bool,
     pub rade_compressor_enabled: bool,
+    /// Bass/Mid/Treble/Vol EQ, same place in the chain and same filter
+    /// shapes as freedv-gui's own mic-in equalizer -- see
+    /// rade_mic_agc.rs's RadeEqualizer doc comment. Runs last in the
+    /// RADE mic-conditioning chain, right before the modem.
+    pub rade_eq_enabled: bool,
+    pub rade_eq: crate::rade_mic_agc::RadeEqParams,
+    /// True while the RADE panel's "Monitor EQ" is on -- makes run()'s
+    /// idle (MOX off) branch keep processing the mic through the RADE
+    /// mic chain into rade_eq_monitor instead of discarding it, so the
+    /// EQ can be tuned by ear without keying the transmitter.
+    pub rade_eq_monitor_enabled: bool,
     /// RNNoise (rade_denoiser.rs) -- the same noise-reduction stage
     /// FreeDV's own mic pipeline applies (tmiw/freedv-backend's
     /// RNNoiseStep), confirmed by reading that source directly. Runs
@@ -571,6 +582,9 @@ impl Default for TxParams {
             // analog leveler/compressor just above.
             rade_leveler_enabled: false,
             rade_compressor_enabled: false,
+            rade_eq_enabled: false,
+            rade_eq: RadeEqParams::default(),
+            rade_eq_monitor_enabled: false,
             rade_denoiser_enabled: false,
             tx_denoiser_enabled: false,
             explicit_passband: None,
@@ -2026,6 +2040,11 @@ fn run(
     // See TxHandle::waveform_tap's doc comment. Fed alongside
     // tx_audio_monitor, same source content, independent capacity.
     waveform_tap: Arc<Mutex<VecDeque<f32>>>,
+    // See TxHandle::rade_eq_monitor's doc comment. Fed only while RADE
+    // is armed, right after rade_mic_agc's EQ step -- so the ear hears
+    // exactly what the Bass/Mid/Treble/Vol sliders did, before RADE's
+    // own codec/modem ever sees it.
+    rade_eq_monitor: Arc<Mutex<VecDeque<(f32, f32)>>>,
     mox: Arc<AtomicBool>,
     params: Arc<Mutex<TxParams>>,
     display: Arc<Mutex<TxDisplay>>,
@@ -2110,6 +2129,7 @@ fn run(
     // transmissions the same way FreeDV's own AgcStep does.
     let mut rade_leveler = RadeLeveler::new();
     let mut rade_compressor = RadeCompressor::new();
+    let mut rade_eq = RadeEqualizer::new();
     let mut rade_denoiser = RadeDenoiser::new();
     // See tx_denoiser_enabled's own call site doc comment -- a separate
     // instance from rade_denoiser above, for ordinary analog voice.
@@ -2233,7 +2253,64 @@ fn run(
             // accumulated while idle so the next PTT doesn't start by
             // replaying a backlog of stale audio, and don't burn CPU
             // running the TXA chain on nothing.
-            mic_buffer.lock().unwrap().clear();
+            //
+            // Exception: "Monitor EQ" (render_rade_panel) -- a per-user
+            // report: it only produced audio while MOX was keyed, i.e.
+            // while actually transmitting, which defeats tuning the EQ by
+            // ear. While monitoring is on, run the same RADE mic chain
+            // (denoise/leveler/compressor/EQ) over the idle mic audio
+            // and feed ONLY rade_eq_monitor -- nothing reaches the modem
+            // or the radio. Full chunks are consumed and any remainder
+            // stays buffered (not cleared) so consecutive 20ms passes
+            // join without gaps.
+            let (monitor_on, mon_denoise, mon_lev, mon_comp, mon_eq_on, mon_eq_params) = {
+                let p = params.lock().unwrap();
+                (
+                    p.rade_eq_monitor_enabled,
+                    p.rade_denoiser_enabled,
+                    p.rade_leveler_enabled,
+                    p.rade_compressor_enabled,
+                    p.rade_eq_enabled,
+                    p.rade_eq,
+                )
+            };
+            if monitor_on {
+                loop {
+                    let mut mon_chunk = {
+                        let mut buf = mic_buffer.lock().unwrap();
+                        if buf.len() < TX_BUFFER_SIZE {
+                            break;
+                        }
+                        let mut v = vec![0.0f32; TX_BUFFER_SIZE];
+                        for slot in v.iter_mut() {
+                            *slot = buf.pop_front().unwrap_or(0.0);
+                        }
+                        v
+                    };
+                    if mon_denoise {
+                        rade_denoiser.process(&mut mon_chunk);
+                    }
+                    if mon_lev {
+                        rade_leveler.process(&mut mon_chunk, mic_rate as f64);
+                    }
+                    if mon_comp {
+                        rade_compressor.process(&mut mon_chunk, mic_rate as f64);
+                    }
+                    if mon_eq_on {
+                        rade_eq.set_params(mon_eq_params);
+                        rade_eq.process(&mut mon_chunk, mic_rate as f64);
+                    }
+                    let mut mon = rade_eq_monitor.lock().unwrap();
+                    for &sample in mon_chunk.iter() {
+                        if mon.len() >= TX_AUDIO_MONITOR_CAPACITY {
+                            mon.pop_front();
+                        }
+                        mon.push_back((sample, sample));
+                    }
+                }
+            } else {
+                mic_buffer.lock().unwrap().clear();
+            }
             tci_tx_audio.lock().unwrap().clear();
             radio_mic_audio.lock().unwrap().clear();
             // BUG FIX (2026-09-17, real report): main.rs's
@@ -2483,9 +2560,15 @@ fn run(
             // RADE's already-modulated tones, not speech). Leveler
             // first, matching the reference's own pipeline order: get a
             // consistent level, then guard the peaks.
-            let (rade_denoise_on, rade_lev_on, rade_comp_on) = {
+            let (rade_denoise_on, rade_lev_on, rade_comp_on, rade_eq_on, rade_eq_params) = {
                 let p = params.lock().unwrap();
-                (p.rade_denoiser_enabled, p.rade_leveler_enabled, p.rade_compressor_enabled)
+                (
+                    p.rade_denoiser_enabled,
+                    p.rade_leveler_enabled,
+                    p.rade_compressor_enabled,
+                    p.rade_eq_enabled,
+                    p.rade_eq,
+                )
             };
             // Denoise first -- so the leveler's own loudness measurement
             // (and the compressor's envelope) reads the cleaned signal,
@@ -2498,6 +2581,29 @@ fn run(
             }
             if rade_comp_on {
                 rade_compressor.process(&mut mic_chunk, mic_rate as f64);
+            }
+            // Equalizer runs LAST, same place freedv-gui's own
+            // TxRxThread.cpp puts its EqualizerStep: after RNNoise/AGC,
+            // immediately before the audio is handed to the modem.
+            if rade_eq_on {
+                rade_eq.set_params(rade_eq_params);
+                rade_eq.process(&mut mic_chunk, mic_rate as f64);
+            }
+            // See TxHandle::rade_eq_monitor's doc comment -- fed
+            // unconditionally (same "cheap, nobody-reads-it-by-default"
+            // reasoning as tx_audio_monitor above), with whatever the
+            // mic chain produced regardless of whether rade_eq_on was
+            // true, so toggling Equalizer off is audible on the monitor
+            // too rather than silently freezing it on the last EQ'd
+            // audio.
+            {
+                let mut mon = rade_eq_monitor.lock().unwrap();
+                for &sample in mic_chunk.iter() {
+                    if mon.len() >= TX_AUDIO_MONITOR_CAPACITY {
+                        mon.pop_front();
+                    }
+                    mon.push_back((sample, sample));
+                }
             }
             // See rade_mic_waveform's own doc comment above.
             rade_mic_waveform.clear();
@@ -2959,6 +3065,15 @@ pub struct TxHandle {
     /// giving the waveform display a longer window doesn't also inflate
     /// tx_audio_monitor's real listen-through-speakers latency.
     pub waveform_tap: Arc<Mutex<VecDeque<f32>>>,
+    /// Post-EQ RADE mic monitor tap -- the raw microphone after
+    /// Denoise/Leveler/Compressor/Equalizer but BEFORE RADE's own
+    /// codec/modem, fed only while RADE is armed. Added so adjusting
+    /// the Bass/Mid/Treble/Vol sliders (render_rade_panel) can be done
+    /// by ear, the same way freedv-gui's own `equalizedMicAudioLink_`
+    /// tap lets you listen to your post-EQ voice in real time -- play
+    /// back locally (`AudioOutput::start(tx_handle.rade_eq_monitor.
+    /// clone(), ...)`) while talking and sliding the EQ bands.
+    pub rade_eq_monitor: Arc<Mutex<VecDeque<(f32, f32)>>>,
     /// Live -- see RadioSession::puresignal_enabled's doc comment
     /// (radio.rs) for the full story. Mirrors that same flag on the TX
     /// side: WDSP's PS engine is always created (TxProcessor::open, see
@@ -3039,6 +3154,7 @@ impl TxHandle {
         let ps_status = Arc::new(Mutex::new(PsStatus::default()));
         let tx_audio_monitor = Arc::new(Mutex::new(VecDeque::with_capacity(TX_AUDIO_MONITOR_CAPACITY)));
         let waveform_tap = Arc::new(Mutex::new(VecDeque::with_capacity(WAVEFORM_TAP_CAPACITY)));
+        let rade_eq_monitor = Arc::new(Mutex::new(VecDeque::with_capacity(TX_AUDIO_MONITOR_CAPACITY)));
         // Live -- see TxHandle::puresignal_enabled's doc comment.
         let puresignal_enabled = Arc::new(AtomicBool::new(puresignal_enabled));
         let stop = Arc::new(AtomicBool::new(false));
@@ -3053,6 +3169,7 @@ impl TxHandle {
             let ps_status = Arc::clone(&ps_status);
             let tx_audio_monitor = Arc::clone(&tx_audio_monitor);
             let waveform_tap = Arc::clone(&waveform_tap);
+            let rade_eq_monitor = Arc::clone(&rade_eq_monitor);
             let puresignal_enabled = Arc::clone(&puresignal_enabled);
             let stop = Arc::clone(&stop);
             let cw_text_elements = Arc::clone(&cw_text_elements);
@@ -3061,7 +3178,7 @@ impl TxHandle {
             thread::spawn(move || {
                 run(
                     mic_buffer, tci_tx_audio, radio_mic_audio, tx_audio_source, report_recorder, rtty, sstv, rade, tci_wants_mic,
-                    tx_iq_out, tx_spectrum_iq, tx_audio_monitor, waveform_tap, mox, params, display, channel,
+                    tx_iq_out, tx_spectrum_iq, tx_audio_monitor, waveform_tap, rade_eq_monitor, mox, params, display, channel,
                     protocol, mic_rate, duc_rate, puresignal_enabled, ps_rx_feedback_iq, ps_tx_feedback_iq,
                     ps_params, ps_status, ps_corr_path, cw_keyer, cw_text_elements, cw_text_active, cw_text_busy, stop,
                 )
@@ -3073,6 +3190,7 @@ impl TxHandle {
             ps_status,
             tx_audio_monitor,
             waveform_tap,
+            rade_eq_monitor,
             puresignal_enabled,
             params,
             ps_params,
@@ -3257,6 +3375,23 @@ impl TxHandle {
     }
     pub fn set_rade_compressor_enabled(&self, enabled: bool) {
         self.params.lock().unwrap().rade_compressor_enabled = enabled;
+    }
+    /// See TxParams::rade_eq_enabled's doc comment.
+    pub fn rade_eq_enabled(&self) -> bool {
+        self.params.lock().unwrap().rade_eq_enabled
+    }
+    pub fn set_rade_eq_enabled(&self, enabled: bool) {
+        self.params.lock().unwrap().rade_eq_enabled = enabled;
+    }
+    pub fn rade_eq(&self) -> RadeEqParams {
+        self.params.lock().unwrap().rade_eq
+    }
+    /// See TxParams::rade_eq_monitor_enabled's doc comment.
+    pub fn set_rade_eq_monitor_enabled(&self, on: bool) {
+        self.params.lock().unwrap().rade_eq_monitor_enabled = on;
+    }
+    pub fn set_rade_eq(&self, eq: RadeEqParams) {
+        self.params.lock().unwrap().rade_eq = eq;
     }
     /// See TxParams::rade_denoiser_enabled's doc comment.
     pub fn rade_denoiser_enabled(&self) -> bool {

@@ -1846,6 +1846,11 @@ struct ConnectedState {
     /// TX audio while transmitting is naturally only useful set up
     /// through headphones/a mixer, not the radio's own speaker path.
     tx_audio_monitor_output: Option<AudioOutput>,
+    /// Local playback of TxHandle::rade_eq_monitor -- same shape as
+    /// tx_audio_monitor_output above, but for the RADE panel's own
+    /// "Monitor EQ" checkbox (render_rade_panel), so adjusting the
+    /// Bass/Mid/Treble/Vol sliders can be done by ear.
+    rade_eq_monitor_output: Option<AudioOutput>,
     rigctl_server: Option<RigctlServer>,
     tci_server: Option<TciServer>,
     cat_server: Option<CatServer>,
@@ -3343,6 +3348,12 @@ fn connect_to_device(device: Device, cfg: &Config) -> Result<ConnectedState, Str
                     if let Some(v) = cfg.rade_compressor_enabled {
                         tx_handle.set_rade_compressor_enabled(v);
                     }
+                    if let Some(v) = cfg.rade_eq_enabled {
+                        tx_handle.set_rade_eq_enabled(v);
+                    }
+                    if let Some(v) = cfg.rade_eq {
+                        tx_handle.set_rade_eq(v);
+                    }
                     // Apply a previously-saved correction table
                     // immediately, if PS is enabled and one exists for
                     // this radio -- see TxHandle::restore_ps_corr's doc
@@ -3449,6 +3460,7 @@ fn connect_to_device(device: Device, cfg: &Config) -> Result<ConnectedState, Str
                 audio_output,
                 audio_output_device,
                 tx_audio_monitor_output: None,
+                rade_eq_monitor_output: None,
                 rigctl_server,
                 tci_server,
                 cat_server,
@@ -3824,6 +3836,11 @@ impl eframe::App for HpsdrApp {
                 match window.show(ui) {
                 DiscoveryAction::Start(device, juice_console, sim_handle) => {
                     let cfg = Config::load(device.mac);
+                    // See retarget_log_for_radio's own doc comment --
+                    // from here on this process's own output goes to a
+                    // log file named after THIS radio, not the generic
+                    // one every instance starts with.
+                    retarget_log_for_radio(device.mac);
                     // Move/resize the main window to wherever it was
                     // last left for THIS radio -- see
                     // Config::window_geometry's doc comment for why this
@@ -3844,8 +3861,25 @@ impl eframe::App for HpsdrApp {
                             ui.ctx().send_viewport_cmd(egui::ViewportCommand::OuterPosition(
                                 egui::pos2(g.x, g.y),
                             ));
+                            // Width forced to the same 1024 main()'s own
+                            // ViewportBuilder pins (a per-user request)
+                            // regardless of what a saved config has --
+                            // only height is restored from g, clamped to
+                            // the same 520 floor main()'s own
+                            // with_min_inner_size uses. ROOT CAUSE FIX
+                            // for a real report: a config saved mid-drag
+                            // (this window got force-killed, more than
+                            // once, while being resized during testing)
+                            // had height: 1.0 persisted, collapsing the
+                            // window down to just its title bar on every
+                            // launch with no way to grab a resize handle
+                            // to fix it (maximize then un-maximize was
+                            // the only recovery). A saved height this
+                            // degenerate is never something the operator
+                            // actually wanted, so clamping it here is
+                            // strictly safer than restoring it verbatim.
                             ui.ctx().send_viewport_cmd(egui::ViewportCommand::InnerSize(
-                                egui::vec2(g.width, g.height),
+                                egui::vec2(1024.0, g.height.max(520.0)),
                             ));
                         }
                     }
@@ -4195,9 +4229,24 @@ impl eframe::App for HpsdrApp {
                     connected.sstv.set_tx_armed(false);
                 }
                 connected.spectrum.set_rade(&connected.rade);
-                let rade_tab_active =
-                    connected.show_digital_window && connected.digital_mode == DigitalMode::Rade;
-                connected.rade.set_rx_enabled(rade_tab_active);
+                // Unlike RTTY/SSTV just above, NOT gated on
+                // show_digital_window -- see render_rade_panel's own
+                // "Hide" button doc comment (a per-user request): once
+                // the mic conditioning/EQ/callsign are set, there's
+                // nothing left to touch here during normal operation, so
+                // RADE keeps decoding/TX-arming with the window hidden,
+                // same as with it open. Gated on the dial Mode instead
+                // (DIGU/DIGL, same pair RADE always runs under while
+                // selected): manually switching to e.g. USB/LSB turns
+                // this off exactly like closing the window does (closing
+                // restores the pre-digital Mode, which already leaves
+                // DIGU/DIGL -- so both paths converge on this same
+                // check), matching a per-user request that switching
+                // mode by hand must always stop RADE, hidden window or
+                // not.
+                let rade_engine_active = connected.digital_mode == DigitalMode::Rade
+                    && matches!(connected.spectrum.mode(), spectrum::Mode::Digu | spectrum::Mode::Digl);
+                connected.rade.set_rx_enabled(rade_engine_active);
                 // Same direct-PTT redesign as RTTY above -- TALK (PTT)
                 // keys real mox itself now (see render_rade_panel's own
                 // mox_request). Leaving the tab mid-over still needs the
@@ -4211,16 +4260,16 @@ impl eframe::App for HpsdrApp {
                 // check (present on RTTY's own identical guard just
                 // above, but dropped here by mistake) -- this whole
                 // block runs every frame regardless of whether the
-                // Digital Modes window is even open, and `rade_tab_active`
-                // is false whenever it's closed (the normal state for
-                // ordinary operation), so it was forcing mox off on
-                // EVERY frame during ANY transmission at all -- plain
-                // SSB via the main MOX button, RTTY, SSTV -- the instant
-                // mox went true, regardless of whether RADE had
-                // anything to do with it. Confirmed exactly matching a
-                // real report of RTTY/SSTV both keying then immediately
-                // unkeying themselves.
-                if !rade_tab_active && connected.rade.tx_armed() && connected.session.mox_active() {
+                // Digital Modes window is even open, and `rade_engine_active`
+                // is false whenever RADE isn't selected/the dial has left
+                // DIGU/DIGL (the normal state for ordinary operation), so
+                // it was forcing mox off on EVERY frame during ANY
+                // transmission at all -- plain SSB via the main MOX
+                // button, RTTY, SSTV -- the instant mox went true,
+                // regardless of whether RADE had anything to do with it.
+                // Confirmed exactly matching a real report of RTTY/SSTV
+                // both keying then immediately unkeying themselves.
+                if !rade_engine_active && connected.rade.tx_armed() && connected.session.mox_active() {
                     set_rade_aware_mox(connected, false);
                 }
                 // Held off while a graceful unkey from the block above
@@ -4234,7 +4283,7 @@ impl eframe::App for HpsdrApp {
                 // transmitter keyed with mic/TCI audio instead of
                 // finishing the burst it already promised the far end.
                 if connected.rade_pending_unkey.is_none() {
-                    connected.rade.set_tx_armed(rade_tab_active);
+                    connected.rade.set_tx_armed(rade_engine_active);
                 }
                 // See ConnectedState::rade_pending_unkey's own doc comment.
                 // Polled every frame so the real radio stays keyed exactly
@@ -5266,6 +5315,13 @@ impl eframe::App for HpsdrApp {
                                     }
                                 }
                             });
+
+                            // Compact RADE status while the Digital window
+                            // is hidden now lives as an overlay directly
+                            // on the spectrum display instead (a per-user
+                            // request after seeing this toolbar version --
+                            // see the spectrum-draw call site's own
+                            // "RADE hidden-status overlay" comment).
 
                             // LEV/PROC/CFC -- moved up here (next to
                             // Settings/Add Receiver/Juice Console, in the
@@ -7018,6 +7074,31 @@ impl eframe::App for HpsdrApp {
                             // VFO-B boxes' own RX/TX badge, which already
                             // shows the same state right where the eye
                             // is -- see freq_a_color's doc comment).
+
+                            // RADE status -- see draw_rade_status_row's
+                            // own doc comment. Shown here, at the right
+                            // of this same MOX/TUNE/TWO TONE/Record row,
+                            // only while RADE is active but the Digital
+                            // window is hidden (a per-user request,
+                            // replacing an earlier attempt that painted
+                            // this on the spectrum itself instead --
+                            // this spot has more room for the row's full
+                            // content and sits right next to MOX, where
+                            // the eye already is while operating). Same
+                            // condition as render_rade_panel's own
+                            // "Hide" button and the per-frame
+                            // `rade_engine_active` enable check: gone
+                            // the instant Mode leaves DIGU/DIGL by hand.
+                            if connected.digital_mode == DigitalMode::Rade
+                                && !connected.show_digital_window
+                                && matches!(
+                                    connected.spectrum.mode(),
+                                    spectrum::Mode::Digu | spectrum::Mode::Digl
+                                )
+                            {
+                                ui.add_space(12.0);
+                                draw_rade_status_row(ui, &connected.rade, true);
+                            }
                         });
                     }
 
@@ -7110,8 +7191,26 @@ impl eframe::App for HpsdrApp {
                         const WF_WIDTH: f32 = 160.0;
                         const WF_HEIGHT: f32 = 50.0;
                         const WF_MARGIN: f32 = 8.0;
+                        // Lifted an extra row's worth when the RADE
+                        // status row (draw_rade_status_row, MOX/TUNE row
+                        // above) is showing -- a per-user report: that
+                        // row runs right up against this box's own
+                        // fixed position otherwise, since this box is
+                        // painted directly at a screen coordinate (not
+                        // part of the normal layout flow that would
+                        // otherwise push it down to make room). Same
+                        // condition as that row's own -- see its call
+                        // site just above.
+                        let rade_status_row_showing = connected.digital_mode == DigitalMode::Rade
+                            && !connected.show_digital_window
+                            && matches!(connected.spectrum.mode(), spectrum::Mode::Digu | spectrum::Mode::Digl);
+                        const RADE_STATUS_ROW_LIFT: f32 = 26.0;
+                        let extra_lift = if rade_status_row_showing { RADE_STATUS_ROW_LIFT } else { 0.0 };
                         let above_rect = egui::Rect::from_min_size(
-                            egui::pos2(rect.right() - WF_MARGIN - WF_WIDTH, rect.top() - WF_MARGIN - WF_HEIGHT),
+                            egui::pos2(
+                                rect.right() - WF_MARGIN - WF_WIDTH,
+                                rect.top() - WF_MARGIN - WF_HEIGHT - extra_lift,
+                            ),
                             egui::vec2(WF_WIDTH, WF_HEIGHT),
                         );
                         // draw_audio_waveform insets its own panel by
@@ -11584,6 +11683,7 @@ impl eframe::App for HpsdrApp {
                                             connected.ptt_held = false;
                                             connected.tx_handle = None;
                                             connected.tx_audio_monitor_output = None;
+                                            connected.rade_eq_monitor_output = None;
                                             connected.mic_input = None;
                                             connected.tx_enabled = false;
                                             // tx_handle is gone regardless, but tune_active/
@@ -13083,6 +13183,7 @@ impl eframe::App for HpsdrApp {
                     let rade_callsign = &mut connected.rade_callsign;
                     let rtty_send_on_return = &mut connected.rtty_send_on_return;
                     let tx_handle_ref = connected.tx_handle.as_ref();
+                    let rade_eq_monitor_output_active = connected.rade_eq_monitor_output.is_some();
                     let mut digital_mode = connected.digital_mode;
                     let mut fit_filter_clicked = false;
                     let mut sstv_fit_filter_clicked = false;
@@ -13121,6 +13222,17 @@ impl eframe::App for HpsdrApp {
                     // set_rade_aware_mox (needs connected, not available
                     // in here).
                     let mut rade_mox_request: Option<bool> = None;
+                    // See render_rade_panel's own eq_monitor_request doc
+                    // comment -- Some(bool) when the "Monitor EQ"
+                    // checkbox was toggled this frame, applied after the
+                    // closure below (starting/stopping an AudioOutput
+                    // needs connected, not available in here).
+                    let mut rade_eq_monitor_request: Option<bool> = None;
+                    // See render_rade_panel's own hide_clicked doc comment
+                    // -- true when "Hide" was clicked this frame, applied
+                    // after the closure below (connected isn't available
+                    // in here).
+                    let mut rade_hide_clicked = false;
                     // See ConnectedState::digital_window_geometry's own
                     // doc comment -- live-tracked every frame the window
                     // is open (not just when Config save fires), same
@@ -13252,18 +13364,21 @@ impl eframe::App for HpsdrApp {
                                             sstv_mox_request = sstv_mox_request.or(mox_request);
                                         }
                                         DigitalMode::Rade => {
-                                            let (clicked, quick_tune, mox_request) = render_rade_panel(
+                                            let (clicked, quick_tune, mox_request, eq_monitor_request, hide_clicked) = render_rade_panel(
                                                 ui,
                                                 &rade,
                                                 rade_callsign,
                                                 mox,
                                                 tx_handle_ref,
                                                 connected.rade_filter_wide,
+                                                rade_eq_monitor_output_active,
                                             );
                                             rade_fit_filter_clicked |= clicked;
                                             rade_filter_rotate_clicked |= clicked;
                                             digital_quick_tune_hz = digital_quick_tune_hz.or(quick_tune);
                                             rade_mox_request = rade_mox_request.or(mox_request);
+                                            rade_eq_monitor_request = rade_eq_monitor_request.or(eq_monitor_request);
+                                            rade_hide_clicked |= hide_clicked;
                                         }
                                     }
                                 });
@@ -13297,6 +13412,42 @@ impl eframe::App for HpsdrApp {
                         // unkey the main MOX button's own click handler
                         // uses, not a plain set_mox(false).
                         set_rade_aware_mox(connected, want);
+                    }
+                    if let Some(want) = rade_eq_monitor_request {
+                        // See TxHandle::rade_eq_monitor's and
+                        // ConnectedState::rade_eq_monitor_output's own doc
+                        // comments -- same start/stop-an-AudioOutput shape
+                        // as "Monitor TX Audio" below, always the system
+                        // default output device.
+                        if want {
+                            if let Some(tx) = &connected.tx_handle {
+                                match AudioOutput::start(Arc::clone(&tx.rade_eq_monitor), None, None) {
+                                    Ok(out) => {
+                                        connected.rade_eq_monitor_output = Some(out);
+                                        // Lets tx.rs's idle branch feed the
+                                        // monitor without MOX being keyed.
+                                        tx.set_rade_eq_monitor_enabled(true);
+                                    }
+                                    Err(e) => eprintln!("rade eq monitor unavailable: {e}"),
+                                }
+                            }
+                        } else {
+                            connected.rade_eq_monitor_output = None;
+                            if let Some(tx) = &connected.tx_handle {
+                                tx.set_rade_eq_monitor_enabled(false);
+                            }
+                        }
+                    }
+                    if rade_hide_clicked {
+                        // Deliberately NOT the same cleanup as
+                        // close_requested/the "Digital..." button's close
+                        // branch -- this only tucks the window away.
+                        // digital_mode, the dial Mode (DIGU/DIGL), and the
+                        // explicit passband are all left exactly as they
+                        // are, so RX decode/TX-armed stay live (see the
+                        // rade_engine_active block above, which no longer
+                        // depends on show_digital_window at all).
+                        connected.show_digital_window = false;
                     }
                     if let Some(hz) = digital_quick_tune_hz {
                         // See SSTV_QUICK_TUNE_HZ/RADE_QUICK_TUNE_HZ's own
@@ -13574,6 +13725,8 @@ impl eframe::App for HpsdrApp {
                         rade_denoiser_enabled: connected.tx_handle.as_ref().map(|t| t.rade_denoiser_enabled()),
                         rade_leveler_enabled: connected.tx_handle.as_ref().map(|t| t.rade_leveler_enabled()),
                         rade_compressor_enabled: connected.tx_handle.as_ref().map(|t| t.rade_compressor_enabled()),
+                        rade_eq_enabled: connected.tx_handle.as_ref().map(|t| t.rade_eq_enabled()),
+                        rade_eq: connected.tx_handle.as_ref().map(|t| t.rade_eq()),
                         tci_tx_gain: Some(connected.tci_tx_gain),
                         tx_power_watts: Some(connected.session.tx_power_watts.load(Ordering::Relaxed)),
                         cw_keyer_mode: Some(connected.session.cw_keyer.mode.load(Ordering::Relaxed)),
@@ -13820,6 +13973,8 @@ impl eframe::App for HpsdrApp {
                     manual_discovery(Arc::clone(&discovered), device.address.ip());
                     let device = discovered.lock().unwrap().first().copied().unwrap_or(device);
                     let cfg = Config::load(device.mac);
+                    // See retarget_log_for_radio's own doc comment.
+                    retarget_log_for_radio(device.mac);
                     self.state = match connect_to_device(device, &cfg) {
                         Ok(new_connected) => AppState::Connected(new_connected),
                         Err(e) => AppState::Error(e),
@@ -14787,6 +14942,117 @@ fn render_sstv_panel(
 const RADE_QUICK_TUNE_HZ: [(&str, u32); 5] =
     [("80m", 3_630_000), ("40m", 7_180_000), ("20m", 14_236_000), ("15m", 21_180_000), ("10m", 28_330_000)];
 
+/// Sync dot + SNR + freq offset (+ RX level bar/dropped-sample warning
+/// when `compact` is false) -- RADE's live RX status row, same content
+/// render_rade_panel has always shown, now factored out so main.rs's
+/// MOX/TUNE/TWO TONE row (render_main_window's own call site) can show
+/// the same thing when the Digital window is hidden, instead of the
+/// earlier, sparser dot+RADE+SNR+CALL overlay painted on the spectrum --
+/// a per-user request after trying that one. `compact` drops the RX
+/// level bar and dropped-sample warning (the two widest pieces) so CALL
+/// -- the one thing missing from the old overlay version -- reliably
+/// fits next to MOX without colliding with the audio-waveform scope box
+/// floating in that same corner (a real report: the full-width version
+/// ran right into it). `render_rade_panel` itself has the room to spare,
+/// so it always passes `compact: false`.
+fn draw_rade_status_row(ui: &mut egui::Ui, rade: &rade_link::RadeHandle, compact: bool) {
+    let amber = egui::Color32::from_rgb(230, 150, 50);
+    let green = egui::Color32::from_rgb(40, 190, 70);
+    let st = rade.stats();
+    // Real report: occasional "DMR-like" robotic/glitchy audio, random,
+    // even at otherwise good SNR -- matches a known, documented RADE V1
+    // acquisition characteristic (see rade_c's own commit history, an
+    // OTA test note from the author: a brief "false-sync-then-reacquire
+    // transient" can report `sync` before the decoder has really locked
+    // well, producing a few garbled-sounding frames before it settles).
+    // Purely a VISUAL flag, on request -- no audio behaviour changes
+    // here at all -- so the operator can correlate what they hear
+    // against this indicator and confirm/rule out that explanation,
+    // rather than the app silently deciding to mute or otherwise act on
+    // it. RADE V1's own usable floor is documented around -2dB SNR, so a
+    // few dB of margin above that (rather than 0dB) catches a real dip
+    // approaching the danger zone without flagging every ordinary few-dB
+    // wobble on a strong signal.
+    const RADE_SYNC_MARGINAL_SNR_DB: f32 = 4.0;
+    let marginal = st.sync && st.snr_db < RADE_SYNC_MARGINAL_SNR_DB;
+    ui.horizontal(|ui| {
+        let (rect, _) = ui.allocate_exact_size(egui::vec2(14.0, 14.0), egui::Sense::hover());
+        let dot_color = if !st.sync {
+            amber
+        } else if marginal {
+            egui::Color32::from_rgb(230, 200, 40) // yellow
+        } else {
+            green
+        };
+        ui.painter().circle_filled(rect.center(), 6.0, dot_color);
+        // Each field gets a fixed-width slot sized for its worst-case text,
+        // so the values oscillating (SNR/offset change every frame) never
+        // shift the items after them -- a per-user report: the row moving
+        // around was visibly disturbing the spectrum below it. "(marginal)"
+        // dropped from the label too (a per-user request): the yellow
+        // already says it, and the hover text still explains.
+        let font = egui::TextStyle::Body.resolve(ui.style());
+        let text_w = |ui: &egui::Ui, s: &str| -> f32 {
+            ui.painter().layout_no_wrap(s.to_string(), font.clone(), egui::Color32::WHITE).size().x
+        };
+        let row_h = ui.spacing().interact_size.y;
+        let slot = |ui: &mut egui::Ui, width: f32, add: &mut dyn FnMut(&mut egui::Ui)| {
+            ui.allocate_ui_with_layout(
+                egui::vec2(width, row_h),
+                egui::Layout::left_to_right(egui::Align::Center),
+                |ui| add(ui),
+            );
+        };
+        let sync_w = text_w(ui, "no sync");
+        let snr_w = text_w(ui, "SNR -99 dB");
+        let off_w = text_w(ui, "offset +999 Hz");
+        let call_w = text_w(ui, &format!("last call: {}", "M".repeat(rade::text::MAX_CHARS)));
+
+        slot(ui, sync_w, &mut |ui| {
+            if !st.sync {
+                ui.label("no sync");
+            } else if marginal {
+                ui.colored_label(dot_color, "SYNC").on_hover_text(
+                    "SNR is close to RADE V1's usable floor (~-2dB) -- a real, \
+                     documented acquisition characteristic of this mode can \
+                     briefly report sync before it has really settled here, \
+                     sometimes audible as a few garbled/robotic-sounding \
+                     frames before it locks properly. Not this app changing \
+                     anything -- just flagging when conditions match.",
+                );
+            } else {
+                ui.label("SYNC");
+            }
+        });
+        slot(ui, snr_w, &mut |ui| {
+            if st.sync {
+                ui.label(format!("SNR {:.0} dB", st.snr_db));
+            }
+        });
+        slot(ui, off_w, &mut |ui| {
+            if st.sync {
+                ui.label(format!("offset {:+.0} Hz", st.freq_offset_hz));
+            }
+        });
+        if !compact {
+            ui.add(
+                egui::ProgressBar::new(st.rx_level.clamp(0.0, 1.0))
+                    .desired_width(100.0)
+                    .text("RX level"),
+            );
+            if st.dropped > 0 {
+                ui.colored_label(amber, format!("{} samples dropped", st.dropped));
+            }
+        }
+        let last_call = rade.rx_log().last().map(|e| e.call.clone());
+        slot(ui, call_w, &mut |ui| {
+            if let Some(call) = &last_call {
+                ui.label(format!("last call: {call}"));
+            }
+        });
+    });
+}
+
 fn render_rade_panel(
     ui: &mut egui::Ui,
     rade: &rade_link::RadeHandle,
@@ -14794,9 +15060,28 @@ fn render_rade_panel(
     mox: bool,
     tx_handle: Option<&TxHandle>,
     filter_wide: bool,
-) -> (bool, Option<u32>, Option<bool>) {
+    // Whether TxHandle::rade_eq_monitor is currently being played back
+    // locally -- the caller owns the actual AudioOutput (main.rs isn't
+    // reachable from in here), this just reads/toggles it. See the
+    // "Monitor EQ" checkbox below and this fn's last return value.
+    monitoring_eq: bool,
+) -> (bool, Option<u32>, Option<bool>, Option<bool>, bool) {
     let mut fit_filter_clicked = false;
     let mut quick_tune_hz = None;
+    let mut eq_monitor_request: Option<bool> = None;
+    // True the frame "Hide" is clicked -- see this fn's own doc comment
+    // and the call site's handling. Unlike the window's native X/Escape
+    // (close_requested, handled entirely at the call site), this does
+    // NOT restore the pre-digital Mode or filters: the whole point is
+    // to keep RADE actually running (RX decode, TX armed) with the
+    // window just out of the way, not to leave the mode. A per-user
+    // request: once the EQ/Leveler/Compressor/callsign are set, there's
+    // nothing left to touch here during normal operation, so keeping
+    // this whole panel on screen is wasted space -- the compact
+    // sync/SNR/RX level/CALL readout main.rs shows in the main
+    // toolbar while hidden (see ConnectedState's own render call site)
+    // covers everything actually needed moment-to-moment.
+    let mut hide_clicked = false;
     // Some(bool) the frame TALK (PTT) is clicked -- the caller (main.rs's
     // call site) turns this into a real connected.session.set_mox() call
     // via set_rade_aware_mox (session isn't reachable from in here, and
@@ -14807,14 +15092,13 @@ fn render_rade_panel(
     let mut mox_request: Option<bool> = None;
     let amber = egui::Color32::from_rgb(230, 150, 50);
     let red = egui::Color32::from_rgb(220, 50, 50);
-    let green = egui::Color32::from_rgb(40, 190, 70);
 
     if !rade.available() {
         ui.colored_label(
             red,
             "RADE failed to start this session (see the log) -- this mode is unavailable until the app is restarted.",
         );
-        return (false, None, None);
+        return (false, None, None, None, false);
     }
 
     ui.horizontal(|ui| {
@@ -14829,6 +15113,22 @@ fn render_rade_panel(
             rade.set_callsign(callsign);
         }
         ui.add_space(8.0);
+        // See hide_clicked's own doc comment above -- "once this is
+        // parametrized there's nothing left to touch" request: tucks
+        // the window away without leaving RADE (unlike the window's own
+        // X), shown rightmost so it reads as "I'm done setting up, not
+        // closing the mode".
+        if ui
+            .button("Hide")
+            .on_hover_text(
+                "Keep RADE running (RX decode, TX armed for MOX) and put this window away -- \
+                 the main screen shows sync/SNR/RX level/last CALL in its place. Switching Mode \
+                 away from DIGU/DIGL turns RADE off same as closing this window would.",
+            )
+            .clicked()
+        {
+            hide_clicked = true;
+        }
         // Same explicit_passband mechanism as RTTY/SSTV's own Fit Filter
         // -- see this panel's own call site for the two widths this
         // rotates between on every click (deskHPSDR's 700-2300Hz figure
@@ -14921,68 +15221,101 @@ fn render_rade_panel(
             {
                 tx.set_rade_compressor_enabled(comp);
             }
+            let mut eq_on = tx.rade_eq_enabled();
+            if ui
+                .checkbox(&mut eq_on, "Equalizer")
+                .on_hover_text(
+                    "Bass/Mid/Treble/Vol EQ, same shapes and defaults as FreeDV GUI's own \
+                     Mic In Equaliser, applied last before the modem",
+                )
+                .changed()
+            {
+                tx.set_rade_eq_enabled(eq_on);
+            }
+            let mut monitor_eq = monitoring_eq;
+            if ui
+                .checkbox(&mut monitor_eq, "Monitor EQ")
+                .on_hover_text(
+                    "Plays your mic audio back through the local speaker/headphones right after \
+                     Denoise/Leveler/Compressor/Equalizer, before RADE's own codec -- so you can \
+                     tune the EQ by ear while talking, same idea as FreeDV GUI's own post-EQ \
+                     mic monitor",
+                )
+                .changed()
+            {
+                eq_monitor_request = Some(monitor_eq);
+            }
         });
+        if tx.rade_eq_enabled() {
+            let mut eq = tx.rade_eq();
+            let mut changed = false;
+            let gain_range = rade_mic_agc::EQ_GAIN_MIN_DB..=rade_mic_agc::EQ_GAIN_MAX_DB;
+            // Same layout as freedv-gui's own Mic In Equaliser tab
+            // (dlg_filter.cpp's `newEQ`/`newEQControl`): one boxed column
+            // per band (Vol, Bass, Mid, Treble, in that order), each a
+            // small stack of vertical sliders (Freq/Gain/Q) with the
+            // live value printed under each -- narrow per-band, so all
+            // four sit comfortably in one row instead of needing the
+            // wide horizontal sliders tried before this.
+            ui.horizontal(|ui| {
+                ui.add_space(16.0);
+                ui.group(|ui| {
+                    ui.vertical(|ui| {
+                        ui.label("Vol");
+                        changed |= vertical_eq_slider(ui, "Gain", &mut eq.vol_gain_db, gain_range.clone(), " dB", 1);
+                    });
+                });
+                ui.group(|ui| {
+                    ui.vertical(|ui| {
+                        ui.label("Bass");
+                        ui.horizontal(|ui| {
+                            changed |= vertical_eq_slider(
+                                ui, "Freq", &mut eq.bass_freq_hz, 1.0..=rade_mic_agc::EQ_BASS_FREQ_MAX_HZ, " Hz", 0,
+                            );
+                            changed |= vertical_eq_slider(ui, "Gain", &mut eq.bass_gain_db, gain_range.clone(), " dB", 1);
+                        });
+                    });
+                });
+                ui.group(|ui| {
+                    ui.vertical(|ui| {
+                        ui.label("Mid");
+                        ui.horizontal(|ui| {
+                            changed |= vertical_eq_slider(
+                                ui, "Freq", &mut eq.mid_freq_hz, 1.0..=rade_mic_agc::EQ_MID_FREQ_MAX_HZ, " Hz", 0,
+                            );
+                            changed |= vertical_eq_slider(ui, "Gain", &mut eq.mid_gain_db, gain_range.clone(), " dB", 1);
+                            changed |= vertical_eq_slider(
+                                ui, "Q", &mut eq.mid_q, rade_mic_agc::EQ_Q_MIN..=rade_mic_agc::EQ_Q_MAX, "", 2,
+                            );
+                        });
+                    });
+                });
+                ui.group(|ui| {
+                    ui.vertical(|ui| {
+                        ui.label("Treble");
+                        ui.horizontal(|ui| {
+                            changed |= vertical_eq_slider(
+                                ui, "Freq", &mut eq.treble_freq_hz, 1.0..=rade_mic_agc::EQ_TREBLE_FREQ_MAX_HZ, " Hz", 0,
+                            );
+                            changed |= vertical_eq_slider(ui, "Gain", &mut eq.treble_gain_db, gain_range.clone(), " dB", 1);
+                        });
+                    });
+                });
+                ui.vertical(|ui| {
+                    ui.add_space(4.0);
+                    if ui.button("Default").on_hover_text("Reset to FreeDV GUI's own defaults").clicked() {
+                        eq = rade_mic_agc::RadeEqParams::default();
+                        changed = true;
+                    }
+                });
+            });
+            if changed {
+                tx.set_rade_eq(eq);
+            }
+        }
     }
 
-    let st = rade.stats();
-    // Real report: occasional "DMR-like" robotic/glitchy audio, random,
-    // even at otherwise good SNR -- matches a known, documented RADE V1
-    // acquisition characteristic (see rade_c's own commit history, an
-    // OTA test note from the author: a brief "false-sync-then-reacquire
-    // transient" can report `sync` before the decoder has really locked
-    // well, producing a few garbled-sounding frames before it settles).
-    // Purely a VISUAL flag, on request -- no audio behaviour changes
-    // here at all -- so the operator can correlate what they hear
-    // against this indicator and confirm/rule out that explanation,
-    // rather than the app silently deciding to mute or otherwise act on
-    // it. RADE V1's own usable floor is documented around -2dB SNR, so a
-    // few dB of margin above that (rather than 0dB) catches a real dip
-    // approaching the danger zone without flagging every ordinary few-dB
-    // wobble on a strong signal.
-    const RADE_SYNC_MARGINAL_SNR_DB: f32 = 4.0;
-    let marginal = st.sync && st.snr_db < RADE_SYNC_MARGINAL_SNR_DB;
-    ui.horizontal(|ui| {
-        let (rect, _) = ui.allocate_exact_size(egui::vec2(14.0, 14.0), egui::Sense::hover());
-        let dot_color = if !st.sync {
-            amber
-        } else if marginal {
-            egui::Color32::from_rgb(230, 200, 40) // yellow
-        } else {
-            green
-        };
-        ui.painter().circle_filled(rect.center(), 6.0, dot_color);
-        let sync_label = if !st.sync {
-            "no sync"
-        } else if marginal {
-            "SYNC (marginal)"
-        } else {
-            "SYNC"
-        };
-        if marginal {
-            ui.colored_label(dot_color, sync_label).on_hover_text(
-                "SNR is close to RADE V1's usable floor (~-2dB) -- a real, \
-                 documented acquisition characteristic of this mode can \
-                 briefly report sync before it has really settled here, \
-                 sometimes audible as a few garbled/robotic-sounding \
-                 frames before it locks properly. Not this app changing \
-                 anything -- just flagging when conditions match.",
-            );
-        } else {
-            ui.label(sync_label);
-        }
-        if st.sync {
-            ui.label(format!("SNR {:.0} dB", st.snr_db));
-            ui.label(format!("offset {:+.0} Hz", st.freq_offset_hz));
-        }
-        ui.add(
-            egui::ProgressBar::new(st.rx_level.clamp(0.0, 1.0))
-                .desired_width(100.0)
-                .text("RX level"),
-        );
-        if st.dropped > 0 {
-            ui.colored_label(amber, format!("{} samples dropped", st.dropped));
-        }
-    });
+    draw_rade_status_row(ui, rade, false);
 
     ui.horizontal(|ui| {
         // Direct PTT control -- no separate arm step, matching
@@ -15042,7 +15375,7 @@ fn render_rade_panel(
         });
 
     ui.ctx().request_repaint_after(Duration::from_millis(300));
-    (fit_filter_clicked, quick_tune_hz, mox_request)
+    (fit_filter_clicked, quick_tune_hz, mox_request, eq_monitor_request, hide_clicked)
 }
 
 /// Draws the CW decoder panel pinned to exactly `rect` (the caller
@@ -15661,6 +15994,29 @@ fn scroll_drag_value_f32(
         }
     }
     changed
+}
+
+/// A single vertical slider with a small caption above and the live
+/// value printed below -- the same per-control shape as freedv-gui's
+/// own `FilterDlg::newEQControl` (a label, a `wxSL_VERTICAL` slider,
+/// then a value readout), used to build the RADE EQ's Vol/Bass/Mid/
+/// Treble band boxes (render_rade_panel). `decimals` controls the
+/// value readout's precision (0 for Hz, 1 for dB, 2 for Q).
+fn vertical_eq_slider(
+    ui: &mut egui::Ui,
+    caption: &str,
+    value: &mut f32,
+    range: std::ops::RangeInclusive<f32>,
+    suffix: &str,
+    decimals: usize,
+) -> bool {
+    ui.vertical(|ui| {
+        ui.weak(caption);
+        let resp = ui.add(egui::Slider::new(value, range).vertical());
+        ui.label(format!("{:.*}{}", decimals, *value, suffix));
+        resp.changed()
+    })
+    .inner
 }
 
 fn scroll_slider_f32(
@@ -17957,7 +18313,9 @@ fn enter_digital_mode_filters(connected: &mut ConnectedState) {
         eq.enabled = false;
         tx.set_eq(eq);
     }
-    connected.spectrum_zoom = 8;
+    // Per-user correction: was 8x, found 6x reads better for digital
+    // modes' narrower passbands.
+    connected.spectrum_zoom = 6;
     connected.spectrum_pan = 0.0;
 }
 
@@ -18836,11 +19194,11 @@ impl Palette {
 /// process's lifetime instead of being closed out from under it the
 /// moment this function returns.
 #[cfg(all(windows, not(debug_assertions)))]
-fn redirect_stdio_to_log_file() {
+fn redirect_stdio_to_log_file(filename: &str) {
     use std::os::windows::io::IntoRawHandle;
     use windows_sys::Win32::System::Console::{SetStdHandle, STD_ERROR_HANDLE, STD_OUTPUT_HANDLE};
 
-    let Some(path) = debug_log::log_path("hpsdr-rs.log") else {
+    let Some(path) = debug_log::log_path(filename) else {
         return;
     };
     let Ok(file) = std::fs::File::create(&path) else {
@@ -18852,6 +19210,29 @@ fn redirect_stdio_to_log_file() {
         SetStdHandle(STD_ERROR_HANDLE, handle);
     }
 }
+
+/// Re-points stdout/stderr at a per-radio log file (`hpsdr-rs-<mac>.log`,
+/// same MAC-keyed naming as `config::config_path`/`ps_corr_path`), called
+/// once a radio's MAC is known (both `DiscoveryAction::Start` call
+/// sites, right after `Config::load(device.mac)`). A per-user request:
+/// running two instances at once (e.g. one radio receiving, another
+/// transmitting, bridged together) previously meant both processes
+/// fought over the exact same `hpsdr-rs.log` -- each `File::create` at
+/// its own startup truncated whatever the other had already written,
+/// and after that both appended to the same file, interleaving their
+/// output with no way to tell which process logged which line. Before
+/// this point (still on the Discovery screen, no radio chosen yet),
+/// output keeps going to the generic `hpsdr-rs.log` from
+/// `redirect_stdio_to_log_file` at startup -- there's no MAC to key off
+/// yet. Windows-release-only, matching `redirect_stdio_to_log_file`
+/// itself; see `retarget_log_for_radio_unix` for the Unix equivalent.
+#[cfg(all(windows, not(debug_assertions)))]
+fn retarget_log_for_radio(mac: [u8; 6]) {
+    let [a, b, c, d, e, f] = mac;
+    redirect_stdio_to_log_file(&format!("hpsdr-rs-{a:02x}-{b:02x}-{c:02x}-{d:02x}-{e:02x}-{f:02x}.log"));
+}
+#[cfg(not(all(windows, not(debug_assertions))))]
+fn retarget_log_for_radio(_mac: [u8; 6]) {}
 
 /// Unix equivalent of redirect_stdio_to_log_file above, but opt-in
 /// (`HPSDR_RS_LOG_FILE=1`) rather than unconditional: unlike Windows
@@ -18946,7 +19327,7 @@ fn main() -> eframe::Result<()> {
     // this matters: with no console auto-allocated on Windows release
     // builds, println!/eprintln! output would otherwise go nowhere.
     #[cfg(all(windows, not(debug_assertions)))]
-    redirect_stdio_to_log_file();
+    redirect_stdio_to_log_file("hpsdr-rs.log");
     // See that function's own doc comment -- opt-in via HPSDR_RS_LOG_FILE=1.
     #[cfg(unix)]
     redirect_stdio_to_log_file_if_requested();
@@ -19046,9 +19427,23 @@ fn main() -> eframe::Result<()> {
             .with_fullscreen(true)
             .with_icon(icon)
     } else {
+        // Width locked at 1024 -- a per-user request: horizontal
+        // resizing isn't wanted, only vertical. min/max width both
+        // pinned to the same 1024 (rather than with_resizable(false),
+        // which would also lock height) clamps any horizontal drag
+        // straight back, while height stays freely resizable via its
+        // own unconstrained max. See the DiscoveryAction::Start handler
+        // below, which forces the same 1024 width when restoring a
+        // per-radio saved window geometry too, in case an older config
+        // saved a different width before this was pinned.
         egui::ViewportBuilder::default()
-            .with_inner_size([1200.0, 660.0])
-            .with_min_inner_size([900.0, 520.0])
+            .with_inner_size([1024.0, 660.0])
+            .with_min_inner_size([1024.0, 520.0])
+            // A large finite bound, not f32::INFINITY -- safer/more
+            // conventional for a window-manager max-size hint, and
+            // avoids relying on every platform backend handling an
+            // actually-infinite value the same way.
+            .with_max_inner_size([1024.0, 4000.0])
             .with_icon(icon)
     };
     let options = eframe::NativeOptions {

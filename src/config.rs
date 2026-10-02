@@ -39,6 +39,12 @@ pub struct Config {
     pub rade_leveler_enabled: Option<bool>,
     #[serde(default)]
     pub rade_compressor_enabled: Option<bool>,
+    /// RADE mic Bass/Mid/Treble/Vol equalizer -- see
+    /// tx::TxParams::rade_eq_enabled's doc comment.
+    #[serde(default)]
+    pub rade_eq_enabled: Option<bool>,
+    #[serde(default)]
+    pub rade_eq: Option<crate::rade_mic_agc::RadeEqParams>,
     /// Output device for local RX audio playback (Settings -> Audio's
     /// "Output device" picker), by name -- e.g. "CABLE Input (VB-Audio
     /// Virtual Cable)" to feed a decoder instead of/alongside real
