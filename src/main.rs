@@ -13141,7 +13141,11 @@ impl eframe::App for HpsdrApp {
                     // this constant (see digital_window_initial_geometry
                     // below) -- their layout instead self-adjusts via
                     // render_digital_panel's own rx_height calculation.
-                    let size = [640.0, 540.0];
+                    // Kiosk: near the whole 1024x600 panel instead of
+                    // 640x540 -- the RADE panel (callsign, mic
+                    // conditioning row, status, RX log) is wider/taller
+                    // than the other tabs and clipped at the old size.
+                    let size = if digital_kiosk { [1000.0, 580.0] } else { [640.0, 540.0] };
                     let mut digital_viewport = egui::ViewportBuilder::default()
                         .with_title("Digital Modes")
                         .with_inner_size(size)
@@ -15257,6 +15261,7 @@ fn render_rade_panel(
             // live value printed under each -- narrow per-band, so all
             // four sit comfortably in one row instead of needing the
             // wide horizontal sliders tried before this.
+            let mut eq_bands = |ui: &mut egui::Ui| {
             ui.horizontal(|ui| {
                 ui.add_space(16.0);
                 ui.group(|ui| {
@@ -15309,6 +15314,19 @@ fn render_rade_panel(
                     }
                 });
             });
+            };
+            // Kiosk (1024x600): the band sliders are ~380px tall, which
+            // doesn't fit alongside the rest of this panel in the fixed
+            // 600px-high screen, so they sit in a header that starts
+            // collapsed there. Desktop is unchanged -- drawn directly,
+            // no header.
+            if lcd_kiosk_mode() {
+                egui::CollapsingHeader::new("Equalizer bands")
+                    .default_open(false)
+                    .show(ui, |ui| eq_bands(ui));
+            } else {
+                eq_bands(ui);
+            }
             if changed {
                 tx.set_rade_eq(eq);
             }
