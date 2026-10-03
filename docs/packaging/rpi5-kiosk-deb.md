@@ -176,3 +176,17 @@ Build from a Linux checkout (or a copy exported with
 line ends in a carriage return. `.gitattributes` forces LF for
 `assets/deb-kiosk/*` and the packaging scripts. The Ozy firmware
 `assets/ozy/ozyfw-sdr1k.hex` is stored with CRLF in git and ships that way.
+
+## Branches and updating
+
+The kiosk is the same code base as the desktop build (`HPSDR_LCD_1024X600=1`
+only changes the layout geometry), so the `.deb` is built from `master`; the
+`kiosk-rpi` branch is kept equal to `master`. To update a Pi: build the next
+package revision (`scripts/rpi5-kiosk-deb/2-build-deb.sh <revision>`), copy it
+to `/tmp` on the Pi and `sudo apt install -y /tmp/<file>.deb`. Delete older
+packages from `/tmp` afterwards: `/tmp` is a 2 GB tmpfs on the Pi and fills up
+with old versions.
+
+Per-radio settings live in `~/.config/hpsdr-rs/` and survive an upgrade; a
+`.json.bak` copy of each radio's file (as it was at start-up) is kept beside it.
+Run with `HPSDR_RS_LOG_FILE=1 hpsdr-rs-kiosk` to write a log there too.

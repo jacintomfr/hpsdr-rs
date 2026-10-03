@@ -27,6 +27,7 @@ from source and project status, see the [top-level README](../../README.md).
 19. [Ozy USB](19-ozy-usb.md) -- connecting the original Ozy/Mercury/Penny hardware over USB (new, unconfirmed)
 20. [RX-888 Mk2](20-rx888-mk2.md) -- receive-only direct-sampling SDR, software DDC, multiple receivers
 21. [Direct connection](21-direct-connection.md) -- plugging a radio straight into a PC or Raspberry Pi (no router), link-local addressing on Windows and Linux
+22. [Controls and the VFO window](22-controls-and-vfo-window.md) -- button style, VFO keypad window, RIT/XIT gestures, RxPGA/AGC switches, desktop vs kiosk layout
 
 **PDF**: this whole manual is also available as a single PDF, useful for
 offline/printed reading. It's built automatically by the "Manual PDF"

@@ -220,8 +220,10 @@ you have your own authorization for out-of-band operation.
 
 The controls themselves:
 
-- **MOX** -- toggles transmit on/off. While active it turns red and reads
-  **MOX ON**, and a red **TRANSMITTING** label appears.
+- **MOX** -- toggles transmit on/off. While transmitting it turns red with
+  white text (as do **TUNE** and **TWO TONE** while they run); the VFO box
+  badge also changes from RX to TX. Idle, they are grey like the other
+  buttons -- see [Controls and the VFO window](22-controls-and-vfo-window.md).
 - **TUNE** -- transmits a steady test tone, centered in the current filter
   passband, at the reduced **Tune Power %** set in Settings → TX (not full
   TX Power) -- for safely tuning an antenna or amplifier.
@@ -238,7 +240,8 @@ The controls themselves:
 - **RIT**/**XIT** both: click to toggle on/off; scroll while hovering to
   adjust the offset (Shift for 10 Hz steps, otherwise 100 Hz, clamped to
   ±9,999 Hz) -- the button's own label shows the current offset once it's
-  non-zero (e.g. **RIT +250**); **Clear** zeros it. Independent of each
+  non-zero (e.g. **RIT +250**); **holding the button down (about 0.6 s)** zeros it
+  (there is no Clear button). They sit to the right of the band buttons. Independent of each
   other and of CTUN -- any combination can be on at once, and neither RIT
   nor XIT ever moves the CTUN listen point or the displayed VFO
   frequency.
