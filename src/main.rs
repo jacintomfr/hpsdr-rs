@@ -5228,7 +5228,7 @@ impl eframe::App for HpsdrApp {
                                 // desktop keeps normal case, just the
                                 // same yellow fill now (a real request).
                                 let settings_clicked = if lcd_kiosk_mode() {
-                                    toggle_chip(ui, "SETTINGS...", connected.show_settings_window, 0.0, "").clicked()
+                                    solid_chip_text(ui, "SETTINGS...", egui::Color32::from_rgb(235, 195, 40), egui::Color32::BLACK, true).clicked()
                                 } else {
                                     kiosk_accent_button(ui, "Settings...").clicked()
                                 };
@@ -5301,13 +5301,14 @@ impl eframe::App for HpsdrApp {
                                 // Digital modes (RTTY for now) -- one
                                 // entry point for all of them, see
                                 // render_digital_window.
-                                if toggle_chip(
+                                if solid_chip_text(
                                     ui,
-                                    "Digital...",
-                                    connected.show_digital_window,
-                                    0.0,
-                                    "Digital modes: RTTY decoder/encoder",
+                                    "DIGITAL...",
+                                    egui::Color32::from_rgb(110, 190, 240),
+                                    egui::Color32::BLACK,
+                                    true,
                                 )
+                                .on_hover_text("Digital modes: RTTY decoder/encoder")
                                 .clicked()
                                 {
                                     let opening = !connected.show_digital_window;
@@ -5778,7 +5779,7 @@ impl eframe::App for HpsdrApp {
                         // the mode-buttons row now. Record stays out of
                         // this call -- it lives on the RIT/XIT row
                         // instead, alongside Clear (see that call site).
-                        ui.add_space(8.0);
+                        ui.add_space(28.0);
                         if render_snb_anf_bin_chips(ui, connected) {
                             settings_changed = true;
                         }
@@ -5866,7 +5867,10 @@ impl eframe::App for HpsdrApp {
                         // actual fix and why.
 
                         egui::Grid::new("gain_filter_grid").num_columns(6).show(ui, |ui| {
-                        audio_gain_label_width = ui.label("Audio gain:").rect.width();
+                        let col0_w = label_box_width(ui, &["Audio gain:", "RxPGA:", "AGC Gain:", "RX Gain:"]);
+                        let col4_w = label_box_width(ui, &["Mic gain:", "TX Power:"]);
+                        let col6_w = label_box_width(ui, &["TCI TX gain:", "Filter width:"]);
+                        audio_gain_label_width = framed_label(ui, "Audio gain:", col0_w).rect.width();
                         let mut gain = current_gain;
                         // ROOT CAUSE FIX: max raised from 1.5 -- a real
                         // report needed more than that even with the
@@ -5906,7 +5910,7 @@ impl eframe::App for HpsdrApp {
 
                         if connected.tx_enabled {
                             if connected.tx_handle.is_some() {
-                                ui.label("Mic gain:");
+                                framed_label(ui, "Mic gain:", col4_w);
                                 let mut mic_gain = connected.mic_gain;
                                 // Displayed/dragged in dB (see
                                 // scroll_slider_f32_db's doc comment) --
@@ -5935,7 +5939,7 @@ impl eframe::App for HpsdrApp {
                                 // ceiling matches the old 1000.0 linear
                                 // max exactly, -60dB floor matches Audio
                                 // gain's own.
-                                ui.label("TCI TX gain:");
+                                framed_label(ui, "TCI TX gain:", col6_w);
                                 ui.horizontal(|ui| {
                                     let mut tci_tx_gain = connected.tci_tx_gain;
                                     if stable_db_slider(ui, &mut connected.slider_scroll_accum, &mut tci_tx_gain, -60.0, 60.0, 1.0) {
@@ -6076,7 +6080,7 @@ impl eframe::App for HpsdrApp {
                                 if ui
                                     .add_sized(
                                         [audio_gain_label_width, ui.spacing().interact_size.y],
-                                        egui::Button::selectable(connected.autogain_enabled, "RxPGA:"),
+                                        chip_button("RxPGA:", connected.autogain_enabled),
                                     )
                                     .on_hover_text(
                                         "HL2 ADC Auto Gain RxPGA -- Activate RF Gain Automatic:\nControl \
@@ -6090,7 +6094,7 @@ impl eframe::App for HpsdrApp {
                                     settings_changed = true;
                                 }
                             } else {
-                                ui.label("RX Gain:");
+                                framed_label(ui, "RX Gain:", col0_w);
                             }
                             // Read-only while autogain is driving it --
                             // dragging it while autogain is also writing
@@ -6208,7 +6212,7 @@ impl eframe::App for HpsdrApp {
                             // worked but couldn't be calibrated to match a
                             // real wattmeter reading the way P1's watts
                             // slider already could.
-                            ui.label("TX Power:");
+                            framed_label(ui, "TX Power:", col4_w);
                             // Adjustable during Tune too, not just
                             // normal TX -- Tune Power only sets the
                             // starting reduced level when TUNE is
@@ -6240,7 +6244,7 @@ impl eframe::App for HpsdrApp {
                         // a real request: grouped with RX Gain/TX Power
                         // as "how much signal in/out" rather than sharing
                         // a row with the mode buttons.
-                        ui.label("Filter width:");
+                        framed_label(ui, "Filter width:", col6_w);
                         ui.horizontal(|ui| {
                             let mut width = current_width;
                             if stable_f64_slider(ui, &mut connected.slider_scroll_accum, &mut width, 50.0..=5000.0, 50.0, " Hz") {
@@ -6380,17 +6384,7 @@ impl eframe::App for HpsdrApp {
                             // allocate_exact_size below, so the slider
                             // right after this keeps its own already-
                             // correct start position.
-                            let (agc_label_rect, _agc_label_resp) = ui.allocate_exact_size(
-                                egui::vec2(audio_gain_label_width, ui.spacing().interact_size.y),
-                                egui::Sense::hover(),
-                            );
-                            ui.painter().text(
-                                agc_label_rect.left_center(),
-                                egui::Align2::LEFT_CENTER,
-                                "AGC Gain:",
-                                egui::TextStyle::Body.resolve(ui.style()),
-                                ui.visuals().text_color(),
-                            );
+                            framed_label(ui, "AGC Gain:", audio_gain_label_width);
                             let mut agc_top_db = connected.spectrum.agc_params().agc_top_db;
                             if stable_f64_slider(ui, &mut connected.slider_scroll_accum, &mut agc_top_db, 0.0..=140.0, 2.0, " dB") {
                                 connected.spectrum.set_agc_top_db(agc_top_db);
@@ -6408,7 +6402,7 @@ impl eframe::App for HpsdrApp {
                             if ui
                                 .add_sized(
                                     [100.0, ui.spacing().interact_size.y],
-                                    egui::Button::selectable(current_agc != spectrum::Agc::Off, current_agc.label()),
+                                    chip_button(current_agc.label(), current_agc != spectrum::Agc::Off),
                                 )
                                 .on_hover_text("Click to cycle: Off -> Long -> Slow -> Medium -> Fast -> Off")
                                 .clicked()
@@ -15880,6 +15874,49 @@ fn render_step_combo(ui: &mut egui::Ui, connected: &mut ConnectedState) -> bool 
     changed
 }
 
+/// Styled button shared by the chip helpers: thin outline, rounded corners,
+/// grey when off and orange when on.
+fn chip_button(label: &str, active: bool) -> egui::Button<'static> {
+    let orange = egui::Color32::from_rgb(232, 150, 46);
+    let (fill, text, stroke) = if active {
+        (orange, egui::Color32::from_gray(15), egui::Stroke::new(1.0, orange))
+    } else {
+        (
+            egui::Color32::from_gray(48),
+            egui::Color32::from_gray(205),
+            egui::Stroke::new(1.0, egui::Color32::from_gray(95)),
+        )
+    };
+    egui::Button::new(egui::RichText::new(label.to_string()).color(text))
+        .fill(fill)
+        .stroke(stroke)
+        .corner_radius(5.0)
+}
+
+/// Width of a framed label box big enough for the widest of `texts`.
+fn label_box_width(ui: &egui::Ui, texts: &[&str]) -> f32 {
+    let font = egui::TextStyle::Body.resolve(ui.style());
+    let widest = texts
+        .iter()
+        .map(|s| ui.painter().layout_no_wrap(s.to_string(), font.clone(), egui::Color32::WHITE).size().x)
+        .fold(0.0f32, f32::max);
+    widest + 14.0
+}
+
+/// Slider name in a rounded box with a thin outline (same look as the chips and
+/// value boxes). `width` comes from `label_box_width` so a column lines up.
+fn framed_label(ui: &mut egui::Ui, text: &str, width: f32) -> egui::Response {
+    egui::Frame::new()
+        .stroke(egui::Stroke::new(1.0, egui::Color32::from_gray(95)))
+        .corner_radius(5.0)
+        .inner_margin(egui::Margin::symmetric(6, 3))
+        .show(ui, |ui| {
+            ui.set_min_width((width - 14.0).max(0.0));
+            ui.label(text);
+        })
+        .response
+}
+
 /// Rounded toggle "chip" (SNB/ANF/BIN/NB/NR): thin outline and dark fill when
 /// inactive, orange fill when active -- same look as the value boxes and the
 /// AGC button. `min_width` lets a set of chips share one width.
@@ -15908,6 +15945,17 @@ fn toggle_chip(ui: &mut egui::Ui, label: &str, active: bool, min_width: f32, hov
 /// Same rounded, thin-outline chip but with a fixed fill color (STOP, REC,
 /// PLAY): used for actions rather than on/off toggles.
 fn solid_chip(ui: &mut egui::Ui, label: &str, fill: egui::Color32, enabled: bool) -> egui::Response {
+    solid_chip_text(ui, label, fill, egui::Color32::WHITE, enabled)
+}
+
+/// `solid_chip` with an explicit text color (dark text on the yellow/blue chips).
+fn solid_chip_text(
+    ui: &mut egui::Ui,
+    label: &str,
+    fill: egui::Color32,
+    text: egui::Color32,
+    enabled: bool,
+) -> egui::Response {
     let lighten = |c: egui::Color32, k: f32| {
         let f = |v: u8| (v as f32 + (255.0 - v as f32) * k).round() as u8;
         egui::Color32::from_rgb(f(c.r()), f(c.g()), f(c.b()))
@@ -15917,9 +15965,9 @@ fn solid_chip(ui: &mut egui::Ui, label: &str, fill: egui::Color32, enabled: bool
         w.inactive.weak_bg_fill = fill;
         w.hovered.weak_bg_fill = lighten(fill, 0.25);
         w.active.weak_bg_fill = lighten(fill, 0.45);
-        w.inactive.fg_stroke.color = egui::Color32::WHITE;
-        w.hovered.fg_stroke.color = egui::Color32::WHITE;
-        w.active.fg_stroke.color = egui::Color32::WHITE;
+        w.inactive.fg_stroke.color = text;
+        w.hovered.fg_stroke.color = text;
+        w.active.fg_stroke.color = text;
         ui.add_enabled(
             enabled,
             egui::Button::new(label).stroke(egui::Stroke::new(1.0, lighten(fill, 0.35))).corner_radius(5.0),
@@ -16160,7 +16208,12 @@ fn alex_att_combo(ui: &mut egui::Ui, alex_atten: &mut usize) -> bool {
 /// color.
 fn stable_value_box(ui: &mut egui::Ui, text: String) {
     let visuals = ui.visuals().widgets.inactive;
-    egui::Frame::new().fill(visuals.bg_fill).corner_radius(visuals.corner_radius).inner_margin(4).show(ui, |ui| {
+    egui::Frame::new()
+        .fill(visuals.bg_fill)
+        .stroke(egui::Stroke::new(1.0, egui::Color32::from_gray(95)))
+        .corner_radius(5.0)
+        .inner_margin(4)
+        .show(ui, |ui| {
         ui.label(egui::RichText::new(text).monospace());
     });
 }
