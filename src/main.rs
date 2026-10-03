@@ -2737,6 +2737,12 @@ pub(crate) fn with_orange_selection(mut visuals: egui::Visuals) -> egui::Visuals
     visuals
 }
 
+// No "MIN" button next to "CLOSE" on the kiosk's secondary windows (Settings, RX
+// settings, Juice console, ...): minimizing any one window of this process makes
+// XWayland/the compositor throttle redraws for the WHOLE app to ~1 frame per second
+// (see the long comment at the Settings viewport), and on a kiosk with no taskbar
+// there is no visible way to bring the minimized window back -- a real report:
+// "after leaving Settings everything runs at 1 fps" while no window was visible.
 /// A yellow-filled button, used ONLY for kiosk mode's own window-chrome
 /// controls (STOP, SETTINGS, MIN, CLOSE) -- a real request: those are
 /// the small on-screen replacements for a native title bar's controls
@@ -3354,15 +3360,15 @@ fn connect_to_device(device: Device, cfg: &Config) -> Result<ConnectedState, Str
                     if let Some(v) = cfg.rade_eq {
                         tx_handle.set_rade_eq(v);
                     }
+                    if let Some(v) = cfg.rade_mute_edges {
+                        rade.set_mute_edges(v);
+                    }
                     // Apply a previously-saved correction table
                     // immediately, if PS is enabled and one exists for
                     // this radio -- see TxHandle::restore_ps_corr's doc
                     // comment. Correcting can be true right away, no
                     // Two-Tone needed every session.
                     if settings.puresignal_enabled {
-                    if let Some(v) = cfg.rade_mute_edges {
-                        rade.set_mute_edges(v);
-                    }
                         if let Some(path) = ps_corr_path(device.mac) {
                             if path.exists() {
                                 tx_handle.restore_ps_corr();
@@ -3752,6 +3758,42 @@ impl eframe::App for HpsdrApp {
             });
         }
         let root_close_requested = ui.input(|i| i.viewport().close_requested());
+
+        // Kiosk: keep an open Settings / Digital window in front of the
+        // fullscreen main window. ROOT CAUSE FIX for a real report ("after
+        // leaving Settings everything runs at ~1 fps, but no other window is
+        // visible"): clicking the main window while Settings was open raised
+        // the fullscreen main window over it, burying Settings completely.
+        // The window was still open, but a fully covered window gets no frame
+        // callbacks from the compositor, its buffer swap blocks, and because
+        // this app draws all of its viewports one after the other the whole
+        // app dropped to ~1 fps with the CPU idle (measured on a Pi 5: 5
+        // distinct frames in 4.2 s with the buried window, 16 in 16 samples
+        // as soon as it was closed). When the main window takes focus while
+        // one of these windows is open, hand the focus straight back to it.
+        if lcd_kiosk_mode() && ui.input(|i| i.viewport().focused).unwrap_or(false) {
+            if matches!(self.state, AppState::Discovering(_)) {
+                // Fresh launch: the fullscreen main window maps over the
+                // Discover window, leaving a black screen.
+                ui.ctx().send_viewport_cmd_to(
+                    egui::ViewportId::from_hash_of("discovery_window"),
+                    egui::ViewportCommand::Focus,
+                );
+            }
+            if let AppState::Connected(c) = &self.state {
+                if c.show_settings_window {
+                    ui.ctx().send_viewport_cmd_to(
+                        egui::ViewportId::from_hash_of("settings_window"),
+                        egui::ViewportCommand::Focus,
+                    );
+                } else if c.show_digital_window {
+                    ui.ctx().send_viewport_cmd_to(
+                        egui::ViewportId::from_hash_of("digital_modes_window"),
+                        egui::ViewportCommand::Focus,
+                    );
+                }
+            }
+        }
 
         // BUG FIX: clicking the main window while it's not the active/
         // focused OS window would both raise/focus it AND process that
@@ -8889,11 +8931,6 @@ impl eframe::App for HpsdrApp {
                                     .anchor(egui::Align2::RIGHT_BOTTOM, egui::vec2(-6.0, -6.0))
                                     .show(ui, |ui| {
                                         ui.horizontal(|ui| {
-                                            if kiosk_accent_button(ui, "\u{2013} MIN").clicked() {
-                                                ui.ctx().send_viewport_cmd(
-                                                    egui::ViewportCommand::Minimized(true),
-                                                );
-                                            }
                                             if kiosk_accent_button(ui, "\u{2715} CLOSE").clicked() {
                                                 let mut rx = rx_for_closure.lock().unwrap();
                                                 rx.open = false;
@@ -8982,11 +9019,6 @@ impl eframe::App for HpsdrApp {
                                             .anchor(egui::Align2::RIGHT_BOTTOM, egui::vec2(-6.0, -6.0))
                                             .show(ui.ctx(), |ui| {
                                                 ui.horizontal(|ui| {
-                                                    if kiosk_accent_button(ui, "\u{2013} MIN").clicked() {
-                                                        ui.ctx().send_viewport_cmd(
-                                                            egui::ViewportCommand::Minimized(true),
-                                                        );
-                                                    }
                                                     if kiosk_accent_button(ui, "\u{2715} CLOSE").clicked() {
                                                         rx_for_settings.lock().unwrap().show_settings_window =
                                                             false;
@@ -9137,11 +9169,6 @@ impl eframe::App for HpsdrApp {
                                     .anchor(egui::Align2::RIGHT_BOTTOM, egui::vec2(-6.0, -6.0))
                                     .show(ui.ctx(), |ui| {
                                         ui.horizontal(|ui| {
-                                            if kiosk_accent_button(ui, "\u{2013} MIN").clicked() {
-                                                ui.ctx().send_viewport_cmd(
-                                                    egui::ViewportCommand::Minimized(true),
-                                                );
-                                            }
                                             if kiosk_accent_button(ui, "\u{2715} CLOSE").clicked() {
                                                 close_requested = true;
                                             }
@@ -13008,11 +13035,6 @@ impl eframe::App for HpsdrApp {
                                         .anchor(egui::Align2::RIGHT_BOTTOM, egui::vec2(-6.0, -6.0))
                                         .show(ui.ctx(), |ui| {
                                             ui.horizontal(|ui| {
-                                                if kiosk_accent_button(ui, "\u{2013} MIN").clicked() {
-                                                    ui.ctx().send_viewport_cmd(
-                                                        egui::ViewportCommand::Minimized(true),
-                                                    );
-                                                }
                                                 if kiosk_accent_button(ui, "\u{2715} CLOSE").clicked() {
                                                     close_requested = true;
                                                 }
@@ -13700,6 +13722,7 @@ impl eframe::App for HpsdrApp {
                         rade_compressor_enabled: connected.tx_handle.as_ref().map(|t| t.rade_compressor_enabled()),
                         rade_eq_enabled: connected.tx_handle.as_ref().map(|t| t.rade_eq_enabled()),
                         rade_eq: connected.tx_handle.as_ref().map(|t| t.rade_eq()),
+                        rade_mute_edges: Some(connected.rade.mute_edges()),
                         tci_tx_gain: Some(connected.tci_tx_gain),
                         tx_power_watts: Some(connected.session.tx_power_watts.load(Ordering::Relaxed)),
                         cw_keyer_mode: Some(connected.session.cw_keyer.mode.load(Ordering::Relaxed)),
@@ -13722,7 +13745,6 @@ impl eframe::App for HpsdrApp {
                         db_high: Some(connected.db_high),
                         waterfall_db_low: Some(connected.waterfall_db_low),
                         waterfall_db_high: Some(connected.waterfall_db_high),
-                        rade_mute_edges: Some(connected.rade.mute_edges()),
                         waterfall_db_low_auto: Some(connected.waterfall_db_low_auto),
                         agc_auto: Some(connected.agc_auto),
                         agc_auto_offset_db: Some(connected.agc_auto_offset_db),
@@ -15337,6 +15359,20 @@ fn render_rade_panel(
         {
             rade.set_mute_analog(muted);
         }
+        let mut mute_edges = rade.mute_edges();
+        if ui
+            .checkbox(&mut mute_edges, "Mute start/end")
+            .on_hover_text(
+                "Silence the decoded speech while RADE is still settling after it locks on \
+                 (about half a second) and from the moment the over ends or the signal \
+                 collapses to noise -- the odd garbled voices at both ends of an over. \
+                 Off by default: neither freedv-gui nor SDRoxide does this, and it costs \
+                 the first moments of speech.",
+            )
+            .changed()
+        {
+            rade.set_mute_edges(mute_edges);
+        }
         if ui.button("Reset RX").on_hover_text("Drop sync and start hunting again").clicked() {
             rade.reset_rx();
         }
@@ -15359,20 +15395,6 @@ fn render_rade_panel(
             }
             for entry in &log {
                 ui.label(format!("{}  (SNR {:.0} dB)", entry.call, entry.snr_db));
-        let mut mute_edges = rade.mute_edges();
-        if ui
-            .checkbox(&mut mute_edges, "Mute start/end")
-            .on_hover_text(
-                "Silence the decoded speech while RADE is still settling after it locks on \
-                 (about half a second) and from the moment the over ends or the signal \
-                 collapses to noise -- the odd garbled voices at both ends of an over. \
-                 Off by default: neither freedv-gui nor SDRoxide does this, and it costs \
-                 the first moments of speech.",
-            )
-            .changed()
-        {
-            rade.set_mute_edges(mute_edges);
-        }
             }
         });
 
