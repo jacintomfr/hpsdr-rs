@@ -16327,23 +16327,32 @@ fn alex_att_combo(ui: &mut egui::Ui, alex_atten: &mut usize) -> bool {
 /// current theme, so it matches everything else without hardcoding a
 /// color.
 fn stable_value_box(ui: &mut egui::Ui, text: String) {
+    // Every value box is allocated at one exact size (same width AND height),
+    // independent of where it sits: inside a Grid cell or inside a
+    // `ui.horizontal` (which vertically stretched a Frame-based box in some
+    // rows -- RxPGA and TX Power looked taller than Audio/Mic/TCI gain).
+    // Size = text box + 4 px margin + 1 px outline on each side.
+    const MARGIN: f32 = 5.0;
+    let font = egui::TextStyle::Monospace.resolve(ui.style());
+    let reference = ui.painter().layout_no_wrap("-100 dB ".to_string(), font.clone(), egui::Color32::WHITE);
+    let galley = ui.painter().layout_no_wrap(
+        format!("{:>8}", text.trim()),
+        font,
+        egui::Color32::WHITE,
+    );
+    let size = reference.size() + egui::vec2(2.0 * MARGIN, 2.0 * MARGIN);
+    let (rect, _) = ui.allocate_exact_size(size, egui::Sense::hover());
     let visuals = ui.visuals().widgets.inactive;
-    egui::Frame::new()
-        .fill(visuals.bg_fill)
-        .stroke(egui::Stroke::new(1.0, egui::Color32::from_gray(95)))
-        .corner_radius(5.0)
-        .inner_margin(4)
-        .show(ui, |ui| {
-            // Every value box has the same width (room for "-100 dB" /
-            // "5000 Hz"), so the boxes line up in a column across rows.
-            let font = egui::TextStyle::Monospace.resolve(ui.style());
-            let w = ui.painter().layout_no_wrap("-100 dB ".to_string(), font, egui::Color32::WHITE).size().x;
-            ui.set_min_width(w);
-            // White, right-aligned by padding to a fixed character count (the
-            // font is monospace and the box has a fixed width). No layout
-            // tricks: a right-to-left layout here made the box stretch.
-            ui.label(egui::RichText::new(format!("{:>8}", text.trim())).monospace().color(egui::Color32::WHITE));
-        });
+    ui.painter().rect(
+        rect,
+        5.0,
+        visuals.bg_fill,
+        egui::Stroke::new(1.0, egui::Color32::from_gray(95)),
+        egui::StrokeKind::Inside,
+    );
+    // Right-aligned, vertically centred, white.
+    let pos = egui::pos2(rect.right() - MARGIN - galley.size().x, rect.center().y - galley.size().y / 2.0);
+    ui.painter().galley(pos, galley, egui::Color32::WHITE);
 }
 
 /// Recent audio peak for the PK readout: (peak in dBFS, clipping). Measured
