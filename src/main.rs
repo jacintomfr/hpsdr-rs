@@ -2734,6 +2734,11 @@ struct HpsdrApp {
 pub(crate) fn with_orange_selection(mut visuals: egui::Visuals) -> egui::Visuals {
     visuals.selection.bg_fill = egui::Color32::from_rgb(230, 126, 34);
     visuals.selection.stroke.color = egui::Color32::WHITE;
+    // Buttons/combos used to grow by 2 px while hovered or pressed (egui's default
+    // `expansion`), which made every control visibly tremble under the mouse.
+    visuals.widgets.hovered.expansion = 0.0;
+    visuals.widgets.active.expansion = 0.0;
+    visuals.widgets.open.expansion = 0.0;
     visuals
 }
 
