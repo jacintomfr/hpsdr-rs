@@ -8773,10 +8773,14 @@ impl eframe::App for HpsdrApp {
                             .adc1_overload
                             .load(std::sync::atomic::Ordering::Relaxed);
                         let line_height = ui.text_style_height(&egui::TextStyle::Body);
-                        let (row_rect, _resp) = ui.allocate_exact_size(
-                            egui::vec2(180.0, line_height),
-                            egui::Sense::hover(),
-                        );
+                        let row_rect = if lcd_kiosk_mode() {
+                            // Kiosk: don't reserve the row (the meter area is drawn scaled
+                            // up and the reserved height grew its hit area over REC/PLAY);
+                            // the warning just draws right under the meter.
+                            egui::Rect::from_min_size(meter_rect.left_bottom(), egui::vec2(180.0, line_height))
+                            } else {
+                            ui.allocate_exact_size(egui::vec2(180.0, line_height), egui::Sense::hover()).0
+                            };
                         if adc0_ov || adc1_ov {
                             let text = if adc0_ov && adc1_ov {
                                 "ADC0+ADC1 OVERLOAD"
@@ -8809,10 +8813,11 @@ impl eframe::App for HpsdrApp {
                         if fifo_under || fifo_over {
                             connected.tx_fifo_warning_until = Some(Instant::now() + Duration::from_secs(2));
                         }
-                        let (fifo_row_rect, _resp) = ui.allocate_exact_size(
-                            egui::vec2(180.0, line_height),
-                            egui::Sense::hover(),
-                        );
+                        let fifo_row_rect = if lcd_kiosk_mode() {
+                            egui::Rect::from_min_size(meter_rect.left_bottom() + egui::vec2(0.0, line_height), egui::vec2(180.0, line_height))
+                            } else {
+                            ui.allocate_exact_size(egui::vec2(180.0, line_height), egui::Sense::hover()).0
+                            };
                         if let Some(until) = connected.tx_fifo_warning_until {
                             if Instant::now() < until {
                                 let text = if fifo_under && fifo_over {
