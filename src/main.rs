@@ -5881,10 +5881,10 @@ impl eframe::App for HpsdrApp {
                         // actual fix and why.
 
                         egui::Grid::new("gain_filter_grid").num_columns(6).show(ui, |ui| {
-                        let col0_w = label_box_width(ui, &["Audio gain:", "RxPGA:", "AGC Gain:", "RX Gain:"]);
-                        let col4_w = label_box_width(ui, &["Mic gain:", "TX Power:"]);
-                        let col6_w = label_box_width(ui, &["TCI TX gain:", "Filter width:"]);
-                        audio_gain_label_width = framed_label(ui, "Audio gain:", col0_w).rect.width();
+                        let col0_w = label_box_width(ui, &["AUDIO GAIN:", "RxPGA:", "AGC GAIN:", "RX GAIN:"]);
+                        let col4_w = label_box_width(ui, &["MIC GAIN:", "TX POWER:"]);
+                        let col6_w = label_box_width(ui, &["TCI TX GAIN:", "FILTER WIDTH:"]);
+                        audio_gain_label_width = framed_label(ui, "AUDIO GAIN:", col0_w).rect.width();
                         let mut gain = current_gain;
                         // ROOT CAUSE FIX: max raised from 1.5 -- a real
                         // report needed more than that even with the
@@ -5924,7 +5924,7 @@ impl eframe::App for HpsdrApp {
 
                         if connected.tx_enabled {
                             if connected.tx_handle.is_some() {
-                                framed_label(ui, "Mic gain:", col4_w);
+                                framed_label(ui, "MIC GAIN:", col4_w);
                                 let mut mic_gain = connected.mic_gain;
                                 // Displayed/dragged in dB (see
                                 // scroll_slider_f32_db's doc comment) --
@@ -5953,7 +5953,7 @@ impl eframe::App for HpsdrApp {
                                 // ceiling matches the old 1000.0 linear
                                 // max exactly, -60dB floor matches Audio
                                 // gain's own.
-                                framed_label(ui, "TCI TX gain:", col6_w);
+                                framed_label(ui, "TCI TX GAIN:", col6_w);
                                 ui.horizontal(|ui| {
                                     let mut tci_tx_gain = connected.tci_tx_gain;
                                     if stable_db_slider(ui, &mut connected.slider_scroll_accum, &mut tci_tx_gain, -60.0, 60.0, 1.0) {
@@ -6108,7 +6108,7 @@ impl eframe::App for HpsdrApp {
                                     settings_changed = true;
                                 }
                             } else {
-                                framed_label(ui, "RX Gain:", col0_w);
+                                framed_label(ui, "RX GAIN:", col0_w);
                             }
                             // Read-only while autogain is driving it --
                             // dragging it while autogain is also writing
@@ -6226,7 +6226,7 @@ impl eframe::App for HpsdrApp {
                             // worked but couldn't be calibrated to match a
                             // real wattmeter reading the way P1's watts
                             // slider already could.
-                            framed_label(ui, "TX Power:", col4_w);
+                            framed_label(ui, "TX POWER:", col4_w);
                             // Adjustable during Tune too, not just
                             // normal TX -- Tune Power only sets the
                             // starting reduced level when TUNE is
@@ -6258,7 +6258,7 @@ impl eframe::App for HpsdrApp {
                         // a real request: grouped with RX Gain/TX Power
                         // as "how much signal in/out" rather than sharing
                         // a row with the mode buttons.
-                        framed_label(ui, "Filter width:", col6_w);
+                        framed_label(ui, "FILTER WIDTH:", col6_w);
                         ui.horizontal(|ui| {
                             let mut width = current_width;
                             if stable_f64_slider(ui, &mut connected.slider_scroll_accum, &mut width, 50.0..=5000.0, 50.0, " Hz") {
@@ -6398,7 +6398,23 @@ impl eframe::App for HpsdrApp {
                             // allocate_exact_size below, so the slider
                             // right after this keeps its own already-
                             // correct start position.
-                            framed_label(ui, "AGC Gain:", audio_gain_label_width);
+                            // AGC GAIN doubles as the AGC Auto switch (moved here from
+                            // Settings): orange = off, inverted = auto on.
+                            if ui
+                                .add_sized(
+                                    [audio_gain_label_width, ui.spacing().interact_size.y],
+                                    switch_button("AGC GAIN:", connected.agc_auto),
+                                )
+                                .on_hover_text(
+                                    "Switch: continuously re-target AGC Gain from the tracked noise floor \
+                                     instead of a fixed value (deskHPSDR's \"AGC Automatic\"). The slider \
+                                     becomes read-only while this is on. Offset: Settings.",
+                                )
+                                .clicked()
+                            {
+                                connected.agc_auto = !connected.agc_auto;
+                                settings_changed = true;
+                            }
                             let mut agc_top_db = connected.spectrum.agc_params().agc_top_db;
                             if stable_f64_slider(ui, &mut connected.slider_scroll_accum, &mut agc_top_db, 0.0..=140.0, 2.0, " dB") {
                                 connected.spectrum.set_agc_top_db(agc_top_db);
@@ -10827,20 +10843,11 @@ impl eframe::App for HpsdrApp {
                                     // own doc comment and the per-frame update
                                     // site for the exact formula.
                                     ui.horizontal(|ui| {
-                                        if ui
-                                            .checkbox(&mut connected.agc_auto, "AGC Auto")
-                                            .on_hover_text(
-                                                "Continuously re-target AGC Gain from the tracked \
-                                                 noise floor instead of a fixed value -- matches \
-                                                 deskHPSDR's own \"AGC Automatic\". AGC Gain above \
-                                                 becomes read-only while this is on.",
-                                            )
-                                            .changed()
-                                        {
-                                            settings_changed = true;
-                                        }
+                                        // The AGC Auto on/off switch moved to the main
+                                        // panel (the "AGC GAIN" button); only its offset
+                                        // stays here.
                                         ui.add_enabled_ui(connected.agc_auto, |ui| {
-                                            ui.label("Offset:");
+                                            ui.label("AGC Auto offset:");
                                             let mut offset = connected.agc_auto_offset_db;
                                             if scroll_slider_f32(
                                                 ui,
@@ -15944,7 +15951,7 @@ fn framed_label(ui: &mut egui::Ui, text: &str, width: f32) -> egui::Response {
         .inner_margin(egui::Margin::symmetric(6, 3))
         .show(ui, |ui| {
             ui.set_min_width((width - 14.0).max(0.0));
-            ui.label(text);
+            ui.label(egui::RichText::new(text).color(egui::Color32::WHITE));
         })
         .response
 }
