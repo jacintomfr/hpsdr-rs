@@ -6695,7 +6695,7 @@ impl eframe::App for HpsdrApp {
                             let mox_resp = ui
                                 .add_enabled(
                                     mox_tx_allowed,
-                                    chip_button("MOX", mox_now).min_size(egui::vec2(90.0, 32.0)),
+                                    alert_chip_button("MOX", mox_now).min_size(egui::vec2(90.0, 32.0)),
                                 )
                                 .on_hover_text(if mox_tx_allowed {
                                     "Click to toggle transmit on/off"
@@ -6751,7 +6751,7 @@ impl eframe::App for HpsdrApp {
                             let tune_resp = ui
                                 .add_enabled(
                                     tune_may_start,
-                                    chip_button("TUNE", connected.tune_active),
+                                    alert_chip_button("TUNE", connected.tune_active),
                                 )
                                 .on_hover_text(
                                     "Click to toggle a steady tone centered in the passband, \
@@ -6832,7 +6832,7 @@ impl eframe::App for HpsdrApp {
                             let two_tone_resp = ui
                                 .add_enabled(
                                     two_tone_may_start,
-                                    chip_button("TWO TONE", connected.two_tone_active),
+                                    alert_chip_button("TWO TONE", connected.two_tone_active),
                                 )
                                 .on_hover_text(
                                     "Click to toggle a two-tone test signal, at Tune Power \
@@ -15877,6 +15877,21 @@ fn chip_button(label: &str, active: bool) -> egui::Button<'static> {
         .fill(fill)
         .stroke(stroke)
         .corner_radius(5.0)
+}
+
+/// Chip for the transmit controls (MOX, TUNE, TWO TONE): grey when idle like every
+/// other chip, but red with white text while transmitting (a deliberate exception
+/// to the grey/orange rule -- on-air state must be unmistakable).
+fn alert_chip_button(label: &str, active: bool) -> egui::Button<'static> {
+    if active {
+        let red = egui::Color32::from_rgb(210, 50, 50);
+        egui::Button::new(egui::RichText::new(label.to_string()).color(egui::Color32::WHITE))
+            .fill(red)
+            .stroke(egui::Stroke::new(1.0, red))
+            .corner_radius(5.0)
+    } else {
+        chip_button(label, false)
+    }
 }
 
 /// Switch-style button (RxPGA = HL2 auto gain): orange when the switch is
