@@ -16884,6 +16884,10 @@ fn render_equalizer_panel(ui: &mut egui::Ui, scroll_accum: &mut f32, side_label:
                 }
             }
             ui.style_mut().override_font_id = Some(small);
+            // Spread the spare width between the columns (4..16 px) so the bands read as
+            // separate: gap = what is left over after the columns, shared out.
+            let spare = (avail - n_cols * col_w) / n_cols;
+            ui.spacing_mut().item_spacing.x = spare.clamp(4.0, 16.0);
             let (lo, hi) = if twelve { (-20, 20) } else { (-12, 15) };
             egui::ScrollArea::horizontal().auto_shrink([false, true]).show(ui, |ui| {
             ui.horizontal_top(|ui| {
@@ -16963,6 +16967,7 @@ fn eq_band_column(
                 }
                 r.on_hover_text("Band frequency in Hz (type a value, or use - / +: 10 Hz per click)");
                 ui.horizontal(|ui| {
+                    ui.spacing_mut().item_spacing.x = 4.0;
                     let half = ((col_w - 4.0) / 2.0).max(18.0);
                     if ui.add(chip_button("-", false).min_size(egui::vec2(half, 0.0))).clicked() {
                         *f = (*f - 10).clamp(min_f, max_f);
