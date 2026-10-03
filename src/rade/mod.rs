@@ -144,6 +144,11 @@ impl Rade {
     /// Returns [`RadeError::AlreadyOpen`] if one is already live; drop that one
     /// first.
     pub fn open_v1() -> Result<Self, RadeError> {
+        Self::open_with_flags(sys::RADE_VERBOSE_0 as i32)
+    }
+
+    /// `open_v1` with explicit `rade_open` flags (tests use the verbose ones).
+    pub(crate) fn open_with_flags(flags: i32) -> Result<Self, RadeError> {
         if OPEN.swap(true, Ordering::AcqRel) {
             return Err(RadeError::AlreadyOpen);
         }
@@ -160,7 +165,7 @@ impl Rade {
         // conflict with the app's own stdout redirection, backing up the
         // audio pipeline). Do not re-enable without a different capture
         // strategy (e.g. a separate unredirected process).
-        let r = unsafe { sys::rade_open(model.as_mut_ptr(), sys::RADE_VERBOSE_0 as i32) };
+        let r = unsafe { sys::rade_open(model.as_mut_ptr(), flags) };
         if r.is_null() {
             OPEN.store(false, Ordering::Release);
             return Err(RadeError::OpenFailed);
@@ -556,6 +561,111 @@ mod clip_probe {
         ] {
             let (d, peak, rms) = run(clip, noise);
             println!("{label}: decoded={d:?} (EOO re peak={peak:.3} rms={rms:.3})");
+        }
+    }
+
+    /// Offline analysis of receive-audio dumps (`rade_tail_N.f32`, raw f32 LE, 8 kHz):
+    /// prints a 100 ms RMS envelope and runs the dump through the modem, reporting
+    /// sync and any End-of-Over frame. Run with `cargo test --release analyze_tails
+    /// -- --ignored --nocapture`; the folder comes from RADE_TAILS_DIR.
+    #[test]
+    #[ignore]
+    fn analyze_tails() {
+        let _g = excl();
+        let dir = std::env::var("RADE_TAILS_DIR").unwrap_or_else(|_| ".".into());
+        // Our own End-of-Over waveform for the callsign in the Windows config (CU2FO).
+        let eoo_ref: Vec<f32> = {
+            let mut rr = open();
+            let mut bits = vec![0.0f32; rr.n_eoo_bits()];
+            crate::rade::text::encode("CU2FO", &mut bits);
+            rr.set_tx_eoo_bits(&bits).unwrap();
+            let mut s = Vec::new();
+            rr.tx_eoo(&mut s).unwrap();
+            s.iter().map(|z| z.re).collect()
+        };
+        for n in 1..=12 {
+            let path = format!("{dir}/rade_tail_{n}.f32");
+            let Ok(bytes) = std::fs::read(&path) else { continue };
+            let samples: Vec<f32> = bytes.chunks_exact(4).map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]])).collect();
+            let env: Vec<String> = samples
+                .chunks(800)
+                .map(|c| format!("{:.2}", (c.iter().map(|s| s * s).sum::<f32>() / c.len() as f32).sqrt()))
+                .collect();
+            println!("tail_{n}: env(100ms) = {}", env.join(" "));
+            for gain in [0.1f32, 0.25, 0.5, 1.0, 2.0, 4.0] {
+                let mut r = open();
+                let mut pos = 0;
+                let mut feats = Vec::new();
+                let mut eoo = Vec::new();
+                let mut log = Vec::new();
+                while pos + r.nin() <= samples.len() {
+                    let nin = r.nin();
+                    let block: Vec<Complex32> =
+                        samples[pos..pos + nin].iter().map(|&s| Complex32::new(s * gain, 0.0)).collect();
+                    pos += nin;
+                    let out = r.rx(&block, &mut feats, &mut eoo).expect("rx");
+                    if out.has_eoo {
+                        log.push(format!("EOO at {:.2}s decode={:?}", pos as f32 / 8000.0, crate::rade::text::decode(&eoo)));
+                    }
+                }
+                println!("   gain x{gain}: {}", if log.is_empty() { "no EOO".to_string() } else { log.join(" | ") });
+            }
+            // Correlate the last 3 s with our own End-of-Over waveform.
+            let tailv = &samples[samples.len().saturating_sub(24_000)..];
+            let m = eoo_ref.len();
+            let eref_e: f32 = eoo_ref.iter().map(|x| x * x).sum::<f32>().sqrt();
+            let mut best = (0.0f32, 0usize);
+            let mut speech_best = 0.0f32;
+            for lag in 0..tailv.len().saturating_sub(m) {
+                let seg = &tailv[lag..lag + m];
+                let dot: f32 = seg.iter().zip(&eoo_ref).map(|(a, b)| a * b).sum();
+                let e: f32 = seg.iter().map(|x| x * x).sum::<f32>().sqrt();
+                if e > 1e-3 {
+                    let ncc = dot.abs() / (e * eref_e);
+                    if ncc > best.0 {
+                        best = (ncc, lag);
+                    }
+                    if lag + m < tailv.len().saturating_sub(12_000) && ncc > speech_best {
+                        speech_best = ncc;
+                    }
+                }
+            }
+            println!(
+                "   EOO-correlation (callsign CU2FO): best ncc={:.3} at {:.2}s of the last 3 s (earlier part's best {:.3})",
+                best.0,
+                best.1 as f32 / 8000.0,
+                speech_best
+            );
+            let _ = &eoo_ref;
+        }
+    }
+
+    /// Replays one dump with the library's own verbose per-frame output (state,
+    /// pilot correlation, end-of-over correlation and its threshold) on stderr.
+    #[test]
+    #[ignore]
+    fn verbose_tail() {
+        let _g = excl();
+        let dir = std::env::var("RADE_TAILS_DIR").unwrap_or_else(|_| ".".into());
+        let n = std::env::var("RADE_TAIL_N").unwrap_or_else(|_| "5".into());
+        let bytes = std::fs::read(format!("{dir}/rade_tail_{n}.f32")).expect("dump");
+        let samples: Vec<f32> = bytes.chunks_exact(4).map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]])).collect();
+        let mut r = loop {
+            match Rade::open_with_flags(sys::RADE_VERBOSE_FULL as i32) {
+                Ok(r) => break r,
+                Err(RadeError::AlreadyOpen) => std::thread::sleep(std::time::Duration::from_millis(50)),
+                Err(e) => panic!("open: {e:?}"),
+            }
+        };
+        let mut pos = 0;
+        let mut feats = Vec::new();
+        let mut eoo = Vec::new();
+        while pos + r.nin() <= samples.len() {
+            let nin = r.nin();
+            let block: Vec<Complex32> =
+                samples[pos..pos + nin].iter().map(|&s| Complex32::new(s * RX_REAL_SCALE, 0.0)).collect();
+            pos += nin;
+            let _ = r.rx(&block, &mut feats, &mut eoo).expect("rx");
         }
     }
 }

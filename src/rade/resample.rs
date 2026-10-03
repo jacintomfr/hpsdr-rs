@@ -54,3 +54,24 @@ impl MonoResampler {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The resampler only processes whole CHUNKs, so the tail of a burst stays
+    /// inside it until more input arrives -- the reason the worker pushes a chunk
+    /// of silence after the End-of-Over frame.
+    #[test]
+    fn the_tail_of_a_burst_is_only_released_by_more_input() {
+        let mut r = MonoResampler::new(8_000.0, 48_000.0).expect("resampler");
+        let burst = vec![0.5f32; 1152];
+        let mut out = Vec::new();
+        r.push(&burst, &mut out);
+        let without_flush = out.len();
+        r.push(&vec![0.0f32; 1024], &mut out);
+        let with_flush = out.len();
+        assert!(without_flush < 1152 * 6 - 500, "tail should be held back, got {without_flush}");
+        assert!(with_flush >= 1152 * 6, "after the flush the whole burst is out, got {with_flush}");
+    }
+}

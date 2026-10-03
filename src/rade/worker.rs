@@ -504,6 +504,14 @@ impl Inner {
                 self.tx_out.slots(),
                 self.shared.dropped.load(Ordering::Relaxed) - drops_before
             );
+            // ROOT CAUSE of the End-of-Over callsign almost never decoding: the 8 kHz -> audio
+            // resampler only processes whole 1024-sample input chunks and keeps the rest in
+            // its pending buffer, so the last 0-128 ms of the burst -- including the second
+            // EOO pilot (the final ~24 ms), which the receiver needs -- was never sent.
+            // Push a chunk of silence through it so the real tail comes out.
+            self.iq.clear();
+            self.iq.resize(1024, Complex32::default());
+            self.emit_tx_iq_wait(Duration::from_secs(3));
             self.buf16.clear();
             self.tx_features.clear();
             while self.tx_in.pop().is_ok() {}
