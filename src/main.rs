@@ -7195,6 +7195,15 @@ impl eframe::App for HpsdrApp {
                     // Stop button) below the visible window.
                     let below_waterfall_reserve = 2.0 * (ui.spacing().interact_size.y + 8.0)
                         + SPECTRUM_WATERFALL_DIVIDER_HEIGHT;
+                    // Kiosk UI scale > 100% enlarges the text, hence the rows below the
+                    // waterfall (zoom/pan, status line), but interact_size does not grow
+                    // with it: reserve the difference so the status line is not cut off.
+                    let below_waterfall_reserve = if lcd_kiosk_mode() {
+                        below_waterfall_reserve
+                            + (ui.text_style_height(&egui::TextStyle::Body) - 14.0).max(0.0) * 2.0
+                    } else {
+                        below_waterfall_reserve
+                    };
                     let spectrum_waterfall_height =
                         (ui.available_height() - below_waterfall_reserve).max(200.0);
                     // Waterfall disabled (Settings -> Spectrum): give the
