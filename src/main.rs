@@ -4381,6 +4381,12 @@ impl eframe::App for HpsdrApp {
                         .rade_drained_at
                         .is_some_and(|t| t.elapsed() >= RADE_UNKEY_SETTLE);
                     if settled || started.elapsed() > RADE_UNKEY_TIMEOUT {
+                        eprintln!(
+                            "[rade] PTT released {} ms after the unkey request (queue drained at {:?} ms, timeout hit: {})",
+                            started.elapsed().as_millis(),
+                            connected.rade_drained_at.map(|t| t.duration_since(started).as_millis()),
+                            !settled
+                        );
                         connected.session.set_mox(false);
                         connected.rade.set_unkeying(false);
                         connected.rade_pending_unkey = None;

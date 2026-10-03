@@ -477,7 +477,17 @@ impl Inner {
             if let Err(e) = self.rade.tx_eoo(&mut self.iq) {
                 eprintln!("[rade] rade_tx_eoo failed: {e:?}");
             }
+            let drops_before = self.shared.dropped.load(Ordering::Relaxed);
+            let free_before = self.tx_out.slots();
+            let eoo_iq = self.iq.len();
             self.emit_tx_iq();
+            // Diagnostics for a missing/failed End-of-Over at the far end: how much of the
+            // burst went into the transmit ring, and whether any of it was dropped.
+            eprintln!(
+                "[rade] End-of-Over emitted: {eoo_iq} modem samples, ring free {free_before} -> {}, dropped {}",
+                self.tx_out.slots(),
+                self.shared.dropped.load(Ordering::Relaxed) - drops_before
+            );
             self.buf16.clear();
             self.tx_features.clear();
             while self.tx_in.pop().is_ok() {}
