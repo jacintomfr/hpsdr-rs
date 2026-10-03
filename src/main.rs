@@ -15130,7 +15130,7 @@ fn draw_rade_status_row(ui: &mut egui::Ui, rade: &rade_link::RadeHandle, compact
 
         slot(ui, sync_w, &mut |ui| {
             if !st.sync {
-                ui.label("no sync");
+                ui.colored_label(amber, "no sync");
             } else if marginal {
                 ui.colored_label(dot_color, "SYNC").on_hover_text(
                     "SNR is close to RADE V1's usable floor (~-2dB) -- a real, \
@@ -15141,7 +15141,7 @@ fn draw_rade_status_row(ui: &mut egui::Ui, rade: &rade_link::RadeHandle, compact
                      anything -- just flagging when conditions match.",
                 );
             } else {
-                ui.label("SYNC");
+                ui.colored_label(green, "SYNC");
             }
         });
         slot(ui, snr_w, &mut |ui| {
