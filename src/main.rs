@@ -5779,7 +5779,21 @@ impl eframe::App for HpsdrApp {
                         // the mode-buttons row now. Record stays out of
                         // this call -- it lives on the RIT/XIT row
                         // instead, alongside Clear (see that call site).
-                        ui.add_space(28.0);
+                        // Centre SNB/ANF/BIN between the last mode button and the
+                        // (scaled-up) meter at the right edge.
+                        {
+                            let font = egui::TextStyle::Button.resolve(ui.style());
+                            let chip_w = |s: &str| {
+                                ui.painter().layout_no_wrap(s.to_string(), font.clone(), egui::Color32::WHITE).size().x
+                                    + 2.0 * ui.spacing().button_padding.x
+                                    + 2.0
+                            };
+                            let group_w = chip_w("SNB") + chip_w("ANF") + chip_w("BIN") + 2.0 * ui.spacing().item_spacing.x;
+                            let meter_left = ui.ctx().content_rect().right() - 20.0 - 180.0 * 1.7;
+                            let start = ui.cursor().left();
+                            let free = (meter_left - start - group_w).max(16.0);
+                            ui.add_space((free / 2.0).clamp(16.0, 120.0));
+                        }
                         if render_snb_anf_bin_chips(ui, connected) {
                             settings_changed = true;
                         }
@@ -6080,7 +6094,7 @@ impl eframe::App for HpsdrApp {
                                 if ui
                                     .add_sized(
                                         [audio_gain_label_width, ui.spacing().interact_size.y],
-                                        chip_button("RxPGA:", connected.autogain_enabled),
+                                        switch_button("RxPGA:", connected.autogain_enabled),
                                     )
                                     .on_hover_text(
                                         "HL2 ADC Auto Gain RxPGA -- Activate RF Gain Automatic:\nControl \
@@ -15893,6 +15907,24 @@ fn chip_button(label: &str, active: bool) -> egui::Button<'static> {
         .corner_radius(5.0)
 }
 
+/// Switch-style button (RxPGA = HL2 auto gain): orange when the switch is
+/// off, inverted (dark with an orange outline and text) once pressed, so it
+/// reads as a control and not as a slider name.
+fn switch_button(label: &str, on: bool) -> egui::Button<'static> {
+    let orange = egui::Color32::from_rgb(232, 150, 46);
+    if on {
+        egui::Button::new(egui::RichText::new(label.to_string()).color(orange))
+            .fill(egui::Color32::from_gray(28))
+            .stroke(egui::Stroke::new(1.5, orange))
+            .corner_radius(5.0)
+    } else {
+        egui::Button::new(egui::RichText::new(label.to_string()).color(egui::Color32::from_gray(15)))
+            .fill(orange)
+            .stroke(egui::Stroke::new(1.0, orange))
+            .corner_radius(5.0)
+    }
+}
+
 /// Width of a framed label box big enough for the widest of `texts`.
 fn label_box_width(ui: &egui::Ui, texts: &[&str]) -> f32 {
     let font = egui::TextStyle::Body.resolve(ui.style());
@@ -16214,8 +16246,13 @@ fn stable_value_box(ui: &mut egui::Ui, text: String) {
         .corner_radius(5.0)
         .inner_margin(4)
         .show(ui, |ui| {
-        ui.label(egui::RichText::new(text).monospace());
-    });
+            // Every value box has the same width (room for "-100 dB" /
+            // "5000 Hz"), so the boxes line up in a column across rows.
+            let font = egui::TextStyle::Monospace.resolve(ui.style());
+            let w = ui.painter().layout_no_wrap("-100 dB ".to_string(), font, egui::Color32::WHITE).size().x;
+            ui.set_min_width(w);
+            ui.label(egui::RichText::new(text).monospace());
+        });
 }
 
 /// Recent audio peak for the PK readout: (peak in dBFS, clipping). Measured
