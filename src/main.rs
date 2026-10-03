@@ -5125,6 +5125,9 @@ impl eframe::App for HpsdrApp {
                                     // report. Pulling that exact color
                                     // explicitly keeps this row visually
                                     // consistent.
+                                    if !lcd_kiosk_mode() && render_step_combo(ui, connected) {
+                                        settings_changed = true;
+                                    }
                                     // Only shown while actually in CW
                                     // mode -- see cw_panel_visible's own
                                     // doc comment further down. Also
@@ -5152,10 +5155,12 @@ impl eframe::App for HpsdrApp {
                                 });
                             });
 
-                            ui.add_space(8.0);
-                            ui.vertical(|ui| {
-                                render_net_status_column(ui, connected, rigctl_status, tci_status, cat_status);
-                            });
+                            if lcd_kiosk_mode() {
+                                ui.add_space(8.0);
+                                ui.vertical(|ui| {
+                                    render_net_status_column(ui, connected, rigctl_status, tci_status, cat_status);
+                                });
+                            }
 
                             let vfo_b_label = ui
                                 .group(|ui| {
@@ -5232,7 +5237,7 @@ impl eframe::App for HpsdrApp {
                                 let settings_clicked = if lcd_kiosk_mode() {
                                     solid_chip_text(ui, "SETTINGS...", egui::Color32::from_rgb(235, 195, 40), egui::Color32::BLACK, true).clicked()
                                 } else {
-                                    kiosk_accent_button(ui, "Settings...").clicked()
+                                    solid_chip_text(ui, "Settings...", egui::Color32::from_rgb(235, 195, 40), egui::Color32::BLACK, true).clicked()
                                 };
                                 if settings_clicked {
                                     connected.show_settings_window = !connected.show_settings_window;
@@ -5305,7 +5310,7 @@ impl eframe::App for HpsdrApp {
                                 // render_digital_window.
                                 if solid_chip_text(
                                     ui,
-                                    "DIGITAL...",
+                                    if lcd_kiosk_mode() { "DIGITAL..." } else { "Digital..." },
                                     egui::Color32::from_rgb(110, 190, 240),
                                     egui::Color32::BLACK,
                                     true,
@@ -5781,6 +5786,7 @@ impl eframe::App for HpsdrApp {
                         // the mode-buttons row now. Record stays out of
                         // this call -- it lives on the RIT/XIT row
                         // instead, alongside Clear (see that call site).
+                        if lcd_kiosk_mode() {
                         // Centre SNB/ANF/BIN between the last mode button and the
                         // (scaled-up) meter at the right edge.
                         {
@@ -5798,6 +5804,7 @@ impl eframe::App for HpsdrApp {
                         }
                         if render_snb_anf_bin_chips(ui, connected) {
                             settings_changed = true;
+                        }
                         }
                         ui.add_space(16.0);
                         render_status_row(ui, connected, rigctl_status, tci_status, cat_status);
@@ -5982,7 +5989,7 @@ impl eframe::App for HpsdrApp {
                                     // NB chip (same width as the NR chip on the row
                                     // below, so the two line up vertically).
                                     ui.add_space(6.0);
-                                    if render_nb_chip(ui, connected) {
+                                    if lcd_kiosk_mode() && render_nb_chip(ui, connected) {
                                         settings_changed = true;
                                     }
                                     ui.add_space(6.0);
@@ -6282,7 +6289,7 @@ impl eframe::App for HpsdrApp {
                             // report you could never transmit.
                             if connected.tx_enabled && connected.tx_handle.is_some() {
                                 ui.add_space(6.0);
-                                if render_nr_chip(ui, connected) {
+                                if lcd_kiosk_mode() && render_nr_chip(ui, connected) {
                                     settings_changed = true;
                                 }
                                 ui.add_space(6.0);
@@ -6458,9 +6465,18 @@ impl eframe::App for HpsdrApp {
                             // NB/NR now sit beside REC/PLAY and SNB/ANF/BIN after
                             // DRM; only when there is no TX chain (so no REC/PLAY
                             // cells) do NB/NR stay here.
-                            if connected.tx_enabled && connected.tx_handle.is_none() {
+                            if lcd_kiosk_mode() {
+                                if connected.tx_enabled && connected.tx_handle.is_none() {
+                                    let mut changed = render_nb_chip(ui, connected);
+                                    changed |= render_nr_chip(ui, connected);
+                                    if changed {
+                                        settings_changed = true;
+                                    }
+                                }
+                            } else if connected.tx_enabled {
                                 let mut changed = render_nb_chip(ui, connected);
                                 changed |= render_nr_chip(ui, connected);
+                                changed |= render_snb_anf_bin_chips(ui, connected);
                                 if changed {
                                     settings_changed = true;
                                 }
@@ -7205,9 +7221,11 @@ impl eframe::App for HpsdrApp {
                                     }
                                 }
                             }
-                            ui.add_space(12.0);
-                            if render_step_combo(ui, connected) {
-                                settings_changed = true;
+                            if lcd_kiosk_mode() {
+                                ui.add_space(12.0);
+                                if render_step_combo(ui, connected) {
+                                    settings_changed = true;
+                                }
                             }
 
                             // "TRANSMITTING" text removed from here (a
@@ -8485,7 +8503,7 @@ impl eframe::App for HpsdrApp {
                         // mode's own STOP) -- a real request: made
                         // consistent between the two modes rather than
                         // plain/unstyled here.
-                        if !lcd_kiosk_mode() && kiosk_stop_button(ui, "Stop").clicked() {
+                        if !lcd_kiosk_mode() && solid_chip(ui, "Stop", egui::Color32::from_rgb(210, 50, 50), true).clicked() {
                             stop_clicked = true;
                         }
                         // See ConnectedState::status_message's doc
@@ -8637,7 +8655,7 @@ impl eframe::App for HpsdrApp {
                 egui::Area::new(egui::Id::new("s_meter_area"))
                     // -40 (was -10) -- a real report: the panel sat flush
                     // against the window's right edge, moved ~30px left.
-                    .anchor(egui::Align2::RIGHT_TOP, egui::vec2(-20.0, 10.0))
+                    .anchor(egui::Align2::RIGHT_TOP, egui::vec2(if lcd_kiosk_mode() { -20.0 } else { -40.0 }, 10.0))
                     // The meter area is drawn scaled up in kiosk mode (see below); its
                     // enlarged, invisible hit-rect sat on top of the REC/PLAY buttons and
                     // swallowed the mouse. It has nothing clickable, so make it inert.
@@ -15823,7 +15841,19 @@ fn render_status_row(
 ) {
     // rigctl/TCI/CAT now live in a vertical column in the top row
     // (render_net_status_column), not here.
-    let _ = (rigctl_status, tci_status, cat_status);
+    if !lcd_kiosk_mode() {
+        ui.colored_label(network_status_color(rigctl_status), "rigctl")
+            .on_hover_text(network_status_hover("rigctl", rigctl_status, &connected.rigctl_addr));
+        ui.add_space(12.0);
+        ui.colored_label(network_status_color(tci_status), "TCI").on_hover_text(tci_status_hover(
+            tci_status,
+            &connected.tci_addr,
+            connected.tci_server.as_ref(),
+        ));
+        ui.add_space(12.0);
+        ui.colored_label(network_status_color(cat_status), "CAT")
+            .on_hover_text(network_status_hover("CAT", cat_status, &connected.cat_addr));
+    }
     // PureSignal: only shown when actually enabled for this session (see
     // ConnectedState::puresignal_enabled's doc comment -- a connect-time
     // setting, not live). Same green/gray "Correcting" convention as the
