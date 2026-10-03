@@ -15126,7 +15126,13 @@ fn draw_rade_status_row(ui: &mut egui::Ui, rade: &rade_link::RadeHandle, compact
         let sync_w = text_w(ui, "no sync");
         let snr_w = text_w(ui, "SNR -99 dB");
         let off_w = text_w(ui, "offset +999 Hz");
-        let call_w = text_w(ui, &format!("last call: {}", "M".repeat(rade::text::MAX_CHARS)));
+        // Compact: just the callsign (no "last call:" prefix, in the hover text instead)
+        // in a box sized for a long callsign, so it ends before the scope box.
+        let call_w = if compact {
+            text_w(ui, "EA6/OZ1ABC")
+        } else {
+            text_w(ui, &format!("last call: {}", "M".repeat(rade::text::MAX_CHARS)))
+        };
 
         slot(ui, sync_w, &mut |ui| {
             if !st.sync {
@@ -15167,7 +15173,11 @@ fn draw_rade_status_row(ui: &mut egui::Ui, rade: &rade_link::RadeHandle, compact
         let last_call = rade.rx_log().last().map(|e| e.call.clone());
         slot(ui, call_w, &mut |ui| {
             if let Some(call) = &last_call {
-                ui.label(format!("last call: {call}"));
+                if compact {
+                    ui.label(call).on_hover_text("Last call decoded by RADE");
+                } else {
+                    ui.label(format!("last call: {call}"));
+                }
             }
         });
     });
