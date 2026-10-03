@@ -45,6 +45,9 @@ pub struct Config {
     pub rade_eq_enabled: Option<bool>,
     #[serde(default)]
     pub rade_eq: Option<crate::rade_mic_agc::RadeEqParams>,
+    /// RADE panel's "Mute start/end" -- see rade_link::RadeHandle::mute_edges.
+    #[serde(default)]
+    pub rade_mute_edges: Option<bool>,
     /// Output device for local RX audio playback (Settings -> Audio's
     /// "Output device" picker), by name -- e.g. "CABLE Input (VB-Audio
     /// Virtual Cable)" to feed a decoder instead of/alongside real

@@ -46,6 +46,29 @@ const POLL: Duration = Duration::from_millis(5);
 /// Speech level decays this fast per output block, so the UI meter falls back.
 const LEVEL_DECAY: f32 = 0.85;
 
+/// RX speech gate defaults. The RADE receiver reports SYNC for its first
+/// frames after locking (the estimators are still settling) and for a while
+/// after the far end stops without a clean End-of-Over (it only gives up after
+/// several modem frames without pilots), and every frame it returns while in
+/// SYNC is vocoded and played -- audible as odd, garbled voices at the start
+/// and end of an over. The gate is meant for those two edges ONLY, not as a
+/// squelch: it opens once sync has held a couple of frames with a plausible
+/// SNR, and closes on loss of sync, on an End-of-Over, or when the SNR
+/// estimate collapses to noise level. Mid-over fades of a weak DX signal stay
+/// well above the close threshold and are never cut.
+const SQUELCH_DEFAULT_OPEN_DB: f32 = -4.0;
+/// Close this many dB below the open threshold (open -4 -> close -10: far
+/// below anything RADE can decode, i.e. noise only).
+const SQUELCH_HYSTERESIS_DB: f32 = 6.0;
+/// Consecutive qualifying RX frames (~120 ms each) before the gate opens: the
+/// receiver's timing/frequency/SNR estimates are still settling for the first
+/// few frames after it reports SYNC, and that is when the garbled speech comes
+/// out. Default 4 (~0.5 s).
+const SQUELCH_SETTLE_FRAMES: u32 = 4;
+/// Gain ramp length, in output samples (10 ms at 48 kHz): no clicks when the
+/// gate opens or closes.
+const SQUELCH_RAMP_SAMPLES: f32 = 480.0;
+
 enum Ctl {
     SetTx(bool),
     /// The callsign to transmit in the End-of-Over frame. Re-encoded on change
@@ -81,6 +104,10 @@ struct Shared {
     /// Set once the end-of-over frame has been generated and the TX chain has
     /// nothing further to emit.
     tx_finished: AtomicBool,
+    /// RX speech gate -- see [`RadeWorker::set_squelch`]. Off by default.
+    squelch_on: AtomicBool,
+    /// Open threshold in milli-dB of the 3 kHz SNR estimate.
+    squelch_open_mdb: AtomicI32,
 }
 
 /// A snapshot of receive state for the UI.
@@ -136,6 +163,11 @@ impl RadeWorker {
         let (ctl, ctl_rx) = unbounded();
         let (text_tx, text_rx) = unbounded();
         let shared = Arc::new(Shared::default());
+        // Off by default: opt-in via the RADE panel's "Mute start/end".
+        shared.squelch_on.store(false, Ordering::Relaxed);
+        shared
+            .squelch_open_mdb
+            .store((SQUELCH_DEFAULT_OPEN_DB * 1000.0) as i32, Ordering::Relaxed);
 
         // Never leave the End-of-Over payload at the library's all-zero
         // default: even with no callsign the frame carries the known sequence
@@ -171,6 +203,10 @@ impl RadeWorker {
             transmitting: false,
             was_sync: false,
             level: 0.0,
+            gate_open: false,
+            gate_frames: 0,
+            gate_gain: 0.0,
+            settle_frames: SQUELCH_SETTLE_FRAMES,
         };
 
         let thread = std::thread::Builder::new()
@@ -290,6 +326,17 @@ impl RadeWorker {
         let _ = self.ctl.send(Ctl::SetTxBpf(enable));
     }
 
+    /// Start/end speech gate (off by default; opens at -4 dB SNR): mutes the decoded
+    /// speech unless the receiver is in sync with an SNR estimate at/above
+    /// `open_snr_db` for a couple of frames. Without it the garbled output
+    /// the decoder produces while it locks on and while it gives up after
+    /// the far end unkeys is played as odd voices at both ends of an over.
+    /// Takes effect on the next frame.
+    pub fn set_squelch(&self, on: bool, open_snr_db: f32) {
+        self.shared.squelch_on.store(on, Ordering::Relaxed);
+        self.shared.squelch_open_mdb.store((open_snr_db * 1000.0) as i32, Ordering::Relaxed);
+    }
+
     /// Current receive state, for the UI.
     pub fn stats(&self) -> RadeStats {
         let s = &self.shared;
@@ -366,6 +413,11 @@ struct Inner {
     transmitting: bool,
     was_sync: bool,
     level: f32,
+    /// RX speech gate state -- see SQUELCH_* above.
+    gate_open: bool,
+    gate_frames: u32,
+    gate_gain: f32,
+    settle_frames: u32,
 }
 
 impl Inner {
@@ -473,6 +525,9 @@ impl Inner {
             // still in sync refreshes the SNR the report will carry.
             self.publish_rx_state();
             if out.has_eoo {
+                // The over has ended: nothing after this is speech.
+                self.gate_open = false;
+                self.gate_frames = 0;
                 self.shared.eoo_count.fetch_add(1, Ordering::Relaxed);
                 // Tens of microseconds of belief propagation, once per over,
                 // on this thread -- never the audio callback.
@@ -499,9 +554,38 @@ impl Inner {
                     // freedv-backend's own reference, HRA_56_56 matrix
                     // included).
                     None => {
+                        // Log-only diagnostics of the burst itself, to tell a
+                        // weak burst (low amplitude: the tail of the over was
+                        // cut or faded) from a clean-but-corrupted one (normal
+                        // amplitude, noisy tail): mean amplitude of the
+                        // codeword symbols and of the known-tail symbols, and
+                        // the tail's mean deviation from the expected (1, 0).
+                        let syms = self.eoo_rx.len() / 2;
+                        let amp = |i: usize| {
+                            (self.eoo_rx[2 * i].powi(2) + self.eoo_rx[2 * i + 1].powi(2)).sqrt()
+                        };
+                        let k = super::text::CODEWORD_FLOATS / 2;
+                        let cw_amp = if k > 0 && syms >= k {
+                            (0..k).map(amp).sum::<f32>() / k as f32
+                        } else {
+                            0.0
+                        };
+                        let tail_n = syms.saturating_sub(k);
+                        let (tail_amp, tail_dev) = if tail_n > 0 {
+                            let a: f32 = (k..syms).map(amp).sum::<f32>() / tail_n as f32;
+                            let d: f32 = (k..syms)
+                                .map(|i| {
+                                    let (re, im) = (self.eoo_rx[2 * i], self.eoo_rx[2 * i + 1]);
+                                    ((re - a).powi(2) + im.powi(2)).sqrt()
+                                })
+                                .sum::<f32>()
+                                / tail_n as f32;
+                            (a, d)
+                        } else {
+                            (0.0, 0.0)
+                        };
                         eprintln!(
-                            "[rade] End-of-Over frame detected but text decode failed \
-                             (LDPC/CRC did not check out) -- eoo_rx len={} snr_db={}",
+                            "[rade] End-of-Over frame detected but text decode failed                              (LDPC/CRC did not check out) -- eoo_rx len={} snr_db={}                              cw_amp={cw_amp:.3} tail_amp={tail_amp:.3} tail_dev={tail_dev:.3}",
                             self.eoo_rx.len(),
                             self.last_sync_snr
                         );
@@ -541,6 +625,18 @@ impl Inner {
             Some(r) => r.push(&self.scratch, &mut self.audio),
             None => self.audio.extend_from_slice(&self.scratch),
         }
+        // The vocoder above always runs (keeps FARGAN's state continuous);
+        // only what reaches the speaker is gated.
+        let target = if self.update_gate() { 1.0f32 } else { 0.0f32 };
+        let step = 1.0 / SQUELCH_RAMP_SAMPLES;
+        for i in 0..self.audio.len() {
+            if self.gate_gain < target {
+                self.gate_gain = (self.gate_gain + step).min(target);
+            } else if self.gate_gain > target {
+                self.gate_gain = (self.gate_gain - step).max(target);
+            }
+            self.audio[i] *= self.gate_gain;
+        }
         for &s in &self.audio {
             if self.rx_out.push(s.clamp(-1.0, 1.0)).is_err() {
                 let n = self.shared.dropped.fetch_add(1, Ordering::Relaxed) + 1;
@@ -549,6 +645,39 @@ impl Inner {
                 }
             }
         }
+    }
+
+    /// Advances the speech gate by one RX frame and returns whether it is open.
+    fn update_gate(&mut self) -> bool {
+        if !self.shared.squelch_on.load(Ordering::Relaxed) {
+            self.gate_open = true;
+            self.gate_frames = self.settle_frames;
+            return true;
+        }
+        let open_db = self.shared.squelch_open_mdb.load(Ordering::Relaxed) as f32 / 1000.0;
+        let sync = self.rade.sync();
+        let snr = self.rade.snr_3k_db();
+        let was_open = self.gate_open;
+        if self.gate_open {
+            if !(sync && snr >= open_db - SQUELCH_HYSTERESIS_DB) {
+                self.gate_open = false;
+                self.gate_frames = 0;
+            }
+        } else if sync && snr >= open_db {
+            self.gate_frames += 1;
+            if self.gate_frames >= self.settle_frames {
+                self.gate_open = true;
+            }
+        } else {
+            self.gate_frames = 0;
+        }
+        if self.gate_open != was_open {
+            eprintln!(
+                "[rade] speech gate {} (sync={sync}, snr_db={snr:.1}, threshold={open_db:.1})",
+                if self.gate_open { "opened" } else { "closed" }
+            );
+        }
+        self.gate_open
     }
 
     fn publish_rx_state(&mut self) {

@@ -3360,6 +3360,9 @@ fn connect_to_device(device: Device, cfg: &Config) -> Result<ConnectedState, Str
                     // comment. Correcting can be true right away, no
                     // Two-Tone needed every session.
                     if settings.puresignal_enabled {
+                    if let Some(v) = cfg.rade_mute_edges {
+                        rade.set_mute_edges(v);
+                    }
                         if let Some(path) = ps_corr_path(device.mac) {
                             if path.exists() {
                                 tx_handle.restore_ps_corr();
@@ -13719,6 +13722,7 @@ impl eframe::App for HpsdrApp {
                         db_high: Some(connected.db_high),
                         waterfall_db_low: Some(connected.waterfall_db_low),
                         waterfall_db_high: Some(connected.waterfall_db_high),
+                        rade_mute_edges: Some(connected.rade.mute_edges()),
                         waterfall_db_low_auto: Some(connected.waterfall_db_low_auto),
                         agc_auto: Some(connected.agc_auto),
                         agc_auto_offset_db: Some(connected.agc_auto_offset_db),
@@ -15355,6 +15359,20 @@ fn render_rade_panel(
             }
             for entry in &log {
                 ui.label(format!("{}  (SNR {:.0} dB)", entry.call, entry.snr_db));
+        let mut mute_edges = rade.mute_edges();
+        if ui
+            .checkbox(&mut mute_edges, "Mute start/end")
+            .on_hover_text(
+                "Silence the decoded speech while RADE is still settling after it locks on \
+                 (about half a second) and from the moment the over ends or the signal \
+                 collapses to noise -- the odd garbled voices at both ends of an over. \
+                 Off by default: neither freedv-gui nor SDRoxide does this, and it costs \
+                 the first moments of speech.",
+            )
+            .changed()
+        {
+            rade.set_mute_edges(mute_edges);
+        }
             }
         });
 

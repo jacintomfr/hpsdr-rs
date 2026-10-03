@@ -64,6 +64,8 @@ struct Inner {
     mute_analog: AtomicBool,
     /// See RadeHandle::tx_bpf_enabled's own doc comment.
     tx_bpf_enabled: AtomicBool,
+    /// See RadeHandle::mute_edges's own doc comment.
+    mute_edges: AtomicBool,
 }
 
 #[derive(Clone)]
@@ -95,6 +97,8 @@ impl RadeHandle {
                 // rade_open() default AND freedv-gui itself (confirmed
                 // against its source, it never enables this either).
                 tx_bpf_enabled: AtomicBool::new(false),
+                // Off by default -- an opt-in, see mute_edges's doc comment.
+                mute_edges: AtomicBool::new(false),
             }),
         }
     }
@@ -154,6 +158,23 @@ impl RadeHandle {
     /// button, which toggles this on every click alongside its usual
     /// passband-fit job so both filters get exercised across a test
     /// session without a separate control to remember.
+    /// Start/end speech gate -- see rade::RadeWorker::set_squelch's own doc
+    /// comment. Opt-in (off by default): while RADE locks on at the start of
+    /// an over and gives up after the far end unkeys, the receiver still
+    /// vocodes frames it produces, which is audible as odd garbled voices at
+    /// both ends. Neither freedv-gui nor SDRoxide does anything about it, so
+    /// this is deliberately not the default.
+    pub fn mute_edges(&self) -> bool {
+        self.inner.mute_edges.load(Ordering::Relaxed)
+    }
+
+    pub fn set_mute_edges(&self, on: bool) {
+        self.inner.mute_edges.store(on, Ordering::Relaxed);
+        if let Some(w) = self.inner.worker.lock().unwrap().as_ref() {
+            w.set_squelch(on, -4.0);
+        }
+    }
+
     pub fn tx_bpf_enabled(&self) -> bool {
         self.inner.tx_bpf_enabled.load(Ordering::Relaxed)
     }
