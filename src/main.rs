@@ -16918,13 +16918,41 @@ fn eq_band_column(
         ui.with_layout(egui::Layout::top_down(egui::Align::Center), |ui| {
             ui.label(egui::RichText::new(caption).color(egui::Color32::WHITE));
             if let Some((f, min_f, max_f)) = freq {
+                let max_f = max_f.max(min_f);
+                // deskHPSDR-style spin box: type a value (Enter or click away to apply) or use
+                // the - / + buttons (10 Hz per click); no drag-to-adjust.
+                let id = ui.id().with(("eq_freq_text", caption));
+                let mut text = ui.data(|d| d.get_temp::<String>(id)).unwrap_or_else(|| f.to_string());
                 let r = ui.add(
-                    egui::DragValue::new(f)
-                        .range(min_f..=max_f.max(min_f))
-                        .speed(10.0)
+                    egui::TextEdit::singleline(&mut text)
+                        .desired_width(col_w - 6.0)
+                        .horizontal_align(egui::Align::Center),
                 );
-                changed |= r.changed();
-                r.on_hover_text("Band frequency in Hz");
+                if r.changed() {
+                    ui.data_mut(|d| d.insert_temp(id, text.clone()));
+                }
+                if r.lost_focus() {
+                    if let Ok(v) = text.trim().parse::<i32>() {
+                        let v = v.clamp(min_f, max_f);
+                        if v != *f {
+                            *f = v;
+                            changed = true;
+                        }
+                    }
+                    ui.data_mut(|d| d.remove::<String>(id));
+                }
+                r.on_hover_text("Band frequency in Hz (type a value, or use - / +: 10 Hz per click)");
+                ui.horizontal(|ui| {
+                    let half = ((col_w - 4.0) / 2.0).max(18.0);
+                    if ui.add(chip_button("-", false).min_size(egui::vec2(half, 0.0))).clicked() {
+                        *f = (*f - 10).clamp(min_f, max_f);
+                        changed = true;
+                    }
+                    if ui.add(chip_button("+", false).min_size(egui::vec2(half, 0.0))).clicked() {
+                        *f = (*f + 10).clamp(min_f, max_f);
+                        changed = true;
+                    }
+                });
             }
             let prev = ui.spacing().slider_width;
             ui.spacing_mut().slider_width = 110.0;
