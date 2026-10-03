@@ -4372,7 +4372,7 @@ impl eframe::App for HpsdrApp {
                 // extra hold past tx_drained() so WDSP + the tx_iq_out
                 // queue + the network send actually get the EOO burst's
                 // tail out before the real PTT drops.
-                const RADE_UNKEY_SETTLE: Duration = Duration::from_millis(300);
+                const RADE_UNKEY_SETTLE: Duration = Duration::from_millis(600);
                 if let Some(started) = connected.rade_pending_unkey {
                     if connected.rade_drained_at.is_none() && connected.rade.tx_drained() {
                         connected.rade_drained_at = Some(Instant::now());
