@@ -5584,11 +5584,7 @@ impl eframe::App for HpsdrApp {
                             let one = chip_width(ui, &["RIT -9999"]);
                             let n_chips = if connected.tx_enabled { 2.0 } else { 1.0 };
                             let group_w = one * n_chips + (n_chips - 1.0) * ui.spacing().item_spacing.x;
-                            let meter_left = if lcd_kiosk_mode() {
-                                ui.ctx().content_rect().right() - 20.0 - 180.0 * 1.7
-                            } else {
-                                ui.ctx().content_rect().right() - 40.0 - 180.0
-                            };
+                            let meter_left = meter_left_x(ui);
                             let free = (meter_left - ui.cursor().left() - group_w).max(16.0);
                             ui.add_space((free / 2.0).clamp(16.0, 200.0));
                         }
@@ -5812,7 +5808,7 @@ impl eframe::App for HpsdrApp {
                         // the mode-buttons row now. Record stays out of
                         // this call -- it lives on the RIT/XIT row
                         // instead, alongside Clear (see that call site).
-                        if lcd_kiosk_mode() {
+                        {
                         // Centre SNB/ANF/BIN between the last mode button and the
                         // (scaled-up) meter at the right edge.
                         {
@@ -5823,7 +5819,7 @@ impl eframe::App for HpsdrApp {
                                     + 2.0
                             };
                             let group_w = chip_w("SNB") + chip_w("ANF") + chip_w("BIN") + 2.0 * ui.spacing().item_spacing.x;
-                            let meter_left = ui.ctx().content_rect().right() - 20.0 - 180.0 * 1.7;
+                            let meter_left = meter_left_x(ui);
                             let start = ui.cursor().left();
                             let free = (meter_left - start - group_w).max(16.0);
                             ui.add_space((free / 2.0).clamp(16.0, 120.0));
@@ -6015,7 +6011,7 @@ impl eframe::App for HpsdrApp {
                                     // NB chip (same width as the NR chip on the row
                                     // below, so the two line up vertically).
                                     ui.add_space(6.0);
-                                    if lcd_kiosk_mode() && render_nb_chip(ui, connected) {
+                                    if render_nb_chip(ui, connected) {
                                         settings_changed = true;
                                     }
                                     ui.add_space(6.0);
@@ -6315,7 +6311,7 @@ impl eframe::App for HpsdrApp {
                             // report you could never transmit.
                             if connected.tx_enabled && connected.tx_handle.is_some() {
                                 ui.add_space(6.0);
-                                if lcd_kiosk_mode() && render_nr_chip(ui, connected) {
+                                if render_nr_chip(ui, connected) {
                                     settings_changed = true;
                                 }
                                 ui.add_space(6.0);
@@ -6491,18 +6487,14 @@ impl eframe::App for HpsdrApp {
                             // NB/NR now sit beside REC/PLAY and SNB/ANF/BIN after
                             // DRM; only when there is no TX chain (so no REC/PLAY
                             // cells) do NB/NR stay here.
-                            if lcd_kiosk_mode() {
-                                if connected.tx_enabled && connected.tx_handle.is_none() {
-                                    let mut changed = render_nb_chip(ui, connected);
-                                    changed |= render_nr_chip(ui, connected);
-                                    if changed {
-                                        settings_changed = true;
-                                    }
-                                }
-                            } else if connected.tx_enabled {
+                            // NB/NR sit beside REC/PLAY and SNB/ANF/BIN after DRM; only without a TX
+                            // chain (no REC/PLAY cells) do NB/NR stay on this row -- except in kiosk
+                            // mode with no TX at all, which has its own fallback row.
+                            if (connected.tx_enabled && connected.tx_handle.is_none())
+                                || (!connected.tx_enabled && !lcd_kiosk_mode())
+                            {
                                 let mut changed = render_nb_chip(ui, connected);
                                 changed |= render_nr_chip(ui, connected);
-                                changed |= render_snb_anf_bin_chips(ui, connected);
                                 if changed {
                                     settings_changed = true;
                                 }
@@ -8557,7 +8549,7 @@ impl eframe::App for HpsdrApp {
                 egui::Area::new(egui::Id::new("s_meter_area"))
                     // -40 (was -10) -- a real report: the panel sat flush
                     // against the window's right edge, moved ~30px left.
-                    .anchor(egui::Align2::RIGHT_TOP, egui::vec2(if lcd_kiosk_mode() { -20.0 } else { -40.0 }, 10.0))
+                    .anchor(egui::Align2::RIGHT_TOP, egui::vec2(-20.0, 10.0))
                     // The meter area is drawn scaled up in kiosk mode (see below); its
                     // enlarged, invisible hit-rect sat on top of the REC/PLAY buttons and
                     // swallowed the mouse. It has nothing clickable, so make it inert.
@@ -15987,6 +15979,13 @@ fn render_rit_xit(ui: &mut egui::Ui, connected: &mut ConnectedState) -> bool {
         );
     }
     changed
+}
+
+/// Left edge (x) of the RX/TX meter at the top right: it is anchored 20 px from the
+/// right edge, 180 px wide (drawn 1.7x larger in kiosk mode).
+fn meter_left_x(ui: &egui::Ui) -> f32 {
+    let width = if lcd_kiosk_mode() { 180.0 * 1.7 } else { 180.0 };
+    ui.ctx().content_rect().right() - 20.0 - width
 }
 
 /// Brief orange flash for action buttons (A>B, B>A, A<>B): they have no
