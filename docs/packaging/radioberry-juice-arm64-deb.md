@@ -56,3 +56,32 @@ the FTDI device (0403:6010) and releases it from the kernel's `ftdi_sio` driver,
 so reconnect the board after installing. FTDI's licence notice is shipped in
 `/usr/share/doc/radioberry-juice/copyright` (the D2XX library is for use with the
 Radioberry's genuine FTDI chip only).
+
+## The low-CPU read patch (revision 1.0-3)
+
+On a Raspberry Pi 5 the stock juice kept one CPU core at about 100% whenever a
+client was receiving from the board, at any sample rate, which starved the rest
+of the system (audio glitches in hpsdr-rs). `gdb` on the busy thread showed every
+sample inside `FT_Read()` of FTDI's `libftd2xx.so` 1.4.35, in a loop of
+`clock_gettime` + `pthread_mutex_lock` with no sleeping: the library busy-polls
+while waiting for the 1032 bytes. The idle process (no client) used only 4-8%.
+
+`scripts/juice-arm64/0001-low-cpu-read.patch` changes juice's `read_stream()`
+(`stream.c`) to wait for the data itself, polling `FT_GetQueueStatus` with a
+100 microsecond `usleep` until 1032 bytes are queued (giving up after 1 s, then
+calling `FT_Read` so the timeout handling is unchanged). Apply it to the juice
+tree before building (`patch -p1 < 0001-low-cpu-read.patch`); the juice sources
+themselves are not modified in this repository.
+
+Measured on the Pi 5 with the real board and the same test client (discovery,
+then Start, counting packets for 10 s):
+
+| | packets/s | juice CPU |
+|---|---|---|
+| stock 1.0-2 | 381 | 104% of one core |
+| patched 1.0-3 | 381 | 6% of one core |
+
+The stream is the same (no packets lost or added). If the FPGA stays in a bad
+state after a juice process is killed mid-stream, loading the gateware loops on
+"NSTATUS and NCONF_DONE must be low"; resetting the USB device (hpsdr-rs's
+"Reset USB & Restart" button, or `USBDEVFS_RESET` on the device node) fixes it.

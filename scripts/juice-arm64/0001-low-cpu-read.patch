@@ -1,0 +1,22 @@
+--- a/stream.c	2026-10-03 21:31:15.598955324 +0000
++++ b/stream.c	2026-10-03 21:31:15.650479852 +0000
+@@ -90,6 +90,19 @@
+ 	DWORD TxBytes;
+ 	DWORD BytesReceived;
+ 	
++	/* libftd2xx's blocking FT_Read busy-polls (clock_gettime + mutex, no sleeping) while it
++	 * waits for data, which keeps a whole CPU core at 100%. Wait for the data ourselves with
++	 * short sleeps, then read what is already queued. Gives up after 1 s (the FT_SetTimeouts
++	 * value) and lets FT_Read report the timeout, so error handling is unchanged. */
++	{
++		DWORD queued = 0;
++		int waited_us = 0;
++		while (FT_GetQueueStatus(ftHandleA, &queued) == FT_OK && queued < 1032 && waited_us < 1000000) {
++			usleep(100);
++			waited_us += 100;
++		}
++	}
++
+ 	ftStatus = FT_Read(ftHandleA, stream, 1032, &BytesReceived);
+ 			
+ 	if (ftStatus == FT_OK)
