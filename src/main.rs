@@ -8612,7 +8612,7 @@ impl eframe::App for HpsdrApp {
                         // whole area is drawn scaled up about its top-right corner. The
                         // desktop layout is untouched.
                         if lcd_kiosk_mode() {
-                            const KIOSK_METER_SCALE: f32 = 1.4;
+                            const KIOSK_METER_SCALE: f32 = 1.7;
                             let pivot = meter_rect.right_top().to_vec2();
                             ui.ctx().set_transform_layer(
                                 ui.layer_id(),
