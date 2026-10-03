@@ -463,7 +463,7 @@ impl Inner {
                 let block = std::mem::take(&mut self.tx_features);
                 self.iq.clear();
                 match self.rade.tx(&block, &mut self.iq) {
-                    Ok(()) => self.emit_tx_iq(),
+                    Ok(()) => self.emit_tx_iq_wait(Duration::from_secs(3)),
                     Err(e) => eprintln!("[rade] rade_tx failed flushing the over: {e:?}"),
                 }
             }
@@ -480,7 +480,7 @@ impl Inner {
             let drops_before = self.shared.dropped.load(Ordering::Relaxed);
             let free_before = self.tx_out.slots();
             let eoo_iq = self.iq.len();
-            self.emit_tx_iq();
+            self.emit_tx_iq_wait(Duration::from_secs(3));
             // Diagnostics for a missing/failed End-of-Over at the far end: how much of the
             // burst went into the transmit ring, and whether any of it was dropped.
             eprintln!(
@@ -748,8 +748,22 @@ impl Inner {
     }
 
     /// Take the real part of the modulated IQ, scale it to full-scale audio and
-    /// resample it up for the transmit chain.
+    /// resample it up for the transmit chain. Samples that do not fit in the
+    /// ring are dropped (and counted).
     fn emit_tx_iq(&mut self) {
+        self.emit_tx_iq_inner(None);
+    }
+
+    /// Same, but WAITS (up to `max_wait`) for the transmit chain to drain room in
+    /// the ring instead of dropping. Used for the End-of-Over frame: the ring is
+    /// full of the last second or so of speech when the over ends, and dropping
+    /// the burst there sent only its first few milliseconds -- the far end then
+    /// saw a truncated frame and could never decode the callsign.
+    fn emit_tx_iq_wait(&mut self, max_wait: Duration) {
+        self.emit_tx_iq_inner(Some(max_wait));
+    }
+
+    fn emit_tx_iq_inner(&mut self, max_wait: Option<Duration>) {
         if self.iq.is_empty() {
             return;
         }
@@ -760,13 +774,25 @@ impl Inner {
             Some(r) => r.push(&self.scratch, &mut self.audio),
             None => self.audio.extend_from_slice(&self.scratch),
         }
-        for &s in &self.audio {
-            if self.tx_out.push(s.clamp(-1.0, 1.0)).is_err() {
+        let audio = std::mem::take(&mut self.audio);
+        let deadline = max_wait.map(|w| std::time::Instant::now() + w);
+        for &s in &audio {
+            let v = s.clamp(-1.0, 1.0);
+            loop {
+                if self.tx_out.push(v).is_ok() {
+                    break;
+                }
+                if deadline.is_some_and(|d| std::time::Instant::now() < d) {
+                    std::thread::sleep(Duration::from_millis(1));
+                    continue;
+                }
                 let n = self.shared.dropped.fetch_add(1, Ordering::Relaxed) + 1;
                 if n.is_power_of_two() {
                     eprintln!("[rade] modem ring full, dropped {n} samples total");
                 }
+                break;
             }
         }
+        self.audio = audio;
     }
 }
