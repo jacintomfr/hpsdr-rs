@@ -12954,8 +12954,7 @@ impl eframe::App for HpsdrApp {
                                     if connected.tx_handle.is_some() {
                                         ui.horizontal(|ui| {
                                             for (is_tx, label) in [(false, "RX"), (true, "TX")] {
-                                                if ui
-                                                    .selectable_label(connected.eq_tab_is_tx == is_tx, label)
+                                                if toggle_chip(ui, label, connected.eq_tab_is_tx == is_tx, 0.0, "")
                                                     .clicked()
                                                 {
                                                     connected.eq_tab_is_tx = is_tx;
@@ -16821,13 +16820,13 @@ fn render_equalizer_panel(ui: &mut egui::Ui, scroll_accum: &mut f32, side_label:
     }
     ui.horizontal(|ui| {
         ui.label("Bands:");
-        if ui.add(egui::Button::selectable(eq.band_count == spectrum::EqBandCount::Three, "3-Band")).clicked()
+        if toggle_chip(ui, "3-Band", eq.band_count == spectrum::EqBandCount::Three, 0.0, "").clicked()
             && eq.band_count != spectrum::EqBandCount::Three
         {
             eq.band_count = spectrum::EqBandCount::Three;
             changed = true;
         }
-        if ui.add(egui::Button::selectable(eq.band_count == spectrum::EqBandCount::Ten, "10-Band")).clicked()
+        if toggle_chip(ui, "10-Band", eq.band_count == spectrum::EqBandCount::Ten, 0.0, "").clicked()
             && eq.band_count != spectrum::EqBandCount::Ten
         {
             eq.band_count = spectrum::EqBandCount::Ten;
@@ -16835,37 +16834,62 @@ fn render_equalizer_panel(ui: &mut egui::Ui, scroll_accum: &mut f32, side_label:
         }
     });
     ui.add_space(6.0);
-    ui.horizontal(|ui| {
-        ui.label("Preamp:");
-        if scroll_slider_i32(ui, scroll_accum, &mut eq.preamp_db, -12..=15, 1, " dB") {
-            changed = true;
+    // Bands side by side, each a vertical slider (like the RADE EQ and freedv-gui):
+    // caption on top, the gain readout below.
+    let col_w = label_box_width(ui, &["Preamp", "16kHz"]).max(56.0);
+    ui.horizontal_top(|ui| {
+        changed |= eq_band_column(ui, scroll_accum, "Preamp", &mut eq.preamp_db, col_w);
+        ui.add_space(12.0);
+        match eq.band_count {
+            spectrum::EqBandCount::Three => {
+                const LABELS: [&str; 3] = ["Low", "Mid", "High"];
+                for (label, gain) in LABELS.iter().zip(eq.bands_3_db.iter_mut()) {
+                    changed |= eq_band_column(ui, scroll_accum, label, gain, col_w);
+                }
+            }
+            spectrum::EqBandCount::Ten => {
+                const LABELS: [&str; 10] =
+                    ["32Hz", "63Hz", "125Hz", "250Hz", "500Hz", "1kHz", "2kHz", "4kHz", "8kHz", "16kHz"];
+                for (label, gain) in LABELS.iter().zip(eq.bands_10_db.iter_mut()) {
+                    changed |= eq_band_column(ui, scroll_accum, label, gain, col_w);
+                }
+            }
         }
     });
-    match eq.band_count {
-        spectrum::EqBandCount::Three => {
-            const LABELS: [&str; 3] = ["Low", "Mid", "High"];
-            for (label, gain) in LABELS.iter().zip(eq.bands_3_db.iter_mut()) {
-                ui.horizontal(|ui| {
-                    ui.label(format!("{label}:"));
-                    if scroll_slider_i32(ui, scroll_accum, gain, -12..=15, 1, " dB") {
+    changed
+}
+
+/// One equalizer band: caption, a vertical -12..15 dB slider (scroll over it moves
+/// 1 dB per notch) and a fixed-width gain readout. All columns have the same width.
+fn eq_band_column(ui: &mut egui::Ui, scroll_accum: &mut f32, caption: &str, gain: &mut i32, col_w: f32) -> bool {
+    let mut changed = false;
+    ui.vertical(|ui| {
+        ui.set_width(col_w);
+        ui.with_layout(egui::Layout::top_down(egui::Align::Center), |ui| {
+            ui.label(egui::RichText::new(caption).color(egui::Color32::WHITE));
+            let prev = ui.spacing().slider_width;
+            ui.spacing_mut().slider_width = 150.0;
+            let resp = ui.add(egui::Slider::new(gain, -12..=15).vertical().show_value(false));
+            ui.spacing_mut().slider_width = prev;
+            changed |= resp.changed();
+            if resp.hovered() {
+                let scroll_delta = ui.input(|i| i.smooth_scroll_delta);
+                let delta = if scroll_delta.y.abs() >= scroll_delta.x.abs() { scroll_delta.y } else { scroll_delta.x };
+                if delta != 0.0 {
+                    *scroll_accum += delta;
+                    const NOTCH: f32 = 20.0;
+                    while scroll_accum.abs() >= NOTCH {
+                        let sign = scroll_accum.signum();
+                        *scroll_accum -= sign * NOTCH;
+                        *gain = (*gain + sign as i32).clamp(-12, 15);
                         changed = true;
                     }
-                });
+                }
             }
-        }
-        spectrum::EqBandCount::Ten => {
-            const LABELS: [&str; 10] =
-                ["32Hz", "63Hz", "125Hz", "250Hz", "500Hz", "1kHz", "2kHz", "4kHz", "8kHz", "16kHz"];
-            for (label, gain) in LABELS.iter().zip(eq.bands_10_db.iter_mut()) {
-                ui.horizontal(|ui| {
-                    ui.label(format!("{label}:"));
-                    if scroll_slider_i32(ui, scroll_accum, gain, -12..=15, 1, " dB") {
-                        changed = true;
-                    }
-                });
-            }
-        }
-    }
+            // Fixed-width readout ("+15" / "-12" / "  0").
+            ui.label(egui::RichText::new(format!("{:>+4}", *gain)).monospace().color(egui::Color32::WHITE));
+        });
+    });
     changed
 }
 

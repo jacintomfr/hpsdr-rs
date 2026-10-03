@@ -29,7 +29,9 @@ doesn't affect them, or each other.
   - 10-Band: **32Hz, 63Hz, 125Hz, 250Hz, 500Hz, 1kHz, 2kHz, 4kHz, 8kHz,
     16kHz**.
 - **Preamp** -- an overall gain applied on top of the individual bands.
-- Each band slider: **-12 to 15 dB**.
+- Each band is a **vertical slider** (-12 to 15 dB), with the bands side by
+  side from left to right like the RADE equalizer; scroll over a slider to move
+  it 1 dB per notch.
 
 Switching between 3-Band and 10-Band keeps each mode's own dialed-in gains
 independently -- flipping back and forth doesn't lose either set.
