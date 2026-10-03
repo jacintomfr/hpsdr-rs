@@ -3381,9 +3381,6 @@ fn connect_to_device(device: Device, cfg: &Config) -> Result<ConnectedState, Str
                     if let Some(v) = cfg.rade_eq {
                         tx_handle.set_rade_eq(v);
                     }
-                    if let Some(v) = cfg.rade_mute_edges {
-                        rade.set_mute_edges(v);
-                    }
                     // Apply a previously-saved correction table
                     // immediately, if PS is enabled and one exists for
                     // this radio -- see TxHandle::restore_ps_corr's doc
@@ -3762,24 +3759,6 @@ impl eframe::App for HpsdrApp {
         // save below actually fires, rather than trying to read it fresh
         // only in that one frame. outer_rect (position, includes window-
         // manager chrome) pairs with ViewportBuilder::with_position/
-        // ViewportCommand::OuterPosition; inner_rect (content size, no
-        // chrome) pairs with with_inner_size/InnerSize -- see
-        // Config::window_geometry and the DiscoveryAction::Start handler
-        // below. Both are None on Wayland, but this app already forces
-        // X11 (see main()'s WAYLAND_DISPLAY workaround), so that doesn't
-        // apply here.
-        if let (Some(outer), Some(inner)) =
-            (ui.input(|i| i.viewport().outer_rect), ui.input(|i| i.viewport().inner_rect))
-        {
-            self.main_window_geometry = Some(WindowGeometry {
-                x: outer.min.x,
-                y: outer.min.y,
-                width: inner.width(),
-                height: inner.height(),
-            });
-        }
-        let root_close_requested = ui.input(|i| i.viewport().close_requested());
-
         // Kiosk: keep an open Settings / Digital window in front of the
         // fullscreen main window. ROOT CAUSE FIX for a real report ("after
         // leaving Settings everything runs at ~1 fps, but no other window is
@@ -3815,6 +3794,24 @@ impl eframe::App for HpsdrApp {
                 }
             }
         }
+
+        // ViewportCommand::OuterPosition; inner_rect (content size, no
+        // chrome) pairs with with_inner_size/InnerSize -- see
+        // Config::window_geometry and the DiscoveryAction::Start handler
+        // below. Both are None on Wayland, but this app already forces
+        // X11 (see main()'s WAYLAND_DISPLAY workaround), so that doesn't
+        // apply here.
+        if let (Some(outer), Some(inner)) =
+            (ui.input(|i| i.viewport().outer_rect), ui.input(|i| i.viewport().inner_rect))
+        {
+            self.main_window_geometry = Some(WindowGeometry {
+                x: outer.min.x,
+                y: outer.min.y,
+                width: inner.width(),
+                height: inner.height(),
+            });
+        }
+        let root_close_requested = ui.input(|i| i.viewport().close_requested());
 
         // BUG FIX: clicking the main window while it's not the active/
         // focused OS window would both raise/focus it AND process that
@@ -10075,7 +10072,7 @@ impl eframe::App for HpsdrApp {
                                     ui.label("UI scale (this 1024x600 panel only):");
                                     ui.add_space(4.0);
                                     let current = crate::config::load_kiosk_ui_scale();
-                                    ui.horizontal(|ui| {
+                                    ui.horizontal_wrapped(|ui| {
                                         for &preset in crate::config::kiosk_ui_scale_presets() {
                                             let label = format!("{:.0}%", preset * 100.0);
                                             if ui.selectable_label((current - preset).abs() < 0.001, label).clicked()
@@ -13752,7 +13749,6 @@ impl eframe::App for HpsdrApp {
                         rade_compressor_enabled: connected.tx_handle.as_ref().map(|t| t.rade_compressor_enabled()),
                         rade_eq_enabled: connected.tx_handle.as_ref().map(|t| t.rade_eq_enabled()),
                         rade_eq: connected.tx_handle.as_ref().map(|t| t.rade_eq()),
-                        rade_mute_edges: Some(connected.rade.mute_edges()),
                         tci_tx_gain: Some(connected.tci_tx_gain),
                         tx_power_watts: Some(connected.session.tx_power_watts.load(Ordering::Relaxed)),
                         cw_keyer_mode: Some(connected.session.cw_keyer.mode.load(Ordering::Relaxed)),
@@ -15453,20 +15449,6 @@ fn render_rade_panel(
         {
             rade.set_mute_analog(muted);
         }
-        let mut mute_edges = rade.mute_edges();
-        if ui
-            .checkbox(&mut mute_edges, "Mute start/end")
-            .on_hover_text(
-                "Silence the decoded speech while RADE is still settling after it locks on \
-                 (about half a second) and from the moment the over ends or the signal \
-                 collapses to noise -- the odd garbled voices at both ends of an over. \
-                 Off by default: neither freedv-gui nor SDRoxide does this, and it costs \
-                 the first moments of speech.",
-            )
-            .changed()
-        {
-            rade.set_mute_edges(mute_edges);
-        }
         if ui.button("Reset RX").on_hover_text("Drop sync and start hunting again").clicked() {
             rade.reset_rx();
         }
@@ -15489,6 +15471,20 @@ fn render_rade_panel(
             }
             for entry in &log {
                 ui.label(format!("{}  (SNR {:.0} dB)", entry.call, entry.snr_db));
+        let mut mute_edges = rade.mute_edges();
+        if ui
+            .checkbox(&mut mute_edges, "Mute start/end")
+            .on_hover_text(
+                "Silence the decoded speech while RADE is still settling after it locks on \
+                 (about half a second) and from the moment the over ends or the signal \
+                 collapses to noise -- the odd garbled voices at both ends of an over. \
+                 Off by default: neither freedv-gui nor SDRoxide does this, and it costs \
+                 the first moments of speech.",
+            )
+            .changed()
+        {
+            rade.set_mute_edges(mute_edges);
+        }
             }
         });
 
