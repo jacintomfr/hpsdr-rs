@@ -16861,13 +16861,17 @@ fn render_equalizer_panel(ui: &mut egui::Ui, scroll_accum: &mut f32, side_label:
     // full width (spare width shared out as a gap between columns); the 3-band panel is
     // centred and the outline hugs just its three columns.
     let twelve = eq.band_count == spectrum::EqBandCount::Twelve;
-    let mut panel = |ui: &mut egui::Ui| {
+    let mut panel = |ui: &mut egui::Ui, fixed_w: Option<f32>| {
         egui::Frame::new()
             .stroke(egui::Stroke::new(1.0, egui::Color32::from_gray(95)))
             .corner_radius(5.0)
             .inner_margin(egui::Margin::symmetric(8, 6))
             .show(ui, |ui| {
                 ui.spacing_mut().item_spacing.x = 4.0;
+                if let Some(w) = fixed_w {
+                    ui.set_min_width(w);
+                    ui.set_max_width(w);
+                }
                 // Fit analysis: the columns must fit the width available in this panel. Try
                 // smaller and smaller text until they do; if even the smallest does not fit,
                 // the horizontal scroll area is the fallback (12-band only).
@@ -16933,9 +16937,19 @@ fn render_equalizer_panel(ui: &mut egui::Ui, scroll_accum: &mut f32, side_label:
             });
     };
     if twelve {
-        panel(ui);
+        panel(ui, None);
     } else {
-        ui.vertical_centered(|ui| panel(ui));
+        // Centre the 3-band group: its width is known exactly (3 columns + 2 gaps), so place the
+        // outlined frame with an equal margin on both sides.
+        let body_h = ui.text_style_height(&egui::TextStyle::Body);
+        let font = egui::FontId::proportional(body_h);
+        let col_w = (ui.painter().layout_no_wrap("16000".to_string(), font, egui::Color32::WHITE).size().x + 16.0).max(40.0);
+        let content_w = 3.0 * col_w + 2.0 * 24.0;
+        let side = ((ui.available_width() - (content_w + 18.0)) / 2.0 - ui.spacing().item_spacing.x).max(0.0);
+        ui.horizontal(|ui| {
+            ui.add_space(side);
+            panel(ui, Some(content_w));
+        });
     }
     changed
 }
@@ -16997,7 +17011,10 @@ fn eq_band_column(
             }
             let prev = ui.spacing().slider_width;
             ui.spacing_mut().slider_width = 110.0;
-            let resp = ui.add(egui::Slider::new(gain, lo..=hi).vertical().show_value(false));
+            // Place the slider in an exact column-wide slot so it is centred under the caption
+            // (a bare ui.add left-aligned it in the column).
+            let (slot, _) = ui.allocate_exact_size(egui::vec2(col_w, 110.0), egui::Sense::hover());
+            let resp = ui.put(slot, egui::Slider::new(gain, lo..=hi).vertical().show_value(false));
             ui.spacing_mut().slider_width = prev;
             changed |= resp.changed();
             if resp.hovered() {
