@@ -5702,24 +5702,26 @@ impl eframe::App for HpsdrApp {
 
                                     // Entry display: right-aligned, what has been typed.
                                     let shown = if digits.is_empty() { "0".to_string() } else { digits.clone() };
-                                    egui::Frame::new()
-                                        .fill(egui::Color32::from_gray(28))
-                                        .stroke(egui::Stroke::new(1.0, egui::Color32::from_gray(95)))
-                                        .corner_radius(5.0)
-                                        .inner_margin(egui::Margin::symmetric(8, 4))
-                                        .show(ui, |ui| {
-                                            ui.set_width(ui.available_width());
-                                            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                                                ui.label(
-                                                    egui::RichText::new(shown)
-                                                        .monospace()
-                                                        .size(h * 1.6)
-                                                        .strong()
-                                                        .color(egui::Color32::WHITE),
-                                                );
-                                            });
-                                        });
-                                    ui.add_space(4.0);
+                                    // Exact-size box (a Frame with a right-to-left layout stretched to
+                                    // fill the whole window): text drawn right-aligned inside.
+                                    {
+                                        let font = egui::FontId::monospace(h * 1.6);
+                                        let galley = ui.painter().layout_no_wrap(shown, font, egui::Color32::WHITE);
+                                        let size = egui::vec2(ui.available_width(), h * 2.6);
+                                        let (rect, _) = ui.allocate_exact_size(size, egui::Sense::hover());
+                                        ui.painter().rect(
+                                            rect,
+                                            5.0,
+                                            egui::Color32::from_gray(28),
+                                            egui::Stroke::new(1.0, egui::Color32::from_gray(95)),
+                                            egui::StrokeKind::Inside,
+                                        );
+                                        let pos = egui::pos2(
+                                            rect.right() - 10.0 - galley.size().x,
+                                            rect.center().y - galley.size().y / 2.0,
+                                        );
+                                        ui.painter().galley(pos, galley, egui::Color32::WHITE);
+                                    }
 
                                     ui.horizontal_top(|ui| {
                                         // Keypad (1-9, ".", 0, BS) + units + Clear.
