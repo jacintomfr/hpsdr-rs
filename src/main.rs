@@ -16258,10 +16258,10 @@ fn stable_value_box(ui: &mut egui::Ui, text: String) {
             let font = egui::TextStyle::Monospace.resolve(ui.style());
             let w = ui.painter().layout_no_wrap("-100 dB ".to_string(), font, egui::Color32::WHITE).size().x;
             ui.set_min_width(w);
-            // Right-aligned, white.
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                ui.label(egui::RichText::new(text).monospace().color(egui::Color32::WHITE));
-            });
+            // White, right-aligned by padding to a fixed character count (the
+            // font is monospace and the box has a fixed width). No layout
+            // tricks: a right-to-left layout here made the box stretch.
+            ui.label(egui::RichText::new(format!("{:>8}", text.trim())).monospace().color(egui::Color32::WHITE));
         });
 }
 
