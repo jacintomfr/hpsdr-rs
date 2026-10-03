@@ -5009,8 +5009,8 @@ impl eframe::App for HpsdrApp {
                                 })
                                 .inner;
 
-                            ui.vertical(|ui| {
-                                ui.horizontal(|ui| {
+                            ui.horizontal(|ui| {
+                                ui.vertical(|ui| {
                                     if ui
                                         .button("A>B")
                                         .on_hover_text("Copy VFO A's frequency to VFO B")
@@ -5046,8 +5046,6 @@ impl eframe::App for HpsdrApp {
                                         }
                                         settings_changed = true;
                                     }
-                                });
-                                ui.horizontal(|ui| {
                                     if ui
                                         .button("A<>B")
                                         .on_hover_text("Swap VFO A and VFO B")
@@ -5071,6 +5069,8 @@ impl eframe::App for HpsdrApp {
                                         connected.vfo_b_frequency_hz = new_b;
                                         settings_changed = true;
                                     }
+                                });
+                                ui.vertical(|ui| {
                                     if ui
                                         .add(egui::Button::selectable(connected.split, "Split"))
                                         .on_hover_text(
@@ -5081,8 +5081,6 @@ impl eframe::App for HpsdrApp {
                                         connected.split = !connected.split;
                                         settings_changed = true;
                                     }
-                                });
-                                ui.horizontal(|ui| {
                                     if ui
                                         .add(egui::Button::selectable(connected.ctun, "CTUN"))
                                         .on_hover_text(
@@ -5123,6 +5121,7 @@ impl eframe::App for HpsdrApp {
                                     // report. Pulling that exact color
                                     // explicitly keeps this row visually
                                     // consistent.
+                                    ui.horizontal(|ui| {
                                     ui.colored_label(ui.visuals().widgets.inactive.fg_stroke.color, "Step:");
                                     egui::ComboBox::from_id_salt("tune_step_hz")
                                         .width(60.0)
@@ -5166,6 +5165,7 @@ impl eframe::App for HpsdrApp {
                                         settings_changed = true;
                                     }
                                 });
+                            });
                             });
 
                             let vfo_b_label = ui
