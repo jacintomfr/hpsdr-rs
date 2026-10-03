@@ -6540,6 +6540,15 @@ impl eframe::App for HpsdrApp {
                                 connected.spectrum.set_agc(current_agc.next());
                                 settings_changed = true;
                             }
+                            // RADE compact status, right after the AGC mode button: only while RADE
+                            // is active but the Digital window is hidden.
+                            if connected.digital_mode == DigitalMode::Rade
+                                && !connected.show_digital_window
+                                && matches!(connected.spectrum.mode(), spectrum::Mode::Digu | spectrum::Mode::Digl)
+                            {
+                                ui.add_space(12.0);
+                                draw_rade_status_row(ui, &connected.rade, true);
+                            }
                             // NB/NR/SNB/ANF/BIN -- kiosk-only, all
                             // together right after the AGC mode button (a
                             // real report/correction: splitting these
@@ -7161,16 +7170,6 @@ impl eframe::App for HpsdrApp {
                                         }
                                     }
                                 }
-                            }
-                            // RADE compact status right after Record (it used to sit at the end of
-                            // the mode row near the meter): only while RADE is active but the
-                            // Digital window is hidden.
-                            if connected.digital_mode == DigitalMode::Rade
-                                && !connected.show_digital_window
-                                && matches!(connected.spectrum.mode(), spectrum::Mode::Digu | spectrum::Mode::Digl)
-                            {
-                                ui.add_space(12.0);
-                                draw_rade_status_row(ui, &connected.rade, true);
                             }
 
                             // "TRANSMITTING" text removed from here (a
@@ -15112,6 +15111,8 @@ fn draw_rade_status_row(ui: &mut egui::Ui, rade: &rade_link::RadeHandle, compact
                         ui.set_min_width(width);
                         ui.set_max_width(width);
                         ui.set_min_height(row_h - 4.0);
+                        // White text (the default label color reads grey).
+                        ui.visuals_mut().override_text_color = Some(egui::Color32::WHITE);
                         ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| add(ui));
                     });
             } else {
