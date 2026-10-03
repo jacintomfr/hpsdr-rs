@@ -6695,11 +6695,7 @@ impl eframe::App for HpsdrApp {
                             let mox_resp = ui
                                 .add_enabled(
                                     mox_tx_allowed,
-                                    egui::Button::new(
-                                        egui::RichText::new(mox_label).strong().color(egui::Color32::WHITE),
-                                    )
-                                    .fill(mox_color)
-                                    .min_size(egui::vec2(90.0, 32.0)),
+                                    chip_button("MOX", mox_now).min_size(egui::vec2(90.0, 32.0)),
                                 )
                                 .on_hover_text(if mox_tx_allowed {
                                     "Click to toggle transmit on/off"
@@ -6755,12 +6751,7 @@ impl eframe::App for HpsdrApp {
                             let tune_resp = ui
                                 .add_enabled(
                                     tune_may_start,
-                                    egui::Button::new(
-                                        egui::RichText::new(tune_label)
-                                            .strong()
-                                            .color(egui::Color32::WHITE),
-                                    )
-                                    .fill(tune_color),
+                                    chip_button("TUNE", connected.tune_active),
                                 )
                                 .on_hover_text(
                                     "Click to toggle a steady tone centered in the passband, \
@@ -6841,12 +6832,7 @@ impl eframe::App for HpsdrApp {
                             let two_tone_resp = ui
                                 .add_enabled(
                                     two_tone_may_start,
-                                    egui::Button::new(
-                                        egui::RichText::new(two_tone_label)
-                                            .strong()
-                                            .color(egui::Color32::WHITE),
-                                    )
-                                    .fill(two_tone_color),
+                                    chip_button("TWO TONE", connected.two_tone_active),
                                 )
                                 .on_hover_text(
                                     "Click to toggle a two-tone test signal, at Tune Power \
@@ -6942,10 +6928,8 @@ impl eframe::App for HpsdrApp {
                             let cw_text_resp = ui
                                 .add_enabled(
                                     cw_text_may_start,
-                                    egui::Button::new(
-                                        egui::RichText::new(cw_text_label).strong().color(egui::Color32::WHITE),
-                                    )
-                                    .fill(cw_text_color),
+                                    chip_button(cw_text_label, connected.cw_text_sending)
+                                        .min_size(egui::vec2(chip_width(ui, &["SEND CW"]), 0.0)),
                                 )
                                 .on_hover_text(
                                     "Send the selected message (Settings -> CW) as real CW, at \
@@ -7153,10 +7137,8 @@ impl eframe::App for HpsdrApp {
                                 };
                                 let rec_resp = ui
                                     .add(
-                                        egui::Button::new(
-                                            egui::RichText::new(rec_label).strong().color(egui::Color32::WHITE),
-                                        )
-                                        .fill(rec_color),
+                                        chip_button(rec_label, recording)
+                                            .min_size(egui::vec2(chip_width(ui, &["Recording"]), 0.0)),
                                     )
                                     .on_hover_text(if recording {
                                         "Click to stop recording"
@@ -7179,6 +7161,16 @@ impl eframe::App for HpsdrApp {
                                         }
                                     }
                                 }
+                            }
+                            // RADE compact status right after Record (it used to sit at the end of
+                            // the mode row near the meter): only while RADE is active but the
+                            // Digital window is hidden.
+                            if connected.digital_mode == DigitalMode::Rade
+                                && !connected.show_digital_window
+                                && matches!(connected.spectrum.mode(), spectrum::Mode::Digu | spectrum::Mode::Digl)
+                            {
+                                ui.add_space(12.0);
+                                draw_rade_status_row(ui, &connected.rade, true);
                             }
 
                             // "TRANSMITTING" text removed from here (a
@@ -15109,11 +15101,26 @@ fn draw_rade_status_row(ui: &mut egui::Ui, rade: &rade_link::RadeHandle, compact
         };
         let row_h = ui.spacing().interact_size.y;
         let slot = |ui: &mut egui::Ui, width: f32, add: &mut dyn FnMut(&mut egui::Ui)| {
-            ui.allocate_ui_with_layout(
-                egui::vec2(width, row_h),
-                egui::Layout::left_to_right(egui::Align::Center),
-                |ui| add(ui),
-            );
+            if compact {
+                // Compact (main toolbar) version: each field in a rounded box
+                // with a thin outline, like the buttons around it.
+                egui::Frame::new()
+                    .stroke(egui::Stroke::new(1.0, egui::Color32::from_gray(95)))
+                    .corner_radius(5.0)
+                    .inner_margin(egui::Margin::symmetric(6, 2))
+                    .show(ui, |ui| {
+                        ui.set_min_width(width);
+                        ui.set_max_width(width);
+                        ui.set_min_height(row_h - 4.0);
+                        ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| add(ui));
+                    });
+            } else {
+                ui.allocate_ui_with_layout(
+                    egui::vec2(width, row_h),
+                    egui::Layout::left_to_right(egui::Align::Center),
+                    |ui| add(ui),
+                );
+            }
         };
         let sync_w = text_w(ui, "no sync");
         let snr_w = text_w(ui, "SNR -99 dB");
@@ -15828,13 +15835,6 @@ fn render_status_row(
     // window is hidden. Same condition as render_rade_panel's own "Hide"
     // button and the per-frame `rade_engine_active` enable check: gone
     // the instant Mode leaves DIGU/DIGL by hand.
-    if connected.digital_mode == DigitalMode::Rade
-        && !connected.show_digital_window
-        && matches!(connected.spectrum.mode(), spectrum::Mode::Digu | spectrum::Mode::Digl)
-    {
-        ui.add_space(12.0);
-        draw_rade_status_row(ui, &connected.rade, true);
-    }
 
     // Record used to live at the end of this row -- moved to the
     // RIT/XIT row instead (both modes now, a real request, alongside
