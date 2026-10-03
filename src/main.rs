@@ -7718,8 +7718,8 @@ impl eframe::App for HpsdrApp {
                         // Reserve space at the bottom for the frequency
                         // axis labels drawn there, so the trace/gridlines
                         // never overdraw them. Sized for the 13.0 font
-                        // above (now 14.0; it was 10.0, then 13.0).
-                        const FREQ_AXIS_MARGIN: f32 = 20.0;
+                        // above (now 16.0; it was 10.0, 13.0, 14.0), so the margin is 24.
+                        const FREQ_AXIS_MARGIN: f32 = 24.0;
                         let plot_bottom = rect.bottom() - FREQ_AXIS_MARGIN;
                         let plot_height = plot_bottom - rect.top();
 
@@ -14189,7 +14189,7 @@ fn draw_freq_axis_ticks(
                 egui::pos2(x + 2.0, rect.bottom() - 2.0),
                 egui::Align2::LEFT_BOTTOM,
                 label,
-                egui::FontId::monospace(14.0),
+                egui::FontId::monospace(16.0),
                 egui::Color32::GRAY,
             );
         }
@@ -18324,7 +18324,7 @@ fn render_extra_receiver_ui(ui: &mut egui::Ui, rx: &Arc<Mutex<ExtraReceiver>>) {
         // Reserve space at the bottom for the frequency axis labels
         // drawn there, so the trace/gridlines never overdraw them.
         // Sized for the 13.0 font above, not just the older/smaller 10.0.
-        const FREQ_AXIS_MARGIN: f32 = 20.0;
+        const FREQ_AXIS_MARGIN: f32 = 24.0;
         let plot_bottom = rect.bottom() - FREQ_AXIS_MARGIN;
         let plot_height = plot_bottom - rect.top();
 
