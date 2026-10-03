@@ -2159,6 +2159,8 @@ struct ConnectedState {
     /// existing zoom-notch repurposed as a coarse-tune alias) are
     /// unaffected by this -- see scroll_tune_step_hz's own doc comment.
     tune_step_hz: i64,
+    /// RIT/XIT scroll step (1, 10 or 100 Hz) -- picked in the VFO window.
+    rit_step_hz: i32,
     /// The last value of session.requested_frequency_hz this app has
     /// already handled -- see that field's doc comment. Compared against
     /// its live value once per frame; a mismatch means a network client
@@ -3433,6 +3435,7 @@ fn connect_to_device(device: Device, cfg: &Config) -> Result<ConnectedState, Str
             let ctun_frequency_hz =
                 if ctun { cfg.ctun_frequency_hz.unwrap_or(initial_frequency_hz) } else { initial_frequency_hz };
             let tune_step_hz = cfg.tune_step_hz.unwrap_or(1_000);
+            let rit_step_hz = cfg.rit_step_hz.filter(|s| matches!(s, 1 | 10 | 100)).unwrap_or(100);
             // VFO B / Split -- see ConnectedState's own doc comments.
             // VFO B falls back to A's frequency (matches a real rig's
             // typical power-on state, and this project's own convention
@@ -3585,6 +3588,7 @@ fn connect_to_device(device: Device, cfg: &Config) -> Result<ConnectedState, Str
                 ctun,
                 ctun_frequency_hz,
                 tune_step_hz,
+                rit_step_hz,
                 last_requested_frequency_hz: initial_frequency_hz,
                 vfo_b_frequency_hz,
                 vfo_b_scroll_accum: 0.0,
@@ -3794,6 +3798,11 @@ impl eframe::App for HpsdrApp {
                 } else if c.show_digital_window {
                     ui.ctx().send_viewport_cmd_to(
                         egui::ViewportId::from_hash_of("digital_modes_window"),
+                        egui::ViewportCommand::Focus,
+                    );
+                } else if c.frequency_entry.is_some() {
+                    ui.ctx().send_viewport_cmd_to(
+                        egui::ViewportId::from_hash_of("frequency_entry_window"),
                         egui::ViewportCommand::Focus,
                     );
                 }
@@ -5133,8 +5142,20 @@ impl eframe::App for HpsdrApp {
                                     // report. Pulling that exact color
                                     // explicitly keeps this row visually
                                     // consistent.
-                                    if !connected.tx_enabled && !lcd_kiosk_mode() && render_step_combo(ui, connected) {
-                                        settings_changed = true;
+                                    if toggle_chip(
+                                        ui,
+                                        "VFO",
+                                        connected.frequency_entry.is_some(),
+                                        0.0,
+                                        "Direct frequency entry keypad, RIT step and VFO step",
+                                    )
+                                    .clicked()
+                                    {
+                                        connected.frequency_entry = if connected.frequency_entry.is_some() {
+                                            None
+                                        } else {
+                                            Some(FrequencyEntry { vfo_b: false, digits: String::new() })
+                                        };
                                     }
                                     // Only shown while actually in CW
                                     // mode -- see cw_panel_visible's own
@@ -5598,19 +5619,17 @@ impl eframe::App for HpsdrApp {
                     // own secondary_clicked() handling above.
                     if connected.frequency_entry.is_some() {
                         let mut close_now = false;
+                        // Compact window like piHPSDR's VFO menu (keypad + the two step
+                        // pickers). Bigger in kiosk mode (scaled fonts).
+                        let win_size = if lcd_kiosk_mode() { [500.0, 430.0] } else { [380.0, 340.0] };
                         let mut freq_entry_viewport = egui::ViewportBuilder::default()
-                            .with_title("Enter Frequency")
-                            .with_inner_size([260.0, 360.0])
+                            .with_title("VFO")
+                            .with_inner_size(win_size)
                             .with_resizable(false)
                             .with_active(true);
                         if lcd_kiosk_mode() {
-                            // See kiosk_centered_pos's/Settings window's
-                            // with_decorations(false) doc comments. This
-                            // window already has an on-screen Cancel
-                            // button and Escape handling below, so no
-                            // native title bar close button is needed.
                             freq_entry_viewport = freq_entry_viewport
-                                .with_position(kiosk_centered_pos([260.0, 360.0]))
+                                .with_position(kiosk_centered_pos(win_size))
                                 .with_decorations(false);
                         }
                         ui.ctx().show_viewport_immediate(
@@ -5622,26 +5641,23 @@ impl eframe::App for HpsdrApp {
                                     return;
                                 }
                                 egui::CentralPanel::default().show(ui, |ui| {
-                                    // Pulled out as plain locals rather
-                                    // than held as a live borrow of
-                                    // connected.frequency_entry for the
-                                    // rest of this closure -- Enter below
-                                    // also needs to mutate OTHER
-                                    // connected fields (session,
-                                    // vfo_b_frequency_hz) to actually
-                                    // apply the result, which a held
-                                    // borrow of this one field would
-                                    // otherwise conflict with.
-                                    let (vfo_b, mut digits) = match &connected.frequency_entry {
+                                    let (mut vfo_b, mut digits) = match &connected.frequency_entry {
                                         Some(e) => (e.vfo_b, e.digits.clone()),
                                         None => return,
                                     };
-                                    let mut apply = false;
+                                    // 0 = nothing to apply, otherwise the unit multiplier
+                                    // (1 = Hz/Enter, 1e3 = kHz, 1e6 = MHz) -- as piHPSDR's
+                                    // vfo_num_pad: the number is typed with an optional "."
+                                    // and a unit button (or Enter = Hz) applies it.
+                                    let mut apply_mult: f64 = 0.0;
+                                    let push = |digits: &mut String, c: char| {
+                                        if digits.len() < 11
+                                            && (c.is_ascii_digit() || (c == '.' && !digits.contains('.')))
+                                        {
+                                            digits.push(c);
+                                        }
+                                    };
 
-                                    // Keyboard input -- digits, Backspace,
-                                    // Enter, Escape -- same actions as the
-                                    // on-screen buttons below, for anyone
-                                    // who'd rather type than click.
                                     ui.input(|i| {
                                         for ev in &i.events {
                                             match ev {
@@ -5649,16 +5665,14 @@ impl eframe::App for HpsdrApp {
                                                     digits.pop();
                                                 }
                                                 egui::Event::Key { key: egui::Key::Enter, pressed: true, .. } => {
-                                                    apply = true;
+                                                    apply_mult = 1.0;
                                                 }
                                                 egui::Event::Key { key: egui::Key::Escape, pressed: true, .. } => {
                                                     close_now = true;
                                                 }
                                                 egui::Event::Text(t) => {
                                                     for c in t.chars() {
-                                                        if c.is_ascii_digit() && digits.len() < 9 {
-                                                            digits.push(c);
-                                                        }
+                                                        push(&mut digits, c);
                                                     }
                                                 }
                                                 _ => {}
@@ -5666,93 +5680,149 @@ impl eframe::App for HpsdrApp {
                                         }
                                     });
 
-                                    ui.add_space(8.0);
-                                    ui.vertical_centered(|ui| {
-                                        ui.label(egui::RichText::new(if vfo_b { "VFO-B" } else { "VFO-A" }).weak());
-                                        // 0 while empty (nothing typed
-                                        // yet) rather than blank -- makes
-                                        // it clear this is a live preview,
-                                        // not a label that's just missing.
-                                        let preview_hz: u32 = digits.parse().unwrap_or(0);
-                                        ui.label(
-                                            egui::RichText::new(format_frequency(preview_hz))
-                                                .monospace()
-                                                .size(26.0)
-                                                .strong(),
-                                        );
-                                    });
-                                    ui.add_space(8.0);
+                                    let h = ui.text_style_height(&egui::TextStyle::Body);
+                                    let key_w = h * 3.4;
+                                    let key_h = h * 2.1;
+                                    let gap = ui.spacing().item_spacing.x;
 
-                                    let button_size = [64.0, 42.0];
-                                    egui::Grid::new("frequency_entry_keypad").spacing([6.0, 6.0]).show(ui, |ui| {
-                                        for row in [['7', '8', '9'], ['4', '5', '6'], ['1', '2', '3']] {
-                                            for d in row {
-                                                if ui.add_sized(button_size, egui::Button::new(d.to_string())).clicked()
-                                                    && digits.len() < 9
-                                                {
-                                                    digits.push(d);
-                                                }
-                                            }
-                                            ui.end_row();
-                                        }
-                                        if ui.add_sized(button_size, egui::Button::new("C")).clicked() {
-                                            digits.clear();
-                                        }
-                                        if ui.add_sized(button_size, egui::Button::new("0")).clicked()
-                                            && digits.len() < 9
-                                        {
-                                            digits.push('0');
-                                        }
-                                        if ui.add_sized(button_size, egui::Button::new("\u{2190}")).clicked() {
-                                            digits.pop();
-                                        }
-                                        ui.end_row();
-                                    });
-
-                                    ui.add_space(10.0);
+                                    // Top row: which VFO this edits, and Close.
                                     ui.horizontal(|ui| {
-                                        if ui.add_sized([123.0, 32.0], egui::Button::new("Cancel")).clicked() {
-                                            close_now = true;
+                                        if toggle_chip(ui, "VFO A", !vfo_b, 0.0, "").clicked() {
+                                            vfo_b = false;
                                         }
-                                        if ui.add_sized([123.0, 32.0], egui::Button::new("Enter")).clicked() {
-                                            apply = true;
+                                        if toggle_chip(ui, "VFO B", vfo_b, 0.0, "").clicked() {
+                                            vfo_b = true;
                                         }
+                                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                            if toggle_chip(ui, "Close", false, 0.0, "").clicked() {
+                                                close_now = true;
+                                            }
+                                        });
                                     });
 
-                                    // Write the (possibly just-edited)
-                                    // digits back so they persist to the
-                                    // next frame -- the borrow this takes
-                                    // is brief and doesn't overlap with
-                                    // anything below.
+                                    // Entry display: right-aligned, what has been typed.
+                                    let shown = if digits.is_empty() { "0".to_string() } else { digits.clone() };
+                                    egui::Frame::new()
+                                        .fill(egui::Color32::from_gray(28))
+                                        .stroke(egui::Stroke::new(1.0, egui::Color32::from_gray(95)))
+                                        .corner_radius(5.0)
+                                        .inner_margin(egui::Margin::symmetric(8, 4))
+                                        .show(ui, |ui| {
+                                            ui.set_width(ui.available_width());
+                                            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                                ui.label(
+                                                    egui::RichText::new(shown)
+                                                        .monospace()
+                                                        .size(h * 1.6)
+                                                        .strong()
+                                                        .color(egui::Color32::WHITE),
+                                                );
+                                            });
+                                        });
+                                    ui.add_space(4.0);
+
+                                    ui.horizontal_top(|ui| {
+                                        // Keypad (1-9, ".", 0, BS) + units + Clear.
+                                        ui.vertical(|ui| {
+                                            egui::Grid::new("vfo_keypad").spacing([gap, gap]).show(ui, |ui| {
+                                                let keys = [
+                                                    ["1", "2", "3"],
+                                                    ["4", "5", "6"],
+                                                    ["7", "8", "9"],
+                                                    [".", "0", "BS"],
+                                                ];
+                                                for row in keys {
+                                                    for k in row {
+                                                        if ui
+                                                            .add(chip_button(k, false).min_size(egui::vec2(key_w, key_h)))
+                                                            .clicked()
+                                                        {
+                                                            if k == "BS" {
+                                                                digits.pop();
+                                                            } else if let Some(c) = k.chars().next() {
+                                                                push(&mut digits, c);
+                                                            }
+                                                        }
+                                                    }
+                                                    ui.end_row();
+                                                }
+                                                for (label, mult) in [("Hz", 1.0), ("kHz", 1e3), ("MHz", 1e6)] {
+                                                    if ui
+                                                        .add(chip_button(label, false).min_size(egui::vec2(key_w, key_h)))
+                                                        .clicked()
+                                                    {
+                                                        apply_mult = mult;
+                                                    }
+                                                }
+                                                ui.end_row();
+                                            });
+                                            if ui
+                                                .add(
+                                                    chip_button("Clear", false)
+                                                        .min_size(egui::vec2(key_w * 3.0 + 2.0 * gap, key_h * 0.8)),
+                                                )
+                                                .clicked()
+                                            {
+                                                digits.clear();
+                                            }
+                                        });
+
+                                        ui.add_space(gap * 2.0);
+                                        // Right column: RIT step and VFO step (as piHPSDR).
+                                        ui.vertical(|ui| {
+                                            ui.label("RIT step");
+                                            ui.horizontal(|ui| {
+                                                for step in [1, 10, 100] {
+                                                    if toggle_chip(
+                                                        ui,
+                                                        &step.to_string(),
+                                                        connected.rit_step_hz == step,
+                                                        0.0,
+                                                        "Hz per scroll notch over RIT/XIT",
+                                                    )
+                                                    .clicked()
+                                                    {
+                                                        connected.rit_step_hz = step;
+                                                        settings_changed = true;
+                                                    }
+                                                }
+                                                ui.label("Hz");
+                                            });
+                                            ui.add_space(h);
+                                            ui.label("VFO step");
+                                            if render_step_combo_only(ui, connected) {
+                                                settings_changed = true;
+                                            }
+                                        });
+                                    });
+
                                     if let Some(e) = connected.frequency_entry.as_mut() {
+                                        e.vfo_b = vfo_b;
                                         e.digits = digits.clone();
                                     }
 
-                                    if apply {
-                                        if !digits.is_empty() {
-                                            if let Ok(freq) = digits.parse::<u32>() {
-                                                let clamped = freq.clamp(
-                                                    connected.device.frequency_min as u32,
-                                                    connected.device.frequency_max as u32,
-                                                );
-                                                if vfo_b {
-                                                    connected.vfo_b_frequency_hz = clamped;
-                                                } else {
-                                                    // Unconditional retune, CTUN
-                                                    // or not -- typing an exact
-                                                    // frequency is an explicit
-                                                    // "go here" request, same as
-                                                    // apply_band's own band-switch
-                                                    // handling, not a small nudge
-                                                    // resolve_tune's CTUN-window
-                                                    // clamping is meant for.
-                                                    connected.session.set_frequency(clamped);
-                                                    connected.ctun_frequency_hz = clamped;
-                                                }
-                                                settings_changed = true;
+                                    if apply_mult > 0.0 {
+                                        // As piHPSDR: values below 10 kHz are most likely not
+                                        // intended (e.g. Enter on an empty entry), so ignore.
+                                        let hz = (digits.parse::<f64>().unwrap_or(0.0) * apply_mult + 0.5) as i64;
+                                        if hz >= 10_000 {
+                                            let clamped = (hz as u32).clamp(
+                                                connected.device.frequency_min as u32,
+                                                connected.device.frequency_max as u32,
+                                            );
+                                            if vfo_b {
+                                                connected.vfo_b_frequency_hz = clamped;
+                                            } else {
+                                                // Explicit "go here" request: unconditional
+                                                // retune, CTUN or not.
+                                                connected.session.set_frequency(clamped);
+                                                connected.ctun_frequency_hz = clamped;
                                             }
+                                            settings_changed = true;
                                         }
-                                        close_now = true;
+                                        if let Some(e) = connected.frequency_entry.as_mut() {
+                                            e.digits.clear();
+                                        }
                                     }
                                 });
                             },
@@ -6580,10 +6650,6 @@ impl eframe::App for HpsdrApp {
                                     }
                                 }
                             }
-                            ui.add_space(12.0);
-                            if render_step_combo(ui, connected) {
-                                settings_changed = true;
-                            }
                         });
                     }
 
@@ -7113,12 +7179,6 @@ impl eframe::App for HpsdrApp {
                                             ),
                                         }
                                     }
-                                }
-                            }
-                            {
-                                ui.add_space(12.0);
-                                if render_step_combo(ui, connected) {
-                                    settings_changed = true;
                                 }
                             }
 
@@ -13864,6 +13924,7 @@ impl eframe::App for HpsdrApp {
                         ctun: Some(connected.ctun),
                         ctun_frequency_hz: Some(connected.ctun_frequency_hz),
                         tune_step_hz: Some(connected.tune_step_hz),
+                        rit_step_hz: Some(connected.rit_step_hz),
                         vfo_b_frequency_hz: Some(connected.vfo_b_frequency_hz),
                         split: Some(connected.split),
                         cw_decode_enabled: Some(connected.cw_decode_enabled),
@@ -15782,14 +15843,10 @@ fn render_status_row(
 }
 
 /// Plain (no-modifier) scroll/drag tuning step picker -- see
-/// ConnectedState::tune_step_hz's own doc comment. Standalone fn so both the
-/// MOX/RIT/XIT row (next to Record) and the RX-only fallback row can use it.
+/// ConnectedState::tune_step_hz's own doc comment. Used by the VFO window.
 /// Returns whether the step changed.
-fn render_step_combo(ui: &mut egui::Ui, connected: &mut ConnectedState) -> bool {
+fn render_step_combo_only(ui: &mut egui::Ui, connected: &mut ConnectedState) -> bool {
     let mut changed = false;
-    // Same gray as the neighbouring buttons' inactive text (a plain
-    // ui.label uses a visibly different "noninteractive" gray).
-    ui.colored_label(ui.visuals().widgets.inactive.fg_stroke.color, "Step:");
     egui::ComboBox::from_id_salt("tune_step_hz")
         .width(60.0)
         .selected_text(tune_step_label(connected.tune_step_hz))
@@ -15907,6 +15964,7 @@ fn rit_xit_chip(
     scroll_accum: &mut f32,
     session_enabled: &std::sync::atomic::AtomicBool,
     session_offset: &std::sync::atomic::AtomicI32,
+    step_hz: i64,
     hover: &str,
 ) -> bool {
     use std::sync::atomic::Ordering;
@@ -15936,7 +15994,7 @@ fn rit_xit_chip(
             *scroll_accum += delta;
             const NOTCH: f32 = 100.0;
             let shift = ui.input(|i| i.modifiers.shift);
-            let step: i64 = if shift { 10 } else { 100 };
+            let step: i64 = if shift { 10 } else { step_hz };
             let mut new_offset = *offset_hz as i64;
             while scroll_accum.abs() >= NOTCH {
                 let sign = scroll_accum.signum();
@@ -15964,6 +16022,7 @@ fn render_rit_xit(ui: &mut egui::Ui, connected: &mut ConnectedState) -> bool {
         &mut connected.rit_scroll_accum,
         &connected.session.rit_enabled,
         &connected.session.rit_offset_hz,
+        connected.rit_step_hz as i64,
         "Receiver Incremental Tuning -- nudges what you hear without moving VFO A's displayed/logged frequency.",
     );
     if connected.tx_enabled {
@@ -15975,6 +16034,7 @@ fn render_rit_xit(ui: &mut egui::Ui, connected: &mut ConnectedState) -> bool {
             &mut connected.xit_scroll_accum,
             &connected.session.xit_enabled,
             &connected.session.xit_offset_hz,
+            connected.rit_step_hz as i64,
             "Transmitter Incremental Tuning -- nudges your actual TX frequency without moving VFO A's (or VFO B's, if Split is on) displayed frequency.",
         );
     }

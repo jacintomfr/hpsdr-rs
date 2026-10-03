@@ -578,6 +578,9 @@ pub struct Config {
     /// this project's original hardcoded default.
     #[serde(default)]
     pub tune_step_hz: Option<i64>,
+    /// RIT/XIT scroll step in Hz (1, 10 or 100) -- set in the VFO window.
+    #[serde(default)]
+    pub rit_step_hz: Option<i32>,
     /// VFO B / Split -- see ConnectedState::vfo_b_frequency_hz/split's
     /// doc comments (main.rs). `None`/missing falls back to A's
     /// frequency and Split off, respectively -- same "never leave a
