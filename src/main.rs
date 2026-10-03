@@ -7757,7 +7757,7 @@ impl eframe::App for HpsdrApp {
                                 egui::pos2(rect.left() + 2.0, y),
                                 egui::Align2::LEFT_TOP,
                                 format!("{db:.0} dB"),
-                                egui::FontId::monospace(12.0),
+                                egui::FontId::monospace(14.0),
                                 egui::Color32::GRAY,
                             );
                             db += grid_step_db;
@@ -18343,7 +18343,7 @@ fn render_extra_receiver_ui(ui: &mut egui::Ui, rx: &Arc<Mutex<ExtraReceiver>>) {
                 egui::pos2(rect.left() + 2.0, y),
                 egui::Align2::LEFT_TOP,
                 format!("{db:.0} dB"),
-                egui::FontId::monospace(12.0),
+                egui::FontId::monospace(14.0),
                 egui::Color32::GRAY,
             );
             db += 10.0;
