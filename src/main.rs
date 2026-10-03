@@ -8808,7 +8808,14 @@ impl eframe::App for HpsdrApp {
                             .session
                             .adc1_overload
                             .load(std::sync::atomic::Ordering::Relaxed);
-                        let line_height = ui.text_style_height(&egui::TextStyle::Body);
+                        // Kiosk: the whole area is drawn 1.7x larger, so use a small font and
+                        // short rows for the ADC/FIFO warnings or they dwarf the controls below.
+                        let line_height = if lcd_kiosk_mode() { 11.0 } else { ui.text_style_height(&egui::TextStyle::Body) };
+                        let warn_font = if lcd_kiosk_mode() {
+                            egui::FontId::proportional(8.0)
+                        } else {
+                            egui::TextStyle::Body.resolve(ui.style())
+                        };
                         let row_rect = if lcd_kiosk_mode() {
                             // Kiosk: don't reserve the row (the meter area is drawn scaled
                             // up and the reserved height grew its hit area over REC/PLAY);
@@ -8829,7 +8836,7 @@ impl eframe::App for HpsdrApp {
                                 row_rect.center(),
                                 egui::Align2::CENTER_CENTER,
                                 text,
-                                egui::TextStyle::Body.resolve(ui.style()),
+                                warn_font.clone(),
                                 egui::Color32::from_rgb(255, 60, 60),
                             );
                         }
@@ -8867,7 +8874,7 @@ impl eframe::App for HpsdrApp {
                                     fifo_row_rect.center(),
                                     egui::Align2::CENTER_CENTER,
                                     text,
-                                    egui::TextStyle::Body.resolve(ui.style()),
+                                    warn_font.clone(),
                                     egui::Color32::from_rgb(255, 60, 60),
                                 );
                             } else {
