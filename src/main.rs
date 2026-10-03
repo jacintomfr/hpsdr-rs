@@ -5368,6 +5368,40 @@ impl eframe::App for HpsdrApp {
                             // see the spectrum-draw call site's own
                             // "RADE hidden-status overlay" comment).
 
+                            // PK / MIC / ALC -- same stacked style as
+                            // LEV/PROC/CFC just below (orange when active,
+                            // grey when not): PK is the RX audio peak in
+                            // dBFS (red "CLIP" while the output is being
+                            // hard-clipped), MIC/ALC are the TX meters.
+                            {
+                                let (pk_db, clipping) = audio_peak_state(ui);
+                                let orange = egui::Color32::from_rgb(230, 150, 50);
+                                let mox = connected.session.mox_active();
+                                let disp = connected.tx_handle.as_ref().map(|tx| *tx.display.lock().unwrap());
+                                ui.add_space(12.0);
+                                ui.vertical(|ui| {
+                                    ui.set_min_width(78.0);
+                                    let pk = format!("{} {:.1}", if clipping { "CLIP" } else { "PK" }, pk_db);
+                                    if clipping {
+                                        ui.colored_label(egui::Color32::from_rgb(230, 50, 50), pk);
+                                    } else if !mox {
+                                        ui.colored_label(orange, pk);
+                                    } else {
+                                        ui.weak(pk);
+                                    }
+                                    if connected.tx_enabled {
+                                        let (mic, alc) = disp.map(|d| (d.mic_pk, d.alc_av)).unwrap_or((-99.0, -99.0));
+                                        if mox {
+                                            ui.colored_label(orange, format!("MIC {:.1}", mic));
+                                            ui.colored_label(orange, format!("ALC {:.1}", alc));
+                                        } else {
+                                            ui.weak(format!("MIC {:.1}", mic));
+                                            ui.weak(format!("ALC {:.1}", alc));
+                                        }
+                                    }
+                                });
+                            }
+
                             // LEV/PROC/CFC -- moved up here (next to
                             // Settings/Add Receiver/Juice Console, in the
                             // top VFO row) from its own dedicated row
@@ -5849,14 +5883,7 @@ impl eframe::App for HpsdrApp {
                         // AM users who leave AGC on. Widening THIS
                         // user-controlled slider instead only affects
                         // whoever actually drags it up.
-                        let gain_changed = ui
-                            .horizontal(|ui| {
-                                let ch = stable_db_slider(ui, &mut connected.slider_scroll_accum, &mut gain, -100.0, 30.0, 1.0);
-                                audio_clip_indicator(ui);
-                                ch
-                            })
-                            .inner;
-                        if gain_changed {
+                        if stable_db_slider(ui, &mut connected.slider_scroll_accum, &mut gain, -100.0, 30.0, 1.0) {
                             connected.spectrum.set_gain(gain);
                             settings_changed = true;
                         }
@@ -8680,36 +8707,6 @@ impl eframe::App for HpsdrApp {
                         // declared further down, after this point)
                         // rather than reordering it, to keep this change
                         // small.
-                        if connected.tx_enabled {
-                            if let Some(tx) = &connected.tx_handle {
-                                let disp = *tx.display.lock().unwrap();
-                                let mic_line_height = ui.text_style_height(&egui::TextStyle::Body);
-                                let mic_color = if connected.session.mox_active() {
-                                    egui::Color32::WHITE
-                                } else {
-                                    ui.visuals().weak_text_color()
-                                };
-                                // Fixed-width fields (monospace, each value
-                                // right-aligned in 6 chars = up to "-100.0"
-                                // with sign) in the same fixed 180px slot,
-                                // so the readout stays centered and never
-                                // changes width as the values move -- a
-                                // per-user report: the old 3-decimal Mic
-                                // value ("-0.501") pushed the text past
-                                // the slot's edge while keyed.
-                                ui.add_sized(
-                                    [180.0, mic_line_height],
-                                    egui::Label::new(
-                                        egui::RichText::new(format!(
-                                            "MIC {:>6.1}  ALC {:>6.1}",
-                                            disp.mic_pk, disp.alc_av
-                                        ))
-                                        .font(egui::FontId::monospace(13.0))
-                                        .color(mic_color),
-                                    ),
-                                );
-                            }
-                        }
 
                         // ADC front-end overload -- see
                         // RadioSession::adc0_overload's doc comment.
@@ -15836,11 +15833,10 @@ fn stable_value_box(ui: &mut egui::Ui, text: String) {
     });
 }
 
-/// Clip indicator next to Audio gain: shows the recent audio peak in dBFS
-/// (measured after Audio gain, before the final hard clamp) and turns red
-/// "CLIP" while samples are being cut off, held ~1.5 s so short peaks stay
-/// visible. Fixed width so the grid does not jiggle.
-fn audio_clip_indicator(ui: &mut egui::Ui) {
+/// Recent audio peak for the PK readout: (peak in dBFS, clipping). Measured
+/// after Audio gain and before the final hard clamp; "clipping" is held
+/// ~1.5 s after the last sample above 0 dBFS. Call once per frame.
+fn audio_peak_state(ui: &egui::Ui) -> (f32, bool) {
     let id = egui::Id::new("audio_clip_indicator");
     let peak = spectrum::take_audio_peak();
     let now = ui.input(|i| i.time);
@@ -15853,19 +15849,9 @@ fn audio_clip_indicator(ui: &mut egui::Ui) {
         clip_until = now + 1.5;
     }
     ui.data_mut(|d| d.insert_temp(id, (shown_peak, clip_until)));
-    let clipping = now < clip_until;
     let db = if shown_peak > 0.00001 { 20.0 * shown_peak.log10() } else { -99.0 };
-    let (text, color) = if clipping {
-        (format!("CLIP {:>+5.1}", db), egui::Color32::from_rgb(230, 50, 50))
-    } else {
-        (format!("pk {:>+5.1}", db), egui::Color32::GRAY)
-    };
-    ui.label(egui::RichText::new(text).monospace().color(color))
-        .on_hover_text(
-            "Audio peak in dBFS after Audio gain. Above 0 the output is hard-clipped \
-             (distorted): lower Audio gain and raise the system volume instead.",
-        );
     ui.ctx().request_repaint_after(std::time::Duration::from_millis(100));
+    (db, now < clip_until)
 }
 
 /// REAL BUG FIX (a real report, twice -- the first attempt at this,
