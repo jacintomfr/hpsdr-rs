@@ -5928,19 +5928,20 @@ impl eframe::App for HpsdrApp {
                                     let rr = connected.spectrum.report_recorder.clone();
                                     let recording = rr.is_recording();
                                     let playing = rr.is_playing();
-                                    let rec = egui::Button::new(
-                                        egui::RichText::new("REC").size(16.0).strong().color(egui::Color32::WHITE),
-                                    )
-                                    .fill(egui::Color32::from_rgb(190, 30, 30));
-                                    if ui
-                                        .add_enabled(!playing, rec)
-                                        .on_hover_text(if recording {
+                                    if colored_action_button(
+                                        ui,
+                                        "REC",
+                                        egui::Color32::from_rgb(190, 30, 30),
+                                        !playing,
+                                        if recording {
                                             "Click to stop recording now (records up to 60s)"
                                         } else {
                                             "Record RX audio (what you hear), up to 60s -- to play \
                                              back and give the contact a signal report"
-                                        })
-                                        .clicked()
+                                        },
+                                        "Stop the playback first",
+                                    )
+                                    .clicked()
                                     {
                                         rr.toggle_record();
                                     }
@@ -6224,19 +6225,24 @@ impl eframe::App for HpsdrApp {
                                 let rr = connected.spectrum.report_recorder.clone();
                                 let recording = rr.is_recording();
                                 let playing = rr.is_playing();
-                                let play = egui::Button::new(
-                                    egui::RichText::new("PLAY").size(16.0).strong().color(egui::Color32::WHITE),
-                                )
-                                .fill(egui::Color32::from_rgb(30, 150, 50));
-                                if ui
-                                    .add_enabled(!recording && rr.has_recording(), play)
-                                    .on_hover_text(if playing {
+                                if colored_action_button(
+                                    ui,
+                                    "PLAY",
+                                    egui::Color32::from_rgb(30, 150, 50),
+                                    !recording && rr.has_recording(),
+                                    if playing {
                                         "Click to stop playback now"
                                     } else {
                                         "Transmit the recorded audio back (while PTT/MOX is on), so \
                                          the contact can hear how they were received"
-                                    })
-                                    .clicked()
+                                    },
+                                    if recording {
+                                        "Wait for the recording to finish"
+                                    } else {
+                                        "Record something first (REC)"
+                                    },
+                                )
+                                .clicked()
                                 {
                                     rr.toggle_play();
                                 }
@@ -15643,6 +15649,37 @@ fn start_stop_button(ui: &mut egui::Ui, running: bool) -> bool {
         ("Start", egui::Color32::from_rgb(50, 160, 50))
     };
     ui.add(egui::Button::new(egui::RichText::new(label).color(egui::Color32::WHITE)).fill(color)).clicked()
+}
+
+/// Colored action button (REC/PLAY): default font like the mode buttons, a
+/// real hover/pressed shade (a plain `Button::fill` overrides egui's hover
+/// feedback), and a tooltip that also shows while the button is disabled
+/// (disabled widgets get no ordinary hover tooltip).
+fn colored_action_button(
+    ui: &mut egui::Ui,
+    label: &str,
+    base: egui::Color32,
+    enabled: bool,
+    hover_text: &str,
+    disabled_hover_text: &str,
+) -> egui::Response {
+    let lighten = |c: egui::Color32, k: f32| {
+        let f = |v: u8| (v as f32 + (255.0 - v as f32) * k).round() as u8;
+        egui::Color32::from_rgb(f(c.r()), f(c.g()), f(c.b()))
+    };
+    ui.scope(|ui| {
+        let w = &mut ui.visuals_mut().widgets;
+        w.inactive.weak_bg_fill = base;
+        w.hovered.weak_bg_fill = lighten(base, 0.25);
+        w.active.weak_bg_fill = lighten(base, 0.45);
+        w.inactive.fg_stroke.color = egui::Color32::WHITE;
+        w.hovered.fg_stroke.color = egui::Color32::WHITE;
+        w.active.fg_stroke.color = egui::Color32::WHITE;
+        ui.add_enabled(enabled, egui::Button::new(label))
+            .on_hover_text(hover_text)
+            .on_disabled_hover_text(disabled_hover_text)
+    })
+    .inner
 }
 
 /// rigctl/TCI/CAT/PS/Record status indicators -- a standalone fn (not a
