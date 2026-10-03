@@ -28,6 +28,9 @@ use crate::radio::{CwKeyerAtomics, CW_KEYER_MODE_IAMBIC_A, CW_KEYER_MODE_IAMBIC_
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
+
+/// Total audio frames played from the queue (for the diagnostics log).
+pub static AUDIO_POPS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -89,6 +92,9 @@ pub struct AudioOutput {
     /// (see underrun_count's own doc comment) rather than this struct
     /// owning any windowing/rate-limiting policy itself.
     underruns: Arc<AtomicU64>,
+    /// Lowest queue depth (frames) seen by the output callback over the last
+    /// ~second -- how close playback came to running dry.
+    min_depth: Arc<AtomicU64>,
 }
 
 impl AudioOutput {
@@ -174,6 +180,15 @@ impl AudioOutput {
         let mut recover_left: u32 = 0;
         let underruns = Arc::new(AtomicU64::new(0));
         let cb_underruns = Arc::clone(&underruns);
+        let min_depth = Arc::new(AtomicU64::new(0));
+        let cb_min_depth = Arc::clone(&min_depth);
+        // Jitter buffer: at start and after an underrun, output stays silent until
+        // this much audio has queued up, so one late block from the DSP thread does
+        // not turn into a stream of clicks (seen at 192 kHz on the Pi).
+        const PRIME_FRAMES: usize = 1920; // 40 ms
+        let mut primed = false;
+        let mut win_min: usize = usize::MAX;
+        let mut win_frames: u32 = 0;
 
         let stream = device
             .build_output_stream(
@@ -197,6 +212,17 @@ impl AudioOutput {
                 // mono behavior).
                 move |data: &mut [f32], _: &cpal::OutputCallbackInfo| {
                     let mut buf = buffer.lock().unwrap();
+                    let depth = buf.len();
+                    win_min = win_min.min(depth);
+                    win_frames += (data.len() / OUTPUT_CHANNELS as usize) as u32;
+                    if win_frames >= OUTPUT_SAMPLE_RATE {
+                        cb_min_depth.store(win_min as u64, Ordering::Relaxed);
+                        win_min = usize::MAX;
+                        win_frames = 0;
+                    }
+                    if !primed && depth >= PRIME_FRAMES {
+                        primed = true;
+                    }
                     for frame in data.chunks_mut(OUTPUT_CHANNELS as usize) {
                         // The slew limit only applies around an underrun
                         // (the instant jump to/from silence it exists
@@ -206,15 +232,24 @@ impl AudioOutput {
                         // that only went away at very low Audio gain.
                         let mut limit = recover_left > 0;
                         let mut underrun_now = false;
-                        let (l, r) = match buf.pop_front() {
+                        let popped = if primed { buf.pop_front() } else { None };
+                        if popped.is_some() {
+                            AUDIO_POPS.fetch_add(1, Ordering::Relaxed);
+                        }
+                        let (l, r) = match popped {
                             Some(v) => v,
                             None => {
                                 limit = true;
                                 underrun_now = true;
                                 let silence_expected =
                                     expect_silence.as_ref().is_some_and(|m| m.load(Ordering::Relaxed));
-                                if !silence_expected {
-                                    cb_underruns.fetch_add(1, Ordering::Relaxed);
+                                // Only the moment the queue runs dry counts as a glitch,
+                                // not the silent refill that follows it.
+                                if primed {
+                                    primed = false;
+                                    if !silence_expected {
+                                        cb_underruns.fetch_add(1, Ordering::Relaxed);
+                                    }
                                 }
                                 (0.0, 0.0) // silence on underrun (or on expected silence)
                             }
@@ -244,7 +279,7 @@ impl AudioOutput {
             .play()
             .map_err(|e| format!("failed to start audio playback: {e}"))?;
 
-        Ok(Self { _stream: stream, underruns })
+        Ok(Self { _stream: stream, underruns, min_depth })
     }
 
     /// Cumulative underrun count since this stream started -- see the
@@ -255,6 +290,11 @@ impl AudioOutput {
     /// steal each other's counts).
     pub fn underrun_count(&self) -> u64 {
         self.underruns.load(Ordering::Relaxed)
+    }
+
+    /// Lowest output-queue depth (frames at 48 kHz) over the last second.
+    pub fn min_queue_depth(&self) -> u64 {
+        self.min_depth.load(Ordering::Relaxed)
     }
 }
 

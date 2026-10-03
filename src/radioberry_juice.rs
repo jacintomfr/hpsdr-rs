@@ -319,6 +319,8 @@ impl JuiceHandle {
         set_no_window_own_group(&mut cmd);
 
         let mut child = cmd.spawn()?;
+        #[cfg(target_os = "linux")]
+        boost_juice_priority(child.id());
         let log_file = Arc::new(Mutex::new(open_log_file(&self.exe_path)));
 
         if let Some(stdout) = child.stdout.take() {
@@ -335,6 +337,41 @@ impl JuiceHandle {
         *self.process.lock().unwrap() = Some(child);
         Ok(())
     }
+}
+
+/// Gives every thread of the juice process real-time (SCHED_FIFO) priority. With normal
+/// priority its USB reads were delayed whenever the UI was busy (dragging the spectrum), losing
+/// 2-3% of the samples and causing audio clicks at 192 kHz. Needs the sudoers rule installed by
+/// the kiosk package (/etc/sudoers.d/hpsdr-rs-rt); without it this silently does nothing.
+/// Runs a few passes because juice starts some of its threads a moment after launch.
+#[cfg(target_os = "linux")]
+fn boost_juice_priority(pid: u32) {
+    std::thread::spawn(move || {
+        let mut done: std::collections::HashSet<String> = std::collections::HashSet::new();
+        for _ in 0..8 {
+            std::thread::sleep(std::time::Duration::from_millis(700));
+            let Ok(dir) = std::fs::read_dir(format!("/proc/{pid}/task")) else {
+                return; // juice already gone
+            };
+            for entry in dir.flatten() {
+                let tid = entry.file_name().to_string_lossy().to_string();
+                if !done.insert(tid.clone()) {
+                    continue;
+                }
+                let ok = Command::new("sudo")
+                    .args(["-n", "/usr/bin/chrt", "-f", "-p", "40", &tid])
+                    .stdin(Stdio::null())
+                    .stdout(Stdio::null())
+                    .stderr(Stdio::null())
+                    .status()
+                    .map(|s| s.success())
+                    .unwrap_or(false);
+                if !ok {
+                    return; // no permission: stop trying
+                }
+            }
+        }
+    });
 }
 
 /// Prevents Windows from popping up a separate console window for a

@@ -190,3 +190,12 @@ with old versions.
 Per-radio settings live in `~/.config/hpsdr-rs/` and survive an upgrade; a
 `.json.bak` copy of each radio's file (as it was at start-up) is kept beside it.
 Run with `HPSDR_RS_LOG_FILE=1 hpsdr-rs-kiosk` to write a log there too.
+
+## Real-time priority for juice
+
+The kiosk package ships `/etc/sudoers.d/hpsdr-rs-rt` (mode 0440), which lets user `pi` run only
+`/usr/bin/chrt -f -p 40 <thread id>` without a password. After it launches the Radioberry juice
+process, hpsdr-rs uses that to give juice's threads `SCHED_FIFO` priority; without it, juice
+loses samples while the UI is busy and 192 kHz audio clicks. `postinst` validates the file with
+`visudo -cf` and deletes it if the syntax is invalid. Details:
+[audio-clicks-192k-while-dragging.md](../audio-clicks-192k-while-dragging.md).

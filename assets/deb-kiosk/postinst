@@ -3,6 +3,10 @@
 # (the .desktop file itself is also installed system-wide for the menu).
 set -e
 if [ "$1" = "configure" ]; then
+    # The real-time-priority rule must be valid sudoers syntax or it would break sudo.
+    if [ -f /etc/sudoers.d/hpsdr-rs-rt ] && command -v visudo >/dev/null 2>&1; then
+        visudo -cf /etc/sudoers.d/hpsdr-rs-rt >/dev/null 2>&1 || rm -f /etc/sudoers.d/hpsdr-rs-rt
+    fi
     for home in /home/*; do
         [ -d "$home/Desktop" ] || continue
         owner=$(stat -c %U "$home")

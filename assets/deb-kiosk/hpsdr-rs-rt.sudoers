@@ -1,0 +1,6 @@
+# hpsdr-rs-kiosk: lets the kiosk user give the Radioberry juice process real-time
+# (SCHED_FIFO) priority, so its USB reads are not delayed (and samples lost) while the
+# user interface is busy -- that showed up as audio clicks at 192 kHz when dragging the
+# spectrum. Only `chrt -f -p 40 <thread id>` is allowed. Remove this file to undo it;
+# hpsdr-rs then simply runs juice at normal priority.
+pi ALL=(root) NOPASSWD: /usr/bin/chrt -f -p 40 [0-9]*

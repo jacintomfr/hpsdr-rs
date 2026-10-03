@@ -292,6 +292,7 @@ assets = [
     ["assets/deb-kiosk/hpsdr-rs-kiosk", "usr/bin/", "755"],
     ["assets/deb-kiosk/hpsdr-rs-kiosk.desktop", "usr/share/applications/hpsdr-rs-kiosk.desktop", "644"],
     ["assets/deb-kiosk/hpsdr-rs-kiosk.desktop", "etc/skel/Desktop/hpsdr-rs-kiosk.desktop", "755"],
+    ["assets/deb-kiosk/hpsdr-rs-rt.sudoers", "etc/sudoers.d/hpsdr-rs-rt", "440"],
     ["assets/icons/hpsdr-rs.png", "usr/share/icons/hicolor/256x256/apps/hpsdr-rs.png", "644"],
     ["assets/90-ozy.rules", "usr/share/doc/hpsdr-rs/90-ozy.rules", "644"],
     ["assets/90-rx888.rules", "usr/share/doc/hpsdr-rs/90-rx888.rules", "644"],

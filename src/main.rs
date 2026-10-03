@@ -4928,7 +4928,7 @@ impl eframe::App for HpsdrApp {
                 );
                 if connected.waterfall_signature != Some(wanted_signature) {
                     let _wf_prof = WfProfGuard(Instant::now());
-                    let waterfall_rows: Vec<Vec<f32>> = {
+                    let waterfall_rows: Vec<Arc<Vec<f32>>> = {
                         let d = if transmitting {
                             connected.tx_spectrum.display.lock().unwrap()
                         } else {
@@ -8610,10 +8610,69 @@ impl eframe::App for HpsdrApp {
                         } else {
                             ui.visuals().weak_text_color()
                         };
+                        let audio_min_ms =
+                            connected.audio_output.as_ref().map(|a| a.min_queue_depth() as f32 / 48.0).unwrap_or(0.0);
                         ui.colored_label(
                             audio_color,
-                            format!("Audio glitches: {:.0}/min", connected.underrun_rate_per_min),
+                            format!("Audio glitches: {:.0}/min (buf {audio_min_ms:.0} ms)", connected.underrun_rate_per_min),
+                        )
+                        .on_hover_text(
+                            "Glitches per minute, and the lowest audio buffer level over the last second. \
+                             The buffer refills to 40 ms after a glitch before sound resumes.",
                         );
+                        {
+                            // Worst DSP-thread figures over the last ~10 s (see
+                            // spectrum::dsp_stats_take).
+                            static HELD: Mutex<Option<(Instant, f32, f32, u64, f32, f32, f32)>> = Mutex::new(None);
+                            let (g, p, q) = spectrum::dsp_stats_take();
+                            let (ps, pz, pf) = spectrum::dsp_parts_take();
+                            let grp = spectrum::dsp_groups_take();
+                            let mut held = HELD.lock().unwrap();
+                            let h = held.get_or_insert((Instant::now(), 0.0, 0.0, 0, 0.0, 0.0, 0.0));
+                            if h.0.elapsed().as_secs() >= 10 {
+                                *h = (Instant::now(), 0.0, 0.0, 0, 0.0, 0.0, 0.0);
+                            }
+                            h.1 = h.1.max(g);
+                            h.2 = h.2.max(p);
+                            h.3 = h.3.max(q);
+                            h.4 = h.4.max(ps);
+                            h.5 = h.5.max(pz);
+                            h.6 = h.6.max(pf);
+                            // Diagnostics: while /tmp/hpsdr_diag.enable exists, appends one line per frame to
+                            // /tmp/hpsdr_diag.csv so UI activity can be lined up with audio
+                            // and stream stalls after the fact.
+                            if std::path::Path::new("/tmp/hpsdr_diag.enable").exists() {
+                                use std::io::Write;
+                                static DIAG: Mutex<Option<std::fs::File>> = Mutex::new(None);
+                                let mut f = DIAG.lock().unwrap();
+                                if f.is_none() {
+                                    *f = std::fs::File::create("/tmp/hpsdr_diag.csv").ok();
+                                }
+                                if let Some(file) = f.as_mut() {
+                                    let (down, moved) = ui.input(|i| (i.pointer.any_down(), i.pointer.delta().length() > 0.0));
+                                    let wall = std::time::SystemTime::now()
+                                        .duration_since(std::time::UNIX_EPOCH)
+                                        .map(|d| d.as_millis())
+                                        .unwrap_or(0);
+                                    let _ = writeln!(
+                                        file,
+                                        "{wall},{},{},{:.1},{audio_min_ms:.1},{},{g:.1},{p:.1},{q},{ps:.1},{pz:.1},{pf:.1},{},{},{}",
+                                        down as u8,
+                                        moved as u8,
+                                        connected.session.rx_max_gap_us.load(Ordering::Relaxed) as f64 / 1000.0,
+                                        connected.audio_output.as_ref().map(|a| a.underrun_count()).unwrap_or(0),
+                                        grp.iter().map(|v| format!("{v:.1}")).collect::<Vec<_>>().join(";"),
+                                        spectrum::DSP_CHUNKS.load(Ordering::Relaxed),
+                                        audio::AUDIO_POPS.load(Ordering::Relaxed),
+                                    );
+                                }
+                            }
+                            ui.weak(format!("DSP: gap {:.0} proc {:.0} (set {:.0} zp {:.0} feed {:.0}) ms q {}", h.1, h.2, h.4, h.5, h.6, h.3)).on_hover_text(
+                                "Worst over ~10 s: time between DSP blocks, time to process one block, \
+                                 and IQ samples waiting. A gap well above the block time (5.3 ms at \
+                                 192 kHz) starves the audio.",
+                            );
+                        }
                         let (prof_fps, prof_ms, prof_wf_ms, prof_wf_n, prof_passes) = ui_prof_snapshot();
                         ui.weak(format!("UI: {prof_fps:>2.0} fps ({prof_passes:>2.0} passes) {prof_ms:>4.1} ms")).on_hover_text(format!(
                             "Interface: frames per second and average CPU time per frame.
@@ -18503,7 +18562,7 @@ fn render_extra_receiver_ui(ui: &mut egui::Ui, rx: &Arc<Mutex<ExtraReceiver>>) {
 
         let wanted_signature = (waterfall_data_revision, palette, wf_db_low, wf_db_high, rx.waterfall_display_rows);
         if rx.waterfall_signature != Some(wanted_signature) {
-            let waterfall_rows: Vec<Vec<f32>> = {
+            let waterfall_rows: Vec<Arc<Vec<f32>>> = {
                 let d = rx.spectrum.display.lock().unwrap();
                 d.waterfall_rows.iter().cloned().collect()
             };
@@ -19909,7 +19968,7 @@ fn smooth_trace(points: &[egui::Pos2]) -> Vec<egui::Pos2> {
 /// (already just `rect`-sized, no explicit scaling) ends up 1:1 --
 /// taller pane, more real rows shown, same row height throughout.
 fn build_waterfall_image(
-    rows: &[Vec<f32>],
+    rows: &[Arc<Vec<f32>>],
     palette: Palette,
     db_low: f32,
     db_high: f32,

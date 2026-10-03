@@ -19,7 +19,100 @@ use std::os::raw::c_int;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
-use std::time::Duration;
+use std::time::{Duration, Instant};
+
+// Worst-case figures for the DSP thread since the last `dsp_stats_take()`, shown in the
+// status bar's audio tooltip to find out what starves the audio output.
+/// Total DSP blocks processed (for the diagnostics log).
+pub static DSP_CHUNKS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static DSP_MAX_GAP_US: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static DSP_MAX_PROC_US: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static DSP_MAX_BACKLOG: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+// Parts of one block: WDSP setting changes, zoom/pan reconfiguration, analyzer feed.
+static DSP_MAX_SET_US: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static DSP_MAX_ZP_US: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static DSP_MAX_FEED_US: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+// Worst ms of each group of WDSP setting changes in `demod` (see the checkpoints there).
+static DSP_SET_GROUP: [std::sync::atomic::AtomicU64; 14] = [const { std::sync::atomic::AtomicU64::new(0) }; 14];
+
+/// Worst ms per setting group since the last call.
+pub fn dsp_groups_take() -> [f32; 14] {
+    std::array::from_fn(|i| DSP_SET_GROUP[i].swap(0, Ordering::Relaxed) as f32 / 1000.0)
+}
+
+/// (longest ms between two chunks, longest ms to process one chunk, largest IQ backlog in
+/// samples), then resets them.
+pub fn dsp_stats_take() -> (f32, f32, u64) {
+    (
+        DSP_MAX_GAP_US.swap(0, Ordering::Relaxed) as f32 / 1000.0,
+        DSP_MAX_PROC_US.swap(0, Ordering::Relaxed) as f32 / 1000.0,
+        DSP_MAX_BACKLOG.swap(0, Ordering::Relaxed),
+    )
+}
+
+/// (setting changes, zoom/pan, analyzer feed) worst ms since the last call.
+pub fn dsp_parts_take() -> (f32, f32, f32) {
+    (
+        DSP_MAX_SET_US.swap(0, Ordering::Relaxed) as f32 / 1000.0,
+        DSP_MAX_ZP_US.swap(0, Ordering::Relaxed) as f32 / 1000.0,
+        DSP_MAX_FEED_US.swap(0, Ordering::Relaxed) as f32 / 1000.0,
+    )
+}
+
+// Minimum time between two NBP filter retunes while the frequency keeps changing.
+const NBP_MIN_INTERVAL: Duration = Duration::from_millis(250);
+
+enum ShiftMsg {
+    Set(c_int, f64),
+    Flush(std::sync::mpsc::Sender<()>),
+}
+
+/// Runs `SetRXAShiftFreq` on a thread of its own: the call waits for WDSP to finish the block it is
+/// processing, and that wait must not stall the DSP thread. Pending changes for a channel are
+/// coalesced, so only the latest one is applied.
+fn shift_worker_send(msg: ShiftMsg) {
+    static TX: std::sync::OnceLock<std::sync::mpsc::Sender<ShiftMsg>> = std::sync::OnceLock::new();
+    let tx = TX.get_or_init(|| {
+        let (tx, rx) = std::sync::mpsc::channel::<ShiftMsg>();
+        thread::Builder::new()
+            .name("wdsp-shift".into())
+            .spawn(move || {
+                while let Ok(first) = rx.recv() {
+                    let mut latest: Vec<(c_int, f64)> = Vec::new();
+                    let mut flushes = Vec::new();
+                    let mut handle = |m: ShiftMsg| match m {
+                        ShiftMsg::Set(ch, hz) => match latest.iter_mut().find(|e| e.0 == ch) {
+                            Some(e) => e.1 = hz,
+                            None => latest.push((ch, hz)),
+                        },
+                        ShiftMsg::Flush(ack) => flushes.push(ack),
+                    };
+                    handle(first);
+                    while let Ok(m) = rx.try_recv() {
+                        handle(m);
+                    }
+                    for (ch, hz) in latest {
+                        unsafe {
+                            wdsp::SetRXAShiftFreq(ch, hz);
+                        }
+                    }
+                    for ack in flushes {
+                        let _ = ack.send(());
+                    }
+                }
+            })
+            .expect("spawn wdsp-shift thread");
+        tx
+    });
+    let _ = tx.send(msg);
+}
+
+struct DspTick(Instant);
+impl Drop for DspTick {
+    fn drop(&mut self) {
+        DSP_MAX_PROC_US.fetch_max(self.0.elapsed().as_micros() as u64, Ordering::Relaxed);
+    }
+}
 
 pub const BUFFER_SIZE: usize = 1024;
 
@@ -240,7 +333,7 @@ pub fn default_width_hz(mode: Mode) -> f64 {
 #[derive(Default)]
 pub struct SpectrumDisplay {
     pub spectrum: Vec<f32>,
-    pub waterfall_rows: VecDeque<Vec<f32>>,
+    pub waterfall_rows: VecDeque<Arc<Vec<f32>>>,
     pub meter_db: f64,
     /// Bumped every time feed() below produces fresh spectrum/waterfall
     /// pixel data -- i.e. at roughly SPECTRUM_FPS (10/sec), not once
@@ -789,6 +882,8 @@ struct SpectrumAnalyzer {
     last_ctun: Option<bool>,
     last_ctun_offset: Option<f64>,
     last_lo_frequency: Option<f64>,
+    last_nbp_shift: Option<f64>,
+    last_nbp_at: Instant,
     last_eq: Option<EqualizerParams>,
     /// Edge-triggered diagnostic state for fexchange0's error out-param
     /// -- see its doc comment in demod() for why this exists and why
@@ -1185,6 +1280,8 @@ impl SpectrumAnalyzer {
                 last_ctun: None,
                 last_ctun_offset: None,
                 last_lo_frequency: None,
+                last_nbp_shift: None,
+                last_nbp_at: Instant::now() - Duration::from_secs(1),
                 last_eq: None,
                 last_fexchange_error: None,
                 last_zoom: Some(1),
@@ -1363,6 +1460,8 @@ impl SpectrumAnalyzer {
     /// mutate their input buffers in place.
     fn demod(&mut self, samples: &[IqSample], params: DemodParams, passband: (f64, f64)) -> Vec<(f32, f32)> {
         debug_assert_eq!(samples.len(), BUFFER_SIZE);
+        let t_settings = Instant::now();
+        let mut set_last = t_settings;
 
         if self.last_mode != Some(params.mode) {
             unsafe {
@@ -1370,6 +1469,7 @@ impl SpectrumAnalyzer {
             }
             self.last_mode = Some(params.mode);
         }
+        { let n = Instant::now(); DSP_SET_GROUP[0].fetch_max(n.duration_since(set_last).as_micros() as u64, Ordering::Relaxed); set_last = n; }
         if self.last_passband != Some(passband) {
             unsafe {
                 wdsp::RXASetPassband(self.channel, passband.0, passband.1);
@@ -1381,6 +1481,7 @@ impl SpectrumAnalyzer {
             }
             self.last_passband = Some(passband);
         }
+        { let n = Instant::now(); DSP_SET_GROUP[1].fetch_max(n.duration_since(set_last).as_micros() as u64, Ordering::Relaxed); set_last = n; }
         if self.last_agc != Some(params.agc) {
             unsafe {
                 wdsp::SetRXAAGCMode(self.channel, params.agc as c_int);
@@ -1394,6 +1495,7 @@ impl SpectrumAnalyzer {
             params.agc_top_db,
             params.agc_slope_db,
         );
+        { let n = Instant::now(); DSP_SET_GROUP[2].fetch_max(n.duration_since(set_last).as_micros() as u64, Ordering::Relaxed); set_last = n; }
         if self.last_agc_params != Some(agc_params) {
             let (attack_ms, decay_ms, hang_ms, top_db, slope_db) = agc_params;
             unsafe {
@@ -1419,6 +1521,7 @@ impl SpectrumAnalyzer {
             self.last_agc_params = Some(agc_params);
         }
 
+        { let n = Instant::now(); DSP_SET_GROUP[3].fetch_max(n.duration_since(set_last).as_micros() as u64, Ordering::Relaxed); set_last = n; }
         // Noise blanker: NB (ANB) and NB2 (NOB) are mutually exclusive
         // (see NoiseBlanker's doc comment), so setting one's Run flag
         // always means clearing the other's -- both objects already
@@ -1444,6 +1547,7 @@ impl SpectrumAnalyzer {
             self.last_nb_threshold = Some(params.nb_threshold);
         }
 
+        { let n = Instant::now(); DSP_SET_GROUP[4].fetch_max(n.duration_since(set_last).as_micros() as u64, Ordering::Relaxed); set_last = n; }
         // Noise reduction: NR (ANR), NR2 (EMNR), and NR3 (NNR) are all
         // mutually exclusive. All three live inside the RXA chain
         // itself, so switching is just a set of Set*Run calls --
@@ -1473,6 +1577,7 @@ impl SpectrumAnalyzer {
             self.last_nnr_params = Some(nnr_params);
         }
 
+        { let n = Instant::now(); DSP_SET_GROUP[5].fetch_max(n.duration_since(set_last).as_micros() as u64, Ordering::Relaxed); set_last = n; }
         // SNB ("Spectral Noise Blanker", WDSP's SNBA stage) -- see
         // DemodParams::snb's doc comment for why this is independent
         // of the NoiseReduction mutex above rather than folded into it.
@@ -1483,6 +1588,7 @@ impl SpectrumAnalyzer {
             self.last_snb_enabled = Some(params.snb);
         }
 
+        { let n = Instant::now(); DSP_SET_GROUP[6].fetch_max(n.duration_since(set_last).as_micros() as u64, Ordering::Relaxed); set_last = n; }
         // ANF ("Automatic Notch Filter", WDSP's ANF stage) -- see
         // DemodParams::anf's doc comment. Same independent-toggle
         // treatment as SNB just above.
@@ -1493,6 +1599,7 @@ impl SpectrumAnalyzer {
             self.last_anf_enabled = Some(params.anf);
         }
 
+        { let n = Instant::now(); DSP_SET_GROUP[7].fetch_max(n.duration_since(set_last).as_micros() as u64, Ordering::Relaxed); set_last = n; }
         // Binaural ("phasing") RX audio -- see DemodParams::binaural's
         // doc comment. Same edge-detected Set*-call pattern as every
         // other toggle above; off by default matches open()'s own
@@ -1504,6 +1611,7 @@ impl SpectrumAnalyzer {
             self.last_binaural = Some(params.binaural);
         }
 
+        { let n = Instant::now(); DSP_SET_GROUP[8].fetch_max(n.duration_since(set_last).as_micros() as u64, Ordering::Relaxed); set_last = n; }
         // Graphic EQ -- see EqualizerParams's doc comment for the two
         // band layouts. Matches piHPSDR's own init sequence
         // (receiver.c/transmitter.c): coefficients first, Run flag
@@ -1538,6 +1646,7 @@ impl SpectrumAnalyzer {
             self.last_eq = Some(params.eq);
         }
 
+        { let n = Instant::now(); DSP_SET_GROUP[9].fetch_max(n.duration_since(set_last).as_micros() as u64, Ordering::Relaxed); set_last = n; }
         // CTUN ("Click to Tune"): confirmed against a working reference
         // (rustyHPSDR). SetRXAShiftFreq shifts the IQ into the RXA
         // demod chain so the passband tracks the CTUN'd frequency
@@ -1555,29 +1664,47 @@ impl SpectrumAnalyzer {
                 }
                 self.last_ctun = Some(true);
             }
+            // SetRXAShiftFreq blocks until WDSP has finished the block it is processing (measured
+            // up to 40 ms at 192 kHz on the Pi), which stalled this thread and starved the audio
+            // while dragging. It is done on its own thread instead (see shift_worker).
             if self.last_ctun_offset != Some(params.ctun_offset_hz) {
+                shift_worker_send(ShiftMsg::Set(self.channel, params.ctun_offset_hz));
+                self.last_ctun_offset = Some(params.ctun_offset_hz);
+            }
+            // The NBP filter rebuild is expensive (20-30 ms at 192 kHz on the Pi): while the
+            // offset keeps changing (dragging) it is applied at most every NBP_MIN_INTERVAL,
+            // and the last value always lands once the dragging stops.
+            if self.last_nbp_shift != Some(params.ctun_offset_hz) && self.last_nbp_at.elapsed() >= NBP_MIN_INTERVAL {
+                let t_c = Instant::now();
                 unsafe {
-                    wdsp::SetRXAShiftFreq(self.channel, params.ctun_offset_hz);
                     wdsp::RXANBPSetShiftFrequency(self.channel, params.ctun_offset_hz);
                 }
-                self.last_ctun_offset = Some(params.ctun_offset_hz);
+                DSP_SET_GROUP[12].fetch_max(t_c.elapsed().as_micros() as u64, Ordering::Relaxed);
+                self.last_nbp_shift = Some(params.ctun_offset_hz);
+                self.last_nbp_at = Instant::now();
             }
         } else {
             if self.last_ctun != Some(false) {
+                shift_worker_send(ShiftMsg::Set(self.channel, 0.0));
                 unsafe {
-                    wdsp::SetRXAShiftFreq(self.channel, 0.0);
                     wdsp::SetRXAShiftRun(self.channel, 0);
                 }
                 self.last_ctun = Some(false);
                 self.last_ctun_offset = Some(0.0);
             }
-            if self.last_lo_frequency != Some(params.lo_frequency_hz) {
+            if self.last_lo_frequency != Some(params.lo_frequency_hz) && self.last_nbp_at.elapsed() >= NBP_MIN_INTERVAL {
+                let t_c = Instant::now();
                 unsafe {
                     wdsp::RXANBPSetTuneFrequency(self.channel, params.lo_frequency_hz);
                 }
+                DSP_SET_GROUP[13].fetch_max(t_c.elapsed().as_micros() as u64, Ordering::Relaxed);
                 self.last_lo_frequency = Some(params.lo_frequency_hz);
+                self.last_nbp_at = Instant::now();
             }
         }
+
+        { let n = Instant::now(); DSP_SET_GROUP[10].fetch_max(n.duration_since(set_last).as_micros() as u64, Ordering::Relaxed); set_last = n; }
+        DSP_MAX_SET_US.fetch_max(t_settings.elapsed().as_micros() as u64, Ordering::Relaxed);
 
         for (i, s) in samples.iter().enumerate() {
             self.demod_iq_scratch[i * 2] = s.i as f64 / IQ_NORM;
@@ -1653,6 +1780,10 @@ impl SpectrumAnalyzer {
 
 impl Drop for SpectrumAnalyzer {
     fn drop(&mut self) {
+        // Let any queued SetRXAShiftFreq finish before this channel is closed.
+        let (ack_tx, ack_rx) = std::sync::mpsc::channel();
+        shift_worker_send(ShiftMsg::Flush(ack_tx));
+        let _ = ack_rx.recv_timeout(Duration::from_secs(2));
         // Same lock SpectrumAnalyzer::open takes around OpenChannel --
         // see wdsp_sys::SETUP_LOCK's doc comment. ROOT CAUSE FIX for a
         // real report: CloseChannel/DestroyAnalyzer touch the same
@@ -1808,10 +1939,12 @@ fn run(
     let mut txrx_audio_silence_remaining: usize = 0;
     let mut demod_scratch: Vec<IqSample> = Vec::with_capacity(BUFFER_SIZE);
 
+    let mut last_chunk_at = Instant::now();
     while !stop.load(Ordering::Relaxed) {
         chunk.clear();
         {
             let mut buf = iq_buffer.lock().unwrap();
+            DSP_MAX_BACKLOG.fetch_max(buf.len() as u64, Ordering::Relaxed);
             if buf.len() >= BUFFER_SIZE {
                 chunk.extend(buf.drain(..BUFFER_SIZE));
             }
@@ -1821,6 +1954,10 @@ fn run(
             thread::sleep(Duration::from_millis(5));
             continue;
         }
+        let _tick = DspTick(Instant::now());
+        DSP_CHUNKS.fetch_add(1, Ordering::Relaxed);
+        DSP_MAX_GAP_US.fetch_max(last_chunk_at.elapsed().as_micros() as u64, Ordering::Relaxed);
+        last_chunk_at = Instant::now();
 
         // Zero the first few ms of RX IQ right after a TX->RX transition
         // -- a direct, faithful port of deskHPSDR's own `rxtx()` (radio.c):
@@ -1923,9 +2060,13 @@ fn run(
         if digital_rx_active {
             params.agc = Agc::Off;
         }
+        let t_zp = Instant::now();
         analyzer.set_zoom_pan(params.zoom, params.pan, sample_rate);
+        DSP_MAX_ZP_US.fetch_max(t_zp.elapsed().as_micros() as u64, Ordering::Relaxed);
 
+        let t_feed = Instant::now();
         let (spectrum, waterfall) = analyzer.feed(&chunk);
+        DSP_MAX_FEED_US.fetch_max(t_feed.elapsed().as_micros() as u64, Ordering::Relaxed);
         if spectrum.is_some() || waterfall.is_some() {
             // Same correction as the S-meter (real request -- one
             // shared control rather than a second independent one, see
@@ -1967,7 +2108,7 @@ fn run(
                             *v += cal;
                         }
                     }
-                    d.waterfall_rows.push_front(w);
+                    d.waterfall_rows.push_front(Arc::new(w));
                     if d.waterfall_rows.len() > WATERFALL_HISTORY {
                         d.waterfall_rows.pop_back();
                     }
