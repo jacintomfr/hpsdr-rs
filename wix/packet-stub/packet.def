@@ -1,0 +1,13 @@
+LIBRARY packet.dll
+EXPORTS
+    PacketOpenAdapter
+    PacketSendPacket
+    PacketAllocatePacket
+    PacketInitPacket
+    PacketFreePacket
+    PacketReceivePacket
+    PacketCloseAdapter
+    PacketSetHwFilter
+    PacketGetAdapterNames
+    PacketSetBuff
+    PacketSetMinToCopy

@@ -142,6 +142,24 @@
                                 KeyPath='yes'/>
                         </Component>
                         <!--
+                          The MinGW build imports Npcap's Packet.dll as a normal
+                          (non-delay-loaded) dependency, so on a clean Windows PC
+                          without Npcap the exe would refuse to start. This is a
+                          small forwarding stub (wix/packet-stub, built by
+                          scripts/build-packet-stub.sh): it forwards to the real
+                          Npcap/WinPcap Packet.dll when installed and otherwise
+                          lets the app start with the Npcap-dependent features
+                          (firmware update, interface names) unavailable.
+                        -->
+                        <Component Id='packetdll' Guid='B3D5F7A9-4C2E-4A8B-9F61-3E7D2C1A5B90'>
+                            <File
+                                Id='packetdll'
+                                Name='packet.dll'
+                                DiskId='1'
+                                Source='wix\packet-stub\packet.dll'
+                                KeyPath='yes'/>
+                        </Component>
+                        <!--
                           Ozy USB (legacy Ozy/Mercury/Penny hardware) FX2/FPGA
                           firmware, mirroring the .deb package's bundled copy.
                           See src/ozy.rs's `bundled_path()`, which checks
@@ -209,6 +227,7 @@
 
             <ComponentRef Id='binary0'/>
             <ComponentRef Id='fftw3dll'/>
+            <ComponentRef Id='packetdll'/>
             <ComponentRef Id='OzyFirmware'/>
             <ComponentRef Id='ApplicationShortcut'/>
 
