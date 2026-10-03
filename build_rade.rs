@@ -154,6 +154,16 @@ project(hpsdr_rs_rade C)
 set(CMAKE_C_STANDARD 11)
 set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 
+# Cross-compiling to Linux/arm64 with GCC (e.g. `cargo build --target
+# aarch64-unknown-linux-gnu` for the Raspberry Pi package): BuildOpus.cmake
+# only passes `--host` to Opus's ./configure from CMAKE_C_COMPILER_TARGET,
+# which is a Clang-only variable and empty with GCC -- so without this Opus
+# is silently built for the BUILD machine and the final link fails with
+# "skipping incompatible libopus.a".
+if(CMAKE_CROSSCOMPILING AND NOT CMAKE_C_COMPILER_TARGET AND CMAKE_SYSTEM_PROCESSOR MATCHES "aarch64")
+  set(CMAKE_C_COMPILER_TARGET aarch64-linux-gnu)
+endif()
+
 # Fetches and patches the FARGAN/LPCNet-enabled Opus, and defines the imported
 # `opus` target plus its include directories for everything below.
 include(${RADE_C_DIR}/cmake/BuildOpus.cmake)

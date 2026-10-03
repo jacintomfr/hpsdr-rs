@@ -274,10 +274,29 @@ assets = [
 # Conflicts/replaces the plain package: both install usr/bin/hpsdr-rs.
 [package.metadata.deb.variants.kiosk]
 name = "hpsdr-rs-kiosk"
-depends = "$auto, libxkbcommon-x11-0, libxkbcommon0, libgl1, libegl1, libx11-6, libxcursor1, libxrandr2, libxi6, libwayland-client0, libasound2-plugins"
+depends = "$auto, libxkbcommon-x11-0, libxkbcommon0, libgl1, libegl1, libx11-6, libx11-xcb1, libxcb1, libxcursor1, libxrandr2, libxi6, libxinerama1, libxrender1, libwayland-client0, libwayland-egl1"
+recommends = "libasound2-plugins"
 conflicts = "hpsdr-rs"
 replaces = "hpsdr-rs"
 provides = "hpsdr-rs"
-merge-assets.append = [
+# postinst copies the Kiosk launcher onto every existing user's ~/Desktop
+# (postrm removes it again); /etc/skel covers users created later.
+maintainer-scripts = "assets/deb-kiosk"
+# Full list (not merge-assets) so the plain desktop launcher is left out --
+# a kiosk install should show only the Kiosk entry.
+assets = [
+    ["target/release/hpsdr-rs", "usr/bin/", "755"],
+    ["README.md", "usr/share/doc/hpsdr-rs/README.md", "644"],
+    ["docs/manual/*.md", "usr/share/doc/hpsdr-rs/manual/", "644"],
+    ["docs/manual/images/*", "usr/share/doc/hpsdr-rs/manual/images/", "644"],
     ["assets/hpsdr-rs-kiosk.desktop", "usr/share/applications/hpsdr-rs-kiosk.desktop", "644"],
+    ["assets/hpsdr-rs-kiosk.desktop", "etc/skel/Desktop/hpsdr-rs-kiosk.desktop", "755"],
+    ["assets/icons/hpsdr-rs.png", "usr/share/icons/hicolor/256x256/apps/hpsdr-rs.png", "644"],
+    ["assets/90-ozy.rules", "usr/share/doc/hpsdr-rs/90-ozy.rules", "644"],
+    ["assets/90-rx888.rules", "usr/share/doc/hpsdr-rs/90-rx888.rules", "644"],
+    ["assets/ozy/ozyfw-sdr1k.hex", "usr/share/hpsdr-rs/ozy/ozyfw-sdr1k.hex", "644"],
+    ["assets/ozy/Ozy_Janus.rbf", "usr/share/hpsdr-rs/ozy/Ozy_Janus.rbf", "644"],
+    ["assets/rx888/SDDC_FX3.img", "usr/share/hpsdr-rs/rx888/SDDC_FX3.img", "644"],
+    ["assets/rx888/LICENSE.txt", "usr/share/hpsdr-rs/rx888/LICENSE.txt", "644"],
+    ["assets/rx888/PROVENANCE.md", "usr/share/hpsdr-rs/rx888/PROVENANCE.md", "644"],
 ]

@@ -125,6 +125,8 @@ Since there's no native title bar to close a secondary window from, each one ins
 
 Off by default -- this is a fixed-size kiosk layout for a specific small panel, not a general "small screen" mode, so it would be actively wrong on a normal resizable desktop monitor.
 
+**Raspberry Pi 5 package**: a ready-to-install arm64 `.deb` (`hpsdr-rs-kiosk`, Debian 13 "trixie") with RADE included and a desktop shortcut can be built on a PC by cross-compiling -- see [docs/packaging/rpi5-kiosk-deb.md](docs/packaging/rpi5-kiosk-deb.md) for how it is built, verified and installed.
+
 **Known limitation**: a native OS file-picker dialog (e.g. "Choose..." for the Radioberry Juice executable path, or a firmware `.rbf` file) is a real Windows window, not part of this app's own UI -- its size/position is controlled by Windows itself, not by this app, so it can open larger than the 1024x600 panel or need scrolling to reach its own buttons. Windows remembers a common dialog's last-used size per user, so resizing it down once on the actual kiosk PC should make it stay that size on future opens.
 
 ### Testing without real hardware (hpsdrsim)

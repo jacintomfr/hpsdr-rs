@@ -1,0 +1,18 @@
+#!/bin/sh
+# hpsdr-rs-kiosk: put the Kiosk launcher on every existing user's desktop
+# (the .desktop file itself is also installed system-wide for the menu).
+set -e
+if [ "$1" = "configure" ]; then
+    for home in /home/*; do
+        [ -d "$home/Desktop" ] || continue
+        owner=$(stat -c %U "$home")
+        group=$(stat -c %G "$home")
+        install -m 755 -o "$owner" -g "$group" \
+            /usr/share/applications/hpsdr-rs-kiosk.desktop \
+            "$home/Desktop/hpsdr-rs-kiosk.desktop"
+    done
+    if command -v gtk-update-icon-cache >/dev/null 2>&1; then
+        gtk-update-icon-cache -q -t -f /usr/share/icons/hicolor || true
+    fi
+fi
+exit 0
