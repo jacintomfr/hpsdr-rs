@@ -5133,7 +5133,7 @@ impl eframe::App for HpsdrApp {
                                     // report. Pulling that exact color
                                     // explicitly keeps this row visually
                                     // consistent.
-                                    if !lcd_kiosk_mode() && render_step_combo(ui, connected) {
+                                    if !connected.tx_enabled && !lcd_kiosk_mode() && render_step_combo(ui, connected) {
                                         settings_changed = true;
                                     }
                                     // Only shown while actually in CW
@@ -5163,12 +5163,13 @@ impl eframe::App for HpsdrApp {
                                 });
                             });
 
-                            if lcd_kiosk_mode() {
-                                ui.add_space(8.0);
-                                ui.vertical(|ui| {
-                                    render_net_status_column(ui, connected, rigctl_status, tci_status, cat_status);
-                                });
-                            }
+                            // rigctl/TCI/CAT column, centred between the VFO-A buttons and the
+                            // VFO-B box (equal gap on both sides).
+                            ui.add_space(8.0);
+                            ui.vertical(|ui| {
+                                render_net_status_column(ui, connected, rigctl_status, tci_status, cat_status);
+                            });
+                            ui.add_space(8.0);
 
                             let vfo_b_label = ui
                                 .group(|ui| {
@@ -7122,7 +7123,7 @@ impl eframe::App for HpsdrApp {
                                     }
                                 }
                             }
-                            if lcd_kiosk_mode() {
+                            {
                                 ui.add_space(12.0);
                                 if render_step_combo(ui, connected) {
                                     settings_changed = true;
@@ -15730,19 +15731,7 @@ fn render_status_row(
 ) {
     // rigctl/TCI/CAT now live in a vertical column in the top row
     // (render_net_status_column), not here.
-    if !lcd_kiosk_mode() {
-        ui.colored_label(network_status_color(rigctl_status), "rigctl")
-            .on_hover_text(network_status_hover("rigctl", rigctl_status, &connected.rigctl_addr));
-        ui.add_space(12.0);
-        ui.colored_label(network_status_color(tci_status), "TCI").on_hover_text(tci_status_hover(
-            tci_status,
-            &connected.tci_addr,
-            connected.tci_server.as_ref(),
-        ));
-        ui.add_space(12.0);
-        ui.colored_label(network_status_color(cat_status), "CAT")
-            .on_hover_text(network_status_hover("CAT", cat_status, &connected.cat_addr));
-    }
+    let _ = (rigctl_status, tci_status, cat_status);
     // PureSignal: only shown when actually enabled for this session (see
     // ConnectedState::puresignal_enabled's doc comment -- a connect-time
     // setting, not live). Same green/gray "Correcting" convention as the
