@@ -5975,11 +5975,10 @@ impl eframe::App for HpsdrApp {
                                         rr.toggle_record();
                                     }
                                     if let Some(progress) = rr.record_progress() {
-                                        ui.add(
-                                            egui::ProgressBar::new(progress)
-                                                .desired_width(60.0)
-                                                .desired_height(14.0)
-                                                .text(format!("{:.0}s", progress * report_recorder::MAX_SECONDS)),
+                                        action_progress_bar(
+                                            ui,
+                                            progress,
+                                            format!("{:.0}s", progress * report_recorder::MAX_SECONDS),
                                         );
                                     }
                                 });
@@ -6276,12 +6275,7 @@ impl eframe::App for HpsdrApp {
                                     rr.toggle_play();
                                 }
                                 if let Some(progress) = rr.play_progress() {
-                                    ui.add(
-                                        egui::ProgressBar::new(progress)
-                                            .desired_width(60.0)
-                                            .desired_height(14.0)
-                                            .text(format!("{:.0}%", progress * 100.0)),
-                                    );
+                                    action_progress_bar(ui, progress, format!("{:.0}%", progress * 100.0));
                                 }
                             }
                         });
@@ -15715,6 +15709,17 @@ fn render_net_status_column(
     ));
     ui.colored_label(network_status_color(cat_status), "CAT")
         .on_hover_text(network_status_hover("CAT", cat_status, &connected.cat_addr));
+}
+
+/// Progress bar shown next to REC/PLAY: same font and height as those buttons
+/// (it used a smaller, older-looking default).
+fn action_progress_bar(ui: &mut egui::Ui, progress: f32, text: String) {
+    ui.add(
+        egui::ProgressBar::new(progress)
+            .desired_width(80.0)
+            .desired_height(ui.spacing().interact_size.y)
+            .text(egui::RichText::new(text).text_style(egui::TextStyle::Button)),
+    );
 }
 
 /// Colored action button (REC/PLAY): default font like the mode buttons, a
