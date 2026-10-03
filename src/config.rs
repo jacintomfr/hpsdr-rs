@@ -831,7 +831,11 @@ pub(crate) fn settings_dir() -> Option<PathBuf> {
 /// shrink/grow the OS window to compensate, so the two would drift out
 /// of sync with the physical 1024x600 panel). 1.0 (100%) is the
 /// original, un-scaled kiosk size.
-const KIOSK_SCALE_PRESETS: [f32; 3] = [1.0, 1.10, 1.25];
+// 150%/175%/200% added at a user's request (text on a Raspberry Pi panel read
+// ~25% smaller than the Windows kiosk build). Only text sizes scale (see
+// main()'s use of this), not fixed-width widgets, so the largest steps can
+// clip rows that were laid out for 100%.
+const KIOSK_SCALE_PRESETS: [f32; 6] = [1.0, 1.10, 1.25, 1.5, 1.75, 2.0];
 
 fn kiosk_scale_path() -> Option<PathBuf> {
     let mut path = settings_dir()?;
