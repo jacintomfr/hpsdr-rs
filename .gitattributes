@@ -1,1 +1,2 @@
 assets/deb-kiosk/* text eol=lf
+scripts/rpi5-kiosk-deb/*.sh text eol=lf
