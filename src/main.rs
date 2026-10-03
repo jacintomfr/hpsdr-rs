@@ -5228,7 +5228,7 @@ impl eframe::App for HpsdrApp {
                                 // desktop keeps normal case, just the
                                 // same yellow fill now (a real request).
                                 let settings_clicked = if lcd_kiosk_mode() {
-                                    kiosk_accent_button(ui, "SETTINGS...").clicked()
+                                    toggle_chip(ui, "SETTINGS...", connected.show_settings_window, 0.0, "").clicked()
                                 } else {
                                     kiosk_accent_button(ui, "Settings...").clicked()
                                 };
@@ -5248,7 +5248,7 @@ impl eframe::App for HpsdrApp {
                                 // consequential action than SETTINGS/
                                 // Juice Console next to it.
                                 if lcd_kiosk_mode() {
-                                    if kiosk_stop_button(ui, "STOP").clicked() {
+                                    if solid_chip(ui, "STOP", egui::Color32::from_rgb(210, 50, 50), true).clicked() {
                                         stop_clicked = true;
                                     }
                                 } else {
@@ -5301,10 +5301,14 @@ impl eframe::App for HpsdrApp {
                                 // Digital modes (RTTY for now) -- one
                                 // entry point for all of them, see
                                 // render_digital_window.
-                                if ui
-                                    .button("Digital...")
-                                    .on_hover_text("Digital modes: RTTY decoder/encoder")
-                                    .clicked()
+                                if toggle_chip(
+                                    ui,
+                                    "Digital...",
+                                    connected.show_digital_window,
+                                    0.0,
+                                    "Digital modes: RTTY decoder/encoder",
+                                )
+                                .clicked()
                                 {
                                     let opening = !connected.show_digital_window;
                                     connected.show_digital_window = opening;
@@ -5489,7 +5493,7 @@ impl eframe::App for HpsdrApp {
                                 continue;
                             }
                             let selected = Some(band.name) == current_band;
-                            if ui.add(egui::Button::selectable(selected, band.name)).clicked() && !selected {
+                            if toggle_chip(ui, band.name, selected, 0.0, "").clicked() && !selected {
                                 // Explicitly leaving any active XVTR --
                                 // see ConnectedState::active_xvtr's doc
                                 // comment. Rest of the switch (recall
@@ -5508,7 +5512,7 @@ impl eframe::App for HpsdrApp {
                         {
                             let gen = gen_band(connected.device.frequency_min, connected.device.frequency_max);
                             let selected = current_band == Some("Gen");
-                            if ui.add(egui::Button::selectable(selected, "Gen")).clicked() && !selected {
+                            if toggle_chip(ui, "Gen", selected, 0.0, "").clicked() && !selected {
                                 apply_band(connected, &gen);
                                 settings_changed = true;
                             }
@@ -5538,7 +5542,7 @@ impl eframe::App for HpsdrApp {
                                 continue;
                             }
                             let selected = active_xvtr_name.as_deref() == Some(xvtr.name.as_str());
-                            if ui.add(egui::Button::selectable(selected, &xvtr.name)).clicked() && !selected {
+                            if toggle_chip(ui, &xvtr.name, selected, 0.0, "").clicked() && !selected {
                                 // Explicit selection -- see
                                 // ConnectedState::active_xvtr's doc
                                 // comment.
@@ -5761,9 +5765,7 @@ impl eframe::App for HpsdrApp {
                     ui.horizontal_wrapped(|ui| {
                         for mode in ALL_MODES {
                             let selected = mode == current_mode;
-                            if ui
-                                .add(egui::Button::selectable(selected, mode.label()))
-                                .clicked()
+                            if toggle_chip(ui, mode.label(), selected, 0.0, "").clicked()
                                 && !selected
                             {
                                 apply_mode(connected, mode, dial_freq_hz);
@@ -15766,7 +15768,17 @@ fn colored_action_button(
         let font = egui::TextStyle::Button.resolve(ui.style());
         let text_w = ui.painter().layout_no_wrap("PLAY".to_string(), font, egui::Color32::WHITE).size().x;
         let min_w = text_w + 2.0 * ui.spacing().button_padding.x;
-        ui.add_enabled(enabled, egui::Button::new(label).min_size(egui::vec2(min_w, 0.0)))
+        let lighten_c = |c: egui::Color32, k: f32| {
+            let f = |v: u8| (v as f32 + (255.0 - v as f32) * k).round() as u8;
+            egui::Color32::from_rgb(f(c.r()), f(c.g()), f(c.b()))
+        };
+        ui.add_enabled(
+            enabled,
+            egui::Button::new(label)
+                .min_size(egui::vec2(min_w, 0.0))
+                .stroke(egui::Stroke::new(1.0, lighten_c(base, 0.35)))
+                .corner_radius(5.0),
+        )
             .on_hover_text(hover_text)
             .on_disabled_hover_text(disabled_hover_text)
     })
@@ -15879,14 +15891,41 @@ fn toggle_chip(ui: &mut egui::Ui, label: &str, active: bool, min_width: f32, hov
     } else {
         (grey, egui::Color32::from_gray(205), egui::Stroke::new(1.0, egui::Color32::from_gray(95)))
     };
-    ui.add(
+    let resp = ui.add(
         egui::Button::new(egui::RichText::new(label).color(text))
             .fill(fill)
             .stroke(stroke)
             .corner_radius(5.0)
             .min_size(egui::vec2(min_width, 0.0)),
-    )
-    .on_hover_text(hover)
+    );
+    if hover.is_empty() {
+        resp
+    } else {
+        resp.on_hover_text(hover)
+    }
+}
+
+/// Same rounded, thin-outline chip but with a fixed fill color (STOP, REC,
+/// PLAY): used for actions rather than on/off toggles.
+fn solid_chip(ui: &mut egui::Ui, label: &str, fill: egui::Color32, enabled: bool) -> egui::Response {
+    let lighten = |c: egui::Color32, k: f32| {
+        let f = |v: u8| (v as f32 + (255.0 - v as f32) * k).round() as u8;
+        egui::Color32::from_rgb(f(c.r()), f(c.g()), f(c.b()))
+    };
+    ui.scope(|ui| {
+        let w = &mut ui.visuals_mut().widgets;
+        w.inactive.weak_bg_fill = fill;
+        w.hovered.weak_bg_fill = lighten(fill, 0.25);
+        w.active.weak_bg_fill = lighten(fill, 0.45);
+        w.inactive.fg_stroke.color = egui::Color32::WHITE;
+        w.hovered.fg_stroke.color = egui::Color32::WHITE;
+        w.active.fg_stroke.color = egui::Color32::WHITE;
+        ui.add_enabled(
+            enabled,
+            egui::Button::new(label).stroke(egui::Stroke::new(1.0, lighten(fill, 0.35))).corner_radius(5.0),
+        )
+    })
+    .inner
 }
 
 /// Width shared by the NB and NR chips: the widest label either can show.
