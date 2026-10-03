@@ -814,10 +814,21 @@ pub const DEFAULT_EXE_NAME: &str = "radioberry-juice";
 #[cfg(not(windows))]
 pub const DEFAULT_INSTALLED_PATH: &str = "/usr/local/bin/radioberry-juice";
 
-/// juice reads `radioberry.props` from its own working directory (see
-/// BUILD-README.md's "Configuration" section) -- i.e. right next to
-/// the executable in the normal `dist/...` layout the build produces.
+/// juice reads its configuration like this (register.c, `loadRadioberryProps`): on
+/// Linux `/home/pi/.radioberry/radioberry.props` if that file exists, otherwise
+/// `./radioberry.props` in its working directory (the executable's folder in the
+/// normal `dist/...` layout). Windows only has the working-directory file. This
+/// follows the same lookup, so the FPGA choice is read from and written to the
+/// file juice will really use -- and, for an `apt`-installed juice, to a folder the
+/// user owns instead of `/usr/local/bin` or `/opt`, which are not writable.
 pub fn props_path_for(exe_path: &Path) -> PathBuf {
+    #[cfg(not(windows))]
+    {
+        let home_props = Path::new("/home/pi/.radioberry/radioberry.props");
+        if home_props.exists() {
+            return home_props.to_path_buf();
+        }
+    }
     exe_path
         .parent()
         .map(|dir| dir.join("radioberry.props"))

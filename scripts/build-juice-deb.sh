@@ -124,6 +124,12 @@ if [ -n "$target_user" ] && [ "$target_user" != root ]; then
 else
     echo "Add your login user to the 'radioberry' group manually: sudo usermod -aG radioberry \$USER"
 fi
+# dpkg installs the files as root; make the user's config folder and props file theirs
+# (juice reads it first, and hpsdr-rs writes the FPGA choice there) -- the folder is
+# hard-wired to /home/pi in juice itself.
+if id pi >/dev/null 2>&1 && [ -d /home/pi/.radioberry ]; then
+    chown -R pi:pi /home/pi/.radioberry
+fi
 udevadm control --reload-rules 2>/dev/null || true
 udevadm trigger --subsystem-match=usb 2>/dev/null || true
 echo "radioberry-juice installed. Edit /home/pi/.radioberry/radioberry.props (fpga=CL016 or CL025), reconnect the Radioberry, then run: radioberry-juice"
