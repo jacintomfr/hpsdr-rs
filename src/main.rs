@@ -8608,6 +8608,17 @@ impl eframe::App for HpsdrApp {
                         // the actual space math).
                         let (meter_rect, _resp) =
                             ui.allocate_exact_size(egui::vec2(180.0, 85.0), egui::Sense::hover());
+                        // Kiosk (1024x600 panel) only: the meter reads small there, so the
+                        // whole area is drawn scaled up about its top-right corner. The
+                        // desktop layout is untouched.
+                        if lcd_kiosk_mode() {
+                            const KIOSK_METER_SCALE: f32 = 1.4;
+                            let pivot = meter_rect.right_top().to_vec2();
+                            ui.ctx().set_transform_layer(
+                                ui.layer_id(),
+                                egui::emath::TSTransform::new(pivot * (1.0 - KIOSK_METER_SCALE), KIOSK_METER_SCALE),
+                            );
+                        }
                         if connected.session.mox_active() {
                             let raw_fwd = connected
                                 .session
