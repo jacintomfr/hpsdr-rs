@@ -48,6 +48,32 @@ pub struct Config {
     /// RADE panel's "Mute start/end" -- see rade_link::RadeHandle::mute_edges.
     #[serde(default)]
     pub rade_mute_edges: Option<bool>,
+    /// Digital window state (all were reset on every launch): RADE "Mute
+    /// Analog" and the "Fit Filter" width toggle, the RTTY/SSTV/RADE tab
+    /// (0/1/2), RTTY "Send on Return", and the SSTV RX/TX options
+    /// (`sstv_rx_mode`: index into SstvMode::ALL, -1 = Auto).
+    #[serde(default)]
+    pub rade_mute_analog: Option<bool>,
+    #[serde(default)]
+    pub rade_filter_wide: Option<bool>,
+    #[serde(default)]
+    pub digital_mode: Option<u8>,
+    #[serde(default)]
+    pub rtty_send_on_return: Option<bool>,
+    #[serde(default)]
+    pub sstv_rx_mode: Option<i32>,
+    #[serde(default)]
+    pub sstv_rx_auto_save: Option<bool>,
+    #[serde(default)]
+    pub sstv_tx_mode: Option<usize>,
+    #[serde(default)]
+    pub sstv_tx_banner: Option<bool>,
+    #[serde(default)]
+    pub sstv_tx_ppm: Option<f32>,
+    #[serde(default)]
+    pub sstv_tx_fsk_id: Option<bool>,
+    #[serde(default)]
+    pub sstv_tx_lead_ms: Option<u32>,
     /// Output device for local RX audio playback (Settings -> Audio's
     /// "Output device" picker), by name -- e.g. "CABLE Input (VB-Audio
     /// Virtual Cable)" to feed a decoder instead of/alongside real

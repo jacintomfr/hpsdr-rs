@@ -3281,6 +3281,27 @@ fn connect_to_device(device: Device, cfg: &Config) -> Result<ConnectedState, Str
             }
             let sstv = sstv_link::SstvHandle::new();
             let rade = rade_link::RadeHandle::new();
+            if let Some(v) = cfg.rade_mute_edges {
+                rade.set_mute_edges(v);
+            }
+            if let Some(v) = cfg.rade_mute_analog {
+                rade.set_mute_analog(v);
+            }
+            if let Some(v) = cfg.sstv_rx_mode {
+                sstv.set_expected(usize::try_from(v).ok().and_then(|i| sstv::SstvMode::ALL.get(i).copied()));
+            }
+            if let Some(v) = cfg.sstv_rx_auto_save {
+                sstv.set_rx_auto_save(v);
+            }
+            if let Some(v) = cfg.sstv_tx_ppm {
+                sstv.set_tx_ppm(v);
+            }
+            if let Some(v) = cfg.sstv_tx_fsk_id {
+                sstv.set_tx_fsk_id_enabled(v);
+            }
+            if let Some(v) = cfg.sstv_tx_lead_ms {
+                sstv.set_tx_lead_ms(v);
+            }
             let rade_callsign = cfg.rade_callsign.clone().unwrap_or_default();
             if !rade_callsign.is_empty() {
                 rade.set_callsign(&rade_callsign);
@@ -3492,7 +3513,7 @@ fn connect_to_device(device: Device, cfg: &Config) -> Result<ConnectedState, Str
                 waterfall_db_low_auto: cfg.waterfall_db_low_auto.unwrap_or(false),
                 agc_auto: cfg.agc_auto.unwrap_or(false),
                 agc_auto_offset_db: cfg.agc_auto_offset_db.unwrap_or(-25.0),
-                rade_filter_wide: false,
+                rade_filter_wide: cfg.rade_filter_wide.unwrap_or(false),
                 tx_db_low: cfg.tx_db_low.unwrap_or(cfg.db_low.unwrap_or(-140.0)),
                 tx_db_high: cfg.tx_db_high.unwrap_or(cfg.db_high.unwrap_or(-40.0) + 60.0),
                 tx_waterfall_db_low: cfg
@@ -3525,18 +3546,18 @@ fn connect_to_device(device: Device, cfg: &Config) -> Result<ConnectedState, Str
                 sim_handle: None,
                 show_juice_console_window: false,
                 show_digital_window: false,
-                digital_mode: DigitalMode::Rtty,
+                digital_mode: match cfg.digital_mode { Some(1) => DigitalMode::Sstv, Some(2) => DigitalMode::Rade, _ => DigitalMode::Rtty },
                 rtty,
                 rtty_tx_input: String::new(),
-                rtty_send_on_return: true,
+                rtty_send_on_return: cfg.rtty_send_on_return.unwrap_or(true),
                 rtty_over_had_text: false,
                 sstv,
                 sstv_texture: None,
                 sstv_texture_image_id: 0,
                 sstv_tx_prepared: None,
                 sstv_tx_source: None,
-                sstv_tx_mode: sstv::SstvMode::ALL[0],
-                sstv_tx_banner: true,
+                sstv_tx_mode: cfg.sstv_tx_mode.and_then(|i| sstv::SstvMode::ALL.get(i).copied()).unwrap_or(sstv::SstvMode::ALL[0]),
+                sstv_tx_banner: cfg.sstv_tx_banner.unwrap_or(true),
                 sstv_tx_texture: None,
                 sstv_tx_sending: false,
                 rade,
@@ -13685,7 +13706,7 @@ impl eframe::App for HpsdrApp {
                             }
                         })
                         .collect();
-                    Config {
+                    let mut cfg_out = Config {
                         radioberry_juice_path: None,
                         radioberry_juice_fpga: None,
                         rx_gain_calibration_db: Some(connected.rx_gain_calibration_db),
@@ -13754,6 +13775,29 @@ impl eframe::App for HpsdrApp {
                         db_high: Some(connected.db_high),
                         waterfall_db_low: Some(connected.waterfall_db_low),
                         waterfall_db_high: Some(connected.waterfall_db_high),
+                        rade_mute_edges: Some(connected.rade.mute_edges()),
+                        rade_mute_analog: Some(connected.rade.mute_analog()),
+                        rade_filter_wide: Some(connected.rade_filter_wide),
+                        digital_mode: Some(match connected.digital_mode {
+                            DigitalMode::Rtty => 0,
+                            DigitalMode::Sstv => 1,
+                            DigitalMode::Rade => 2,
+                        }),
+                        rtty_send_on_return: Some(connected.rtty_send_on_return),
+                        sstv_rx_mode: Some(
+                            connected
+                                .sstv
+                                .expected()
+                                .and_then(|m| sstv::SstvMode::ALL.iter().position(|x| *x == m))
+                                .map(|i| i as i32)
+                                .unwrap_or(-1),
+                        ),
+                        sstv_rx_auto_save: Some(connected.sstv.rx_auto_save()),
+                        sstv_tx_mode: sstv::SstvMode::ALL.iter().position(|x| *x == connected.sstv_tx_mode),
+                        sstv_tx_banner: Some(connected.sstv_tx_banner),
+                        sstv_tx_ppm: Some(connected.sstv.tx_ppm()),
+                        sstv_tx_fsk_id: Some(connected.sstv.tx_fsk_id_enabled()),
+                        sstv_tx_lead_ms: Some(connected.sstv.tx_lead_ms()),
                         waterfall_db_low_auto: Some(connected.waterfall_db_low_auto),
                         agc_auto: Some(connected.agc_auto),
                         agc_auto_offset_db: Some(connected.agc_auto_offset_db),
@@ -13882,8 +13926,49 @@ impl eframe::App for HpsdrApp {
                         midi_device_name: None,
                         midi_device_names: connected.midi.device_names.lock().unwrap().clone(),
                         midi_bindings: connected.midi_bindings.clone(),
+                    };
+                    // While the TX chain isn't armed (Enable Transmit off or
+                    // the mic failed to open) there is no handle to read the
+                    // TX DSP settings from: keep what is already on disk
+                    // instead of overwriting it with "unset".
+                    if connected.tx_handle.is_none() {
+                        let prev = Config::load(connected.device.mac);
+                        cfg_out.tx_eq = prev.tx_eq;
+                        cfg_out.tx_leveler_enabled = prev.tx_leveler_enabled;
+                        cfg_out.tx_leveler_gain_db = prev.tx_leveler_gain_db;
+                        cfg_out.tx_leveler_decay_ms = prev.tx_leveler_decay_ms;
+                        cfg_out.tx_compressor_enabled = prev.tx_compressor_enabled;
+                        cfg_out.tx_compressor_gain_db = prev.tx_compressor_gain_db;
+                        cfg_out.tx_cfc_enabled = prev.tx_cfc_enabled;
+                        cfg_out.tx_denoiser_enabled = prev.tx_denoiser_enabled;
+                        cfg_out.rade_denoiser_enabled = prev.rade_denoiser_enabled;
+                        cfg_out.rade_leveler_enabled = prev.rade_leveler_enabled;
+                        cfg_out.rade_compressor_enabled = prev.rade_compressor_enabled;
+                        cfg_out.rade_eq_enabled = prev.rade_eq_enabled;
+                        cfg_out.rade_eq = prev.rade_eq;
                     }
-                    .save(connected.device.mac);
+                    // The Digital window forces NB/NR/SNB, the TX processors,
+                    // zoom and mode while it is open (enter_digital_mode_filters);
+                    // save what the operator had BEFORE that, not the forced
+                    // values, so closing the app with it open doesn't lose them.
+                    if let Some(f) = &connected.pre_digital_filters {
+                        cfg_out.noise_blanker = Some(f.nb);
+                        cfg_out.noise_reduction = Some(f.nr);
+                        cfg_out.snb = Some(f.snb);
+                        cfg_out.tx_leveler_enabled = Some(f.tx_leveler);
+                        cfg_out.tx_compressor_enabled = Some(f.tx_compressor);
+                        cfg_out.tx_cfc_enabled = Some(f.tx_cfc);
+                        if let Some(mut eq) = cfg_out.tx_eq {
+                            eq.enabled = f.tx_eq;
+                            cfg_out.tx_eq = Some(eq);
+                        }
+                        cfg_out.spectrum_zoom = Some(f.zoom);
+                        cfg_out.spectrum_pan = Some(f.pan);
+                    }
+                    if let Some(m) = connected.pre_digital_mode {
+                        cfg_out.mode = Some(m);
+                    }
+                    cfg_out.save(connected.device.mac);
                 }
                 // Bounded rather than unconditional: this is what
                 // keeps the meter/spectrum/waterfall live without a
