@@ -1485,6 +1485,7 @@ enum SettingsTab {
     OpenCollector,
     Antenna,
     Firmware,
+    Juice,
     Midi,
     Meter,
     Screen,
@@ -2070,7 +2071,6 @@ struct ConnectedState {
     /// window's toolbar) -- this is a fixed offset against a known
     /// reference, set once and rarely touched.
     rx_gain_calibration_db: i32,
-    show_juice_console_window: bool,
     /// "Digital..." window (digital modes -- RTTY, SSTV and RADE). See
     /// rtty_link.rs/sstv_link.rs/rade_link.rs; `rtty`/`sstv`/`rade` are
     /// owned here, not by SpectrumHandle, so they survive the main
@@ -2703,13 +2703,17 @@ static PROF_FRAMES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64:
 static PROF_BUSY_US: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 static PROF_WF_US: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 static PROF_WF_N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static PROF_PASSES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// Records the time from its creation to its drop as one UI frame.
-struct UiProfGuard(Instant);
+struct UiProfGuard(Instant, bool);
 impl Drop for UiProfGuard {
     fn drop(&mut self) {
         PROF_BUSY_US.fetch_add(self.0.elapsed().as_micros() as u64, Ordering::Relaxed);
-        PROF_FRAMES.fetch_add(1, Ordering::Relaxed);
+        PROF_PASSES.fetch_add(1, Ordering::Relaxed);
+        if self.1 {
+            PROF_FRAMES.fetch_add(1, Ordering::Relaxed);
+        }
     }
 }
 
@@ -2724,30 +2728,37 @@ impl Drop for WfProfGuard {
 
 struct ProfSnap {
     at: Instant,
-    base: [u64; 4],
+    base: [u64; 5],
     // frames/s, avg ms per frame, avg ms per waterfall rebuild, rebuilds/s
-    values: (f32, f32, f32, f32),
+    values: (f32, f32, f32, f32, f32),
 }
 
 static PROF_SNAP: Mutex<Option<ProfSnap>> = Mutex::new(None);
 
 /// (frames per second, average ms per frame, average ms per waterfall rebuild,
 /// waterfall rebuilds per second) over the last second or so.
-fn ui_prof_snapshot() -> (f32, f32, f32, f32) {
+fn ui_prof_snapshot() -> (f32, f32, f32, f32, f32) {
     let now = [
         PROF_FRAMES.load(Ordering::Relaxed),
         PROF_BUSY_US.load(Ordering::Relaxed),
         PROF_WF_US.load(Ordering::Relaxed),
         PROF_WF_N.load(Ordering::Relaxed),
+        PROF_PASSES.load(Ordering::Relaxed),
     ];
     let mut g = PROF_SNAP.lock().unwrap();
-    let snap = g.get_or_insert(ProfSnap { at: Instant::now(), base: now, values: (0.0, 0.0, 0.0, 0.0) });
+    let snap = g.get_or_insert(ProfSnap { at: Instant::now(), base: now, values: (0.0, 0.0, 0.0, 0.0, 0.0) });
     let dt = snap.at.elapsed().as_secs_f32();
     if dt >= 1.0 {
-        let d = [now[0] - snap.base[0], now[1] - snap.base[1], now[2] - snap.base[2], now[3] - snap.base[3]];
+        let d = [
+            now[0] - snap.base[0],
+            now[1] - snap.base[1],
+            now[2] - snap.base[2],
+            now[3] - snap.base[3],
+            now[4] - snap.base[4],
+        ];
         let frames = d[0].max(1) as f32;
         let wf = d[3].max(1) as f32;
-        snap.values = (d[0] as f32 / dt, d[1] as f32 / 1000.0 / frames, d[2] as f32 / 1000.0 / wf, d[3] as f32 / dt);
+        snap.values = (d[0] as f32 / dt, d[1] as f32 / 1000.0 / frames, d[2] as f32 / 1000.0 / wf, d[3] as f32 / dt, d[4] as f32 / dt);
         snap.base = now;
         snap.at = Instant::now();
     }
@@ -3607,7 +3618,6 @@ fn connect_to_device(device: Device, cfg: &Config) -> Result<ConnectedState, Str
                 firmware_update: None,
                 juice_console: None,
                 sim_handle: None,
-                show_juice_console_window: false,
                 show_digital_window: false,
                 digital_mode: match cfg.digital_mode { Some(1) => DigitalMode::Sstv, Some(2) => DigitalMode::Rade, _ => DigitalMode::Rtty },
                 rtty,
@@ -3786,7 +3796,7 @@ impl eframe::App for HpsdrApp {
     // eframe 0.35 replaced `update(&Context)` with `ui(&mut Ui)` -- see
     // https://github.com/emilk/egui/blob/main/CHANGELOG.md (0.35.0).
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
-        let _prof = UiProfGuard(Instant::now());
+        let _prof = UiProfGuard(Instant::now(), ui.ctx().current_pass_index() == 0);
         // Kiosk mode assumes an exact 1024x600 PHYSICAL pixel panel (see
         // main()'s ViewportBuilder::with_inner_size for that mode) --
         // this counteracts whatever HiDPI scale factor the OS/window
@@ -4051,7 +4061,16 @@ impl eframe::App for HpsdrApp {
                     connected.device.version % 10,
                     connected.device.address.ip()
                 );
-                ui.ctx().send_viewport_cmd(egui::ViewportCommand::Title(base_title.clone()));
+                // Only when it changes: send_viewport_cmd requests an immediate repaint,
+                // so sending it every frame kept the UI redrawing at 60 fps.
+                {
+                    static LAST_TITLE: Mutex<String> = Mutex::new(String::new());
+                    let mut last = LAST_TITLE.lock().unwrap();
+                    if *last != base_title {
+                        ui.ctx().send_viewport_cmd(egui::ViewportCommand::Title(base_title.clone()));
+                        *last = base_title.clone();
+                    }
+                }
                 // None = not running, Some(false) = listening/idle,
                 // Some(true) = a client is currently connected. Drives
                 // the gray/green/red status text in the main panel.
@@ -5398,9 +5417,7 @@ impl eframe::App for HpsdrApp {
                                 // which don't have their own separate juice process to
                                 // control anyway (there's only ever one juice per radio
                                 // session, matching the one board it drives).
-                                if connected.juice_console.is_some() && ui.button("Juice Console...").clicked() {
-                                    connected.show_juice_console_window = !connected.show_juice_console_window;
-                                }
+                                // (Juice Console button moved into the Settings window.)
                                 // Digital modes (RTTY for now) -- one
                                 // entry point for all of them, see
                                 // render_digital_window.
@@ -8597,8 +8614,8 @@ impl eframe::App for HpsdrApp {
                             audio_color,
                             format!("Audio glitches: {:.0}/min", connected.underrun_rate_per_min),
                         );
-                        let (prof_fps, prof_ms, prof_wf_ms, prof_wf_n) = ui_prof_snapshot();
-                        ui.weak(format!("UI: {prof_fps:>2.0} fps {prof_ms:>4.1} ms")).on_hover_text(format!(
+                        let (prof_fps, prof_ms, prof_wf_ms, prof_wf_n, prof_passes) = ui_prof_snapshot();
+                        ui.weak(format!("UI: {prof_fps:>2.0} fps ({prof_passes:>2.0} passes) {prof_ms:>4.1} ms")).on_hover_text(format!(
                             "Interface: frames per second and average CPU time per frame.
 Waterfall rebuilds: {prof_wf_n:.0}/s, {prof_wf_ms:.1} ms each."
                         ));
@@ -9318,6 +9335,7 @@ Waterfall rebuilds: {prof_wf_n:.0}/s, {prof_wf_ms:.1} ms each."
                                     (SettingsTab::Diversity, "Diversity"),
                                     (SettingsTab::Equalizer, "Equalizer"),
                                     (SettingsTab::Firmware, "Firmware"),
+                                    (SettingsTab::Juice, "Juice"),
                                     (SettingsTab::Meter, "Meter"),
                                     (SettingsTab::Midi, "MIDI"),
                                     (SettingsTab::Network, "Network"),
@@ -9347,6 +9365,11 @@ Waterfall rebuilds: {prof_wf_n:.0}/s, {prof_wf_ms:.1} ms each."
                                     // freely, so this tab would be a no-op
                                     // (and confusing) there.
                                     if tab == SettingsTab::Screen && !lcd_kiosk_mode() {
+                                        continue;
+                                    }
+                                    // Juice console only exists when this
+                                    // session launched a juice process.
+                                    if tab == SettingsTab::Juice && connected.juice_console.is_none() {
                                         continue;
                                     }
                                     if ui
@@ -9633,6 +9656,66 @@ Waterfall rebuilds: {prof_wf_n:.0}/s, {prof_wf_ms:.1} ms each."
                                             connected.device.address.ip(),
                                             connected.device.mac,
                                         ));
+                                    }
+                                }
+
+                                SettingsTab::Juice => {
+                                    if let Some(console) = connected.juice_console.clone() {
+                                        ui.label(
+                                            "Live output from the Radioberry Juice process launched \
+                                             from Discover. The full history is also saved to \
+                                             radioberry-juice.log next to the juice executable.",
+                                        );
+                                        ui.horizontal(|ui| {
+                                            let running = console.is_running();
+                                            ui.label(if running { "Status: running" } else { "Status: stopped" });
+                                            if ui.add_enabled(running, egui::Button::new("Stop")).clicked() {
+                                                console.stop();
+                                            }
+                                            if ui
+                                                .button("Restart")
+                                                .on_hover_text(
+                                                    "Kills juice if it's stuck or unresponsive and \
+                                                     starts it again -- an alternative to \
+                                                     unplugging the USB cable. This will drop the \
+                                                     current radio connection; reconnect from \
+                                                     Discover once juice is back up.",
+                                                )
+                                                .clicked()
+                                            {
+                                                let _ = console.restart();
+                                            }
+                                            // Windows-only: only needed if Stop ever fails
+                                            // with a permissions error.
+                                            if cfg!(windows)
+                                                && ui
+                                                    .button("Run as Administrator")
+                                                    .on_hover_text(
+                                                        "Only needed if Stop ever fails with a \
+                                                         permissions error -- most people never hit \
+                                                         this.",
+                                                    )
+                                                    .clicked()
+                                                && crate::radioberry_juice::relaunch_elevated().is_ok()
+                                            {
+                                                std::process::exit(0);
+                                            }
+                                        });
+                                        ui.separator();
+                                        egui::ScrollArea::vertical().id_salt("juice_log").stick_to_bottom(true).show(
+                                            ui,
+                                            |ui| {
+                                                ui.add(
+                                                    egui::TextEdit::multiline(&mut console.snapshot().join("\n"))
+                                                        .desired_width(f32::INFINITY)
+                                                        .desired_rows(12)
+                                                        .font(egui::TextStyle::Monospace)
+                                                        .interactive(false),
+                                                );
+                                            },
+                                        );
+                                        // Keeps the log live-updating while this tab is open.
+                                        ui.ctx().request_repaint_after(Duration::from_millis(300));
                                     }
                                 }
 
@@ -13095,144 +13178,8 @@ Waterfall rebuilds: {prof_wf_n:.0}/s, {prof_wf_ms:.1} ms each."
                     }
                 }
 
-                if connected.show_juice_console_window {
-                    if let Some(console) = connected.juice_console.clone() {
-                        let light_visuals = with_orange_selection(egui::Visuals::dark());
-                        let light_style = egui::Style { visuals: light_visuals.clone(), ..Default::default() };
-                        let mut close_requested = false;
-                        let juice_kiosk = lcd_kiosk_mode();
-                        let mut juice_viewport = egui::ViewportBuilder::default()
-                            .with_title("Radioberry Juice Console")
-                            .with_inner_size([700.0, 420.0])
-                            // NOT AlwaysOnTop in kiosk mode -- same
-                            // "would block a native dialog opened from
-                            // another still-open kiosk window" reasoning
-                            // as the Discover/Settings windows' own fix.
-                            .with_window_level(if juice_kiosk {
-                                egui::WindowLevel::Normal
-                            } else {
-                                egui::WindowLevel::AlwaysOnTop
-                            });
-                        if juice_kiosk {
-                            // See kiosk_centered_pos's/Settings window's
-                            // with_decorations(false) doc comments.
-                            juice_viewport = juice_viewport
-                                .with_position(kiosk_centered_pos([700.0, 420.0]))
-                                .with_max_inner_size([700.0, 420.0])
-                                .with_resizable(false)
-                                .with_decorations(false);
-                        }
-                        ui.ctx().show_viewport_immediate(
-                            egui::ViewportId::from_hash_of("juice_console_window"),
-                            juice_viewport,
-                            |ui, _class| {
-                                let escape_pressed = juice_kiosk
-                                    && ui.input(|i| {
-                                        i.events.iter().any(|ev| {
-                                            matches!(
-                                                ev,
-                                                egui::Event::Key {
-                                                    key: egui::Key::Escape,
-                                                    pressed: true,
-                                                    ..
-                                                }
-                                            )
-                                        })
-                                    });
-                                if ui.input(|i| i.viewport().close_requested()) || escape_pressed {
-                                    close_requested = true;
-                                    return;
-                                }
-                                if juice_kiosk {
-                                    egui::Area::new(egui::Id::new("kiosk_close_juice"))
-                                        .anchor(egui::Align2::RIGHT_BOTTOM, egui::vec2(-6.0, -6.0))
-                                        .show(ui.ctx(), |ui| {
-                                            ui.horizontal(|ui| {
-                                                if kiosk_accent_button(ui, "\u{2715} CLOSE").clicked() {
-                                                    close_requested = true;
-                                                }
-                                            });
-                                        });
-                                }
-                                egui::CentralPanel::default()
-                                    .frame(egui::Frame::central_panel(&light_style))
-                                    .show(ui, |ui| {
-                                        ui.visuals_mut().clone_from(&light_visuals);
-                                        ui.label(
-                                            "Live output from the Radioberry Juice process launched \
-                                             from Discover. The full history is also saved to \
-                                             radioberry-juice.log next to the juice executable.",
-                                        );
-                                        ui.horizontal(|ui| {
-                                            let running = console.is_running();
-                                            ui.label(if running { "Status: running" } else { "Status: stopped" });
-                                            if ui.add_enabled(running, egui::Button::new("Stop")).clicked() {
-                                                console.stop();
-                                            }
-                                            if ui
-                                                .button("Restart")
-                                                .on_hover_text(
-                                                    "Kills juice if it's stuck or unresponsive and \
-                                                     starts it again -- an alternative to \
-                                                     unplugging the USB cable. This will drop the \
-                                                     current radio connection; reconnect from \
-                                                     Discover once juice is back up.",
-                                                )
-                                                .clicked()
-                                            {
-                                                let _ = console.restart();
-                                            }
-                                            // Windows-only: elevation is a Windows-specific
-                                            // concept, see discovery_ui.rs's matching comment.
-                                            //
-                                            // Quiet, always-available option rather than an
-                                            // alarmist banner -- the graceful shutdown path
-                                            // needs no elevation at all (a process closing
-                                            // itself never does), so most people will never
-                                            // actually need this. It only matters for the rare
-                                            // force-kill fallback, where Windows can silently
-                                            // refuse without it -- the console already says so,
-                                            // reactively, exactly if/when that happens.
-                                            if cfg!(windows)
-                                                && ui
-                                                    .button("Run as Administrator")
-                                                    .on_hover_text(
-                                                        "Only needed if Stop ever fails with a \
-                                                         permissions error -- most people never hit \
-                                                         this.",
-                                                    )
-                                                    .clicked()
-                                                && crate::radioberry_juice::relaunch_elevated().is_ok()
-                                            {
-                                                std::process::exit(0);
-                                            }
-                                        });
-                                        ui.separator();
-                                        egui::ScrollArea::vertical().stick_to_bottom(true).show(ui, |ui| {
-                                            ui.add(
-                                                egui::TextEdit::multiline(&mut console.snapshot().join("\n"))
-                                                    .desired_width(f32::INFINITY)
-                                                    .desired_rows(20)
-                                                    .font(egui::TextStyle::Monospace)
-                                                    .interactive(false),
-                                            );
-                                        });
-                                        // Keeps the view live-updating while
-                                        // this window is open, same reasoning
-                                        // as the Discover window's own inline
-                                        // preview (see discovery_ui.rs).
-                                        ui.ctx().request_repaint_after(Duration::from_millis(300));
-                                    });
-                            },
-                        );
-                        if close_requested {
-                            connected.show_juice_console_window = false;
-                        }
-                    }
-                }
-
                 // "Digital..." window -- same viewport pattern as the
-                // Juice Console window just above.
+                // Settings window.
                 if connected.show_digital_window {
                     let light_visuals = with_orange_selection(egui::Visuals::dark());
                     let light_style = egui::Style { visuals: light_visuals.clone(), ..Default::default() };
@@ -18725,6 +18672,7 @@ fn render_extra_receiver_settings(ui: &mut egui::Ui, rx: &Arc<Mutex<ExtraReceive
         // Firmware update is against the whole radio, not a per-receiver
         // concept -- redirect same as Network.
         SettingsTab::Firmware => rx.settings_tab = SettingsTab::Agc,
+        SettingsTab::Juice => rx.settings_tab = SettingsTab::Agc,
         // MIDI control targets the primary receiver/VFO A+B only (see
         // dispatch_midi_event) -- not a per-receiver concept, redirect
         // same as Firmware.
