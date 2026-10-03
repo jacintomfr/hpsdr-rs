@@ -171,6 +171,7 @@ impl AudioOutput {
         const SLEW_RAMP_SECS: f32 = 0.003;
         let max_step = 2.0 / (SLEW_RAMP_SECS * OUTPUT_SAMPLE_RATE as f32);
         let mut current: (f32, f32) = (0.0, 0.0);
+        let mut recover_left: u32 = 0;
         let underruns = Arc::new(AtomicU64::new(0));
         let cb_underruns = Arc::clone(&underruns);
 
@@ -197,9 +198,19 @@ impl AudioOutput {
                 move |data: &mut [f32], _: &cpal::OutputCallbackInfo| {
                     let mut buf = buffer.lock().unwrap();
                     for frame in data.chunks_mut(OUTPUT_CHANNELS as usize) {
+                        // The slew limit only applies around an underrun
+                        // (the instant jump to/from silence it exists
+                        // for). Applied to ordinary audio it rounded off
+                        // any voice louder than ~-20 dBFS (amplitude x
+                        // frequency above ~106): audibly crushed speech
+                        // that only went away at very low Audio gain.
+                        let mut limit = recover_left > 0;
+                        let mut underrun_now = false;
                         let (l, r) = match buf.pop_front() {
                             Some(v) => v,
                             None => {
+                                limit = true;
+                                underrun_now = true;
                                 let silence_expected =
                                     expect_silence.as_ref().is_some_and(|m| m.load(Ordering::Relaxed));
                                 if !silence_expected {
@@ -208,8 +219,14 @@ impl AudioOutput {
                                 (0.0, 0.0) // silence on underrun (or on expected silence)
                             }
                         };
-                        current.0 += (l - current.0).clamp(-max_step, max_step);
-                        current.1 += (r - current.1).clamp(-max_step, max_step);
+                        if limit {
+                            current.0 += (l - current.0).clamp(-max_step, max_step);
+                            current.1 += (r - current.1).clamp(-max_step, max_step);
+                            // Keep limiting for a few ms after an underrun only.
+                            recover_left = if underrun_now { 144 } else { recover_left - 1 };
+                        } else {
+                            current = (l, r);
+                        }
                         if let [left, right, ..] = frame {
                             *left = current.0;
                             *right = current.1;
