@@ -5572,6 +5572,10 @@ impl eframe::App for HpsdrApp {
                                 settings_changed = true;
                             }
                         }
+                        ui.add_space(20.0);
+                        if render_rit_xit(ui, connected) {
+                            settings_changed = true;
+                        }
                     });
 
                     // Right-click VFO -> keypad frequency-entry popup --
@@ -7056,130 +7060,6 @@ impl eframe::App for HpsdrApp {
                             } else if !space_down && connected.ptt_held {
                                 connected.ptt_held = false;
                                 connected.session.set_mox(false);
-                            }
-
-                            // RIT: click toggles on/off, scroll while
-                            // hovering adjusts the offset. Placed here
-                            // next to XIT (not up by VFO A/B, where it
-                            // originally lived) at the user's own
-                            // request, for the two to read as an obvious
-                            // pair -- the tradeoff is RIT now only shows
-                            // up once TX is armed too, same as XIT,
-                            // even though RIT itself has nothing to do
-                            // with TX capability.
-                            let rit_label = if connected.rit_offset_hz == 0.0 {
-                                "RIT".to_string()
-                            } else {
-                                format!("RIT {:+.0}", connected.rit_offset_hz)
-                            };
-                            let rit_resp = ui
-                                .add(egui::Button::selectable(connected.rit_enabled, rit_label))
-                                .on_hover_text(
-                                    "Receiver Incremental Tuning -- nudges what you hear \
-                                     without moving VFO A's displayed/logged frequency. \
-                                     Scroll to adjust -- Shift: 10 Hz, none: 100 Hz.",
-                                );
-                            if rit_resp.clicked() {
-                                connected.rit_enabled = !connected.rit_enabled;
-                                connected
-                                    .session
-                                    .rit_enabled
-                                    .store(connected.rit_enabled, std::sync::atomic::Ordering::Relaxed);
-                                settings_changed = true;
-                            }
-                            if rit_resp.hovered() {
-                                let scroll_delta = ui.input(|i| i.smooth_scroll_delta);
-                                let delta = if scroll_delta.y.abs() >= scroll_delta.x.abs() {
-                                    scroll_delta.y
-                                } else {
-                                    scroll_delta.x
-                                };
-                                if delta != 0.0 {
-                                    connected.rit_scroll_accum += delta;
-                                    const NOTCH: f32 = 100.0;
-                                    let shift = ui.input(|i| i.modifiers.shift);
-                                    let step: i64 = if shift { 10 } else { 100 };
-                                    let mut new_offset = connected.rit_offset_hz as i64;
-                                    while connected.rit_scroll_accum.abs() >= NOTCH {
-                                        let sign = connected.rit_scroll_accum.signum();
-                                        connected.rit_scroll_accum -= sign * NOTCH;
-                                        new_offset += step * sign as i64;
-                                    }
-                                    new_offset = new_offset.clamp(-9_999, 9_999);
-                                    if new_offset as f64 != connected.rit_offset_hz {
-                                        connected.rit_offset_hz = new_offset as f64;
-                                        connected
-                                            .session
-                                            .rit_offset_hz
-                                            .store(new_offset as i32, std::sync::atomic::Ordering::Relaxed);
-                                        settings_changed = true;
-                                    }
-                                }
-                            }
-                            if ui.button("Clear").on_hover_text("Zero the RIT offset").clicked() {
-                                connected.rit_offset_hz = 0.0;
-                                connected.session.rit_offset_hz.store(0, std::sync::atomic::Ordering::Relaxed);
-                                settings_changed = true;
-                            }
-
-                            // XIT: same click-to-toggle/hover-to-scroll
-                            // convention as RIT just above. See
-                            // ConnectedState::xit_enabled's doc comment
-                            // for how this nudges the real TX frequency.
-                            let xit_label = if connected.xit_offset_hz == 0.0 {
-                                "XIT".to_string()
-                            } else {
-                                format!("XIT {:+.0}", connected.xit_offset_hz)
-                            };
-                            let xit_resp = ui
-                                .add(egui::Button::selectable(connected.xit_enabled, xit_label))
-                                .on_hover_text(
-                                    "Transmitter Incremental Tuning -- nudges your actual TX \
-                                     frequency without moving VFO A's (or VFO B's, if Split is \
-                                     on) displayed frequency. Scroll to adjust -- Shift: 10 Hz, \
-                                     none: 100 Hz.",
-                                );
-                            if xit_resp.clicked() {
-                                connected.xit_enabled = !connected.xit_enabled;
-                                connected
-                                    .session
-                                    .xit_enabled
-                                    .store(connected.xit_enabled, std::sync::atomic::Ordering::Relaxed);
-                                settings_changed = true;
-                            }
-                            if xit_resp.hovered() {
-                                let scroll_delta = ui.input(|i| i.smooth_scroll_delta);
-                                let delta = if scroll_delta.y.abs() >= scroll_delta.x.abs() {
-                                    scroll_delta.y
-                                } else {
-                                    scroll_delta.x
-                                };
-                                if delta != 0.0 {
-                                    connected.xit_scroll_accum += delta;
-                                    const NOTCH: f32 = 100.0;
-                                    let shift = ui.input(|i| i.modifiers.shift);
-                                    let step: i64 = if shift { 10 } else { 100 };
-                                    let mut new_offset = connected.xit_offset_hz as i64;
-                                    while connected.xit_scroll_accum.abs() >= NOTCH {
-                                        let sign = connected.xit_scroll_accum.signum();
-                                        connected.xit_scroll_accum -= sign * NOTCH;
-                                        new_offset += step * sign as i64;
-                                    }
-                                    new_offset = new_offset.clamp(-9_999, 9_999);
-                                    if new_offset as f64 != connected.xit_offset_hz {
-                                        connected.xit_offset_hz = new_offset as f64;
-                                        connected
-                                            .session
-                                            .xit_offset_hz
-                                            .store(new_offset as i32, std::sync::atomic::Ordering::Relaxed);
-                                        settings_changed = true;
-                                    }
-                                }
-                            }
-                            if ui.button("Clear").on_hover_text("Zero the XIT offset").clicked() {
-                                connected.xit_offset_hz = 0.0;
-                                connected.session.xit_offset_hz.store(0, std::sync::atomic::Ordering::Relaxed);
-                                settings_changed = true;
                             }
 
                             // Record -- moved here next to Clear from its
@@ -15950,14 +15830,14 @@ fn chip_button(label: &str, active: bool) -> egui::Button<'static> {
 fn switch_button(label: &str, on: bool) -> egui::Button<'static> {
     let orange = egui::Color32::from_rgb(232, 150, 46);
     if on {
-        egui::Button::new(egui::RichText::new(label.to_string()).color(orange))
-            .fill(egui::Color32::from_gray(28))
-            .stroke(egui::Stroke::new(1.5, orange))
-            .corner_radius(5.0)
-    } else {
         egui::Button::new(egui::RichText::new(label.to_string()).color(egui::Color32::from_gray(15)))
             .fill(orange)
             .stroke(egui::Stroke::new(1.0, orange))
+            .corner_radius(5.0)
+    } else {
+        egui::Button::new(egui::RichText::new(label.to_string()).color(orange))
+            .fill(egui::Color32::from_gray(28))
+            .stroke(egui::Stroke::new(1.5, orange))
             .corner_radius(5.0)
     }
 }
@@ -15976,6 +15856,130 @@ fn draw_warning_chip(ui: &egui::Ui, center: egui::Pos2, text: &str, font: egui::
         egui::StrokeKind::Inside,
     );
     ui.painter().galley(rect.center() - galley.size() / 2.0, galley, egui::Color32::WHITE);
+}
+
+/// Result of watching a button for a short click vs. a long press.
+#[derive(PartialEq)]
+enum PressGesture {
+    None,
+    Short,
+    Long,
+}
+
+/// Short click -> `Short` (on release); holding the button down for
+/// `LONG_PRESS_SECS` -> `Long` once (and the release afterwards is ignored).
+fn press_gesture(ui: &egui::Ui, resp: &egui::Response, key: &str) -> PressGesture {
+    const LONG_PRESS_SECS: f64 = 0.6;
+    let id = egui::Id::new(key);
+    let now = ui.input(|i| i.time);
+    let (start, fired): (f64, bool) = ui.data(|d| d.get_temp(id)).unwrap_or((-1.0, false));
+    if resp.is_pointer_button_down_on() {
+        ui.ctx().request_repaint_after(std::time::Duration::from_millis(50));
+        if start < 0.0 {
+            ui.data_mut(|d| d.insert_temp(id, (now, false)));
+            return PressGesture::None;
+        }
+        if !fired && now - start >= LONG_PRESS_SECS {
+            ui.data_mut(|d| d.insert_temp(id, (start, true)));
+            return PressGesture::Long;
+        }
+        PressGesture::None
+    } else {
+        if start >= 0.0 {
+            ui.data_mut(|d| d.insert_temp(id, (-1.0f64, false)));
+        }
+        if resp.clicked() && !fired {
+            PressGesture::Short
+        } else {
+            PressGesture::None
+        }
+    }
+}
+
+/// One RIT/XIT chip: fixed width (room for "-9999"), click toggles on/off,
+/// long press clears the offset, scrolling over it adjusts the offset
+/// (Shift: 10 Hz, none: 100 Hz). Returns whether anything changed.
+#[allow(clippy::too_many_arguments)]
+fn rit_xit_chip(
+    ui: &mut egui::Ui,
+    name: &str,
+    enabled: &mut bool,
+    offset_hz: &mut f64,
+    scroll_accum: &mut f32,
+    session_enabled: &std::sync::atomic::AtomicBool,
+    session_offset: &std::sync::atomic::AtomicI32,
+    hover: &str,
+) -> bool {
+    use std::sync::atomic::Ordering;
+    let mut changed = false;
+    let label = if *offset_hz == 0.0 { name.to_string() } else { format!("{name} {:+.0}", *offset_hz) };
+    let w = chip_width(ui, &[&format!("{name} -9999")]);
+    let resp = ui
+        .add(chip_button(&label, *enabled).min_size(egui::vec2(w, 0.0)))
+        .on_hover_text(format!("{hover}\nClick: on/off -- hold: clear the offset -- scroll: adjust (Shift: 10 Hz, none: 100 Hz)."));
+    match press_gesture(ui, &resp, &format!("hold_{name}")) {
+        PressGesture::Short => {
+            *enabled = !*enabled;
+            session_enabled.store(*enabled, Ordering::Relaxed);
+            changed = true;
+        }
+        PressGesture::Long => {
+            *offset_hz = 0.0;
+            session_offset.store(0, Ordering::Relaxed);
+            changed = true;
+        }
+        PressGesture::None => {}
+    }
+    if resp.hovered() {
+        let scroll_delta = ui.input(|i| i.smooth_scroll_delta);
+        let delta = if scroll_delta.y.abs() >= scroll_delta.x.abs() { scroll_delta.y } else { scroll_delta.x };
+        if delta != 0.0 {
+            *scroll_accum += delta;
+            const NOTCH: f32 = 100.0;
+            let shift = ui.input(|i| i.modifiers.shift);
+            let step: i64 = if shift { 10 } else { 100 };
+            let mut new_offset = *offset_hz as i64;
+            while scroll_accum.abs() >= NOTCH {
+                let sign = scroll_accum.signum();
+                *scroll_accum -= sign * NOTCH;
+                new_offset += step * sign as i64;
+            }
+            new_offset = new_offset.clamp(-9_999, 9_999);
+            if new_offset as f64 != *offset_hz {
+                *offset_hz = new_offset as f64;
+                session_offset.store(new_offset as i32, Ordering::Relaxed);
+                changed = true;
+            }
+        }
+    }
+    changed
+}
+
+/// RIT and XIT chips for the band row (XIT only with TX armed).
+fn render_rit_xit(ui: &mut egui::Ui, connected: &mut ConnectedState) -> bool {
+    let mut changed = rit_xit_chip(
+        ui,
+        "RIT",
+        &mut connected.rit_enabled,
+        &mut connected.rit_offset_hz,
+        &mut connected.rit_scroll_accum,
+        &connected.session.rit_enabled,
+        &connected.session.rit_offset_hz,
+        "Receiver Incremental Tuning -- nudges what you hear without moving VFO A's displayed/logged frequency.",
+    );
+    if connected.tx_enabled {
+        changed |= rit_xit_chip(
+            ui,
+            "XIT",
+            &mut connected.xit_enabled,
+            &mut connected.xit_offset_hz,
+            &mut connected.xit_scroll_accum,
+            &connected.session.xit_enabled,
+            &connected.session.xit_offset_hz,
+            "Transmitter Incremental Tuning -- nudges your actual TX frequency without moving VFO A's (or VFO B's, if Split is on) displayed frequency.",
+        );
+    }
+    changed
 }
 
 /// Brief orange flash for action buttons (A>B, B>A, A<>B): they have no
