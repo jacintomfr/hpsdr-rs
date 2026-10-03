@@ -5380,8 +5380,13 @@ impl eframe::App for HpsdrApp {
                                 let disp = connected.tx_handle.as_ref().map(|tx| *tx.display.lock().unwrap());
                                 ui.add_space(12.0);
                                 ui.vertical(|ui| {
-                                    ui.set_min_width(78.0);
-                                    let pk = format!("{} {:.1}", if clipping { "CLIP" } else { "PK" }, pk_db);
+                                    // Fixed width = the widest possible text, so the column never
+                                    // resizes (and nothing shifts) as the digits change.
+                                    let font = egui::TextStyle::Body.resolve(ui.style());
+                                    let w = ui.painter().layout_no_wrap("CLIP -99.9".to_string(), font, egui::Color32::WHITE).size().x;
+                                    ui.set_min_width(w);
+                                    ui.set_max_width(w);
+                                    let pk = format!("{} {:.1}", if clipping { "CLIP" } else { "PK" }, pk_db.clamp(-99.9, 99.9));
                                     if clipping {
                                         ui.colored_label(egui::Color32::from_rgb(230, 50, 50), pk);
                                     } else if !mox {
@@ -5392,11 +5397,11 @@ impl eframe::App for HpsdrApp {
                                     if connected.tx_enabled {
                                         let (mic, alc) = disp.map(|d| (d.mic_pk, d.alc_av)).unwrap_or((-99.0, -99.0));
                                         if mox {
-                                            ui.colored_label(orange, format!("MIC {:.1}", mic));
-                                            ui.colored_label(orange, format!("ALC {:.1}", alc));
+                                            ui.colored_label(orange, format!("MIC {:.1}", mic.clamp(-99.9, 99.9)));
+                                            ui.colored_label(orange, format!("ALC {:.1}", alc.clamp(-99.9, 99.9)));
                                         } else {
-                                            ui.weak(format!("MIC {:.1}", mic));
-                                            ui.weak(format!("ALC {:.1}", alc));
+                                            ui.weak(format!("MIC {:.1}", mic.clamp(-99.9, 99.9)));
+                                            ui.weak(format!("ALC {:.1}", alc.clamp(-99.9, 99.9)));
                                         }
                                     }
                                 });
