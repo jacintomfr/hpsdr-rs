@@ -5776,6 +5776,10 @@ impl eframe::App for HpsdrApp {
                         // the mode-buttons row now. Record stays out of
                         // this call -- it lives on the RIT/XIT row
                         // instead, alongside Clear (see that call site).
+                        ui.add_space(8.0);
+                        if render_snb_anf_bin_chips(ui, connected) {
+                            settings_changed = true;
+                        }
                         ui.add_space(16.0);
                         render_status_row(ui, connected, rigctl_status, tci_status, cat_status);
                     });
@@ -5953,6 +5957,12 @@ impl eframe::App for HpsdrApp {
                                     // comment above describes) instead of
                                     // sitting beside the slider the way a
                                     // bundled single ui.horizontal cell does.
+                                    // NB chip (same width as the NR chip on the row
+                                    // below, so the two line up vertically).
+                                    ui.add_space(6.0);
+                                    if render_nb_chip(ui, connected) {
+                                        settings_changed = true;
+                                    }
                                     ui.add_space(6.0);
                                     let rr = connected.spectrum.report_recorder.clone();
                                     let recording = rr.is_recording();
@@ -6250,6 +6260,10 @@ impl eframe::App for HpsdrApp {
                             // report you could never transmit.
                             if connected.tx_enabled && connected.tx_handle.is_some() {
                                 ui.add_space(6.0);
+                                if render_nr_chip(ui, connected) {
+                                    settings_changed = true;
+                                }
+                                ui.add_space(6.0);
                                 let rr = connected.spectrum.report_recorder.clone();
                                 let recording = rr.is_recording();
                                 let playing = rr.is_playing();
@@ -6413,9 +6427,12 @@ impl eframe::App for HpsdrApp {
                             // manual gaps mixed with the automatic
                             // spacing egui already applies between every
                             // OTHER pair of widgets looked uneven).
-                            if connected.tx_enabled {
-                                let mut changed = render_nb_nr(ui, connected);
-                                changed |= render_snb_anf_bin(ui, connected);
+                            // NB/NR now sit beside REC/PLAY and SNB/ANF/BIN after
+                            // DRM; only when there is no TX chain (so no REC/PLAY
+                            // cells) do NB/NR stay here.
+                            if connected.tx_enabled && connected.tx_handle.is_none() {
+                                let mut changed = render_nb_chip(ui, connected);
+                                changed |= render_nr_chip(ui, connected);
                                 if changed {
                                     settings_changed = true;
                                 }
@@ -6461,9 +6478,8 @@ impl eframe::App for HpsdrApp {
                     if lcd_kiosk_mode() && !connected.tx_enabled {
                         ui.add_space(4.0);
                         ui.horizontal_wrapped(|ui| {
-                            let mut changed = render_nb_nr(ui, connected);
-                            ui.add_space(8.0);
-                            changed |= render_snb_anf_bin(ui, connected);
+                            let mut changed = render_nb_chip(ui, connected);
+                            changed |= render_nr_chip(ui, connected);
                             if changed {
                                 settings_changed = true;
                             }
@@ -8593,7 +8609,7 @@ impl eframe::App for HpsdrApp {
                 egui::Area::new(egui::Id::new("s_meter_area"))
                     // -40 (was -10) -- a real report: the panel sat flush
                     // against the window's right edge, moved ~30px left.
-                    .anchor(egui::Align2::RIGHT_TOP, egui::vec2(-40.0, 10.0))
+                    .anchor(egui::Align2::RIGHT_TOP, egui::vec2(-20.0, 10.0))
                     // The meter area is drawn scaled up in kiosk mode (see below); its
                     // enlarged, invisible hit-rect sat on top of the REC/PLAY buttons and
                     // swallowed the mouse. It has nothing clickable, so make it inert.
@@ -15849,6 +15865,92 @@ fn render_step_combo(ui: &mut egui::Ui, connected: &mut ConnectedState) -> bool 
                 }
             }
         });
+    changed
+}
+
+/// Rounded toggle "chip" (SNB/ANF/BIN/NB/NR): thin outline and dark fill when
+/// inactive, orange fill when active -- same look as the value boxes and the
+/// AGC button. `min_width` lets a set of chips share one width.
+fn toggle_chip(ui: &mut egui::Ui, label: &str, active: bool, min_width: f32, hover: &str) -> egui::Response {
+    let orange = egui::Color32::from_rgb(232, 150, 46);
+    let grey = egui::Color32::from_gray(48);
+    let (fill, text, stroke) = if active {
+        (orange, egui::Color32::from_gray(15), egui::Stroke::new(1.0, orange))
+    } else {
+        (grey, egui::Color32::from_gray(205), egui::Stroke::new(1.0, egui::Color32::from_gray(95)))
+    };
+    ui.add(
+        egui::Button::new(egui::RichText::new(label).color(text))
+            .fill(fill)
+            .stroke(stroke)
+            .corner_radius(5.0)
+            .min_size(egui::vec2(min_width, 0.0)),
+    )
+    .on_hover_text(hover)
+}
+
+/// Width shared by the NB and NR chips: the widest label either can show.
+fn nb_nr_chip_width(ui: &egui::Ui) -> f32 {
+    let font = egui::TextStyle::Button.resolve(ui.style());
+    let widest = ["NB: Off", "NB: NB", "NB: NB2", "NR: Off", "NR: NR", "NR: NR2", "NR: NNR"]
+        .iter()
+        .map(|s| ui.painter().layout_no_wrap(s.to_string(), font.clone(), egui::Color32::WHITE).size().x)
+        .fold(0.0f32, f32::max);
+    widest + 2.0 * ui.spacing().button_padding.x
+}
+
+/// NB chip (cycles Off -> NB -> NB2). Returns whether it changed.
+fn render_nb_chip(ui: &mut egui::Ui, connected: &mut ConnectedState) -> bool {
+    let nb = connected.spectrum.noise_blanker();
+    let w = nb_nr_chip_width(ui);
+    if toggle_chip(ui, nb.label(), nb != spectrum::NoiseBlanker::Off, w, "Click to cycle: Off -> NB -> NB2 -> Off")
+        .clicked()
+    {
+        connected.spectrum.set_noise_blanker(nb.next());
+        return true;
+    }
+    false
+}
+
+/// NR chip (cycles Off -> NR -> NR2 -> NNR). Returns whether it changed.
+fn render_nr_chip(ui: &mut egui::Ui, connected: &mut ConnectedState) -> bool {
+    let nr = connected.spectrum.noise_reduction();
+    let w = nb_nr_chip_width(ui);
+    if toggle_chip(ui, nr.label(), nr != spectrum::NoiseReduction::Off, w, "Click to cycle: Off -> NR -> NR2 -> NNR -> Off")
+        .clicked()
+    {
+        connected.spectrum.set_noise_reduction(nr.next());
+        return true;
+    }
+    false
+}
+
+/// SNB/ANF/BIN as chips (mode row, after DRM). Returns whether anything changed.
+fn render_snb_anf_bin_chips(ui: &mut egui::Ui, connected: &mut ConnectedState) -> bool {
+    let mut changed = false;
+    let snb = connected.spectrum.snb();
+    if toggle_chip(ui, "SNB", snb, 0.0, "Spectral Noise Blanker -- independent of NB/NR, can run alongside them").clicked() {
+        connected.spectrum.set_snb(!snb);
+        changed = true;
+    }
+    let anf = connected.spectrum.anf();
+    if toggle_chip(ui, "ANF", anf, 0.0, "Automatic Notch Filter -- removes a steady heterodyne/carrier").clicked() {
+        connected.spectrum.set_anf(!anf);
+        changed = true;
+    }
+    let binaural = connected.spectrum.binaural();
+    if toggle_chip(
+        ui,
+        "BIN",
+        binaural,
+        0.0,
+        "Binaural (phasing) RX audio -- genuinely different L/R for stereo listening, needs headphones/stereo speakers to hear the effect",
+    )
+    .clicked()
+    {
+        connected.spectrum.set_binaural(!binaural);
+        changed = true;
+    }
     changed
 }
 
