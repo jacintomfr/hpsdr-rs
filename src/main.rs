@@ -5572,7 +5572,20 @@ impl eframe::App for HpsdrApp {
                                 settings_changed = true;
                             }
                         }
-                        ui.add_space(20.0);
+                        // Centre RIT/XIT between the last band button (Gen/XVTR) and the
+                        // meter at the right edge.
+                        {
+                            let one = chip_width(ui, &["RIT -9999"]);
+                            let n_chips = if connected.tx_enabled { 2.0 } else { 1.0 };
+                            let group_w = one * n_chips + (n_chips - 1.0) * ui.spacing().item_spacing.x;
+                            let meter_left = if lcd_kiosk_mode() {
+                                ui.ctx().content_rect().right() - 20.0 - 180.0 * 1.7
+                            } else {
+                                ui.ctx().content_rect().right() - 40.0 - 180.0
+                            };
+                            let free = (meter_left - ui.cursor().left() - group_w).max(16.0);
+                            ui.add_space((free / 2.0).clamp(16.0, 200.0));
+                        }
                         if render_rit_xit(ui, connected) {
                             settings_changed = true;
                         }
