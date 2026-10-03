@@ -202,6 +202,7 @@ impl RadeWorker {
             text_tx,
             transmitting: false,
             was_sync: false,
+            sync_lost_flag: false,
             level: 0.0,
             gate_open: false,
             gate_frames: 0,
@@ -412,6 +413,9 @@ struct Inner {
 
     transmitting: bool,
     was_sync: bool,
+    /// Set when sync drops; consumed in the rx loop to log whether the over ended
+    /// with an End-of-Over frame (see the "over ended" log line).
+    sync_lost_flag: bool,
     level: f32,
     /// RX speech gate state -- see SQUELCH_* above.
     gate_open: bool,
@@ -534,6 +538,13 @@ impl Inner {
             // Before the End-of-Over handling, so a frame that arrived while
             // still in sync refreshes the SNR the report will carry.
             self.publish_rx_state();
+            if self.sync_lost_flag {
+                self.sync_lost_flag = false;
+                eprintln!(
+                    "[rade] over ended: sync lost (last snr_db={:.1}), End-of-Over frame flagged in the same step: {}",
+                    self.last_sync_snr, out.has_eoo
+                );
+            }
             if out.has_eoo {
                 // The over has ended: nothing after this is speech.
                 self.gate_open = false;
@@ -693,6 +704,7 @@ impl Inner {
     fn publish_rx_state(&mut self) {
         let sync = self.rade.sync();
         if self.was_sync && !sync {
+            self.sync_lost_flag = true;
             // Losing sync ends the over: start the vocoder's warm-up again so
             // the next one doesn't continue from stale state.
             self.dec.reset();
