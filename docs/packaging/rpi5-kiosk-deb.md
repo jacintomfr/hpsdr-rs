@@ -18,7 +18,7 @@ no access to the private `rade_c` submodule.
 | Architecture | `arm64` |
 | Binary | `/usr/bin/hpsdr-rs` (one binary; kiosk mode is `HPSDR_LCD_1024X600=1`) |
 | RADE | statically linked into the binary, model weights built in, **no extra files** |
-| Launcher | `/usr/bin/hpsdr-rs-kiosk` (sets `HPSDR_LCD_1024X600=1`; pins the app to the CPU cores reserved with `isolcpus=` when the kernel has any, otherwise starts normally) and the menu entry `/usr/share/applications/hpsdr-rs-kiosk.desktop` |
+| Launcher | `/usr/bin/hpsdr-rs-kiosk` (just sets `HPSDR_LCD_1024X600=1` and starts the app) and the menu entry `/usr/share/applications/hpsdr-rs-kiosk.desktop` |
 | Desktop shortcut | copied to `~/Desktop` of every user that has one (postinst); `/etc/skel/Desktop` covers future users; removed on uninstall |
 | Docs / firmware | manual, Ozy and RX-888 firmware, udev rule examples under `/usr/share/...` (same as the normal package) |
 
@@ -136,16 +136,36 @@ with a signal still need a check on the device.
 * Release policy for this repository: only the no-AVX2 Windows `.exe` is
   published on GitHub Releases; this `.deb` is built locally and not uploaded.
 
-## CPU cores on the Pi (`isolcpus`)
+## CPU cores on the Pi: do not use `isolcpus` for this app
 
-If the Pi's kernel command line has `isolcpus=2,3` (cores reserved for
-real-time SDR work), the scheduler never puts a normal program on those cores:
-`nproc` reports 2 and the app shares cores 0-1 with the desktop and VNC server.
-Measured on a Pi 5 with RADE running: cores 0 and 1 at ~87% each, cores 2 and 3
-idle. Pinning the app to the isolated cores (what `hpsdr-rs-kiosk` does,
-equivalent to `taskset -c 2,3 hpsdr-rs`) moved the desktop to 37-42% on cores
-0-1 and left the app on cores 2-3. The app's main thread (UI, spectrum, DSP)
-still uses close to one full core by itself.
+A Pi set up for real-time SDR work often has `isolcpus=2,3` on its kernel
+command line (`/boot/firmware/cmdline.txt`). The scheduler never puts a normal
+program on isolated cores, so `nproc` reports 2 and the app shares cores 0-1
+with the desktop and the VNC server. Measured on a Pi 5 with RADE running:
+cores 0 and 1 at ~87% each, cores 2 and 3 idle.
+
+**Pinning the app to the isolated cores does not fix it.** Running it with
+`taskset -c 2,3 hpsdr-rs` moved the desktop's load away, but the kernel does
+**not** load-balance between isolated cores: every thread of the app (UI,
+spectrum/DSP, RADE, WDSP and the `cpal_alsa_in`/`cpal_alsa_out` audio threads,
+checked with `ps -L -o tid,psr,pcpu,comm`) stayed on the one core it started
+on, which sat at 100%. The result was audible clicks and dropouts in SSB, even
+though the app's own "Audio glitches" counter and PipeWire's xrun counters
+(`pw-top`) both stayed at zero, because the starved threads were upstream of
+those checks. Moving the heaviest thread to the other isolated core by hand
+(`taskset -cp 2 <tid>`) brought the worst core from 100% to 70%.
+
+The fix is to remove the isolation and let the scheduler use all four cores:
+
+```bash
+sudo cp /boot/firmware/cmdline.txt /boot/firmware/cmdline.txt.bak
+sudo sed -i 's/ isolcpus=2,3//' /boot/firmware/cmdline.txt
+sudo reboot
+```
+
+(`nohz_full=` and `rcu_nocbs=` can stay; they are harmless without
+`isolcpus`.) The `hpsdr-rs-kiosk` launcher therefore does no CPU pinning. If
+you need the isolated cores for something else, pin *that* program instead.
 
 ## Line endings
 
