@@ -16857,70 +16857,86 @@ fn render_equalizer_panel(ui: &mut egui::Ui, scroll_accum: &mut f32, side_label:
     });
     ui.add_space(6.0);
     // All the adjustments inside one thin-outlined rectangle, bands side by side with
-    // vertical sliders (like the RADE EQ and freedv-gui).
-    egui::Frame::new()
-        .stroke(egui::Stroke::new(1.0, egui::Color32::from_gray(95)))
-        .corner_radius(5.0)
-        .inner_margin(egui::Margin::symmetric(8, 6))
-        .show(ui, |ui| {
-            ui.spacing_mut().item_spacing.x = 4.0;
-            // Fit analysis: the columns must fit the width available in this panel. Try
-            // smaller and smaller text until they do; if even the smallest does not fit,
-            // the horizontal scroll area below is the fallback.
-            let twelve = eq.band_count == spectrum::EqBandCount::Twelve;
-            let n_cols = if twelve { 12.0 } else { 3.0 };
-            let avail = ui.available_width();
-            let body_h = ui.text_style_height(&egui::TextStyle::Body);
-            let mut small = egui::FontId::proportional(body_h);
-            let mut col_w = 44.0;
-            for scale in [0.9f32, 0.8, 0.7, 0.6, 0.5] {
-                let font = egui::FontId::proportional((body_h * scale).max(9.0));
-                let w = |s: &str| ui.painter().layout_no_wrap(s.to_string(), font.clone(), egui::Color32::WHITE).size().x;
-                let cw = (w("16000") + 10.0 + 6.0).max(40.0);
-                small = font;
-                col_w = cw;
-                if n_cols * (cw + ui.spacing().item_spacing.x) <= avail {
-                    break;
-                }
-            }
-            ui.style_mut().override_font_id = Some(small);
-            // Spread the spare width between the columns (4..16 px) so the bands read as
-            // separate: gap = what is left over after the columns, shared out.
-            let spare = (avail - n_cols * col_w) / n_cols;
-            ui.spacing_mut().item_spacing.x = spare.clamp(4.0, 16.0);
-            let (lo, hi) = if twelve { (-20, 20) } else { (-12, 15) };
-            egui::ScrollArea::horizontal().auto_shrink([false, true]).show(ui, |ui| {
-            ui.horizontal_top(|ui| {
-                match eq.band_count {
-                    spectrum::EqBandCount::Twelve => {
-                        for i in 0..12 {
-                            // Keep the frequencies ascending, 10 Hz apart (as deskHPSDR).
-                            let min_f = if i == 0 { 10 } else { eq.freqs_12_hz[i - 1] + 10 };
-                            let max_f = if i == 11 { 16_000 } else { eq.freqs_12_hz[i + 1] - 10 };
-                            let mut freq = eq.freqs_12_hz[i];
-                            let caption = format!("{}", i + 1);
-                            changed |= eq_band_column(
-                                ui,
-                                scroll_accum,
-                                &caption,
-                                Some((&mut freq, min_f, max_f)),
-                                &mut eq.bands_12_db[i],
-                                (lo, hi),
-                                col_w,
-                            );
-                            eq.freqs_12_hz[i] = freq;
-                        }
-                    }
-                    _ => {
-                        const LABELS: [&str; 3] = ["Low", "Mid", "High"];
-                        for (label, gain) in LABELS.iter().zip(eq.bands_3_db.iter_mut()) {
-                            changed |= eq_band_column(ui, scroll_accum, label, None, gain, (lo, hi), col_w);
-                        }
+    // vertical sliders (like the RADE EQ and freedv-gui). The 12-band panel spans the
+    // full width (spare width shared out as a gap between columns); the 3-band panel is
+    // centred and the outline hugs just its three columns.
+    let twelve = eq.band_count == spectrum::EqBandCount::Twelve;
+    let mut panel = |ui: &mut egui::Ui| {
+        egui::Frame::new()
+            .stroke(egui::Stroke::new(1.0, egui::Color32::from_gray(95)))
+            .corner_radius(5.0)
+            .inner_margin(egui::Margin::symmetric(8, 6))
+            .show(ui, |ui| {
+                ui.spacing_mut().item_spacing.x = 4.0;
+                // Fit analysis: the columns must fit the width available in this panel. Try
+                // smaller and smaller text until they do; if even the smallest does not fit,
+                // the horizontal scroll area is the fallback (12-band only).
+                let n_cols = if twelve { 12.0 } else { 3.0 };
+                let avail = ui.available_width();
+                let body_h = ui.text_style_height(&egui::TextStyle::Body);
+                let mut small = egui::FontId::proportional(body_h);
+                let mut col_w = 44.0;
+                let scales: &[f32] = if twelve { &[0.9, 0.8, 0.7, 0.6, 0.5] } else { &[1.0] };
+                for &scale in scales {
+                    let font = egui::FontId::proportional((body_h * scale).max(9.0));
+                    let w = |s: &str| ui.painter().layout_no_wrap(s.to_string(), font.clone(), egui::Color32::WHITE).size().x;
+                    let cw = (w("16000") + 10.0 + 6.0).max(40.0);
+                    small = font;
+                    col_w = cw;
+                    if n_cols * (cw + ui.spacing().item_spacing.x) <= avail {
+                        break;
                     }
                 }
+                ui.style_mut().override_font_id = Some(small);
+                // 12 bands: share the spare width out as a gap (4..16 px) so the bands read as
+                // separate. 3 bands: a fixed, roomier gap.
+                ui.spacing_mut().item_spacing.x = if twelve {
+                    ((avail - n_cols * col_w) / n_cols).clamp(4.0, 16.0)
+                } else {
+                    24.0
+                };
+                let (lo, hi) = if twelve { (-20, 20) } else { (-12, 15) };
+                let mut columns = |ui: &mut egui::Ui| {
+                    ui.horizontal_top(|ui| match eq.band_count {
+                        spectrum::EqBandCount::Twelve => {
+                            for i in 0..12 {
+                                // Keep the frequencies ascending, 10 Hz apart (as deskHPSDR).
+                                let min_f = if i == 0 { 10 } else { eq.freqs_12_hz[i - 1] + 10 };
+                                let max_f = if i == 11 { 16_000 } else { eq.freqs_12_hz[i + 1] - 10 };
+                                let mut freq = eq.freqs_12_hz[i];
+                                let caption = format!("{}", i + 1);
+                                changed |= eq_band_column(
+                                    ui,
+                                    scroll_accum,
+                                    &caption,
+                                    Some((&mut freq, min_f, max_f)),
+                                    &mut eq.bands_12_db[i],
+                                    (lo, hi),
+                                    col_w,
+                                );
+                                eq.freqs_12_hz[i] = freq;
+                            }
+                        }
+                        _ => {
+                            const LABELS: [&str; 3] = ["Low", "Mid", "High"];
+                            for (label, gain) in LABELS.iter().zip(eq.bands_3_db.iter_mut()) {
+                                changed |= eq_band_column(ui, scroll_accum, label, None, gain, (lo, hi), col_w);
+                            }
+                        }
+                    });
+                };
+                if twelve {
+                    egui::ScrollArea::horizontal().auto_shrink([false, true]).show(ui, |ui| columns(ui));
+                } else {
+                    columns(ui);
+                }
             });
-            });
-        });
+    };
+    if twelve {
+        panel(ui);
+    } else {
+        ui.vertical_centered(|ui| panel(ui));
+    }
     changed
 }
 
