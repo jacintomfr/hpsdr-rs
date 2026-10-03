@@ -5621,7 +5621,7 @@ impl eframe::App for HpsdrApp {
                         let mut close_now = false;
                         // Compact window like piHPSDR's VFO menu (keypad + the two step
                         // pickers). Bigger in kiosk mode (scaled fonts).
-                        let win_size = if lcd_kiosk_mode() { [500.0, 430.0] } else { [380.0, 340.0] };
+                        let win_size = if lcd_kiosk_mode() { [400.0, 430.0] } else { [310.0, 340.0] };
                         let mut freq_entry_viewport = egui::ViewportBuilder::default()
                             .with_title("VFO")
                             .with_inner_size(win_size)
@@ -5773,23 +5773,20 @@ impl eframe::App for HpsdrApp {
                                         // Right column: RIT step and VFO step (as piHPSDR).
                                         ui.vertical(|ui| {
                                             ui.label("RIT step");
-                                            ui.horizontal(|ui| {
-                                                for step in [1, 10, 100] {
-                                                    if toggle_chip(
-                                                        ui,
-                                                        &step.to_string(),
-                                                        connected.rit_step_hz == step,
-                                                        0.0,
-                                                        "Hz per scroll notch over RIT/XIT",
-                                                    )
-                                                    .clicked()
-                                                    {
-                                                        connected.rit_step_hz = step;
-                                                        settings_changed = true;
+                                            egui::ComboBox::from_id_salt("rit_step_hz")
+                                                .width(60.0)
+                                                .selected_text(format!("{} Hz", connected.rit_step_hz))
+                                                .show_ui(ui, |ui| {
+                                                    for step in [1, 10, 100] {
+                                                        if ui
+                                                            .selectable_label(connected.rit_step_hz == step, format!("{step} Hz"))
+                                                            .clicked()
+                                                        {
+                                                            connected.rit_step_hz = step;
+                                                            settings_changed = true;
+                                                        }
                                                     }
-                                                }
-                                                ui.label("Hz");
-                                            });
+                                                });
                                             ui.add_space(h);
                                             ui.label("VFO step");
                                             if render_step_combo_only(ui, connected) {
