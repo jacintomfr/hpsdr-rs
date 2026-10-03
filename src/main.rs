@@ -5010,9 +5010,11 @@ impl eframe::App for HpsdrApp {
                                 .inner;
 
                             ui.vertical(|ui| {
+                            let cw1 = chip_width(ui, &["A>B", "A<>B", "CTUN"]);
+                            let cw2 = chip_width(ui, &["B>A", "Split"]);
                                 ui.horizontal(|ui| {
                                     if ui
-                                        .button("A>B")
+                                        .add(chip_button("A>B", false).min_size(egui::vec2(cw1, 0.0)))
                                         .on_hover_text("Copy VFO A's frequency to VFO B")
                                         .clicked()
                                     {
@@ -5020,7 +5022,7 @@ impl eframe::App for HpsdrApp {
                                         settings_changed = true;
                                     }
                                     if ui
-                                        .button("B>A")
+                                        .add(chip_button("B>A", false).min_size(egui::vec2(cw2, 0.0)))
                                         .on_hover_text("Retune VFO A to VFO B's frequency")
                                         .clicked()
                                     {
@@ -5049,7 +5051,7 @@ impl eframe::App for HpsdrApp {
                                 });
                                 ui.horizontal(|ui| {
                                     if ui
-                                        .button("A<>B")
+                                        .add(chip_button("A<>B", false).min_size(egui::vec2(cw1, 0.0)))
                                         .on_hover_text("Swap VFO A and VFO B")
                                         .clicked()
                                     {
@@ -5072,7 +5074,7 @@ impl eframe::App for HpsdrApp {
                                         settings_changed = true;
                                     }
                                     if ui
-                                        .add(egui::Button::selectable(connected.split, "Split"))
+                                        .add(chip_button("Split", connected.split).min_size(egui::vec2(cw2, 0.0)))
                                         .on_hover_text(
                                             "Transmit on VFO B while continuing to receive on VFO A",
                                         )
@@ -5084,7 +5086,7 @@ impl eframe::App for HpsdrApp {
                                 });
                                 ui.horizontal(|ui| {
                                     if ui
-                                        .add(egui::Button::selectable(connected.ctun, "CTUN"))
+                                        .add(chip_button("CTUN", connected.ctun).min_size(egui::vec2(cw1, 0.0)))
                                         .on_hover_text(
                                             "Click to Tune: browse within the spectrum without retuning the radio",
                                         )
@@ -15937,6 +15939,16 @@ fn switch_button(label: &str, on: bool) -> egui::Button<'static> {
             .stroke(egui::Stroke::new(1.0, orange))
             .corner_radius(5.0)
     }
+}
+
+/// Width of a chip big enough for the widest of `texts` (so related chips line up).
+fn chip_width(ui: &egui::Ui, texts: &[&str]) -> f32 {
+    let font = egui::TextStyle::Button.resolve(ui.style());
+    let widest = texts
+        .iter()
+        .map(|s| ui.painter().layout_no_wrap(s.to_string(), font.clone(), egui::Color32::WHITE).size().x)
+        .fold(0.0f32, f32::max);
+    widest + 2.0 * ui.spacing().button_padding.x + 2.0
 }
 
 /// Width of a framed label box big enough for the widest of `texts`.
