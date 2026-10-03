@@ -5014,18 +5014,20 @@ impl eframe::App for HpsdrApp {
                             let cw2 = chip_width(ui, &["B>A", "Split"]);
                                 ui.horizontal(|ui| {
                                     if ui
-                                        .add(chip_button("A>B", false).min_size(egui::vec2(cw1, 0.0)))
+                                        .add(chip_button("A>B", flash_on(ui, "flash_a2b")).min_size(egui::vec2(cw1, 0.0)))
                                         .on_hover_text("Copy VFO A's frequency to VFO B")
                                         .clicked()
                                     {
+                                        flash_start(ui, "flash_a2b");
                                         connected.vfo_b_frequency_hz = dial_freq_hz;
                                         settings_changed = true;
                                     }
                                     if ui
-                                        .add(chip_button("B>A", false).min_size(egui::vec2(cw2, 0.0)))
+                                        .add(chip_button("B>A", flash_on(ui, "flash_b2a")).min_size(egui::vec2(cw2, 0.0)))
                                         .on_hover_text("Retune VFO A to VFO B's frequency")
                                         .clicked()
                                     {
+                                        flash_start(ui, "flash_b2a");
                                         // While CTUN is on, "A" is the
                                         // CTUN'd listen frequency, not the
                                         // parked hardware LO -- move that
@@ -5051,10 +5053,11 @@ impl eframe::App for HpsdrApp {
                                 });
                                 ui.horizontal(|ui| {
                                     if ui
-                                        .add(chip_button("A<>B", false).min_size(egui::vec2(cw1, 0.0)))
+                                        .add(chip_button("A<>B", flash_on(ui, "flash_swap")).min_size(egui::vec2(cw1, 0.0)))
                                         .on_hover_text("Swap VFO A and VFO B")
                                         .clicked()
                                     {
+                                        flash_start(ui, "flash_swap");
                                         // Same CTUN-aware handling as B>A
                                         // above.
                                         let new_b = dial_freq_hz;
@@ -8830,9 +8833,9 @@ impl eframe::App for HpsdrApp {
                             .load(std::sync::atomic::Ordering::Relaxed);
                         // Kiosk: the whole area is drawn 1.7x larger, so use a small font and
                         // short rows for the ADC/FIFO warnings or they dwarf the controls below.
-                        let line_height = if lcd_kiosk_mode() { 11.0 } else { ui.text_style_height(&egui::TextStyle::Body) };
+                        let line_height = if lcd_kiosk_mode() { 15.0 } else { ui.text_style_height(&egui::TextStyle::Body) };
                         let warn_font = if lcd_kiosk_mode() {
-                            egui::FontId::proportional(8.0)
+                            egui::FontId::proportional(11.0)
                         } else {
                             egui::TextStyle::Body.resolve(ui.style())
                         };
@@ -15969,6 +15972,27 @@ fn switch_button(label: &str, on: bool) -> egui::Button<'static> {
             .stroke(egui::Stroke::new(1.0, orange))
             .corner_radius(5.0)
     }
+}
+
+/// Brief orange flash for action buttons (A>B, B>A, A<>B): they have no
+/// on/off state, so a click shows as the chip lighting up for a moment.
+const CHIP_FLASH_SECS: f64 = 0.25;
+
+fn flash_on(ui: &egui::Ui, key: &str) -> bool {
+    let now = ui.input(|i| i.time);
+    let until = ui.data(|d| d.get_temp::<f64>(egui::Id::new(key))).unwrap_or(0.0);
+    if now < until {
+        ui.ctx().request_repaint_after(std::time::Duration::from_millis(50));
+        true
+    } else {
+        false
+    }
+}
+
+fn flash_start(ui: &egui::Ui, key: &str) {
+    let until = ui.input(|i| i.time) + CHIP_FLASH_SECS;
+    ui.data_mut(|d| d.insert_temp(egui::Id::new(key), until));
+    ui.ctx().request_repaint();
 }
 
 /// Width of a chip big enough for the widest of `texts` (so related chips line up).
