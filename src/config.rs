@@ -995,9 +995,16 @@ impl Config {
     /// or a blank/default one if there isn't one yet (first run for
     /// this radio) or it can't be read/parsed for any reason.
     pub fn load(mac: [u8; 6]) -> Config {
-        config_path(mac)
-            .and_then(|p| std::fs::read_to_string(p).ok())
-            .and_then(|s| serde_json::from_str(&s).ok())
+        let Some(path) = config_path(mac) else {
+            return Config::default();
+        };
+        let parse = |p: &std::path::Path| {
+            std::fs::read_to_string(p).ok().and_then(|s| serde_json::from_str::<Config>(&s).ok())
+        };
+        // A missing/corrupt main file falls back to the copy taken at the start
+        // of the previous run (see save) instead of silently resetting everything.
+        parse(&path)
+            .or_else(|| parse(&path.with_extension("json.bak")))
             .unwrap_or_default()
     }
 
@@ -1006,7 +1013,23 @@ impl Config {
             return;
         };
         if let Ok(json) = serde_json::to_string_pretty(self) {
-            if let Err(e) = std::fs::write(&path, json) {
+            // Once per run, keep the file as it was when the program started
+            // (valid JSON only) as <config>.json.bak -- a safety net against any
+            // later bug or crash wiping settings.
+            static BACKED_UP: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+            if !BACKED_UP.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                let valid = std::fs::read_to_string(&path)
+                    .ok()
+                    .is_some_and(|s| serde_json::from_str::<Config>(&s).is_ok());
+                if valid {
+                    let _ = std::fs::copy(&path, path.with_extension("json.bak"));
+                }
+            }
+            // Write to a temp file then rename, so a crash mid-write can never
+            // leave a truncated config.
+            let tmp = path.with_extension("json.tmp");
+            let result = std::fs::write(&tmp, json).and_then(|_| std::fs::rename(&tmp, &path));
+            if let Err(e) = result {
                 eprintln!("failed to save config to {}: {e}", path.display());
             }
         }
