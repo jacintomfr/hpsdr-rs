@@ -8855,13 +8855,7 @@ impl eframe::App for HpsdrApp {
                             } else {
                                 "ADC1 OVERLOAD"
                             };
-                            ui.painter().text(
-                                row_rect.center(),
-                                egui::Align2::CENTER_CENTER,
-                                text,
-                                warn_font.clone(),
-                                egui::Color32::from_rgb(255, 60, 60),
-                            );
+                            draw_warning_chip(ui, row_rect.center(), text, warn_font.clone());
                         }
 
                         // TX FIFO overrun/underrun -- see
@@ -8893,13 +8887,7 @@ impl eframe::App for HpsdrApp {
                                 } else {
                                     "TX Overrun"
                                 };
-                                ui.painter().text(
-                                    fifo_row_rect.center(),
-                                    egui::Align2::CENTER_CENTER,
-                                    text,
-                                    warn_font.clone(),
-                                    egui::Color32::from_rgb(255, 60, 60),
-                                );
+                                draw_warning_chip(ui, fifo_row_rect.center(), text, warn_font.clone());
                             } else {
                                 connected.tx_fifo_warning_until = None;
                             }
@@ -15972,6 +15960,22 @@ fn switch_button(label: &str, on: bool) -> egui::Button<'static> {
             .stroke(egui::Stroke::new(1.0, orange))
             .corner_radius(5.0)
     }
+}
+
+/// Warning message (ADC OVERLOAD, TX Underrun/Overrun) as a chip: white text on
+/// a red rounded box with a thin lighter outline, centred on `center`.
+fn draw_warning_chip(ui: &egui::Ui, center: egui::Pos2, text: &str, font: egui::FontId) {
+    let red = egui::Color32::from_rgb(200, 40, 40);
+    let galley = ui.painter().layout_no_wrap(text.to_string(), font, egui::Color32::WHITE);
+    let rect = egui::Rect::from_center_size(center, galley.size() + egui::vec2(12.0, 4.0));
+    ui.painter().rect(
+        rect,
+        5.0,
+        red,
+        egui::Stroke::new(1.0, egui::Color32::from_rgb(255, 150, 150)),
+        egui::StrokeKind::Inside,
+    );
+    ui.painter().galley(rect.center() - galley.size() / 2.0, galley, egui::Color32::WHITE);
 }
 
 /// Brief orange flash for action buttons (A>B, B>A, A<>B): they have no
