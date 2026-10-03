@@ -2696,6 +2696,64 @@ enum AppState {
     Error(String),
 }
 
+// ---- Built-in UI timing (shown in the status bar as "UI: NN fps  N.N ms") ----
+// Counts the frames drawn, the CPU time spent inside `ui()` and the waterfall texture
+// rebuilds, so a slow interface can be diagnosed without attaching a debugger.
+static PROF_FRAMES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static PROF_BUSY_US: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static PROF_WF_US: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static PROF_WF_N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Records the time from its creation to its drop as one UI frame.
+struct UiProfGuard(Instant);
+impl Drop for UiProfGuard {
+    fn drop(&mut self) {
+        PROF_BUSY_US.fetch_add(self.0.elapsed().as_micros() as u64, Ordering::Relaxed);
+        PROF_FRAMES.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+/// Records one waterfall image rebuild plus texture upload.
+struct WfProfGuard(Instant);
+impl Drop for WfProfGuard {
+    fn drop(&mut self) {
+        PROF_WF_US.fetch_add(self.0.elapsed().as_micros() as u64, Ordering::Relaxed);
+        PROF_WF_N.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+struct ProfSnap {
+    at: Instant,
+    base: [u64; 4],
+    // frames/s, avg ms per frame, avg ms per waterfall rebuild, rebuilds/s
+    values: (f32, f32, f32, f32),
+}
+
+static PROF_SNAP: Mutex<Option<ProfSnap>> = Mutex::new(None);
+
+/// (frames per second, average ms per frame, average ms per waterfall rebuild,
+/// waterfall rebuilds per second) over the last second or so.
+fn ui_prof_snapshot() -> (f32, f32, f32, f32) {
+    let now = [
+        PROF_FRAMES.load(Ordering::Relaxed),
+        PROF_BUSY_US.load(Ordering::Relaxed),
+        PROF_WF_US.load(Ordering::Relaxed),
+        PROF_WF_N.load(Ordering::Relaxed),
+    ];
+    let mut g = PROF_SNAP.lock().unwrap();
+    let snap = g.get_or_insert(ProfSnap { at: Instant::now(), base: now, values: (0.0, 0.0, 0.0, 0.0) });
+    let dt = snap.at.elapsed().as_secs_f32();
+    if dt >= 1.0 {
+        let d = [now[0] - snap.base[0], now[1] - snap.base[1], now[2] - snap.base[2], now[3] - snap.base[3]];
+        let frames = d[0].max(1) as f32;
+        let wf = d[3].max(1) as f32;
+        snap.values = (d[0] as f32 / dt, d[1] as f32 / 1000.0 / frames, d[2] as f32 / 1000.0 / wf, d[3] as f32 / dt);
+        snap.base = now;
+        snap.at = Instant::now();
+    }
+    snap.values
+}
+
 struct HpsdrApp {
     state: AppState,
     // See the focus-transition check at the top of `ui()` for what this
@@ -3728,6 +3786,7 @@ impl eframe::App for HpsdrApp {
     // eframe 0.35 replaced `update(&Context)` with `ui(&mut Ui)` -- see
     // https://github.com/emilk/egui/blob/main/CHANGELOG.md (0.35.0).
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        let _prof = UiProfGuard(Instant::now());
         // Kiosk mode assumes an exact 1024x600 PHYSICAL pixel panel (see
         // main()'s ViewportBuilder::with_inner_size for that mode) --
         // this counteracts whatever HiDPI scale factor the OS/window
@@ -4849,6 +4908,7 @@ impl eframe::App for HpsdrApp {
                     connected.waterfall_display_rows,
                 );
                 if connected.waterfall_signature != Some(wanted_signature) {
+                    let _wf_prof = WfProfGuard(Instant::now());
                     let waterfall_rows: Vec<Vec<f32>> = {
                         let d = if transmitting {
                             connected.tx_spectrum.display.lock().unwrap()
@@ -8537,6 +8597,11 @@ impl eframe::App for HpsdrApp {
                             audio_color,
                             format!("Audio glitches: {:.0}/min", connected.underrun_rate_per_min),
                         );
+                        let (prof_fps, prof_ms, prof_wf_ms, prof_wf_n) = ui_prof_snapshot();
+                        ui.weak(format!("UI: {prof_fps:>2.0} fps {prof_ms:>4.1} ms")).on_hover_text(format!(
+                            "Interface: frames per second and average CPU time per frame.
+Waterfall rebuilds: {prof_wf_n:.0}/s, {prof_wf_ms:.1} ms each."
+                        ));
 
                         // Jitter meter (Thetis-style), TX + RX -- the
                         // largest real gap seen between consecutive
