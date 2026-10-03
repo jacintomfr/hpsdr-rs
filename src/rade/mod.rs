@@ -430,4 +430,45 @@ mod tests {
         }
         assert!(!r.sync());
     }
+
+    /// Software loopback of the whole transmit chain's End-of-Over frame: our
+    /// callsign encoder -> rade_tx_eoo -> (scaling as the app does) -> rade_rx
+    /// -> text::decode. If this passes, a callsign that fails to decode over the
+    /// air is not a software encoding problem on the transmit side.
+    #[test]
+    fn eoo_callsign_survives_the_modem_loopback() {
+        let _g = exclusive();
+        let mut r = Rade::open_v1().expect("open");
+        let mut bits = vec![0.0f32; r.n_eoo_bits()];
+        crate::rade::text::encode("CU2ED", &mut bits);
+        r.set_tx_eoo_bits(&bits).expect("eoo bits");
+        let mut sig = Vec::new();
+        let feats = vec![0.0f32; r.n_features()];
+        for _ in 0..40 {
+            r.tx(&feats, &mut sig).expect("tx");
+        }
+        r.tx_eoo(&mut sig).expect("tx_eoo");
+        sig.extend(std::iter::repeat(Complex32::default()).take(8000));
+        let mut pos = 0;
+        let mut feats_out = Vec::new();
+        let mut eoo = Vec::new();
+        let mut decoded = None;
+        let mut saw_eoo = false;
+        while pos + r.nin() <= sig.len() {
+            let nin = r.nin();
+            // TX_REAL_SCALE (0.5) then RX_REAL_SCALE (4.0): the app's real-valued path.
+            let block: Vec<Complex32> = sig[pos..pos + nin]
+                .iter()
+                .map(|z| Complex32::new(z.re * TX_REAL_SCALE * RX_REAL_SCALE, 0.0))
+                .collect();
+            pos += nin;
+            let out = r.rx(&block, &mut feats_out, &mut eoo).expect("rx");
+            if out.has_eoo {
+                saw_eoo = true;
+                decoded = crate::rade::text::decode(&eoo);
+            }
+        }
+        assert!(saw_eoo, "the receiver never reported an End-of-Over frame");
+        assert_eq!(decoded.as_deref(), Some("CU2ED"));
+    }
 }
