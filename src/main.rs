@@ -16854,9 +16854,15 @@ fn render_equalizer_panel(ui: &mut egui::Ui, scroll_accum: &mut f32, side_label:
         .inner_margin(egui::Margin::symmetric(8, 6))
         .show(ui, |ui| {
             ui.spacing_mut().item_spacing.x = 4.0;
+            // Smaller text inside the panel so 13 columns fit; a horizontal scroll bar is the
+            // fallback on a narrower window.
+            let small = egui::FontId::proportional((ui.text_style_height(&egui::TextStyle::Body) * 0.8).max(10.0));
+            ui.style_mut().override_font_id = Some(small.clone());
             let twelve = eq.band_count == spectrum::EqBandCount::Twelve;
-            let col_w = label_box_width(ui, &["Preamp", "16000"]).max(52.0);
+            let text_w = |ui: &egui::Ui, s: &str| ui.painter().layout_no_wrap(s.to_string(), small.clone(), egui::Color32::WHITE).size().x;
+            let col_w = (text_w(ui, "Preamp").max(text_w(ui, "16000") + 10.0) + 6.0).max(44.0);
             let (lo, hi) = if twelve { (-20, 20) } else { (-12, 15) };
+            egui::ScrollArea::horizontal().auto_shrink([false, true]).show(ui, |ui| {
             ui.horizontal_top(|ui| {
                 let preamp = if twelve { &mut eq.preamp12_db } else { &mut eq.preamp_db };
                 changed |= eq_band_column(ui, scroll_accum, "Preamp", None, preamp, (lo, hi), col_w);
@@ -16888,6 +16894,7 @@ fn render_equalizer_panel(ui: &mut egui::Ui, scroll_accum: &mut f32, side_label:
                         }
                     }
                 }
+            });
             });
         });
     changed
