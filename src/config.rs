@@ -864,10 +864,8 @@ pub(crate) fn settings_dir() -> Option<PathBuf> {
 // ~25% smaller than the Windows kiosk build). Only text sizes scale (see
 // main()'s use of this), not fixed-width widgets, so the largest steps can
 // clip rows that were laid out for 100%.
-// TEMPORARY: 100%..180% in 5% steps to find the ideal font size on the Pi panel.
-const KIOSK_SCALE_PRESETS: [f32; 17] = [
-    1.0, 1.05, 1.10, 1.15, 1.20, 1.25, 1.30, 1.35, 1.40, 1.45, 1.50, 1.55, 1.60, 1.65, 1.70, 1.75, 1.80,
-];
+// 160% added after trying 100%-180% in 5% steps on the Pi panel: it is the size that reads best at 1024x600.
+const KIOSK_SCALE_PRESETS: [f32; 7] = [1.0, 1.10, 1.25, 1.5, 1.6, 1.75, 2.0];
 
 fn kiosk_scale_path() -> Option<PathBuf> {
     let mut path = settings_dir()?;
