@@ -18,7 +18,7 @@ no access to the private `rade_c` submodule.
 | Architecture | `arm64` |
 | Binary | `/usr/bin/hpsdr-rs` (one binary; kiosk mode is `HPSDR_LCD_1024X600=1`) |
 | RADE | statically linked into the binary, model weights built in, **no extra files** |
-| Launcher | `/usr/share/applications/hpsdr-rs-kiosk.desktop` (runs `env HPSDR_LCD_1024X600=1 hpsdr-rs`) |
+| Launcher | `/usr/bin/hpsdr-rs-kiosk` (sets `HPSDR_LCD_1024X600=1`; pins the app to the CPU cores reserved with `isolcpus=` when the kernel has any, otherwise starts normally) and the menu entry `/usr/share/applications/hpsdr-rs-kiosk.desktop` |
 | Desktop shortcut | copied to `~/Desktop` of every user that has one (postinst); `/etc/skel/Desktop` covers future users; removed on uninstall |
 | Docs / firmware | manual, Ozy and RX-888 firmware, udev rule examples under `/usr/share/...` (same as the normal package) |
 
@@ -44,7 +44,7 @@ Everything lives in the repository:
 | File | Purpose |
 |---|---|
 | `Cargo.toml` -> `[package.metadata.deb.variants.kiosk]` | the package definition (name, dependencies, files) |
-| `assets/hpsdr-rs-kiosk.desktop` | the launcher |
+| `assets/deb-kiosk/hpsdr-rs-kiosk`, `assets/deb-kiosk/hpsdr-rs-kiosk.desktop` | the launcher script and the menu/desktop entry |
 | `assets/deb-kiosk/postinst`, `postrm` | create / remove the desktop shortcut |
 | `build_rade.rs` | cross-compile fix for the RADE/Opus build (see below) |
 | `scripts/rpi5-kiosk-deb/1-setup-cross.sh` | one-time setup of the build machine |
@@ -135,3 +135,24 @@ with a signal still need a check on the device.
   for the real panel.
 * Release policy for this repository: only the no-AVX2 Windows `.exe` is
   published on GitHub Releases; this `.deb` is built locally and not uploaded.
+
+## CPU cores on the Pi (`isolcpus`)
+
+If the Pi's kernel command line has `isolcpus=2,3` (cores reserved for
+real-time SDR work), the scheduler never puts a normal program on those cores:
+`nproc` reports 2 and the app shares cores 0-1 with the desktop and VNC server.
+Measured on a Pi 5 with RADE running: cores 0 and 1 at ~87% each, cores 2 and 3
+idle. Pinning the app to the isolated cores (what `hpsdr-rs-kiosk` does,
+equivalent to `taskset -c 2,3 hpsdr-rs`) moved the desktop to 37-42% on cores
+0-1 and left the app on cores 2-3. The app's main thread (UI, spectrum, DSP)
+still uses close to one full core by itself.
+
+## Line endings
+
+Build from a Linux checkout (or a copy exported with
+`git -c core.autocrlf=false archive`), not from a Windows working tree: with
+`core.autocrlf=true` the text files there have CRLF line endings, and a
+`.desktop` file with CRLF is rejected by `desktop-file-validate` and its `Exec`
+line ends in a carriage return. `.gitattributes` forces LF for
+`assets/deb-kiosk/*` and the packaging scripts. The Ozy firmware
+`assets/ozy/ozyfw-sdr1k.hex` is stored with CRLF in git and ships that way.

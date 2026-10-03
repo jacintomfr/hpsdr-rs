@@ -1,0 +1,13 @@
+#!/bin/sh
+# Starts hpsdr-rs in 1024x600 kiosk mode. On machines that reserve CPU cores
+# for dedicated tasks (kernel option isolcpus=..., e.g. cores 2-3 on a
+# Raspberry Pi 5 set up for SDR work) the scheduler never places anything on
+# those cores by itself, so the app would be squeezed onto the remaining ones
+# next to the desktop. Pin it to the isolated cores when there are any;
+# otherwise just start it normally.
+export HPSDR_LCD_1024X600=1
+isolated=$(cat /sys/devices/system/cpu/isolated 2>/dev/null)
+if [ -n "$isolated" ] && command -v taskset >/dev/null 2>&1; then
+    exec taskset -c "$isolated" /usr/bin/hpsdr-rs "$@"
+fi
+exec /usr/bin/hpsdr-rs "$@"
