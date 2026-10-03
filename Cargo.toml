@@ -262,3 +262,22 @@ assets = [
     ["assets/rx888/LICENSE.txt", "usr/share/hpsdr-rs/rx888/LICENSE.txt", "644"],
     ["assets/rx888/PROVENANCE.md", "usr/share/hpsdr-rs/rx888/PROVENANCE.md", "644"],
 ]
+
+# `cargo deb --variant kiosk` -- same binary, packaged for a dedicated
+# 1024x600 LCD panel (Raspberry Pi 5 / Debian 13 "trixie", arm64). Adds the
+# Kiosk launcher the plain package deliberately omits (see the comment on
+# the `assets` list above) and lists the X11/GL libraries winit/glow load
+# at RUNTIME with dlopen -- those never show up in `$auto` (which only sees
+# linked libraries), so a minimal image without them would start the app
+# but fail to open a window. RADE (rade_c, with its Opus/FARGAN code) is
+# statically linked into the binary, so nothing extra is needed for it.
+# Conflicts/replaces the plain package: both install usr/bin/hpsdr-rs.
+[package.metadata.deb.variants.kiosk]
+name = "hpsdr-rs-kiosk"
+depends = "$auto, libxkbcommon-x11-0, libxkbcommon0, libgl1, libegl1, libx11-6, libxcursor1, libxrandr2, libxi6, libwayland-client0, libasound2-plugins"
+conflicts = "hpsdr-rs"
+replaces = "hpsdr-rs"
+provides = "hpsdr-rs"
+merge-assets.append = [
+    ["assets/hpsdr-rs-kiosk.desktop", "usr/share/applications/hpsdr-rs-kiosk.desktop", "644"],
+]
