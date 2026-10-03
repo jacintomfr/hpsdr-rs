@@ -15675,7 +15675,11 @@ fn colored_action_button(
         w.inactive.fg_stroke.color = egui::Color32::WHITE;
         w.hovered.fg_stroke.color = egui::Color32::WHITE;
         w.active.fg_stroke.color = egui::Color32::WHITE;
-        ui.add_enabled(enabled, egui::Button::new(label))
+        // REC and PLAY share one width (the wider "PLAY"), so they line up.
+        let font = egui::TextStyle::Button.resolve(ui.style());
+        let text_w = ui.painter().layout_no_wrap("PLAY".to_string(), font, egui::Color32::WHITE).size().x;
+        let min_w = text_w + 2.0 * ui.spacing().button_padding.x;
+        ui.add_enabled(enabled, egui::Button::new(label).min_size(egui::vec2(min_w, 0.0)))
             .on_hover_text(hover_text)
             .on_disabled_hover_text(disabled_hover_text)
     })
