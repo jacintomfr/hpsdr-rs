@@ -203,8 +203,6 @@ impl RadeWorker {
             transmitting: false,
             was_sync: false,
             sync_lost_flag: false,
-            rx_tail: std::collections::VecDeque::new(),
-            tail_dumps: 0,
             level: 0.0,
             gate_open: false,
             gate_frames: 0,
@@ -418,10 +416,6 @@ struct Inner {
     /// Set when sync drops; consumed in the rx loop to log whether the over ended
     /// with an End-of-Over frame (see the "over ended" log line).
     sync_lost_flag: bool,
-    /// Last ~4 s of modem-rate receive audio, dumped to a file when an over ends
-    /// (diagnostic: lets the End-of-Over burst be inspected offline).
-    rx_tail: std::collections::VecDeque<f32>,
-    tail_dumps: u32,
     level: f32,
     /// RX speech gate state -- see SQUELCH_* above.
     gate_open: bool,
@@ -547,10 +541,6 @@ impl Inner {
             self.iq
                 .extend(self.buf8[..nin].iter().map(|&s| Complex32::new(s * RX_REAL_SCALE, 0.0)));
             self.buf8.drain(..nin);
-            self.rx_tail.extend(self.iq.iter().map(|z| z.re));
-            while self.rx_tail.len() > 32_000 {
-                self.rx_tail.pop_front();
-            }
 
             let out = match self.rade.rx(&self.iq, &mut self.features, &mut self.eoo_rx) {
                 Ok(o) => o,
@@ -564,7 +554,6 @@ impl Inner {
             self.publish_rx_state();
             if self.sync_lost_flag {
                 self.sync_lost_flag = false;
-                self.dump_rx_tail();
                 eprintln!(
                     "[rade] over ended: sync lost (last snr_db={:.1}), End-of-Over frame flagged in the same step: {}",
                     self.last_sync_snr, out.has_eoo
@@ -724,27 +713,6 @@ impl Inner {
             );
         }
         self.gate_open
-    }
-
-    /// Write the last few seconds of receive audio (raw f32 little-endian, 8 kHz)
-    /// to `rade_tail_<n>.f32` in the settings folder -- the first few overs only.
-    fn dump_rx_tail(&mut self) {
-        if self.tail_dumps >= 12 || self.rx_tail.len() < 8000 {
-            return;
-        }
-        let Some(mut path) = crate::config::settings_dir() else {
-            return;
-        };
-        self.tail_dumps += 1;
-        path.push(format!("rade_tail_{}.f32", self.tail_dumps));
-        let mut bytes = Vec::with_capacity(self.rx_tail.len() * 4);
-        for &s in &self.rx_tail {
-            bytes.extend_from_slice(&s.to_le_bytes());
-        }
-        match std::fs::write(&path, bytes) {
-            Ok(()) => eprintln!("[rade] wrote {} samples of receive audio to {}", self.rx_tail.len(), path.display()),
-            Err(e) => eprintln!("[rade] couldn't write {}: {e}", path.display()),
-        }
     }
 
     fn publish_rx_state(&mut self) {
