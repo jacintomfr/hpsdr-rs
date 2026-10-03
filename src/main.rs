@@ -4367,12 +4367,12 @@ impl eframe::App for HpsdrApp {
                 // as long as the End-of-Over burst needs, no longer -- with
                 // a hard timeout so a stuck drain can never hang the
                 // transmitter the way it did before set_unkeying existed.
-                const RADE_UNKEY_TIMEOUT: Duration = Duration::from_secs(2);
+                const RADE_UNKEY_TIMEOUT: Duration = Duration::from_secs(4);
                 // See ConnectedState::rade_drained_at's own doc comment:
                 // extra hold past tx_drained() so WDSP + the tx_iq_out
                 // queue + the network send actually get the EOO burst's
                 // tail out before the real PTT drops.
-                const RADE_UNKEY_SETTLE: Duration = Duration::from_millis(600);
+                const RADE_UNKEY_SETTLE: Duration = Duration::from_millis(2000);
                 if let Some(started) = connected.rade_pending_unkey {
                     if connected.rade_drained_at.is_none() && connected.rade.tx_drained() {
                         connected.rade_drained_at = Some(Instant::now());

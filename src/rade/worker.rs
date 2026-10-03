@@ -455,6 +455,12 @@ impl Inner {
             while self.rx_in.pop().is_ok() {}
             self.buf8.clear();
             self.reset_rx();
+            // Mic audio keeps being pushed while idle (up to the ring size, ~1 s). Keying
+            // used to encode all of that stale audio at once: a permanent extra second of
+            // transmit latency and a transmit ring that was full from the start.
+            while self.tx_in.pop().is_ok() {}
+            self.buf16.clear();
+            self.tx_features.clear();
         } else {
             // Leaving transmit: flush whatever mic audio is left, then emit the
             // End-of-Over frame the far end uses to close the over.

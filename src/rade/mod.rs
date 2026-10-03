@@ -472,3 +472,90 @@ mod tests {
         assert_eq!(decoded.as_deref(), Some("CU2ED"));
     }
 }
+
+#[cfg(test)]
+mod clip_probe {
+    use super::*;
+    use std::sync::{Mutex, MutexGuard};
+    static LOCK2: Mutex<()> = Mutex::new(());
+    fn excl() -> MutexGuard<'static, ()> {
+        LOCK2.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    fn open() -> Rade {
+        loop {
+            match Rade::open_v1() {
+                Ok(r) => return r,
+                Err(RadeError::AlreadyOpen) => std::thread::sleep(std::time::Duration::from_millis(50)),
+                Err(e) => panic!("open: {e:?}"),
+            }
+        }
+    }
+
+    /// Run speech frames + the EOO through the modem with the transmit chain's
+    /// hard clip (`clip` on the real part, None = no clip) and report the decode.
+    fn run(clip: Option<f32>, noise_rms: f32) -> (Option<String>, f32, f32) {
+        let mut r = open();
+        let mut bits = vec![0.0f32; r.n_eoo_bits()];
+        crate::rade::text::encode("CU2ED", &mut bits);
+        r.set_tx_eoo_bits(&bits).unwrap();
+        let mut sig = Vec::new();
+        let feats = vec![0.0f32; r.n_features()];
+        for _ in 0..40 {
+            r.tx(&feats, &mut sig).unwrap();
+        }
+        let eoo_start = sig.len();
+        r.tx_eoo(&mut sig).unwrap();
+        let peak = sig[eoo_start..].iter().fold(0.0f32, |a, z| a.max(z.re.abs()));
+        let rms = (sig[eoo_start..].iter().map(|z| z.re * z.re).sum::<f32>() / (sig.len() - eoo_start) as f32).sqrt();
+        sig.extend(std::iter::repeat(Complex32::default()).take(8000));
+        // Small deterministic noise source.
+        let mut seed = 12345u32;
+        let mut noise = || {
+            let mut s = 0.0f32;
+            for _ in 0..12 {
+                seed = seed.wrapping_mul(1664525).wrapping_add(1013904223);
+                s += (seed >> 8) as f32 / (1u32 << 24) as f32;
+            }
+            (s - 6.0) * noise_rms
+        };
+        let mut pos = 0;
+        let mut feats_out = Vec::new();
+        let mut eoo = Vec::new();
+        let mut decoded = None;
+        while pos + r.nin() <= sig.len() {
+            let nin = r.nin();
+            let block: Vec<Complex32> = sig[pos..pos + nin]
+                .iter()
+                .map(|z| {
+                    let re = match clip {
+                        Some(c) => z.re.clamp(-c, c),
+                        None => z.re,
+                    };
+                    Complex32::new((re + noise()) * 2.0, 0.0)
+                })
+                .collect();
+            pos += nin;
+            let out = r.rx(&block, &mut feats_out, &mut eoo).expect("rx");
+            if out.has_eoo {
+                decoded = crate::rade::text::decode(&eoo);
+            }
+        }
+        (decoded, peak, rms)
+    }
+
+    #[test]
+    fn eoo_decode_through_the_tx_hard_clip() {
+        let _g = excl();
+        for (label, clip, noise) in [
+            ("no clip, no noise", None, 0.0),
+            ("clip 1.0, no noise", Some(1.0), 0.0),
+            ("clip 0.5, no noise", Some(0.5), 0.0),
+            ("no clip, noise 0.15", None, 0.15),
+            ("clip 1.0, noise 0.15", Some(1.0), 0.15),
+        ] {
+            let (d, peak, rms) = run(clip, noise);
+            println!("{label}: decoded={d:?} (EOO re peak={peak:.3} rms={rms:.3})");
+        }
+    }
+}
