@@ -5123,24 +5123,6 @@ impl eframe::App for HpsdrApp {
                                     // report. Pulling that exact color
                                     // explicitly keeps this row visually
                                     // consistent.
-                                    ui.colored_label(ui.visuals().widgets.inactive.fg_stroke.color, "Step:");
-                                    egui::ComboBox::from_id_salt("tune_step_hz")
-                                        .width(60.0)
-                                        .selected_text(tune_step_label(connected.tune_step_hz))
-                                        .show_ui(ui, |ui| {
-                                            for hz in ALL_TUNE_STEPS_HZ {
-                                                if ui
-                                                    .selectable_label(
-                                                        connected.tune_step_hz == hz,
-                                                        tune_step_label(hz),
-                                                    )
-                                                    .clicked()
-                                                {
-                                                    connected.tune_step_hz = hz;
-                                                    settings_changed = true;
-                                                }
-                                            }
-                                        });
                                     // Only shown while actually in CW
                                     // mode -- see cw_panel_visible's own
                                     // doc comment further down. Also
@@ -5166,6 +5148,11 @@ impl eframe::App for HpsdrApp {
                                         settings_changed = true;
                                     }
                                 });
+                            });
+
+                            ui.add_space(8.0);
+                            ui.vertical(|ui| {
+                                render_net_status_column(ui, connected, rigctl_status, tci_status, cat_status);
                             });
 
                             let vfo_b_label = ui
@@ -6515,6 +6502,10 @@ impl eframe::App for HpsdrApp {
                                     }
                                 }
                             }
+                            ui.add_space(12.0);
+                            if render_step_combo(ui, connected) {
+                                settings_changed = true;
+                            }
                         });
                     }
 
@@ -7169,6 +7160,10 @@ impl eframe::App for HpsdrApp {
                                         }
                                     }
                                 }
+                            }
+                            ui.add_space(12.0);
+                            if render_step_combo(ui, connected) {
+                                settings_changed = true;
                             }
 
                             // "TRANSMITTING" text removed from here (a
@@ -15687,6 +15682,26 @@ fn start_stop_button(ui: &mut egui::Ui, running: bool) -> bool {
     ui.add(egui::Button::new(egui::RichText::new(label).color(egui::Color32::WHITE)).fill(color)).clicked()
 }
 
+/// rigctl/TCI/CAT as a vertical column (top row, between the VFO-A buttons
+/// and VFO-B) -- same colors/tooltips the mode-row version had.
+fn render_net_status_column(
+    ui: &mut egui::Ui,
+    connected: &ConnectedState,
+    rigctl_status: Option<bool>,
+    tci_status: Option<bool>,
+    cat_status: Option<bool>,
+) {
+    ui.colored_label(network_status_color(rigctl_status), "rigctl")
+        .on_hover_text(network_status_hover("rigctl", rigctl_status, &connected.rigctl_addr));
+    ui.colored_label(network_status_color(tci_status), "TCI").on_hover_text(tci_status_hover(
+        tci_status,
+        &connected.tci_addr,
+        connected.tci_server.as_ref(),
+    ));
+    ui.colored_label(network_status_color(cat_status), "CAT")
+        .on_hover_text(network_status_hover("CAT", cat_status, &connected.cat_addr));
+}
+
 /// rigctl/TCI/CAT/PS/Record status indicators -- a standalone fn (not a
 /// closure) specifically so it can be called from inside another
 /// closure (the mode-buttons row's ui.horizontal_wrapped, in kiosk
@@ -15699,17 +15714,9 @@ fn render_status_row(
     tci_status: Option<bool>,
     cat_status: Option<bool>,
 ) {
-    ui.colored_label(network_status_color(rigctl_status), "rigctl")
-        .on_hover_text(network_status_hover("rigctl", rigctl_status, &connected.rigctl_addr));
-    ui.add_space(12.0);
-    ui.colored_label(network_status_color(tci_status), "TCI").on_hover_text(tci_status_hover(
-        tci_status,
-        &connected.tci_addr,
-        connected.tci_server.as_ref(),
-    ));
-    ui.add_space(12.0);
-    ui.colored_label(network_status_color(cat_status), "CAT")
-        .on_hover_text(network_status_hover("CAT", cat_status, &connected.cat_addr));
+    // rigctl/TCI/CAT now live in a vertical column in the top row
+    // (render_net_status_column), not here.
+    let _ = (rigctl_status, tci_status, cat_status);
     // PureSignal: only shown when actually enabled for this session (see
     // ConnectedState::puresignal_enabled's doc comment -- a connect-time
     // setting, not live). Same green/gray "Correcting" convention as the
@@ -15765,6 +15772,29 @@ fn render_status_row(
     // Record used to live at the end of this row -- moved to the
     // RIT/XIT row instead (both modes now, a real request, alongside
     // Clear -- see that row's own comment) so it's not repeated here.
+}
+
+/// Plain (no-modifier) scroll/drag tuning step picker -- see
+/// ConnectedState::tune_step_hz's own doc comment. Standalone fn so both the
+/// MOX/RIT/XIT row (next to Record) and the RX-only fallback row can use it.
+/// Returns whether the step changed.
+fn render_step_combo(ui: &mut egui::Ui, connected: &mut ConnectedState) -> bool {
+    let mut changed = false;
+    // Same gray as the neighbouring buttons' inactive text (a plain
+    // ui.label uses a visibly different "noninteractive" gray).
+    ui.colored_label(ui.visuals().widgets.inactive.fg_stroke.color, "Step:");
+    egui::ComboBox::from_id_salt("tune_step_hz")
+        .width(60.0)
+        .selected_text(tune_step_label(connected.tune_step_hz))
+        .show_ui(ui, |ui| {
+            for hz in ALL_TUNE_STEPS_HZ {
+                if ui.selectable_label(connected.tune_step_hz == hz, tune_step_label(hz)).clicked() {
+                    connected.tune_step_hz = hz;
+                    changed = true;
+                }
+            }
+        });
+    changed
 }
 
 /// NB/NR toggle buttons -- standalone fn for the same nested-closure
