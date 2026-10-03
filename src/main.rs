@@ -16844,6 +16844,16 @@ fn render_equalizer_panel(ui: &mut egui::Ui, scroll_accum: &mut f32, side_label:
             eq.band_count = spectrum::EqBandCount::Twelve;
             changed = true;
         }
+        // Preamp (the 12-band mode's frequency-independent gain) as a horizontal slider
+        // on this row, which leaves the full width below for the bands.
+        ui.add_space(20.0);
+        ui.label("Preamp:");
+        let twelve_now = eq.band_count == spectrum::EqBandCount::Twelve;
+        let (plo, phi) = if twelve_now { (-20, 20) } else { (-12, 15) };
+        let preamp = if twelve_now { &mut eq.preamp12_db } else { &mut eq.preamp_db };
+        if scroll_slider_i32(ui, scroll_accum, preamp, plo..=phi, 1, " dB") {
+            changed = true;
+        }
     });
     ui.add_space(6.0);
     // All the adjustments inside one thin-outlined rectangle, bands side by side with
@@ -16854,19 +16864,29 @@ fn render_equalizer_panel(ui: &mut egui::Ui, scroll_accum: &mut f32, side_label:
         .inner_margin(egui::Margin::symmetric(8, 6))
         .show(ui, |ui| {
             ui.spacing_mut().item_spacing.x = 4.0;
-            // Smaller text inside the panel so 13 columns fit; a horizontal scroll bar is the
-            // fallback on a narrower window.
-            let small = egui::FontId::proportional((ui.text_style_height(&egui::TextStyle::Body) * 0.8).max(10.0));
-            ui.style_mut().override_font_id = Some(small.clone());
+            // Fit analysis: the columns must fit the width available in this panel. Try
+            // smaller and smaller text until they do; if even the smallest does not fit,
+            // the horizontal scroll area below is the fallback.
             let twelve = eq.band_count == spectrum::EqBandCount::Twelve;
-            let text_w = |ui: &egui::Ui, s: &str| ui.painter().layout_no_wrap(s.to_string(), small.clone(), egui::Color32::WHITE).size().x;
-            let col_w = (text_w(ui, "Preamp").max(text_w(ui, "16000") + 10.0) + 6.0).max(44.0);
+            let n_cols = if twelve { 12.0 } else { 3.0 };
+            let avail = ui.available_width();
+            let body_h = ui.text_style_height(&egui::TextStyle::Body);
+            let mut small = egui::FontId::proportional(body_h);
+            let mut col_w = 44.0;
+            for scale in [0.9f32, 0.8, 0.7, 0.6, 0.5] {
+                let font = egui::FontId::proportional((body_h * scale).max(9.0));
+                let w = |s: &str| ui.painter().layout_no_wrap(s.to_string(), font.clone(), egui::Color32::WHITE).size().x;
+                let cw = (w("16000") + 10.0 + 6.0).max(40.0);
+                small = font;
+                col_w = cw;
+                if n_cols * (cw + ui.spacing().item_spacing.x) <= avail {
+                    break;
+                }
+            }
+            ui.style_mut().override_font_id = Some(small);
             let (lo, hi) = if twelve { (-20, 20) } else { (-12, 15) };
             egui::ScrollArea::horizontal().auto_shrink([false, true]).show(ui, |ui| {
             ui.horizontal_top(|ui| {
-                let preamp = if twelve { &mut eq.preamp12_db } else { &mut eq.preamp_db };
-                changed |= eq_band_column(ui, scroll_accum, "Preamp", None, preamp, (lo, hi), col_w);
-                ui.add_space(8.0);
                 match eq.band_count {
                     spectrum::EqBandCount::Twelve => {
                         for i in 0..12 {
