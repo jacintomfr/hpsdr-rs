@@ -2,3 +2,4 @@
 /log
 /dist
 /.deb-revision
+wix/packet-stub/packet_noreal_test.dll
