@@ -8600,6 +8600,10 @@ impl eframe::App for HpsdrApp {
                     // -40 (was -10) -- a real report: the panel sat flush
                     // against the window's right edge, moved ~30px left.
                     .anchor(egui::Align2::RIGHT_TOP, egui::vec2(-40.0, 10.0))
+                    // The meter area is drawn scaled up in kiosk mode (see below); its
+                    // enlarged, invisible hit-rect sat on top of the REC/PLAY buttons and
+                    // swallowed the mouse. It has nothing clickable, so make it inert.
+                    .interactable(!lcd_kiosk_mode())
                     .show(ui, |ui| {
                         // Height lowered from 110 -- once draw_s_meter's
                         // Y_SQUASH flattened the arc, 110 left a real gap
