@@ -378,45 +378,59 @@ impl NoiseReduction {
     }
 }
 
-/// WDSP's graphic-EQ stage (`eq.c`) offers two fixed band layouts, both
-/// confirmed by reading the source directly: a legacy 3-band EQ (preamp +
-/// low/mid/high, corners at 150/400/1500/6000Hz -- `SetRXAGrphEQ`/
-/// `SetTXAGrphEQ`) and a 10-band EQ (preamp + 10 bands, 32Hz..16kHz --
-/// `SetRXAGrphEQ10`/`SetTXAGrphEQ10`). Same layout on both RXA and TXA, so
-/// this one enum/struct pair serves both chains (see EqualizerParams).
+/// WDSP's graphic-EQ stage offers two fixed band layouts (legacy 3-band and a
+/// fixed 10-band, `SetRXAGrphEQ`/`SetRXAGrphEQ10`), and the parametric profile
+/// (`SetRXAEQProfile`) that deskHPSDR uses: 12 bands at editable frequencies
+/// plus a frequency-independent gain. `Twelve` reproduces deskHPSDR's EQ
+/// (default RX points 50..8000 Hz, TX 70..8000 Hz, gains -20..+20 dB); `Ten`
+/// is kept only so old configs still load (the UI migrates it to `Twelve`).
 #[derive(Copy, Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum EqBandCount {
     Three,
     Ten,
+    Twelve,
 }
 
 impl Default for EqBandCount {
     fn default() -> Self {
-        EqBandCount::Three
+        EqBandCount::Twelve
     }
 }
 
-/// Graphic-EQ settings for one WDSP channel (RXA or TXA -- see
-/// EqBandCount's doc comment for why one type covers both). Mirrors
-/// piHPSDR's own equalizer_menu.c/radio.c defaults and range exactly:
-/// disabled, all-zero (flat) gains, dB values -12..15 (WDSP's own
-/// SetXXAGrphEQ[10] take `int*`, so gains are whole dB, not fractional).
-/// bands_3_db and bands_10_db are kept as two INDEPENDENT arrays (not one
-/// reused buffer) so switching band_count back and forth never clobbers
-/// whichever mode isn't currently active.
+/// deskHPSDR's default RX equalizer frequencies (receiver.c), Hz.
+pub const EQ12_DEFAULT_RX_HZ: [i32; 12] = [50, 100, 200, 500, 1000, 1500, 2000, 2500, 3000, 5000, 6000, 8000];
+/// deskHPSDR's default TX equalizer frequencies (transmitter.c), Hz.
+pub const EQ12_DEFAULT_TX_HZ: [i32; 12] = [70, 150, 300, 500, 1000, 1500, 2000, 2500, 3000, 3500, 6000, 8000];
+
+fn default_eq12_freqs() -> [i32; 12] {
+    EQ12_DEFAULT_RX_HZ
+}
+
+/// Equalizer settings for one WDSP channel (RXA or TXA -- see EqBandCount's
+/// doc comment). Disabled and flat by default. The 3-/10-band gains are whole
+/// dB in -12..15 (SetXXAGrphEQ[10] take `int*`); the 12-band mode takes
+/// -20..+20 dB and per-band frequencies (10..16000 Hz, kept in ascending
+/// order). Each mode keeps its own gains, so switching back and forth never
+/// clobbers whichever mode isn't active.
 #[derive(Copy, Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct EqualizerParams {
     pub enabled: bool,
     pub band_count: EqBandCount,
     pub preamp_db: i32,
-    /// low, mid, high -- see SetRXAGrphEQ's own doc comment in eq.c: WDSP
-    /// internally duplicates the low gain onto two adjacent corner
-    /// frequencies, this is its own fixed layout, not something to work
-    /// around here.
+    /// low, mid, high -- see SetRXAGrphEQ's own doc comment in eq.c.
     pub bands_3_db: [i32; 3],
-    /// 32/63/125/250/500/1000/2000/4000/8000/16000 Hz, in that order --
-    /// WDSP's own fixed 10-band layout (SetRXAGrphEQ10's F[] table).
+    /// 32/63/125/250/500/1000/2000/4000/8000/16000 Hz (legacy, see EqBandCount).
     pub bands_10_db: [i32; 10],
+    /// deskHPSDR-style 12-band gains, dB.
+    #[serde(default)]
+    pub bands_12_db: [i32; 12],
+    /// Frequencies of the 12 bands, Hz.
+    #[serde(default = "default_eq12_freqs")]
+    pub freqs_12_hz: [i32; 12],
+    /// Frequency-independent gain of the 12-band mode ("Added Frequency-Independent
+    /// Gain" in deskHPSDR), dB; the 3-/10-band modes use `preamp_db`.
+    #[serde(default)]
+    pub preamp12_db: i32,
 }
 
 impl Default for EqualizerParams {
@@ -427,7 +441,30 @@ impl Default for EqualizerParams {
             preamp_db: 0,
             bands_3_db: [0; 3],
             bands_10_db: [0; 10],
+            bands_12_db: [0; 12],
+            freqs_12_hz: EQ12_DEFAULT_RX_HZ,
+            preamp12_db: 0,
         }
+    }
+}
+
+impl EqualizerParams {
+    /// Defaults for the transmit side (deskHPSDR's TX frequencies).
+    pub fn default_tx() -> Self {
+        Self { freqs_12_hz: EQ12_DEFAULT_TX_HZ, ..Self::default() }
+    }
+
+    /// `F`/`G` arrays for `SetRXAEQProfile`/`SetTXAEQProfile` (index 0 = the
+    /// frequency-independent gain, then the 12 bands).
+    pub fn profile12(&self) -> ([f64; 13], [f64; 13]) {
+        let mut f = [0.0f64; 13];
+        let mut g = [0.0f64; 13];
+        g[0] = self.preamp12_db as f64;
+        for i in 0..12 {
+            f[i + 1] = self.freqs_12_hz[i] as f64;
+            g[i + 1] = self.bands_12_db[i] as f64;
+        }
+        (f, g)
     }
 }
 
@@ -1490,6 +1527,10 @@ impl SpectrumAnalyzer {
                         coeffs[0] = params.eq.preamp_db;
                         coeffs[1..11].copy_from_slice(&params.eq.bands_10_db);
                         wdsp::SetRXAGrphEQ10(self.channel, coeffs.as_mut_ptr());
+                    }
+                    EqBandCount::Twelve => {
+                        let (mut fr, mut gn) = params.eq.profile12();
+                        wdsp::SetRXAEQProfile(self.channel, 12, fr.as_mut_ptr(), gn.as_mut_ptr());
                     }
                 }
                 wdsp::SetRXAEQRun(self.channel, params.eq.enabled as c_int);

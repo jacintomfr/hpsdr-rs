@@ -489,6 +489,12 @@ unsafe extern "C" {
     pub fn SetRXAGrphEQ10(channel: ::std::os::raw::c_int, rxeq: *mut ::std::os::raw::c_int);
 }
 unsafe extern "C" {
+    // Parametric/NURBS EQ profile (what deskHPSDR uses): F and G hold nfreqs+1 entries,
+    // index 0 = the frequency-independent gain (F[0] unused), then the bands.
+    pub fn SetRXAEQProfile(channel: ::std::os::raw::c_int, nfreqs: ::std::os::raw::c_int, F: *mut f64, G: *mut f64);
+    pub fn SetTXAEQProfile(channel: ::std::os::raw::c_int, nfreqs: ::std::os::raw::c_int, F: *mut f64, G: *mut f64);
+}
+unsafe extern "C" {
     pub fn create_divEXT(
         id: ::std::os::raw::c_int,
         run: ::std::os::raw::c_int,

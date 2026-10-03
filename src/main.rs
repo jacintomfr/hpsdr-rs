@@ -16815,6 +16815,11 @@ fn scroll_slider_i32(
 /// change" shape as the rest of this file's Settings panels.
 fn render_equalizer_panel(ui: &mut egui::Ui, scroll_accum: &mut f32, side_label: &str, eq: &mut spectrum::EqualizerParams) -> bool {
     let mut changed = false;
+    // The old fixed 10-band layout is retired in favour of deskHPSDR's 12 bands.
+    if eq.band_count == spectrum::EqBandCount::Ten {
+        eq.band_count = spectrum::EqBandCount::Twelve;
+        changed = true;
+    }
     if ui.checkbox(&mut eq.enabled, format!("Enable {side_label} Equalizer")).changed() {
         changed = true;
     }
@@ -16826,50 +16831,97 @@ fn render_equalizer_panel(ui: &mut egui::Ui, scroll_accum: &mut f32, side_label:
             eq.band_count = spectrum::EqBandCount::Three;
             changed = true;
         }
-        if toggle_chip(ui, "10-Band", eq.band_count == spectrum::EqBandCount::Ten, 0.0, "").clicked()
-            && eq.band_count != spectrum::EqBandCount::Ten
+        if toggle_chip(
+            ui,
+            "12-Band",
+            eq.band_count == spectrum::EqBandCount::Twelve,
+            0.0,
+            "deskHPSDR-style: 12 bands at editable frequencies, -20..+20 dB",
+        )
+        .clicked()
+            && eq.band_count != spectrum::EqBandCount::Twelve
         {
-            eq.band_count = spectrum::EqBandCount::Ten;
+            eq.band_count = spectrum::EqBandCount::Twelve;
             changed = true;
         }
     });
     ui.add_space(6.0);
-    // Bands side by side, each a vertical slider (like the RADE EQ and freedv-gui):
-    // caption on top, the gain readout below.
-    let col_w = label_box_width(ui, &["Preamp", "16kHz"]).max(56.0);
-    ui.horizontal_top(|ui| {
-        changed |= eq_band_column(ui, scroll_accum, "Preamp", &mut eq.preamp_db, col_w);
-        ui.add_space(12.0);
-        match eq.band_count {
-            spectrum::EqBandCount::Three => {
-                const LABELS: [&str; 3] = ["Low", "Mid", "High"];
-                for (label, gain) in LABELS.iter().zip(eq.bands_3_db.iter_mut()) {
-                    changed |= eq_band_column(ui, scroll_accum, label, gain, col_w);
+    // All the adjustments inside one thin-outlined rectangle, bands side by side with
+    // vertical sliders (like the RADE EQ and freedv-gui).
+    egui::Frame::new()
+        .stroke(egui::Stroke::new(1.0, egui::Color32::from_gray(95)))
+        .corner_radius(5.0)
+        .inner_margin(egui::Margin::symmetric(8, 6))
+        .show(ui, |ui| {
+            ui.spacing_mut().item_spacing.x = 4.0;
+            let twelve = eq.band_count == spectrum::EqBandCount::Twelve;
+            let col_w = label_box_width(ui, &["Preamp", "16000"]).max(52.0);
+            let (lo, hi) = if twelve { (-20, 20) } else { (-12, 15) };
+            ui.horizontal_top(|ui| {
+                let preamp = if twelve { &mut eq.preamp12_db } else { &mut eq.preamp_db };
+                changed |= eq_band_column(ui, scroll_accum, "Preamp", None, preamp, (lo, hi), col_w);
+                ui.add_space(8.0);
+                match eq.band_count {
+                    spectrum::EqBandCount::Twelve => {
+                        for i in 0..12 {
+                            // Keep the frequencies ascending, 10 Hz apart (as deskHPSDR).
+                            let min_f = if i == 0 { 10 } else { eq.freqs_12_hz[i - 1] + 10 };
+                            let max_f = if i == 11 { 16_000 } else { eq.freqs_12_hz[i + 1] - 10 };
+                            let mut freq = eq.freqs_12_hz[i];
+                            let caption = format!("{}", i + 1);
+                            changed |= eq_band_column(
+                                ui,
+                                scroll_accum,
+                                &caption,
+                                Some((&mut freq, min_f, max_f)),
+                                &mut eq.bands_12_db[i],
+                                (lo, hi),
+                                col_w,
+                            );
+                            eq.freqs_12_hz[i] = freq;
+                        }
+                    }
+                    _ => {
+                        const LABELS: [&str; 3] = ["Low", "Mid", "High"];
+                        for (label, gain) in LABELS.iter().zip(eq.bands_3_db.iter_mut()) {
+                            changed |= eq_band_column(ui, scroll_accum, label, None, gain, (lo, hi), col_w);
+                        }
+                    }
                 }
-            }
-            spectrum::EqBandCount::Ten => {
-                const LABELS: [&str; 10] =
-                    ["32Hz", "63Hz", "125Hz", "250Hz", "500Hz", "1kHz", "2kHz", "4kHz", "8kHz", "16kHz"];
-                for (label, gain) in LABELS.iter().zip(eq.bands_10_db.iter_mut()) {
-                    changed |= eq_band_column(ui, scroll_accum, label, gain, col_w);
-                }
-            }
-        }
-    });
+            });
+        });
     changed
 }
 
-/// One equalizer band: caption, a vertical -12..15 dB slider (scroll over it moves
-/// 1 dB per notch) and a fixed-width gain readout. All columns have the same width.
-fn eq_band_column(ui: &mut egui::Ui, scroll_accum: &mut f32, caption: &str, gain: &mut i32, col_w: f32) -> bool {
+/// One equalizer band: caption, (12-band mode) the band's frequency as an editable
+/// number, a vertical slider (scroll over it moves 1 dB per notch) and a
+/// fixed-width gain readout. All columns have the same width.
+fn eq_band_column(
+    ui: &mut egui::Ui,
+    scroll_accum: &mut f32,
+    caption: &str,
+    freq: Option<(&mut i32, i32, i32)>,
+    gain: &mut i32,
+    (lo, hi): (i32, i32),
+    col_w: f32,
+) -> bool {
     let mut changed = false;
     ui.vertical(|ui| {
         ui.set_width(col_w);
         ui.with_layout(egui::Layout::top_down(egui::Align::Center), |ui| {
             ui.label(egui::RichText::new(caption).color(egui::Color32::WHITE));
+            if let Some((f, min_f, max_f)) = freq {
+                let r = ui.add(
+                    egui::DragValue::new(f)
+                        .range(min_f..=max_f.max(min_f))
+                        .speed(10.0)
+                );
+                changed |= r.changed();
+                r.on_hover_text("Band frequency in Hz");
+            }
             let prev = ui.spacing().slider_width;
-            ui.spacing_mut().slider_width = 150.0;
-            let resp = ui.add(egui::Slider::new(gain, -12..=15).vertical().show_value(false));
+            ui.spacing_mut().slider_width = 110.0;
+            let resp = ui.add(egui::Slider::new(gain, lo..=hi).vertical().show_value(false));
             ui.spacing_mut().slider_width = prev;
             changed |= resp.changed();
             if resp.hovered() {
@@ -16881,7 +16933,7 @@ fn eq_band_column(ui: &mut egui::Ui, scroll_accum: &mut f32, caption: &str, gain
                     while scroll_accum.abs() >= NOTCH {
                         let sign = scroll_accum.signum();
                         *scroll_accum -= sign * NOTCH;
-                        *gain = (*gain + sign as i32).clamp(-12, 15);
+                        *gain = (*gain + sign as i32).clamp(lo, hi);
                         changed = true;
                     }
                 }

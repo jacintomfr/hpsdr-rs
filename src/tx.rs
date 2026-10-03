@@ -561,7 +561,7 @@ impl Default for TxParams {
             width_hz: crate::spectrum::default_width_hz(Mode::Usb),
             tune: false,
             two_tone: false,
-            eq: EqualizerParams::default(),
+            eq: EqualizerParams::default_tx(),
             // Off by default -- matches this project's and piHPSDR's own
             // prior behavior exactly (open()'s SetTXALevelerSt(channel, 0)
             // at channel creation); an explicit opt-in via Settings -> TX.
@@ -1258,6 +1258,10 @@ impl TxProcessor {
                         coeffs[0] = eq.preamp_db;
                         coeffs[1..11].copy_from_slice(&eq.bands_10_db);
                         wdsp::SetTXAGrphEQ10(self.channel, coeffs.as_mut_ptr());
+                    }
+                    EqBandCount::Twelve => {
+                        let (mut fr, mut gn) = eq.profile12();
+                        wdsp::SetTXAEQProfile(self.channel, 12, fr.as_mut_ptr(), gn.as_mut_ptr());
                     }
                 }
                 wdsp::SetTXAEQRun(self.channel, eq.enabled as c_int);
