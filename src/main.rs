@@ -5849,7 +5849,14 @@ impl eframe::App for HpsdrApp {
                         // AM users who leave AGC on. Widening THIS
                         // user-controlled slider instead only affects
                         // whoever actually drags it up.
-                        if stable_db_slider(ui, &mut connected.slider_scroll_accum, &mut gain, -100.0, 30.0, 1.0) {
+                        let gain_changed = ui
+                            .horizontal(|ui| {
+                                let ch = stable_db_slider(ui, &mut connected.slider_scroll_accum, &mut gain, -100.0, 30.0, 1.0);
+                                audio_clip_indicator(ui);
+                                ch
+                            })
+                            .inner;
+                        if gain_changed {
                             connected.spectrum.set_gain(gain);
                             settings_changed = true;
                         }
@@ -15827,6 +15834,38 @@ fn stable_value_box(ui: &mut egui::Ui, text: String) {
     egui::Frame::new().fill(visuals.bg_fill).corner_radius(visuals.corner_radius).inner_margin(4).show(ui, |ui| {
         ui.label(egui::RichText::new(text).monospace());
     });
+}
+
+/// Clip indicator next to Audio gain: shows the recent audio peak in dBFS
+/// (measured after Audio gain, before the final hard clamp) and turns red
+/// "CLIP" while samples are being cut off, held ~1.5 s so short peaks stay
+/// visible. Fixed width so the grid does not jiggle.
+fn audio_clip_indicator(ui: &mut egui::Ui) {
+    let id = egui::Id::new("audio_clip_indicator");
+    let peak = spectrum::take_audio_peak();
+    let now = ui.input(|i| i.time);
+    let (mut shown_peak, mut clip_until) = ui
+        .data(|d| d.get_temp::<(f32, f64)>(id))
+        .unwrap_or((0.0, 0.0));
+    // Peak hold decays slowly so the number is readable.
+    shown_peak = if peak > shown_peak { peak } else { shown_peak * 0.97 };
+    if peak > 1.0 {
+        clip_until = now + 1.5;
+    }
+    ui.data_mut(|d| d.insert_temp(id, (shown_peak, clip_until)));
+    let clipping = now < clip_until;
+    let db = if shown_peak > 0.00001 { 20.0 * shown_peak.log10() } else { -99.0 };
+    let (text, color) = if clipping {
+        (format!("CLIP {:>+5.1}", db), egui::Color32::from_rgb(230, 50, 50))
+    } else {
+        (format!("pk {:>+5.1}", db), egui::Color32::GRAY)
+    };
+    ui.label(egui::RichText::new(text).monospace().color(color))
+        .on_hover_text(
+            "Audio peak in dBFS after Audio gain. Above 0 the output is hard-clipped \
+             (distorted): lower Audio gain and raise the system volume instead.",
+        );
+    ui.ctx().request_repaint_after(std::time::Duration::from_millis(100));
 }
 
 /// REAL BUG FIX (a real report, twice -- the first attempt at this,

@@ -175,6 +175,18 @@ impl Mode {
 /// setting sees no change.
 static CW_PITCH_HZ: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(600);
 
+/// Largest |sample| * Audio gain seen since the UI last called
+/// `take_audio_peak()`, in thousandths of full scale, measured just
+/// BEFORE the final clamp -- so 1000 is 0 dBFS and anything above is
+/// being hard-clipped. A static for the same reason as `CW_PITCH_HZ`.
+static AUDIO_PEAK_MILLI: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
+/// Peak (linear, 1.0 = full scale, may exceed 1.0 = clipping) since the
+/// previous call; resets the tracker.
+pub fn take_audio_peak() -> f32 {
+    AUDIO_PEAK_MILLI.swap(0, Ordering::Relaxed) as f32 / 1000.0
+}
+
 pub fn cw_pitch_hz() -> f64 {
     CW_PITCH_HZ.load(Ordering::Relaxed) as f64
 }
@@ -2174,6 +2186,10 @@ fn run(
                 // the real (l, r) pair -- identical (l==r) when binaural
                 // is off, same as every consumer effectively saw before
                 // this was ever a stereo pair at all.
+                let peak_in = (l.abs().max(r.abs()) * params.gain * 1000.0) as u32;
+                if peak_in > AUDIO_PEAK_MILLI.load(Ordering::Relaxed) {
+                    AUDIO_PEAK_MILLI.store(peak_in, Ordering::Relaxed);
+                }
                 let (l, r) = ((l * params.gain).clamp(-1.0, 1.0), (r * params.gain).clamp(-1.0, 1.0));
                 // While RADE is the active decoder its OWN decoded speech
                 // (pushed below, after this lock scope) replaces the
