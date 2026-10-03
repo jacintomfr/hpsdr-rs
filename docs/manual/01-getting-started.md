@@ -19,6 +19,8 @@ openHPSDR UDP discovery broadcast, port 1024).
 
 ![Discovery window](images/01-discovery-window.png)
 
+> **Radio plugged straight into the computer (no router)?** The computer's interface needs a `169.254.x.x` address or nothing will be listed -- see [Connecting a radio directly to the computer](21-direct-connection.md).
+
 The window lists every radio that responded, one row per device, with
 columns:
 

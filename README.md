@@ -108,6 +108,8 @@ On Windows, a release build no longer pops up a console window alongside the app
 
 The main window's toolbar has a **Record** button that saves the RX audio you're currently hearing to a WAV file under a `recordings` folder alongside the settings above — useful for capturing a signal to play back later, or to demonstrate a feature (see the [Noise Reduction demo](#noise-reduction-demo) below for an example).
 
+**Radio plugged straight into the computer (no router)?** The computer's network interface needs a link-local `169.254.x.x` address or discovery finds nothing. Windows assigns one by itself; Linux/NetworkManager does not (it needs `ipv4.method link-local`) -- see [Connecting a radio directly to the computer](docs/manual/21-direct-connection.md).
+
 See the **[User Manual](docs/manual/README.md)** for a full walkthrough of the UI -- every settings tab, tuning gestures, extra receivers, and the PureSignal/Diversity/Equalizer features.
 
 ### Fixed-resolution LCD kiosk mode
