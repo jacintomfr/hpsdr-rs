@@ -185,6 +185,19 @@ pub enum MidiAction {
     CwMacro3,
     CwMacro4,
     CwMacro5,
+    /// The on-screen toolbar boxes (kiosk), named like piHPSDR's TOOLBAR1-7 and FUNCTION: ToolBar1-7
+    /// run the function currently assigned to that box, Function steps to the next layer -- so
+    /// physical switches can drive the toolbar.
+    Toolbar1,
+    Toolbar2,
+    Toolbar3,
+    Toolbar4,
+    Toolbar5,
+    Toolbar6,
+    Toolbar7,
+    Toolbar8,
+    /// Previous toolbar layer (piHPSDR's FuncRev).
+    ToolbarFuncRev,
 }
 
 impl MidiAction {
@@ -262,6 +275,15 @@ impl MidiAction {
             MidiAction::CwMacro3 => "Send CW Message 3",
             MidiAction::CwMacro4 => "Send CW Message 4",
             MidiAction::CwMacro5 => "Send CW Message 5",
+            MidiAction::Toolbar1 => "ToolBar1",
+            MidiAction::Toolbar2 => "ToolBar2",
+            MidiAction::Toolbar3 => "ToolBar3",
+            MidiAction::Toolbar4 => "ToolBar4",
+            MidiAction::Toolbar5 => "ToolBar5",
+            MidiAction::Toolbar6 => "ToolBar6",
+            MidiAction::Toolbar7 => "ToolBar7",
+            MidiAction::Toolbar8 => "Function",
+            MidiAction::ToolbarFuncRev => "FuncRev",
         }
     }
 }
@@ -317,6 +339,15 @@ pub const KEY_ACTIONS: &[MidiAction] = &[
     MidiAction::CwMacro3,
     MidiAction::CwMacro4,
     MidiAction::CwMacro5,
+    MidiAction::Toolbar1,
+    MidiAction::Toolbar2,
+    MidiAction::Toolbar3,
+    MidiAction::Toolbar4,
+    MidiAction::Toolbar5,
+    MidiAction::Toolbar6,
+    MidiAction::Toolbar7,
+    MidiAction::Toolbar8,
+    MidiAction::ToolbarFuncRev,
 ];
 
 /// Actions valid for a Knob (absolute value) binding.

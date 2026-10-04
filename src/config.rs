@@ -581,6 +581,13 @@ pub struct Config {
     /// RIT/XIT scroll step in Hz (1, 10 or 100) -- set in the VFO window.
     #[serde(default)]
     pub rit_step_hz: Option<i32>,
+    /// Kiosk bottom toolbar (see toolbar.rs): the function assigned to each button, one list of
+    /// names per layer, and the layer FNC left selected. Missing/unknown entries keep the factory
+    /// assignment.
+    #[serde(default)]
+    pub toolbar_layers: Option<Vec<Vec<String>>>,
+    #[serde(default)]
+    pub toolbar_layer: Option<usize>,
     /// VFO B / Split -- see ConnectedState::vfo_b_frequency_hz/split's
     /// doc comments (main.rs). `None`/missing falls back to A's
     /// frequency and Split off, respectively -- same "never leave a

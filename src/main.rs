@@ -41,6 +41,7 @@ mod rx888;
 mod spectrum;
 mod sysstats;
 mod tci;
+mod toolbar;
 mod tx;
 mod wdsp_sys;
 
@@ -917,7 +918,19 @@ fn dispatch_midi_event(connected: &mut ConnectedState, ev: RawMidiEvent, freq_hz
         }
         return;
     };
+    dispatch_midi_binding(connected, binding, ev, freq_hz, sample_rate, passband);
+}
 
+/// Applies an already-matched binding -- split out of `dispatch_midi_event` so the on-screen
+/// toolbar (toolbar.rs) can run the same actions without a MIDI event.
+fn dispatch_midi_binding(
+    connected: &mut ConnectedState,
+    binding: MidiBinding,
+    ev: RawMidiEvent,
+    freq_hz: u32,
+    sample_rate: u32,
+    passband: (f64, f64),
+) {
     // A Key binding without `momentary` only fires on press; WITH
     // momentary it fires on both press AND release (piHPSDR's ONOFF
     // modifier) -- e.g. so Mox can be bound press-to-transmit/release-to-
@@ -1418,6 +1431,35 @@ fn dispatch_midi_event(connected: &mut ConnectedState, ev: RawMidiEvent, freq_hz
             let new_phase = (current as f64 + step).clamp(-180.0, 180.0) as f32;
             connected.session.diversity_phase_deg.store(new_phase.to_bits(), Ordering::Relaxed);
         }
+        // The on-screen toolbar boxes, pressed from outside (e.g. the physical switches under the
+        // screen via MIDI): F1-F7 run whatever is assigned to that box in the current layer, F8 is FNC.
+        MidiAction::Toolbar1
+        | MidiAction::Toolbar2
+        | MidiAction::Toolbar3
+        | MidiAction::Toolbar4
+        | MidiAction::Toolbar5
+        | MidiAction::Toolbar6
+        | MidiAction::Toolbar7 => {
+            let slot = match binding.action {
+                MidiAction::Toolbar1 => 0,
+                MidiAction::Toolbar2 => 1,
+                MidiAction::Toolbar3 => 2,
+                MidiAction::Toolbar4 => 3,
+                MidiAction::Toolbar5 => 4,
+                MidiAction::Toolbar6 => 5,
+                _ => 6,
+            };
+            let f = connected.toolbar_layers[connected.toolbar_layer][slot];
+            run_toolbar_fn(connected, f, freq_hz, sample_rate, passband);
+        }
+        MidiAction::Toolbar8 => {
+            connected.toolbar_layer = (connected.toolbar_layer + 1) % toolbar::LAYERS;
+            connected.settings_dirty.store(true, Ordering::Relaxed);
+        }
+        MidiAction::ToolbarFuncRev => {
+            connected.toolbar_layer = (connected.toolbar_layer + toolbar::LAYERS - 1) % toolbar::LAYERS;
+            connected.settings_dirty.store(true, Ordering::Relaxed);
+        }
         MidiAction::CwMacro1
         | MidiAction::CwMacro2
         | MidiAction::CwMacro3
@@ -1489,6 +1531,7 @@ enum SettingsTab {
     Midi,
     Meter,
     Screen,
+    Toolbar,
     About,
 }
 
@@ -2164,6 +2207,14 @@ struct ConnectedState {
     tune_step_hz: i64,
     /// RIT/XIT scroll step (1, 10 or 100 Hz) -- picked in the VFO window.
     rit_step_hz: i32,
+    /// Kiosk bottom toolbar -- see toolbar.rs. `toolbar_pending` is a button press waiting to be
+    /// run at the next MIDI-dispatch point; `toolbar_two_tone_request` is consumed by the TWO TONE
+    /// button's own handler; `toolbar_choose` is the button being reassigned,.
+    toolbar_layers: toolbar::Layers,
+    toolbar_layer: usize,
+    toolbar_pending: Option<toolbar::ToolbarFn>,
+    toolbar_two_tone_request: bool,
+    toolbar_choose: Option<ToolbarChoose>,
     /// The last value of session.requested_frequency_hz this app has
     /// already handled -- see that field's doc comment. Compared against
     /// its live value once per frame; a mismatch means a network client
@@ -3662,6 +3713,11 @@ fn connect_to_device(device: Device, cfg: &Config) -> Result<ConnectedState, Str
                 ctun_frequency_hz,
                 tune_step_hz,
                 rit_step_hz,
+                toolbar_layers: toolbar::layers_from_config(cfg.toolbar_layers.as_ref()),
+                toolbar_layer: cfg.toolbar_layer.unwrap_or(0).min(toolbar::LAYERS - 1),
+                toolbar_pending: None,
+                toolbar_two_tone_request: false,
+                toolbar_choose: None,
                 last_requested_frequency_hz: initial_frequency_hz,
                 vfo_b_frequency_hz,
                 vfo_b_scroll_accum: 0.0,
@@ -4303,6 +4359,9 @@ impl eframe::App for HpsdrApp {
                         break;
                     }
                     dispatch_midi_event(connected, ev, freq_hz, sample_rate, passband);
+                }
+                if let Some(f) = connected.toolbar_pending.take() {
+                    run_toolbar_fn(connected, f, freq_hz, sample_rate, passband);
                 }
 
                 let current_gain = connected.spectrum.gain();
@@ -6928,7 +6987,9 @@ impl eframe::App for HpsdrApp {
                                      (Settings -> TX) -- required for PureSignal calibration, \
                                      which a steady Tune tone can't provide",
                                 );
-                            if two_tone_resp.clicked() {
+                            let toolbar_two_tone =
+                                std::mem::take(&mut connected.toolbar_two_tone_request) && two_tone_may_start;
+                            if two_tone_resp.clicked() || toolbar_two_tone {
                                 if connected.two_tone_active {
                                     connected.session.set_mox(false);
                                     if let Some(tx) = &connected.tx_handle {
@@ -7280,8 +7341,8 @@ impl eframe::App for HpsdrApp {
                     // waterfall (zoom/pan, status line), but interact_size does not grow
                     // with it: reserve the difference so the status line is not cut off.
                     let below_waterfall_reserve = if lcd_kiosk_mode() {
-                        below_waterfall_reserve
-                            + (ui.text_style_height(&egui::TextStyle::Body) - 14.0).max(0.0) * 2.0
+                        // Only the toolbar (anchored to the bottom of the window) sits below the waterfall.
+                        TOOLBAR_HEIGHT + TOOLBAR_MARGIN + SPECTRUM_WATERFALL_DIVIDER_HEIGHT
                     } else {
                         below_waterfall_reserve
                     };
@@ -8446,6 +8507,17 @@ impl eframe::App for HpsdrApp {
                         }
                     }
 
+                    // Kiosk: the zoom/pan row and the status line below it make way for the
+                    // bottom toolbar (toolbar.rs); the desktop layout is unchanged.
+                    if lcd_kiosk_mode() {
+                        let screen = ui.ctx().content_rect();
+                        egui::Area::new(egui::Id::new("kiosk_toolbar"))
+                            .anchor(egui::Align2::LEFT_BOTTOM, egui::vec2(TOOLBAR_MARGIN, -TOOLBAR_MARGIN))
+                            .show(ui.ctx(), |ui| {
+                                ui.set_width(screen.width() - 2.0 * TOOLBAR_MARGIN);
+                                render_toolbar(ui, connected);
+                            });
+                    } else {
                     ui.horizontal(|ui| {
                         // Fill the available width -- reserve space for
                         // the two labels, Reset button, and inter-widget
@@ -8765,6 +8837,7 @@ Waterfall rebuilds: {prof_wf_n:.0}/s, {prof_wf_ms:.1} ms each."
                             ui.weak(format!("PA current: {current_ma:.0}mA"));
                         }
                     });
+                    }
                 });
 
                 egui::Area::new(egui::Id::new("s_meter_area"))
@@ -9428,6 +9501,7 @@ Waterfall rebuilds: {prof_wf_n:.0}/s, {prof_wf_ms:.1} ms each."
                                     (SettingsTab::Agc, "RX"),
                                     (SettingsTab::Screen, "Screen"),
                                     (SettingsTab::Spectrum, "Spectrum"),
+                                    (SettingsTab::Toolbar, "Toolbar"),
                                     (SettingsTab::Tx, "TX"),
                                     (SettingsTab::Xvtr, "XVTR"),
                                 ] {
@@ -9448,6 +9522,10 @@ Waterfall rebuilds: {prof_wf_n:.0}/s, {prof_wf_ms:.1} ms each."
                                     // freely, so this tab would be a no-op
                                     // (and confusing) there.
                                     if tab == SettingsTab::Screen && !lcd_kiosk_mode() {
+                                        continue;
+                                    }
+                                    // The toolbar only exists in the kiosk layout.
+                                    if tab == SettingsTab::Toolbar && !lcd_kiosk_mode() {
                                         continue;
                                     }
                                     // Juice console only exists when this
@@ -9742,6 +9820,14 @@ Waterfall rebuilds: {prof_wf_n:.0}/s, {prof_wf_ms:.1} ms each."
                                     }
                                 }
 
+                                SettingsTab::Toolbar => {
+                                    ui.label(
+                                        "The eight boxes at the bottom of the screen: F1-F7 run a function and FNC steps \n                                         through six layers. You can also hold a box for a moment to change it.",
+                                    );
+                                    ui.add_space(6.0);
+                                    render_toolbar_config(ui, connected);
+                                }
+
                                 SettingsTab::Juice => {
                                     if let Some(console) = connected.juice_console.clone() {
                                         ui.label(
@@ -10005,6 +10091,11 @@ Waterfall rebuilds: {prof_wf_n:.0}/s, {prof_wf_ms:.1} ms each."
                                             MidiBindingKind::Wheel => WHEEL_ACTIONS,
                                         };
 
+                                        // Alphabetical (numbers in natural order), whatever order the actions are declared in.
+                                        let mut action_choices: Vec<MidiAction> = action_choices.to_vec();
+                                        action_choices.sort_by(|a, b| {
+                                            toolbar::natural_cmp(&midi_action_label(*a, connected), &midi_action_label(*b, connected))
+                                        });
                                         ui.horizontal(|ui| {
                                             ui.label("Action:");
                                             let current_label = connected
@@ -10014,10 +10105,10 @@ Waterfall rebuilds: {prof_wf_n:.0}/s, {prof_wf_ms:.1} ms each."
                                                 .unwrap_or("(choose)");
                                             egui::ComboBox::from_id_salt("midi_learn_action")
                                                 .selected_text(current_label)
+                                                .height(300.0)
                                                 .show_ui(ui, |ui| {
-                                                    for &action in action_choices {
-                                                        let selected =
-                                                            connected.midi_learn.selected_action == Some(action);
+                                                    for &action in &action_choices {
+                                                        let selected = connected.midi_learn.selected_action == Some(action);
                                                         if ui
                                                             .selectable_label(selected, midi_action_label(action, connected))
                                                             .clicked()
@@ -10137,6 +10228,15 @@ Waterfall rebuilds: {prof_wf_n:.0}/s, {prof_wf_ms:.1} ms each."
                                                     if let Some(i) = connected.midi_learn.edit_index {
                                                         connected.midi_bindings[i] = binding;
                                                     } else {
+                                                        // A control can only do one thing, and the first matching binding wins:
+                                                        // drop older ones on the same control so they can't shadow this one.
+                                                        connected.midi_bindings.retain(|b| {
+                                                            !(b.event == binding.event
+                                                                && b.number == binding.number
+                                                                && (b.channel.is_none()
+                                                                    || binding.channel.is_none()
+                                                                    || b.channel == binding.channel))
+                                                        });
                                                         connected.midi_bindings.push(binding);
                                                     }
                                                     settings_changed = true;
@@ -14050,6 +14150,8 @@ Waterfall rebuilds: {prof_wf_n:.0}/s, {prof_wf_ms:.1} ms each."
                         ctun_frequency_hz: Some(connected.ctun_frequency_hz),
                         tune_step_hz: Some(connected.tune_step_hz),
                         rit_step_hz: Some(connected.rit_step_hz),
+                        toolbar_layers: Some(toolbar::layers_to_config(&connected.toolbar_layers)),
+                        toolbar_layer: Some(connected.toolbar_layer),
                         vfo_b_frequency_hz: Some(connected.vfo_b_frequency_hz),
                         split: Some(connected.split),
                         cw_decode_enabled: Some(connected.cw_decode_enabled),
@@ -15772,6 +15874,314 @@ fn render_rade_side_panel_beside(
             render_rade_side_panel(ui, rade, fit_clicked, quick_tune);
         });
     });
+}
+
+/// Height of the kiosk toolbar boxes and the gap kept below and around them.
+const TOOLBAR_HEIGHT: f32 = 40.0;
+const TOOLBAR_MARGIN: f32 = 4.0;
+
+/// Runs one toolbar button's function. MIDI-style actions go through the same dispatcher a MIDI
+/// controller uses; Two Tone is handed to its own button's handler; zoom/pan are plain state edits.
+fn run_toolbar_fn(
+    connected: &mut ConnectedState,
+    f: toolbar::ToolbarFn,
+    freq_hz: u32,
+    sample_rate: u32,
+    passband: (f64, f64),
+) {
+    use toolbar::ToolbarFn;
+    match f {
+        ToolbarFn::None => {}
+        ToolbarFn::Midi(action) => {
+            let binding = MidiBinding {
+                event: midi::MidiEventKind::NoteKey,
+                channel: None,
+                number: 0,
+                kind: midi::MidiBindingKind::Key,
+                action,
+                momentary: false,
+                sensitivity: 1.0,
+                debounce_ms: 0,
+                accel_mode: Default::default(),
+            };
+            let ev = RawMidiEvent { kind: midi::MidiEventKind::NoteKey, channel: 0, number: 0, value: 127, off: false };
+            dispatch_midi_binding(connected, binding, ev, freq_hz, sample_rate, passband);
+        }
+        ToolbarFn::TwoTone => connected.toolbar_two_tone_request = true,
+        ToolbarFn::ZoomIn => connected.spectrum_zoom = (connected.spectrum_zoom + 1).min(16),
+        ToolbarFn::ZoomOut => connected.spectrum_zoom = (connected.spectrum_zoom - 1).max(1),
+        ToolbarFn::ZoomReset => {
+            connected.spectrum_zoom = 1;
+            connected.spectrum_pan = 0.0;
+        }
+        ToolbarFn::PanLeft => {
+            if connected.spectrum_zoom > 1 {
+                connected.spectrum_pan = (connected.spectrum_pan - 0.1).max(-1.0);
+            }
+        }
+        ToolbarFn::PanRight => {
+            if connected.spectrum_zoom > 1 {
+                connected.spectrum_pan = (connected.spectrum_pan + 0.1).min(1.0);
+            }
+        }
+    }
+    connected.settings_dirty.store(true, Ordering::Relaxed);
+}
+
+/// Whether a toolbar function is "on" right now (drawn lighter, like piHPSDR's lit buttons).
+fn toolbar_fn_active(connected: &ConnectedState, f: toolbar::ToolbarFn) -> bool {
+    use toolbar::ToolbarFn;
+    let ToolbarFn::Midi(action) = f else {
+        return matches!(f, ToolbarFn::TwoTone) && connected.two_tone_active;
+    };
+    match action {
+        MidiAction::Mox => connected.session.mox_active(),
+        MidiAction::Tune => connected.tune_active,
+        MidiAction::Split => connected.split,
+        MidiAction::RitToggle => connected.rit_enabled,
+        MidiAction::XitToggle => connected.xit_enabled,
+        MidiAction::CtunToggle => connected.ctun,
+        MidiAction::NoiseBlankerCycle => connected.spectrum.noise_blanker() != spectrum::NoiseBlanker::Off,
+        MidiAction::NoiseReductionCycle => connected.spectrum.noise_reduction() != spectrum::NoiseReduction::Off,
+        MidiAction::AgcCycle => connected.spectrum.agc() != spectrum::Agc::Off,
+        MidiAction::SnbToggle => connected.spectrum.snb(),
+        MidiAction::BinauralToggle => connected.spectrum.binaural(),
+        MidiAction::RxEqToggle => connected.spectrum.eq().enabled,
+        MidiAction::Band160m
+        | MidiAction::Band80m
+        | MidiAction::Band40m
+        | MidiAction::Band30m
+        | MidiAction::Band20m
+        | MidiAction::Band17m
+        | MidiAction::Band15m
+        | MidiAction::Band12m
+        | MidiAction::Band10m
+        | MidiAction::Band6m => {
+            let hz = if connected.ctun {
+                connected.ctun_frequency_hz
+            } else {
+                connected.session.frequency_hz.load(Ordering::Relaxed)
+            };
+            band_for_frequency(hz).is_some_and(|b| b.name == toolbar::ToolbarFn::Midi(action).short_label())
+        }
+        _ => false,
+    }
+}
+
+/// The kiosk's bottom toolbar: seven function boxes plus FNC, piHPSDR style. Grey box with a thin
+/// outline; lighter box and text while pressed; lighter box and whiter text while the function is
+/// on. Click runs the function; holding a function box ~0.6 s opens the function chooser for that
+/// box; FNC steps to the next layer (hold: previous).
+fn render_toolbar(ui: &mut egui::Ui, connected: &mut ConnectedState) {
+    const GAP: f32 = 6.0;
+    const HEIGHT: f32 = TOOLBAR_HEIGHT;
+    let count = toolbar::BUTTONS + 1;
+    let width = ((ui.available_width() - GAP * (count as f32 - 1.0)) / count as f32).floor().max(40.0);
+    let layer = connected.toolbar_layer;
+    ui.horizontal(|ui| {
+        ui.spacing_mut().item_spacing.x = GAP;
+        for slot in 0..count {
+            let is_fnc = slot == toolbar::BUTTONS;
+            let f = if is_fnc { toolbar::ToolbarFn::None } else { connected.toolbar_layers[layer][slot] };
+            let label = if is_fnc { format!("FNC({layer})") } else { f.short_label().to_string() };
+            let active = !is_fnc && toolbar_fn_active(connected, f);
+            let (rect, resp) = ui.allocate_exact_size(egui::vec2(width, HEIGHT), egui::Sense::click());
+            let pressed = resp.is_pointer_button_down_on();
+            let (bg, fg) = if pressed {
+                (egui::Color32::from_gray(98), egui::Color32::from_gray(228))
+            } else if active {
+                (egui::Color32::from_gray(112), egui::Color32::WHITE)
+            } else {
+                (egui::Color32::from_gray(58), egui::Color32::from_gray(172))
+            };
+            ui.painter().rect_filled(rect, 6.0, bg);
+            ui.painter().rect_stroke(
+                rect,
+                6.0,
+                egui::Stroke::new(1.0, egui::Color32::from_gray(120)),
+                egui::StrokeKind::Inside,
+            );
+            // Shrink the text if it would not fit the box.
+            let mut size = 22.0;
+            let mut galley =
+                ui.painter().layout_no_wrap(label.clone(), egui::FontId::proportional(size), fg);
+            if galley.size().x > width - 8.0 {
+                size *= (width - 8.0) / galley.size().x;
+                galley = ui.painter().layout_no_wrap(label.clone(), egui::FontId::proportional(size), fg);
+            }
+            // Faux bold: egui's default font has no bold face, so draw the text twice, a hair apart.
+            let pos = rect.center() - galley.size() / 2.0;
+            ui.painter().galley(pos + egui::vec2(0.7, 0.0), galley.clone(), fg);
+            ui.painter().galley(pos, galley, fg);
+            match press_gesture(ui, &resp, &format!("toolbar_btn_{slot}")) {
+                PressGesture::Short => {
+                    if is_fnc {
+                        connected.toolbar_layer = (layer + 1) % toolbar::LAYERS;
+                        connected.settings_dirty.store(true, Ordering::Relaxed);
+                    } else if f != toolbar::ToolbarFn::None {
+                        connected.toolbar_pending = Some(f);
+                    }
+                }
+                PressGesture::Long => {
+                    if is_fnc {
+                        connected.toolbar_layer = (layer + toolbar::LAYERS - 1) % toolbar::LAYERS;
+                        connected.settings_dirty.store(true, Ordering::Relaxed);
+                    } else {
+                        connected.toolbar_choose = Some(ToolbarChoose {
+                            layer,
+                            slot,
+                            selected: connected.toolbar_layers[layer][slot],
+                            from_settings: false,
+            scroll: 0.0,
+                        });
+                    }
+                }
+                PressGesture::None => {}
+            }
+        }
+    });
+
+    show_toolbar_chooser(ui.ctx(), connected, false);
+}
+
+/// A toolbar button being reassigned: which one, what is highlighted in the list, and which window
+/// (main or Settings) opened it, so only that one draws the dialog.
+struct ToolbarChoose {
+    layer: usize,
+    slot: usize,
+    selected: toolbar::ToolbarFn,
+    from_settings: bool,
+    /// Scroll position of the function list, moved by the page buttons.
+    scroll: f32,
+}
+
+/// piHPSDR's "Choose Function" dialog: Choose and Cancel on top, then a scrolling grid of the
+/// functions, one highlighted; Choose assigns it, Cancel leaves the button as it was.
+/// piHPSDR's "Choose Function" dialog, shared by the toolbar and the MIDI Learn: Choose and Cancel
+/// on top, then a scrolling grid of the items (the list runs downward, as many columns as the width
+/// allows) with page buttons on the right. `selected` is the highlighted item, `scroll` the list's
+/// position. Returns Some(true) on Choose, Some(false) on Cancel.
+fn choose_function_dialog(
+    ctx: &egui::Context,
+    items: &[String],
+    selected: &mut usize,
+    scroll: &mut f32,
+) -> Option<bool> {
+    let screen = ctx.content_rect();
+    const PAGE_BTN_W: f32 = 64.0;
+    const CELL_H: f32 = 36.0;
+    const SPACING: f32 = 4.0;
+    let list_w = (screen.width() - PAGE_BTN_W - 90.0).max(160.0);
+    let cols = ((list_w / (170.0 + SPACING)).floor() as usize).clamp(1, 6);
+    let cell_w = ((list_w - SPACING * cols as f32) / cols as f32).floor();
+    let list_h = (screen.height() - 190.0).clamp(120.0, 400.0);
+    let mut action = None;
+    egui::Window::new("Choose Function")
+        .collapsible(false)
+        .resizable(false)
+        .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+        .show(ctx, |ui| {
+            ui.horizontal(|ui| {
+                if ui.add_sized([110.0, 30.0], egui::Button::new("Choose")).clicked() {
+                    action = Some(true);
+                }
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if ui.add_sized([110.0, 30.0], egui::Button::new("Cancel")).clicked() {
+                        action = Some(false);
+                    }
+                });
+            });
+            let rows = items.len().div_ceil(cols);
+            let content_h = rows as f32 * (CELL_H + SPACING);
+            let max_scroll = (content_h - list_h).max(0.0);
+            let page = (list_h - CELL_H).max(CELL_H);
+            ui.horizontal_top(|ui| {
+                let out = egui::ScrollArea::vertical()
+                    .id_salt("choose_function_scroll")
+                    .max_height(list_h)
+                    .max_width(list_w)
+                    .auto_shrink([false, false])
+                    .vertical_scroll_offset((*scroll).clamp(0.0, max_scroll))
+                    .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysVisible)
+                    .show(ui, |ui| {
+                        egui::Grid::new("choose_function_grid").spacing([SPACING, SPACING]).show(ui, |ui| {
+                            for (i, label) in items.iter().enumerate() {
+                                let b = egui::Button::selectable(*selected == i, label.as_str()).wrap();
+                                if ui.add_sized([cell_w, CELL_H], b).clicked() {
+                                    *selected = i;
+                                }
+                                if i % cols == cols - 1 {
+                                    ui.end_row();
+                                }
+                            }
+                        });
+                    });
+                *scroll = out.state.offset.y;
+                ui.vertical(|ui| {
+                    if ui.add_sized([PAGE_BTN_W, list_h / 2.0 - 2.0], egui::Button::new("\u{25B2}")).clicked() {
+                        *scroll = (*scroll - page).max(0.0);
+                    }
+                    if ui.add_sized([PAGE_BTN_W, list_h / 2.0 - 2.0], egui::Button::new("\u{25BC}")).clicked() {
+                        *scroll = (*scroll + page).min(max_scroll);
+                    }
+                });
+            });
+        });
+    action
+}
+
+fn show_toolbar_chooser(ctx: &egui::Context, connected: &mut ConnectedState, from_settings: bool) {
+    let Some(state) = connected.toolbar_choose.as_mut().filter(|s| s.from_settings == from_settings) else {
+        return;
+    };
+    let functions = toolbar::ToolbarFn::all();
+    let labels: Vec<String> = functions.iter().map(|f| f.long_label()).collect();
+    let mut selected = functions.iter().position(|f| *f == state.selected).unwrap_or(0);
+    let result = choose_function_dialog(ctx, &labels, &mut selected, &mut state.scroll);
+    state.selected = functions[selected];
+    match result {
+        Some(true) => {
+            let (layer, slot, f) = (state.layer, state.slot, state.selected);
+            connected.toolbar_layers[layer][slot] = f;
+            connected.settings_dirty.store(true, Ordering::Relaxed);
+            connected.toolbar_choose = None;
+        }
+        Some(false) => connected.toolbar_choose = None,
+        None => {}
+    }
+}
+
+/// piHPSDR's "Toolbar configuration", shown directly in Settings -> Toolbar: every layer with its
+/// seven buttons (highest layer on top, layer 0 at the bottom like the real toolbar), the FNC box
+/// at the end of each row, and a click on a button goes straight to the function chooser.
+fn render_toolbar_config(ui: &mut egui::Ui, connected: &mut ConnectedState) {
+    let mut open_slot = None;
+    // Eight columns across the available width.
+    let cell_w = ((ui.available_width() - 8.0) / 8.0 - 5.0).clamp(60.0, 120.0).floor();
+    egui::Grid::new("toolbar_config_grid").spacing([5.0, 5.0]).show(ui, |ui| {
+        for layer in (0..toolbar::LAYERS).rev() {
+            for slot in 0..toolbar::BUTTONS {
+                let f = connected.toolbar_layers[layer][slot];
+                let text = if f == toolbar::ToolbarFn::None { "None" } else { f.short_label() };
+                if ui.add_sized([cell_w, 34.0], egui::Button::new(text)).clicked() {
+                    open_slot = Some((layer, slot));
+                }
+            }
+            // The last box of every layer is FNC itself, which is not assignable.
+            ui.add_sized([cell_w, 34.0], egui::Label::new(egui::RichText::new(format!("FNC({layer})")).weak()));
+            ui.end_row();
+        }
+    });
+    if let Some((layer, slot)) = open_slot {
+        connected.toolbar_choose = Some(ToolbarChoose {
+            layer,
+            slot,
+            selected: connected.toolbar_layers[layer][slot],
+            from_settings: true,
+            scroll: 0.0,
+        });
+    }
+    show_toolbar_chooser(ui.ctx(), connected, true);
 }
 
 /// Small audio-waveform display drawn in the top-right corner of the
@@ -18873,6 +19283,7 @@ fn render_extra_receiver_settings(ui: &mut egui::Ui, rx: &Arc<Mutex<ExtraReceive
         // concept -- redirect same as Network.
         SettingsTab::Firmware => rx.settings_tab = SettingsTab::Agc,
         SettingsTab::Juice => rx.settings_tab = SettingsTab::Agc,
+        SettingsTab::Toolbar => rx.settings_tab = SettingsTab::Agc,
         // MIDI control targets the primary receiver/VFO A+B only (see
         // dispatch_midi_event) -- not a per-receiver concept, redirect
         // same as Firmware.
