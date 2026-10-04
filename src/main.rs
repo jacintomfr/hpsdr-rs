@@ -1450,13 +1450,16 @@ fn dispatch_midi_binding(
                 _ => 6,
             };
             let f = connected.toolbar_layers[connected.toolbar_layer][slot];
+            connected.toolbar_flash[slot] = Some(Instant::now());
             run_toolbar_fn(connected, f, freq_hz, sample_rate, passband);
         }
         MidiAction::Toolbar8 => {
+            connected.toolbar_flash[toolbar::BUTTONS] = Some(Instant::now());
             connected.toolbar_layer = (connected.toolbar_layer + 1) % toolbar::LAYERS;
             connected.settings_dirty.store(true, Ordering::Relaxed);
         }
         MidiAction::ToolbarFuncRev => {
+            connected.toolbar_flash[toolbar::BUTTONS] = Some(Instant::now());
             connected.toolbar_layer = (connected.toolbar_layer + toolbar::LAYERS - 1) % toolbar::LAYERS;
             connected.settings_dirty.store(true, Ordering::Relaxed);
         }
@@ -2213,6 +2216,9 @@ struct ConnectedState {
     toolbar_layers: toolbar::Layers,
     toolbar_layer: usize,
     toolbar_pending: Option<toolbar::ToolbarFn>,
+    /// When each toolbar box (F1-F7, FNC) was last pressed, so it can show "pressed" briefly -- also
+    /// for a press that came from a MIDI key and not from the screen.
+    toolbar_flash: [Option<Instant>; 8],
     toolbar_two_tone_request: bool,
     toolbar_choose: Option<ToolbarChoose>,
     /// The last value of session.requested_frequency_hz this app has
@@ -3716,6 +3722,7 @@ fn connect_to_device(device: Device, cfg: &Config) -> Result<ConnectedState, Str
                 toolbar_layers: toolbar::layers_from_config(cfg.toolbar_layers.as_ref()),
                 toolbar_layer: cfg.toolbar_layer.unwrap_or(0).min(toolbar::LAYERS - 1),
                 toolbar_pending: None,
+                toolbar_flash: [None; 8],
                 toolbar_two_tone_request: false,
                 toolbar_choose: None,
                 last_requested_frequency_hz: initial_frequency_hz,
@@ -15879,6 +15886,8 @@ fn render_rade_side_panel_beside(
 /// Height of the kiosk toolbar boxes and the gap kept below and around them.
 const TOOLBAR_HEIGHT: f32 = 40.0;
 const TOOLBAR_MARGIN: f32 = 4.0;
+/// How long a toolbar box keeps its "pressed" look after a press.
+const TOOLBAR_FLASH: Duration = Duration::from_millis(180);
 
 /// Runs one toolbar button's function. MIDI-style actions go through the same dispatcher a MIDI
 /// controller uses; Two Tone is handed to its own button's handler; zoom/pan are plain state edits.
@@ -15979,46 +15988,18 @@ fn toggle_rade_direct(connected: &mut ConnectedState) {
     }
 }
 
-/// Whether a toolbar function is "on" right now (drawn lighter, like piHPSDR's lit buttons).
+/// Whether a toolbar box stays lit (drawn lighter, whiter text) because its function is on.
 fn toolbar_fn_active(connected: &ConnectedState, f: toolbar::ToolbarFn) -> bool {
     use toolbar::ToolbarFn;
-    let ToolbarFn::Midi(action) = f else {
-        return match f {
-            ToolbarFn::TwoTone => connected.two_tone_active,
-            ToolbarFn::Rade => rade_is_running(connected),
-            _ => false,
-        };
-    };
-    match action {
-        MidiAction::Mox => connected.session.mox_active(),
-        MidiAction::Tune => connected.tune_active,
-        MidiAction::Split => connected.split,
-        MidiAction::RitToggle => connected.rit_enabled,
-        MidiAction::XitToggle => connected.xit_enabled,
-        MidiAction::CtunToggle => connected.ctun,
-        MidiAction::NoiseBlankerCycle => connected.spectrum.noise_blanker() != spectrum::NoiseBlanker::Off,
-        MidiAction::NoiseReductionCycle => connected.spectrum.noise_reduction() != spectrum::NoiseReduction::Off,
-        MidiAction::AgcCycle => connected.spectrum.agc() != spectrum::Agc::Off,
-        MidiAction::SnbToggle => connected.spectrum.snb(),
-        MidiAction::BinauralToggle => connected.spectrum.binaural(),
-        MidiAction::RxEqToggle => connected.spectrum.eq().enabled,
-        MidiAction::Band160m
-        | MidiAction::Band80m
-        | MidiAction::Band40m
-        | MidiAction::Band30m
-        | MidiAction::Band20m
-        | MidiAction::Band17m
-        | MidiAction::Band15m
-        | MidiAction::Band12m
-        | MidiAction::Band10m
-        | MidiAction::Band6m => {
-            let hz = if connected.ctun {
-                connected.ctun_frequency_hz
-            } else {
-                connected.session.frequency_hz.load(Ordering::Relaxed)
-            };
-            band_for_frequency(hz).is_some_and(|b| b.name == toolbar::ToolbarFn::Midi(action).short_label())
-        }
+    // Only functions with no indicator of their own on the main screen stay lit: transmit states and
+    // RADE. Everything else (NB, NR, AGC, SNB, BIN, CTUN, Split, RIT, XIT, bands, modes...) already
+    // shows its state, with its variant, in the main window, so its box only flashes when pressed.
+    match f {
+        ToolbarFn::TwoTone => connected.two_tone_active,
+        ToolbarFn::Rade => rade_is_running(connected),
+        ToolbarFn::Midi(MidiAction::Mox) => connected.session.mox_active(),
+        ToolbarFn::Midi(MidiAction::Tune) => connected.tune_active,
+        ToolbarFn::Midi(MidiAction::RxEqToggle) => connected.spectrum.eq().enabled,
         _ => false,
     }
 }
@@ -16041,7 +16022,12 @@ fn render_toolbar(ui: &mut egui::Ui, connected: &mut ConnectedState) {
             let label = if is_fnc { format!("FNC({layer})") } else { f.short_label().to_string() };
             let active = !is_fnc && toolbar_fn_active(connected, f);
             let (rect, resp) = ui.allocate_exact_size(egui::vec2(width, HEIGHT), egui::Sense::click());
-            let pressed = resp.is_pointer_button_down_on();
+            // "Pressed" look while held, and for a moment after any press (screen or MIDI key).
+            let flashing = connected.toolbar_flash[slot].is_some_and(|t| t.elapsed() < TOOLBAR_FLASH);
+            if flashing {
+                ui.ctx().request_repaint_after(TOOLBAR_FLASH);
+            }
+            let pressed = resp.is_pointer_button_down_on() || flashing;
             let (bg, fg) = if pressed {
                 (egui::Color32::from_gray(98), egui::Color32::from_gray(228))
             } else if active {
@@ -16068,6 +16054,9 @@ fn render_toolbar(ui: &mut egui::Ui, connected: &mut ConnectedState) {
             let pos = rect.center() - galley.size() / 2.0;
             ui.painter().galley(pos + egui::vec2(0.7, 0.0), galley.clone(), fg);
             ui.painter().galley(pos, galley, fg);
+            if resp.clicked() {
+                connected.toolbar_flash[slot] = Some(Instant::now());
+            }
             match press_gesture(ui, &resp, &format!("toolbar_btn_{slot}")) {
                 PressGesture::Short => {
                     if is_fnc {
