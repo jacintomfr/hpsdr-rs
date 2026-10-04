@@ -2219,6 +2219,9 @@ struct ConnectedState {
     /// When each toolbar box (F1-F7, FNC) was last pressed, so it can show "pressed" briefly -- also
     /// for a press that came from a MIDI key and not from the screen.
     toolbar_flash: [Option<Instant>; 8],
+    /// Kiosk: screen x of the centre of the TCI TX gain value box and of the NB chip, recorded each frame so
+    /// RIT and XIT (on the row above) line up with them.
+    align_x: (f32, f32),
     toolbar_two_tone_request: bool,
     toolbar_choose: Option<ToolbarChoose>,
     /// The last value of session.requested_frequency_hz this app has
@@ -3723,6 +3726,7 @@ fn connect_to_device(device: Device, cfg: &Config) -> Result<ConnectedState, Str
                 toolbar_layer: cfg.toolbar_layer.unwrap_or(0).min(toolbar::LAYERS - 1),
                 toolbar_pending: None,
                 toolbar_flash: [None; 8],
+                align_x: (0.0, 0.0),
                 toolbar_two_tone_request: false,
                 toolbar_choose: None,
                 last_requested_frequency_hz: initial_frequency_hz,
@@ -5065,8 +5069,21 @@ impl eframe::App for HpsdrApp {
                     } else {
                         egui::Color32::GRAY
                     };
+                    // Kiosk: the step the plain scroll wheel uses now, shown in VFO A's box where the RX badge was
+                    // (the colour of the digits already says RX/TX).
+                    let vfo_step_label = tune_step_label(scroll_tune_step_hz(
+                        connected.tune_step_hz,
+                        matches!(connected.spectrum.mode(), spectrum::Mode::Cwl | spectrum::Mode::Cwu),
+                        false,
+                        false,
+                    ));
                     let (freq_label, vfo_b_label) = ui
                         .horizontal(|ui| {
+                            // Kiosk: tighter gaps in this top row -- at 125% scale it is wider than the 1024 px
+                            // screen, which left no room for the LEV/PROC/CFC column before the meter.
+                            if lcd_kiosk_mode() {
+                                ui.spacing_mut().item_spacing.x = 4.0;
+                            }
                             // VFO A, boxed and labeled to match VFO B's own
                             // box below -- see ConnectedState::
                             // vfo_b_frequency_hz/split's doc comments for
@@ -5121,8 +5138,12 @@ impl eframe::App for HpsdrApp {
                                             // receiving even when it's
                                             // just a stored frequency,
                                             // not actually in use).
-                                            let rx_tx_label = if freq_a_color == egui::Color32::RED { "TX" } else { "RX" };
-                                            ui.colored_label(freq_a_color, rx_tx_label);
+                                            if lcd_kiosk_mode() {
+                                                ui.colored_label(egui::Color32::from_rgb(235, 195, 40), format!("step: {vfo_step_label}"));
+                                            } else {
+                                                let rx_tx_label = if freq_a_color == egui::Color32::RED { "TX" } else { "RX" };
+                                                ui.colored_label(freq_a_color, rx_tx_label);
+                                            }
                                         });
                                         let resp = ui
                                             .add(
@@ -5341,12 +5362,15 @@ impl eframe::App for HpsdrApp {
                             });
 
                             // rigctl/TCI/CAT column, centred between the VFO-A buttons and the
-                            // VFO-B box (equal gap on both sides).
-                            ui.add_space(8.0);
-                            ui.vertical(|ui| {
-                                render_net_status_column(ui, connected, rigctl_status, tci_status, cat_status);
-                            });
-                            ui.add_space(8.0);
+                            // VFO-B box (equal gap on both sides). Kiosk: moved to the band row, and VFO-B
+                            // sits right against the VFO-A buttons, with the same gap VFO-A has to its own.
+                            if !lcd_kiosk_mode() {
+                                ui.add_space(8.0);
+                                ui.vertical(|ui| {
+                                    render_net_status_column(ui, connected, rigctl_status, tci_status, cat_status);
+                                });
+                                ui.add_space(8.0);
+                            }
 
                             let vfo_b_label = ui
                                 .group(|ui| {
@@ -5374,8 +5398,10 @@ impl eframe::App for HpsdrApp {
                                             // own frequency digits'
                                             // color, not falsely claim
                                             // green/RX (a real report).
-                                            let rx_tx_label = if freq_b_color == egui::Color32::RED { "TX" } else { "RX" };
-                                            ui.colored_label(freq_b_color, rx_tx_label);
+                                            if !lcd_kiosk_mode() {
+                                                let rx_tx_label = if freq_b_color == egui::Color32::RED { "TX" } else { "RX" };
+                                                ui.colored_label(freq_b_color, rx_tx_label);
+                                            }
                                         });
                                         let resp = ui
                                             .add(
@@ -5618,7 +5644,20 @@ impl eframe::App for HpsdrApp {
                             // both modes now, stacked as 3 short lines.
                             if connected.tx_enabled {
                                 if let Some(tx) = &connected.tx_handle {
-                                    ui.add_space(12.0);
+                                    // Kiosk: LEV/PROC/CFC sit centred between the PK/MIC/ALC column and the meter.
+                                    if lcd_kiosk_mode() {
+                                    let lev_w = {
+                                        let font = egui::TextStyle::Body.resolve(ui.style());
+                                        ["LEV +99", "PROC +99", "CFC"]
+                                            .iter()
+                                            .map(|s| ui.painter().layout_no_wrap(s.to_string(), font.clone(), egui::Color32::WHITE).size().x)
+                                            .fold(0.0_f32, f32::max)
+                                    };
+                                    let free = meter_left_x(ui) - ui.next_widget_position().x - lev_w;
+                                    ui.add_space((free / 2.0 - ui.spacing().item_spacing.x).max(2.0));
+                                    } else {
+                                        ui.add_space(12.0);
+                                    }
                                     ui.vertical(|ui| {
                                         if tx.leveler_enabled() {
                                             ui.colored_label(
@@ -5756,14 +5795,20 @@ impl eframe::App for HpsdrApp {
                         // Centre RIT/XIT between the last band button (Gen/XVTR) and the
                         // meter at the right edge.
                         {
-                            let one = chip_width(ui, &["RIT -9999"]);
-                            let n_chips = if connected.tx_enabled { 2.0 } else { 1.0 };
+                            // Kiosk: the group is rigctl/TCI/CAT (RIT/XIT moved to the mode row, beside BIN).
+                            let (one, n_chips) = if lcd_kiosk_mode() {
+                                (chip_width(ui, &["rigctl"]), 3.0)
+                            } else {
+                                (chip_width(ui, &["RIT -9999"]), if connected.tx_enabled { 2.0 } else { 1.0 })
+                            };
                             let group_w = one * n_chips + (n_chips - 1.0) * ui.spacing().item_spacing.x;
                             let meter_left = meter_left_x(ui);
                             let free = (meter_left - ui.cursor().left() - group_w).max(16.0);
                             ui.add_space((free / 2.0).clamp(16.0, 200.0));
                         }
-                        if render_rit_xit(ui, connected) {
+                        if lcd_kiosk_mode() {
+                            render_net_status_column(ui, connected, rigctl_status, tci_status, cat_status);
+                        } else if render_rit_xit(ui, connected) {
                             settings_changed = true;
                         }
                     });
@@ -5775,7 +5820,7 @@ impl eframe::App for HpsdrApp {
                         let mut close_now = false;
                         // Compact window like piHPSDR's VFO menu (keypad + the two step
                         // pickers). Bigger in kiosk mode (scaled fonts).
-                        let win_size = if lcd_kiosk_mode() { [400.0, 430.0] } else { [310.0, 340.0] };
+                        let win_size = if lcd_kiosk_mode() { [330.0, 378.0] } else { [310.0, 340.0] };
                         let mut freq_entry_viewport = egui::ViewportBuilder::default()
                             .with_title("VFO")
                             .with_inner_size(win_size)
@@ -5795,6 +5840,18 @@ impl eframe::App for HpsdrApp {
                                     return;
                                 }
                                 egui::CentralPanel::default().show(ui, |ui| {
+                                    // Kiosk: a thin outline around the (undecorated) window, drawn on top.
+                                    if lcd_kiosk_mode() {
+                                        let outline = ui
+                                            .ctx()
+                                            .layer_painter(egui::LayerId::new(egui::Order::Foreground, egui::Id::new("vfo_window_outline")));
+                                        outline.rect_stroke(
+                                            ui.ctx().content_rect(),
+                                            0.0,
+                                            egui::Stroke::new(1.0, egui::Color32::from_gray(130)),
+                                            egui::StrokeKind::Inside,
+                                        );
+                                    }
                                     let (mut vfo_b, mut digits) = match &connected.frequency_entry {
                                         Some(e) => (e.vfo_b, e.digits.clone()),
                                         None => return,
@@ -5841,14 +5898,24 @@ impl eframe::App for HpsdrApp {
 
                                     // Top row: which VFO this edits, and Close.
                                     ui.horizontal(|ui| {
+                                        // Kiosk: which VFO this edits is fixed by how the window was opened (right-click on
+                                        // VFO A or VFO B), so the A/B chips make way for a tighter window.
+                                        if !lcd_kiosk_mode() {
                                         if toggle_chip(ui, "VFO A", !vfo_b, 0.0, "").clicked() {
                                             vfo_b = false;
                                         }
                                         if toggle_chip(ui, "VFO B", vfo_b, 0.0, "").clicked() {
                                             vfo_b = true;
                                         }
+                                        }
                                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                                            if toggle_chip(ui, "Close", false, 0.0, "").clicked() {
+                                            // Kiosk: as big as the number keys.
+                                            let close_resp = if lcd_kiosk_mode() {
+                                                ui.add(chip_button("Close", false).min_size(egui::vec2(key_w, key_h)))
+                                            } else {
+                                                toggle_chip(ui, "Close", false, 0.0, "")
+                                            };
+                                            if close_resp.clicked() {
                                                 close_now = true;
                                             }
                                         });
@@ -5861,7 +5928,9 @@ impl eframe::App for HpsdrApp {
                                     {
                                         let font = egui::FontId::monospace(h * 1.6);
                                         let galley = ui.painter().layout_no_wrap(shown, font, egui::Color32::WHITE);
-                                        let size = egui::vec2(ui.available_width(), h * 2.6);
+                                        // Kiosk: as wide as the keypad -- at most 11 digits are typed, so a window-wide box is just slack.
+                                        let width = if lcd_kiosk_mode() { key_w * 3.0 + gap * 2.0 } else { ui.available_width() };
+                                        let size = egui::vec2(width, h * 2.6);
                                         let (rect, _) = ui.allocate_exact_size(size, egui::Sense::hover());
                                         ui.painter().rect(
                                             rect,
@@ -6051,6 +6120,9 @@ impl eframe::App for HpsdrApp {
                             settings_changed = true;
                         }
                         }
+                        if lcd_kiosk_mode() && render_rit_xit_aligned(ui, connected) {
+                            settings_changed = true;
+                        }
                         ui.add_space(16.0);
                         render_status_row(ui, connected, rigctl_status, tci_status, cat_status);
                     });
@@ -6215,6 +6287,8 @@ impl eframe::App for HpsdrApp {
                                         *connected.session.tci_tx_gain.lock().unwrap() = tci_tx_gain;
                                         settings_changed = true;
                                     }
+                                    // Where the value box ends, for lining up RIT (row above) with it.
+                                    connected.align_x.0 = ui.min_rect().right() - stable_value_box_width(ui) / 2.0;
 
                                     // REC -- see report_recorder.rs's own doc
                                     // comment: temporary (in-memory, never
@@ -6234,9 +6308,12 @@ impl eframe::App for HpsdrApp {
                                     // NB chip (same width as the NR chip on the row
                                     // below, so the two line up vertically).
                                     ui.add_space(6.0);
+                                    connected.align_x.1 = ui.next_widget_position().x + nb_nr_chip_width(ui) / 2.0;
                                     if render_nb_chip(ui, connected) {
                                         settings_changed = true;
                                     }
+                                    // REC/PLAY are not shown in the kiosk layout (they made this row wider than the screen).
+                                    if !lcd_kiosk_mode() {
                                     ui.add_space(6.0);
                                     let rr = connected.spectrum.report_recorder.clone();
                                     let recording = rr.is_recording();
@@ -6264,6 +6341,7 @@ impl eframe::App for HpsdrApp {
                                             progress,
                                             format!("{:.0}s", progress * report_recorder::MAX_SECONDS),
                                         );
+                                    }
                                     }
                                 });
                             }
@@ -6537,6 +6615,7 @@ impl eframe::App for HpsdrApp {
                                 if render_nr_chip(ui, connected) {
                                     settings_changed = true;
                                 }
+                                if !lcd_kiosk_mode() {
                                 ui.add_space(6.0);
                                 let rr = connected.spectrum.report_recorder.clone();
                                 let recording = rr.is_recording();
@@ -6564,6 +6643,7 @@ impl eframe::App for HpsdrApp {
                                 }
                                 if let Some(progress) = rr.play_progress() {
                                     action_progress_bar(ui, progress, format!("{:.0}%", progress * 100.0));
+                                }
                                 }
                             }
                         });
@@ -6847,7 +6927,11 @@ impl eframe::App for HpsdrApp {
                             // control, especially for transmissions
                             // that run many seconds (holding a mouse
                             // button that long is impractical).
-                            let mox_resp = ui
+                            let mox_resp = if lcd_kiosk_mode() {
+                                // Kiosk: the toolbar has this function; not drawn here (its handler below still runs).
+                                ui.allocate_response(egui::Vec2::ZERO, egui::Sense::hover())
+                            } else {
+                                ui
                                 .add_enabled(
                                     mox_tx_allowed,
                                     alert_chip_button("MOX", mox_now).min_size(egui::vec2(90.0, 32.0)),
@@ -6857,7 +6941,8 @@ impl eframe::App for HpsdrApp {
                                 } else {
                                     "Blocked: outside every ham band -- enable \"Allow TX outside ham \
                                      bands\" in Settings -> TX to override"
-                                });
+                                })
+                            };
                             if mox_resp.clicked() {
                                 let want_on = !mox_now;
                                 // See set_rade_aware_mox's own doc
@@ -6903,7 +6988,11 @@ impl eframe::App for HpsdrApp {
                             } else {
                                 egui::Color32::from_gray(60)
                             };
-                            let tune_resp = ui
+                            let tune_resp = if lcd_kiosk_mode() {
+                                // Kiosk: the toolbar has this function; not drawn here (its handler below still runs).
+                                ui.allocate_response(egui::Vec2::ZERO, egui::Sense::hover())
+                            } else {
+                                ui
                                 .add_enabled(
                                     tune_may_start,
                                     alert_chip_button("TUNE", connected.tune_active),
@@ -6911,7 +7000,8 @@ impl eframe::App for HpsdrApp {
                                 .on_hover_text(
                                     "Click to toggle a steady tone centered in the passband, \
                                      at Tune Power (Settings -> TX), for antenna/PA tuning",
-                                );
+                                )
+                            };
                             if tune_resp.clicked() {
                                 if connected.tune_active {
                                     connected.session.set_mox(false);
@@ -6984,7 +7074,11 @@ impl eframe::App for HpsdrApp {
                             } else {
                                 egui::Color32::from_gray(60)
                             };
-                            let two_tone_resp = ui
+                            let two_tone_resp = if lcd_kiosk_mode() {
+                                // Kiosk: the toolbar has this function; not drawn here (its handler below still runs).
+                                ui.allocate_response(egui::Vec2::ZERO, egui::Sense::hover())
+                            } else {
+                                ui
                                 .add_enabled(
                                     two_tone_may_start,
                                     alert_chip_button("TWO TONE", connected.two_tone_active),
@@ -6993,7 +7087,8 @@ impl eframe::App for HpsdrApp {
                                     "Click to toggle a two-tone test signal, at Tune Power \
                                      (Settings -> TX) -- required for PureSignal calibration, \
                                      which a steady Tune tone can't provide",
-                                );
+                                )
+                            };
                             let toolbar_two_tone =
                                 std::mem::take(&mut connected.toolbar_two_tone_request) && two_tone_may_start;
                             if two_tone_resp.clicked() || toolbar_two_tone {
@@ -8854,7 +8949,7 @@ Waterfall rebuilds: {prof_wf_n:.0}/s, {prof_wf_ms:.1} ms each."
                     // The meter area is drawn scaled up in kiosk mode (see below); its
                     // enlarged, invisible hit-rect sat on top of the REC/PLAY buttons and
                     // swallowed the mouse. It has nothing clickable, so make it inert.
-                    .interactable(!lcd_kiosk_mode())
+                    .interactable(!kiosk_meter_scaled())
                     .show(ui, |ui| {
                         // Height lowered from 110 -- once draw_s_meter's
                         // Y_SQUASH flattened the arc, 110 left a real gap
@@ -8867,8 +8962,7 @@ Waterfall rebuilds: {prof_wf_n:.0}/s, {prof_wf_ms:.1} ms each."
                         // Kiosk (1024x600 panel) only: the meter reads small there, so the
                         // whole area is drawn scaled up about its top-right corner. The
                         // desktop layout is untouched.
-                        if lcd_kiosk_mode() {
-                            const KIOSK_METER_SCALE: f32 = 1.7;
+                        if kiosk_meter_scaled() {
                             let pivot = meter_rect.right_top().to_vec2();
                             ui.ctx().set_transform_layer(
                                 ui.layer_id(),
@@ -9023,15 +9117,15 @@ Waterfall rebuilds: {prof_wf_n:.0}/s, {prof_wf_ms:.1} ms each."
                             .session
                             .adc1_overload
                             .load(std::sync::atomic::Ordering::Relaxed);
-                        // Kiosk: the whole area is drawn 1.7x larger, so use a small font and
+                        // Kiosk: the meter area is drawn larger (KIOSK_METER_SCALE), so use a small font and
                         // short rows for the ADC/FIFO warnings or they dwarf the controls below.
-                        let line_height = if lcd_kiosk_mode() { 15.0 } else { ui.text_style_height(&egui::TextStyle::Body) };
-                        let warn_font = if lcd_kiosk_mode() {
+                        let line_height = if kiosk_meter_scaled() { 15.0 } else { ui.text_style_height(&egui::TextStyle::Body) };
+                        let warn_font = if kiosk_meter_scaled() {
                             egui::FontId::proportional(11.0)
                         } else {
                             egui::TextStyle::Body.resolve(ui.style())
                         };
-                        let row_rect = if lcd_kiosk_mode() {
+                        let row_rect = if kiosk_meter_scaled() {
                             // Kiosk: don't reserve the row (the meter area is drawn scaled
                             // up and the reserved height grew its hit area over REC/PLAY);
                             // the warning just draws right under the meter.
@@ -9065,7 +9159,7 @@ Waterfall rebuilds: {prof_wf_n:.0}/s, {prof_wf_ms:.1} ms each."
                         if fifo_under || fifo_over {
                             connected.tx_fifo_warning_until = Some(Instant::now() + Duration::from_secs(2));
                         }
-                        let fifo_row_rect = if lcd_kiosk_mode() {
+                        let fifo_row_rect = if kiosk_meter_scaled() {
                             egui::Rect::from_min_size(meter_rect.left_bottom() + egui::vec2(0.0, line_height), egui::vec2(180.0, line_height))
                             } else {
                             ui.allocate_exact_size(egui::vec2(180.0, line_height), egui::Sense::hover()).0
@@ -9372,7 +9466,21 @@ Waterfall rebuilds: {prof_wf_n:.0}/s, {prof_wf_ms:.1} ms each."
                     // this narrower kiosk size degrades the same way
                     // instead of clipping.
                     let kiosk = lcd_kiosk_mode();
-                    let settings_size = if kiosk { [1000.0, 580.0] } else { [1100.0, 700.0] };
+                    // Kiosk: sized from the real main window, not from a fixed 1024x600 -- the panel can run a
+                    // different mode (the Pi runs its 1024x600 panel at 1280x720), and a fixed 1000x580 then
+                    // sat on the left leaving the right side of the screen unused.
+                    let kiosk_screen = ui
+                        .input(|i| i.viewport().inner_rect)
+                        .map(|r| [r.width(), r.height()])
+                        .unwrap_or([1024.0, 600.0]);
+                    let settings_size = if kiosk {
+                        // Height leaves room for the ~28 px the window manager adds above a window (measured
+                        // on the Pi: asked for y=10, got y=38), so the bottom -- and the CLOSE button -- stays
+                        // on screen.
+                        [(kiosk_screen[0] - 24.0).max(600.0), (kiosk_screen[1] - 60.0).max(380.0)]
+                    } else {
+                        [1100.0, 700.0]
+                    };
                     let mut settings_viewport = egui::ViewportBuilder::default().with_title("Settings");
                     if kiosk {
                         // See kiosk_centered_pos's doc comment -- keeps
@@ -9388,7 +9496,7 @@ Waterfall rebuilds: {prof_wf_n:.0}/s, {prof_wf_ms:.1} ms each."
                         // below this window now needs as a result (no
                         // native title bar left to close it from).
                         settings_viewport = settings_viewport
-                            .with_position(kiosk_centered_pos(settings_size))
+                            .with_position([kiosk_centered_pos_in(kiosk_screen, settings_size)[0], 10.0])
                             .with_max_inner_size(settings_size)
                             .with_resizable(false)
                             .with_decorations(false);
@@ -13386,7 +13494,10 @@ Waterfall rebuilds: {prof_wf_n:.0}/s, {prof_wf_ms:.1} ms each."
                     // 640x540 -- the RADE panel (callsign, mic
                     // conditioning row, status, RX log) is wider/taller
                     // than the other tabs and clipped at the old size.
-                    let size = if digital_kiosk { [1000.0, 580.0] } else { [640.0, 540.0] };
+                    // Kiosk: nearly the whole real main window, with room for the ~28 px the window manager
+                    // adds above a window (measured on the Pi), so the CLOSE button at the bottom stays on screen.
+                    let (kiosk_size, kiosk_pos) = kiosk_window_geometry(ui);
+                    let size = if digital_kiosk { kiosk_size } else { [640.0, 540.0] };
                     let mut digital_viewport = egui::ViewportBuilder::default()
                         .with_title("Digital Modes")
                         .with_inner_size(size)
@@ -13397,7 +13508,7 @@ Waterfall rebuilds: {prof_wf_n:.0}/s, {prof_wf_ms:.1} ms each."
                         });
                     if digital_kiosk {
                         digital_viewport = digital_viewport
-                            .with_position(kiosk_centered_pos(size))
+                            .with_position(kiosk_pos)
                             .with_max_inner_size(size)
                             .with_resizable(false)
                             .with_decorations(false);
@@ -16043,7 +16154,7 @@ fn render_toolbar(ui: &mut egui::Ui, connected: &mut ConnectedState) {
                 egui::StrokeKind::Inside,
             );
             // Shrink the text if it would not fit the box.
-            let mut size = 22.0;
+            let mut size = 24.0;
             let mut galley =
                 ui.painter().layout_no_wrap(label.clone(), egui::FontId::proportional(size), fg);
             if galley.size().x > width - 8.0 {
@@ -16391,15 +16502,34 @@ fn render_net_status_column(
     tci_status: Option<bool>,
     cat_status: Option<bool>,
 ) {
-    ui.colored_label(network_status_color(rigctl_status), "rigctl")
-        .on_hover_text(network_status_hover("rigctl", rigctl_status, &connected.rigctl_addr));
-    ui.colored_label(network_status_color(tci_status), "TCI").on_hover_text(tci_status_hover(
+    if !lcd_kiosk_mode() {
+        // Desktop: the plain coloured labels, as before.
+        ui.colored_label(network_status_color(rigctl_status), "rigctl")
+            .on_hover_text(network_status_hover("rigctl", rigctl_status, &connected.rigctl_addr));
+        ui.colored_label(network_status_color(tci_status), "TCI").on_hover_text(tci_status_hover(
+            tci_status,
+            &connected.tci_addr,
+            connected.tci_server.as_ref(),
+        ));
+        ui.colored_label(network_status_color(cat_status), "CAT")
+            .on_hover_text(network_status_hover("CAT", cat_status, &connected.cat_addr));
+        return;
+    }
+    // Kiosk: the standard chip (grey, thin outline, rounded; orange fill with black text when on).
+    // On = the server is running, with or without a client; the hover text says which.
+    let w = chip_width(ui, &["rigctl"]);
+    let chip = |ui: &mut egui::Ui, name: &str, status: Option<bool>, hover: String| {
+        ui.add(chip_button(name, status.is_some()).min_size(egui::vec2(w, 0.0)).sense(egui::Sense::hover()))
+            .on_hover_text(hover);
+    };
+    chip(ui, "rigctl", rigctl_status, network_status_hover("rigctl", rigctl_status, &connected.rigctl_addr));
+    chip(
+        ui,
+        "TCI",
         tci_status,
-        &connected.tci_addr,
-        connected.tci_server.as_ref(),
-    ));
-    ui.colored_label(network_status_color(cat_status), "CAT")
-        .on_hover_text(network_status_hover("CAT", cat_status, &connected.cat_addr));
+        tci_status_hover(tci_status, &connected.tci_addr, connected.tci_server.as_ref()),
+    );
+    chip(ui, "CAT", cat_status, network_status_hover("CAT", cat_status, &connected.cat_addr));
 }
 
 /// Progress bar shown next to REC/PLAY: same font and height as those buttons
@@ -16708,6 +16838,47 @@ fn rit_xit_chip(
     changed
 }
 
+/// Kiosk: RIT and XIT on the mode row, beside BIN, each centred on the column of the box below it
+/// (RIT over the TCI TX gain value box, XIT over the NB chip) -- see `ConnectedState::align_x`.
+fn render_rit_xit_aligned(ui: &mut egui::Ui, connected: &mut ConnectedState) -> bool {
+    let one = chip_width(ui, &["RIT -9999"]);
+    let (cx_rit, cx_xit) = connected.align_x;
+    let mut changed = false;
+    let gap = |ui: &mut egui::Ui, cx: f32| {
+        if cx > 0.0 {
+            let x = ui.next_widget_position().x;
+            ui.add_space((cx - one / 2.0 - x).max(2.0));
+        }
+    };
+    gap(ui, cx_rit);
+    changed |= rit_xit_chip(
+        ui,
+        "RIT",
+        &mut connected.rit_enabled,
+        &mut connected.rit_offset_hz,
+        &mut connected.rit_scroll_accum,
+        &connected.session.rit_enabled,
+        &connected.session.rit_offset_hz,
+        connected.rit_step_hz as i64,
+        "Receiver Incremental Tuning -- nudges what you hear without moving VFO A's displayed/logged frequency.",
+    );
+    if connected.tx_enabled {
+        gap(ui, cx_xit);
+        changed |= rit_xit_chip(
+            ui,
+            "XIT",
+            &mut connected.xit_enabled,
+            &mut connected.xit_offset_hz,
+            &mut connected.xit_scroll_accum,
+            &connected.session.xit_enabled,
+            &connected.session.xit_offset_hz,
+            connected.rit_step_hz as i64,
+            "Transmitter Incremental Tuning -- nudges your actual TX frequency without moving VFO A's (or VFO B's, if Split is on) displayed frequency.",
+        );
+    }
+    changed
+}
+
 /// RIT and XIT chips for the band row (XIT only with TX armed).
 fn render_rit_xit(ui: &mut egui::Ui, connected: &mut ConnectedState) -> bool {
     let mut changed = rit_xit_chip(
@@ -16737,10 +16908,20 @@ fn render_rit_xit(ui: &mut egui::Ui, connected: &mut ConnectedState) -> bool {
     changed
 }
 
+/// How much larger the RX/TX meter is drawn in kiosk mode (1.0 = the normal size). It was 1.4 and then 1.7
+/// while the Pi ran its 1024x600 panel at 1280x720; back to 1.0 at the native 1024x600 and now 1.3,
+/// the most that fits beside LEV/PROC/CFC and above the RIT/XIT row. Everything that only exists because the meter is enlarged (small ADC/FIFO warning
+/// rows, rows not reserved under it, an inert hit area) follows `kiosk_meter_scaled()`.
+const KIOSK_METER_SCALE: f32 = 1.3;
+
+fn kiosk_meter_scaled() -> bool {
+    lcd_kiosk_mode() && KIOSK_METER_SCALE != 1.0
+}
+
 /// Left edge (x) of the RX/TX meter at the top right: it is anchored 20 px from the
-/// right edge, 180 px wide (drawn 1.7x larger in kiosk mode).
+/// right edge, 180 px wide (drawn KIOSK_METER_SCALE times larger in kiosk mode).
 fn meter_left_x(ui: &egui::Ui) -> f32 {
-    let width = if lcd_kiosk_mode() { 180.0 * 1.7 } else { 180.0 };
+    let width = if lcd_kiosk_mode() { 180.0 * KIOSK_METER_SCALE } else { 180.0 };
     ui.ctx().content_rect().right() - 20.0 - width
 }
 
@@ -17088,6 +17269,12 @@ fn alex_att_combo(ui: &mut egui::Ui, alex_atten: &mut usize) -> bool {
 /// cosmetically. Same fill/rounding as any other inactive widget in the
 /// current theme, so it matches everything else without hardcoding a
 /// color.
+/// Width of every `stable_value_box`.
+fn stable_value_box_width(ui: &egui::Ui) -> f32 {
+    let font = egui::TextStyle::Monospace.resolve(ui.style());
+    ui.painter().layout_no_wrap("-100 dB ".to_string(), font, egui::Color32::WHITE).size().x + 10.0
+}
+
 fn stable_value_box(ui: &mut egui::Ui, text: String) {
     // Every value box is allocated at one exact size (same width AND height),
     // independent of where it sits: inside a Grid cell or inside a
@@ -20839,6 +21026,21 @@ pub(crate) fn lcd_kiosk_mode() -> bool {
 /// window's own visible area.
 pub(crate) fn kiosk_centered_pos(size: [f32; 2]) -> [f32; 2] {
     [((1024.0 - size[0]) / 2.0).max(0.0), ((600.0 - size[1]) / 2.0).max(0.0)]
+}
+
+/// Size and position of a near-full-screen kiosk dialog: the real main window minus a margin, at the
+/// top with 10 px clearance, and 60 px shorter than the window so that the bottom -- where the CLOSE
+/// button is -- is not pushed off screen by the ~28 px the window manager adds above a window.
+fn kiosk_window_geometry(ui: &egui::Ui) -> ([f32; 2], [f32; 2]) {
+    let screen = ui.input(|i| i.viewport().inner_rect).map(|r| [r.width(), r.height()]).unwrap_or([1024.0, 600.0]);
+    let size = [(screen[0] - 24.0).max(600.0), (screen[1] - 60.0).max(380.0)];
+    (size, [kiosk_centered_pos_in(screen, size)[0], 10.0])
+}
+
+/// Same as `kiosk_centered_pos` for a screen of a given size (the real main window, which is not
+/// always 1024x600).
+pub(crate) fn kiosk_centered_pos_in(screen: [f32; 2], size: [f32; 2]) -> [f32; 2] {
+    [((screen[0] - size[0]) / 2.0).max(0.0), ((screen[1] - size[1]) / 2.0).max(0.0)]
 }
 
 fn main() -> eframe::Result<()> {

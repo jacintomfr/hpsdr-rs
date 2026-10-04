@@ -53,3 +53,27 @@ box stays lit while RADE runs; pressing it again does what closing the Digital w
 filters, zoom/pan and passband back as before). Code: `toggle_rade_direct` in `src/main.rs`.
 To add a function, add a `ToolbarFn` variant in `src/toolbar.rs` (key, labels), run it in
 `run_toolbar_fn` and, if it has an on/off state, report it in `toolbar_fn_active`.
+
+## Kiosk layout notes (1024x600 panel)
+
+Everything below applies **only in kiosk mode** (`lcd_kiosk_mode()`); the desktop layout is unchanged.
+
+* **Check the real screen first.** The Pi's MPI7002 panel is natively 1024x600, but a `kanshi` profile can
+  put it in 1280x720 (the panel then up-scales and loses contrast and brightness). `~/.config/kanshi/config`
+  must say `mode 1024x600@60.044`; `wlr-randr` and `xrandr` show the current mode. Do not size anything
+  from a screenshot without knowing the mode.
+* **Secondary windows are sized from the real main window**, not from fixed numbers
+  (`kiosk_window_geometry`, Settings and Digital): nearly the full width, 60 px shorter than the screen and
+  at the top, because the window manager shifts an undecorated window down by about 28 px (measured: asked
+  for y=10, got y=38), which used to cut the CLOSE button in half.
+* **The UI scale is read once at start** (Settings -> Screen); restart the app after changing it.
+* **Meter size:** `KIOSK_METER_SCALE` (now 1.3). The ADC/FIFO warning rows, the unreserved rows under the
+  meter and the inert hit area only exist while it is above 1.0 (`kiosk_meter_scaled()`).
+* **Hidden in the kiosk main window:** REC/PLAY (the signal-report recorder; where they go back is open),
+  and the MOX/TUNE/TWO TONE chips before the spectrum (the toolbar has them).
+* **Moved:** rigctl/TCI/CAT are chips on the band row (the standard chip: grey, orange when on); RIT/XIT sit
+  beside BIN on the mode row, centred on the TCI TX gain value box and the NB chip (their x is recorded each
+  frame in `ConnectedState::align_x`); the top row is tighter and LEV/PROC/CFC are centred between PK/MIC/ALC
+  and the meter; VFO-A shows `step: <wheel step>` in yellow where the RX badge was, VFO-B shows nothing there.
+* **VFO window (the VFO button):** no VFO A/B chips, as wide as the keypad plus the step pickers, a thin
+  outline, and a Close button the size of the number keys.
