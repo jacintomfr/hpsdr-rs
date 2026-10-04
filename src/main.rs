@@ -5384,6 +5384,7 @@ impl eframe::App for HpsdrApp {
                                 .inner;
 
                             ui.vertical(|ui| {
+                            let _black_chips = IdleChipsBlack::new();
                             let cw1 = chip_width(ui, &["A>B", "A<>B", "CTUN"]);
                             let cw2 = chip_width(ui, &["B>A", "Split"]);
                                 ui.horizontal(|ui| {
@@ -17500,6 +17501,7 @@ fn render_net_status_column(
     tci_status: Option<bool>,
     cat_status: Option<bool>,
 ) {
+    let _black_chips = IdleChipsBlack::new();
     if !lcd_kiosk_mode() {
         // Desktop: the plain coloured labels, as before.
         ui.colored_label(network_status_color(rigctl_status), "rigctl")
@@ -17678,6 +17680,39 @@ fn render_step_combo_only(ui: &mut egui::Ui, connected: &mut ConnectedState) -> 
     changed
 }
 
+/// Fill of an idle (not active) chip: the usual grey 48, pure black while the kiosk's first row (band, mode, SNB ...)
+/// is being drawn (`render_kiosk_band_row` raises the flag around it).
+static CHIP_IDLE_BLACK: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Keeps idle chips black while it is alive (kiosk only): used for the VFO button grid and the rigctl/TCI/CAT chips.
+struct IdleChipsBlack(bool);
+
+impl IdleChipsBlack {
+    fn new() -> Self {
+        let on = lcd_kiosk_mode();
+        if on {
+            CHIP_IDLE_BLACK.store(true, Ordering::Relaxed);
+        }
+        IdleChipsBlack(on)
+    }
+}
+
+impl Drop for IdleChipsBlack {
+    fn drop(&mut self) {
+        if self.0 {
+            CHIP_IDLE_BLACK.store(false, Ordering::Relaxed);
+        }
+    }
+}
+
+fn chip_idle_fill() -> egui::Color32 {
+    if CHIP_IDLE_BLACK.load(Ordering::Relaxed) {
+        egui::Color32::BLACK
+    } else {
+        egui::Color32::from_gray(48)
+    }
+}
+
 /// Styled button shared by the chip helpers: thin outline, rounded corners,
 /// grey when off and orange when on.
 fn chip_button(label: &str, active: bool) -> egui::Button<'static> {
@@ -17686,7 +17721,7 @@ fn chip_button(label: &str, active: bool) -> egui::Button<'static> {
         (orange, egui::Color32::from_gray(15), egui::Stroke::new(1.0, orange))
     } else {
         (
-            egui::Color32::from_gray(48),
+            chip_idle_fill(),
             egui::Color32::from_gray(205),
             egui::Stroke::new(1.0, egui::Color32::from_gray(95)),
         )
@@ -17987,6 +18022,7 @@ fn kiosk_top_y(ui: &egui::Ui) -> f32 {
 /// label it can show, then SNB/ANF/BIN, RIT/XIT and the AGC mode button. Returns whether something changed.
 fn render_kiosk_band_row(ui: &mut egui::Ui, connected: &mut ConnectedState, band: &str, mode: &str) -> bool {
     let mut changed = false;
+    CHIP_IDLE_BLACK.store(true, Ordering::Relaxed);
     ui.horizontal(|ui| {
         // One equal gap between every box of the row (the groups used to add their own on top of the natural
         // spacing, which left 7-15 px gaps and pushed AGC against the meter).
@@ -18004,6 +18040,7 @@ fn render_kiosk_band_row(ui: &mut egui::Ui, connected: &mut ConnectedState, band
         changed |= render_nr_chip(ui, connected);
         changed |= render_rit_xit(ui, connected);
     });
+    CHIP_IDLE_BLACK.store(false, Ordering::Relaxed);
     changed
 }
 
@@ -18077,7 +18114,7 @@ fn framed_label(ui: &mut egui::Ui, text: &str, width: f32) -> egui::Response {
 /// AGC button. `min_width` lets a set of chips share one width.
 fn toggle_chip(ui: &mut egui::Ui, label: &str, active: bool, min_width: f32, hover: &str) -> egui::Response {
     let orange = egui::Color32::from_rgb(232, 150, 46);
-    let grey = egui::Color32::from_gray(48);
+    let grey = chip_idle_fill();
     let (fill, text, stroke) = if active {
         (orange, egui::Color32::from_gray(15), egui::Stroke::new(1.0, orange))
     } else {
