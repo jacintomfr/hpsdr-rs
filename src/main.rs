@@ -17137,7 +17137,7 @@ fn render_toolbar(ui: &mut egui::Ui, connected: &mut ConnectedState) {
                 egui::StrokeKind::Inside,
             );
             // Shrink the text if it would not fit the box.
-            let mut size = 24.0;
+            let mut size = 23.0;
             let mut galley =
                 ui.painter().layout_no_wrap(label.clone(), egui::FontId::proportional(size), fg);
             if galley.size().x > width - 8.0 {

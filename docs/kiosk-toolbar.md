@@ -69,11 +69,13 @@ Everything below applies **only in kiosk mode** (`lcd_kiosk_mode()`); the deskto
 * **The UI scale is read once at start** (Settings -> Screen); restart the app after changing it.
 * **Meter size:** `KIOSK_METER_SCALE` (now 1.3). The ADC/FIFO warning rows, the unreserved rows under the
   meter and the inert hit area only exist while it is above 1.0 (`kiosk_meter_scaled()`).
-* **Hidden in the kiosk main window:** REC/PLAY (the signal-report recorder; where they go back is open),
-  and the MOX/TUNE/TWO TONE chips before the spectrum (the toolbar has them).
+* **Hidden in the kiosk main window:** the MOX/TUNE/TWO TONE chips before the spectrum (the toolbar has them).
+  REC/PLAY/Record now live on the spectrum, see [kiosk-main-window.md](kiosk-main-window.md).
 * **Moved:** rigctl/TCI/CAT are chips on the band row (the standard chip: grey, orange when on); RIT/XIT sit
   beside BIN on the mode row, centred on the TCI TX gain value box and the NB chip (their x is recorded each
   frame in `ConnectedState::align_x`); the top row is tighter and LEV/PROC/CFC are centred between PK/MIC/ALC
   and the meter; VFO-A shows `step: <wheel step>` in yellow where the RX badge was, VFO-B shows nothing there.
 * **VFO window (the VFO button):** no VFO A/B chips, as wide as the keypad plus the step pickers, a thin
   outline, and a Close button the size of the number keys.
+
+More kiosk main-window details (gain grid, Squelch, LOCK/DUP, menus, Diagnostic line): [kiosk-main-window.md](kiosk-main-window.md).
