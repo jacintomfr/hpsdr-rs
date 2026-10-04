@@ -972,7 +972,10 @@ fn dispatch_midi_binding(
                     connected.allow_out_of_band_tx.load(Ordering::Relaxed),
                 )
             {
-                connected.session.set_mox(want_on);
+                // Same path as the on-screen MOX button: with RADE armed, unkeying waits for its End-of-Over burst
+                // (and tells the RADE engine the over has ended). Cutting mox here left RADE's receiver without sync
+                // after every transmission made with the toolbar/MIDI MOX.
+                set_rade_aware_mox(connected, want_on);
             }
         }
         // Same gates as the REC / PLAY buttons of the desktop window (render of those: see "REC"/"PLAY").
@@ -5265,8 +5268,8 @@ impl eframe::App for HpsdrApp {
                             // box below -- see ConnectedState::
                             // vfo_b_frequency_hz/split's doc comments for
                             // what the buttons between the two boxes do.
-                            let freq_label = ui
-                                .group(|ui| {
+                            let freq_label = vfo_box_frame(ui)
+                                .show(ui, |ui| {
                                     if lcd_kiosk_mode() {
                                         ui.set_min_height(60.0);
                                     }
@@ -5560,8 +5563,8 @@ impl eframe::App for HpsdrApp {
                                 ui.add_space(8.0);
                             }
 
-                            let vfo_b_label = ui
-                                .group(|ui| {
+                            let vfo_b_label = vfo_box_frame(ui)
+                                .show(ui, |ui| {
                                     if lcd_kiosk_mode() {
                                         ui.set_min_height(60.0);
                                     }
@@ -7830,7 +7833,8 @@ impl eframe::App for HpsdrApp {
                                 connected.session.set_mox(true);
                             } else if !space_down && connected.ptt_held {
                                 connected.ptt_held = false;
-                                connected.session.set_mox(false);
+                                // RADE-aware, like the MOX button (see set_rade_aware_mox).
+                                set_rade_aware_mox(connected, false);
                             }
 
                             // Record -- moved here next to Clear from its
@@ -15555,6 +15559,17 @@ fn diag_text(connected: &ConnectedState, id: &str) -> Option<(String, u8)> {
         }
         _ => return None,
     })
+}
+
+/// Frame of the VFO A / VFO B boxes: the usual group frame; in the kiosk filled like the meter (grey 20) so the
+/// frequency boxes stand out from the window background, with a thin light-grey outline (125).
+fn vfo_box_frame(ui: &egui::Ui) -> egui::Frame {
+    let frame = egui::Frame::group(ui.style());
+    if lcd_kiosk_mode() {
+        frame.fill(egui::Color32::from_gray(20)).stroke(egui::Stroke::new(1.0, egui::Color32::from_gray(125)))
+    } else {
+        frame
+    }
 }
 
 /// CW message picker plus the SEND CW / STOP button. On the desktop it sits in the TX row; in the kiosk it is the
