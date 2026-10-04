@@ -1950,6 +1950,9 @@ struct ConnectedState {
     /// starting point, matching this app's own prior behaviour before
     /// this toggle existed.
     rade_filter_wide: bool,
+    /// Clicks on the RADE side panel (Fit Filter / Quick Tune), applied later in the frame.
+    rade_side_fit: bool,
+    rade_side_tune: Option<u32>,
     /// Spectrum/waterfall display range while transmitting -- see
     /// Config's field docs for why these are separate from the RX
     /// ones above rather than a fixed offset applied at render time.
@@ -3588,6 +3591,8 @@ fn connect_to_device(device: Device, cfg: &Config) -> Result<ConnectedState, Str
                 agc_auto: cfg.agc_auto.unwrap_or(false),
                 agc_auto_offset_db: cfg.agc_auto_offset_db.unwrap_or(-25.0),
                 rade_filter_wide: cfg.rade_filter_wide.unwrap_or(false),
+                rade_side_fit: false,
+                rade_side_tune: None,
                 tx_db_low: cfg.tx_db_low.unwrap_or(cfg.db_low.unwrap_or(-140.0)),
                 tx_db_high: cfg.tx_db_high.unwrap_or(cfg.db_high.unwrap_or(-40.0) + 60.0),
                 tx_waterfall_db_low: cfg
@@ -6623,15 +6628,7 @@ impl eframe::App for HpsdrApp {
                                 connected.spectrum.set_agc(current_agc.next());
                                 settings_changed = true;
                             }
-                            // RADE compact status, right after the AGC mode button: only while RADE
-                            // is active but the Digital window is hidden.
-                            if connected.digital_mode == DigitalMode::Rade
-                                && !connected.show_digital_window
-                                && matches!(connected.spectrum.mode(), spectrum::Mode::Digu | spectrum::Mode::Digl)
-                            {
-                                ui.add_space(12.0);
-                                draw_rade_status_row(ui, &connected.rade, true);
-                            }
+                            // (RADE status moved to the side panel -- see render_rade_side_panel.)
                             // NB/NR/SNB/ANF/BIN -- kiosk-only, all
                             // together right after the AGC mode button (a
                             // real report/correction: splitting these
@@ -7327,7 +7324,12 @@ impl eframe::App for HpsdrApp {
                     // the "CW Decode" button next to CTUN (see its own
                     // doc comment above).
                     let cw_panel_visible = cw_mode && connected.cw_decode_enabled;
-                    let cw_panel_reserved_width = if cw_panel_visible { CW_PANEL_WIDTH + CW_PANEL_GAP } else { 0.0 };
+                    // RADE shows its status in the same side panel while its Digital window is hidden.
+                    let rade_panel_visible = connected.digital_mode == DigitalMode::Rade
+                        && !connected.show_digital_window
+                        && matches!(connected.spectrum.mode(), spectrum::Mode::Digu | spectrum::Mode::Digl);
+                    let cw_panel_reserved_width =
+                        if cw_panel_visible || rade_panel_visible { CW_PANEL_WIDTH + CW_PANEL_GAP } else { 0.0 };
                     let (rect, spectrum_resp) = ui.allocate_exact_size(
                         egui::vec2(ui.available_width() - cw_panel_reserved_width, spectrum_height),
                         egui::Sense::click_and_drag(),
@@ -7362,7 +7364,12 @@ impl eframe::App for HpsdrApp {
                         const WF_HEIGHT: f32 = 50.0;
                         const WF_MARGIN: f32 = 8.0;
                         let above_rect = egui::Rect::from_min_size(
-                            egui::pos2(rect.right() - WF_MARGIN - WF_WIDTH, rect.top() - WF_MARGIN - WF_HEIGHT),
+                            egui::pos2(
+                                // Right edge of the full width, not of the (narrower) plot, so
+                                // the scope stays put when a side panel (CW decoder, RADE) opens.
+                                rect.right() + cw_panel_reserved_width - WF_MARGIN - WF_WIDTH,
+                                rect.top() - WF_MARGIN - WF_HEIGHT,
+                            ),
                             egui::vec2(WF_WIDTH, WF_HEIGHT),
                         );
                         // draw_audio_waveform insets its own panel by
@@ -8420,6 +8427,23 @@ impl eframe::App for HpsdrApp {
                                 egui::pos2(spectrum_right + CW_PANEL_GAP + CW_PANEL_WIDTH, waterfall_bottom),
                             ),
                         );
+                    } else if rade_panel_visible {
+                        let mut fit = false;
+                        let mut tune = None;
+                        render_rade_side_panel_beside(
+                            ui,
+                            &connected.rade,
+                            &mut fit,
+                            &mut tune,
+                            egui::Rect::from_min_max(
+                                egui::pos2(spectrum_right + CW_PANEL_GAP, spectrum_top),
+                                egui::pos2(spectrum_right + CW_PANEL_GAP + CW_PANEL_WIDTH, waterfall_bottom),
+                            ),
+                        );
+                        connected.rade_side_fit |= fit;
+                        if tune.is_some() {
+                            connected.rade_side_tune = tune;
+                        }
                     }
 
                     ui.horizontal(|ui| {
@@ -13730,6 +13754,41 @@ Waterfall rebuilds: {prof_wf_n:.0}/s, {prof_wf_ms:.1} ms each."
                     }
                 }
 
+                // RADE side panel clicks (Fit Filter / Quick Tune) -- handled here so they also work
+                // while the Digital window is hidden (its own copies of this live inside that window).
+                if connected.rade_side_fit || connected.rade_side_tune.is_some() {
+                    let mut refit = false;
+                    if let Some(hz) = connected.rade_side_tune.take() {
+                        connected.active_xvtr = None;
+                        connected.session.set_frequency(hz);
+                        connected.ctun_frequency_hz = hz;
+                        let new_mode = digi_mode_for_band(hz);
+                        connected.spectrum.set_mode(new_mode);
+                        if let Some(tx) = &connected.tx_handle {
+                            tx.set_mode(new_mode);
+                        }
+                        refit = true; // the band's sign may have changed
+                        settings_changed = true;
+                    }
+                    // A real Fit Filter press rotates between the two RX widths, as in the Digital window.
+                    if std::mem::take(&mut connected.rade_side_fit) {
+                        connected.rade_filter_wide = !connected.rade_filter_wide;
+                        refit = true;
+                    }
+                    if refit {
+                        let mode = connected.spectrum.mode();
+                        let lsb = matches!(mode, spectrum::Mode::Lsb | spectrum::Mode::Digl);
+                        let tx_passband = if lsb { (-2300.0, -700.0) } else { (700.0, 2300.0) };
+                        if let Some(tx) = &connected.tx_handle {
+                            tx.set_explicit_passband(Some(tx_passband));
+                        }
+                        let (low, high) = if connected.rade_filter_wide { (300.0, 2700.0) } else { (700.0, 2300.0) };
+                        let rx_passband = if lsb { (-high, -low) } else { (low, high) };
+                        connected.spectrum.set_explicit_passband(Some(rx_passband));
+                        settings_changed = true;
+                    }
+                }
+
                 // root_close_requested/stop_clicked (computed earlier
                 // this frame -- see their own declarations) also force a
                 // save here rather than relying on settings_dirty alone,
@@ -15629,6 +15688,88 @@ fn render_cw_decoder_panel_beside(ui: &mut egui::Ui, spectrum: &SpectrumHandle, 
             ui.set_width(rect.width());
             ui.set_height(rect.height());
             render_cw_decoder_panel(ui, spectrum);
+        });
+    });
+}
+
+/// Side panel shown beside the spectrum/waterfall while RADE is active and its Digital window is
+/// hidden (same place and size as the CW decoder panel): sync, SNR, offset, Fit Filter, a Quick
+/// Tune popup, and the received callsigns stacking up at the bottom, newest last.
+fn render_rade_side_panel(
+    ui: &mut egui::Ui,
+    rade: &rade_link::RadeHandle,
+    fit_clicked: &mut bool,
+    quick_tune: &mut Option<u32>,
+) {
+    let amber = egui::Color32::from_rgb(230, 150, 50);
+    let green = egui::Color32::from_rgb(40, 190, 70);
+    let st = rade.stats();
+    ui.heading("RADE v1 mode");
+    ui.separator();
+    // Same thresholds as draw_rade_status_row.
+    let marginal = st.sync && st.snr_db < 4.0;
+    ui.horizontal(|ui| {
+        let (rect, _) = ui.allocate_exact_size(egui::vec2(14.0, 14.0), egui::Sense::hover());
+        let (color, text) = if !st.sync {
+            (amber, "no sync")
+        } else if marginal {
+            (egui::Color32::from_rgb(230, 200, 40), "SYNC")
+        } else {
+            (green, "SYNC")
+        };
+        ui.painter().circle_filled(rect.center(), 6.0, color);
+        ui.colored_label(color, text);
+    });
+    // Fixed-width rows so the numbers changing never move what is below them.
+    let blank = |sync: bool, s: String| if sync { s } else { String::new() };
+    ui.label(egui::RichText::new(blank(st.sync, format!("SNR    {:>4.0} dB", st.snr_db))).monospace());
+    ui.label(egui::RichText::new(blank(st.sync, format!("Offset {:>+4.0} Hz", st.freq_offset_hz))).monospace());
+    ui.horizontal(|ui| {
+        if ui.button("Fit Filter").on_hover_text("Narrow the RX filter to RADE V1's tone band").clicked() {
+            *fit_clicked = true;
+        }
+        ui.menu_button("Quick Tune", |ui| {
+            for &(label, hz) in &RADE_QUICK_TUNE_HZ {
+                if ui
+                    .button(label)
+                    .on_hover_text(format!("{:.3} MHz -- a community FreeDV/RADE calling frequency", hz as f64 / 1_000_000.0))
+                    .clicked()
+                {
+                    *quick_tune = Some(hz);
+                    ui.close();
+                }
+            }
+        });
+    });
+    ui.separator();
+    ui.strong("Received callsigns");
+    // Anchored to the bottom of the panel; the list grows upward as callsigns arrive.
+    let log = rade.rx_log();
+    let row_h = ui.text_style_height(&egui::TextStyle::Monospace) + ui.spacing().item_spacing.y;
+    egui::ScrollArea::vertical().auto_shrink([false, false]).stick_to_bottom(true).show(ui, |ui| {
+        let free = ui.available_height() - row_h * log.len() as f32;
+        if free > 0.0 {
+            ui.add_space(free);
+        }
+        for e in &log {
+            ui.label(egui::RichText::new(format!("{:<10} {:>3.0} dB", e.call, e.snr_db)).monospace());
+        }
+    });
+    ui.ctx().request_repaint_after(Duration::from_millis(300));
+}
+
+fn render_rade_side_panel_beside(
+    ui: &mut egui::Ui,
+    rade: &rade_link::RadeHandle,
+    fit_clicked: &mut bool,
+    quick_tune: &mut Option<u32>,
+    rect: egui::Rect,
+) {
+    egui::Area::new(egui::Id::new("rade_side_panel_main")).fixed_pos(rect.min).show(ui, |ui| {
+        egui::Frame::group(ui.style()).show(ui, |ui| {
+            ui.set_width(rect.width());
+            ui.set_height(rect.height());
+            render_rade_side_panel(ui, rade, fit_clicked, quick_tune);
         });
     });
 }

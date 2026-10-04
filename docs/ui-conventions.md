@@ -52,3 +52,17 @@ Short click vs long press is handled by `press_gesture` (RIT/XIT: click
 toggles, hold ~0.6 s clears). Brief orange confirmation flashes
 (`flash_on` / `flash_start`) are for buttons without a state (A>B, B>A,
 A<>B).
+
+## Side panel (CW decoder, RADE)
+
+The CW decoder and the RADE status share one side panel to the right of the spectrum and
+waterfall (`render_cw_decoder_panel_beside`, `render_rade_side_panel_beside`; fixed
+`CW_PANEL_WIDTH`). Opening it shrinks the plot instead of covering it, and anything anchored to
+the plot's right edge must use the full width (`cw_panel_reserved_width` is added back), as the
+audio scope does, so it does not move when the panel opens.
+
+RADE ("RADE v1 mode") shows it while the mode is DIGU/DIGL, RADE is the active digital mode and the
+Digital window is hidden: SYNC, SNR, offset, Fit Filter, a Quick Tune popup, and the received
+callsigns stacked at the bottom, newest last. Its clicks are recorded in
+`ConnectedState::rade_side_fit` / `rade_side_tune` and applied once per frame outside the Digital
+window's own handlers, so they work while that window is closed.
