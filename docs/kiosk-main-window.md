@@ -100,3 +100,6 @@ Behaviour on the desktop is meant to be identical, but these are shared, so chec
 * `DemodParams` has new fields (`muted`, `duplex`, `squelch`, `squelch_enable`), the config has `squelch_memory`,
   `duplex`, `diag_items`; the squelch is applied for every mode change on the desktop as well (off by default).
 * The spectrum waterfall switch uses `mox && !duplex` (same while DUP is off).
+* MIDI `Mox` and the Space PTT unkey through `set_rade_aware_mox` (as the on-screen MOX button always did): with RADE
+  armed the End-of-Over burst goes out and the RADE engine learns the over ended; cutting mox directly left RADE's
+  receiver without sync after each transmission (confirmed fixed on the Pi).
