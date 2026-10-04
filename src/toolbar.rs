@@ -20,6 +20,8 @@ pub enum ToolbarFn {
     None,
     Midi(MidiAction),
     TwoTone,
+    /// Turns RADE on or off in one press: what Digital -> RADE -> Hide does with the mouse.
+    Rade,
     ZoomIn,
     ZoomOut,
     ZoomReset,
@@ -30,7 +32,7 @@ pub enum ToolbarFn {
 impl ToolbarFn {
     /// Every assignable function, `None` first.
     pub fn all() -> Vec<ToolbarFn> {
-        let mut v = vec![ToolbarFn::TwoTone];
+        let mut v = vec![ToolbarFn::TwoTone, ToolbarFn::Rade];
         // The Toolbar (F1-F8) MIDI actions press toolbar boxes, so they make no sense inside one.
         v.extend(KEY_ACTIONS.iter().copied().filter(|a| !is_toolbar_action(*a)).map(ToolbarFn::Midi));
         v.extend([
@@ -52,6 +54,7 @@ impl ToolbarFn {
             ToolbarFn::None => "None".to_string(),
             ToolbarFn::Midi(a) => format!("{a:?}"),
             ToolbarFn::TwoTone => "TwoTone".to_string(),
+            ToolbarFn::Rade => "Rade".to_string(),
             ToolbarFn::ZoomIn => "ZoomIn".to_string(),
             ToolbarFn::ZoomOut => "ZoomOut".to_string(),
             ToolbarFn::ZoomReset => "ZoomReset".to_string(),
@@ -69,6 +72,7 @@ impl ToolbarFn {
         match self {
             ToolbarFn::None => "",
             ToolbarFn::TwoTone => "2TONE",
+            ToolbarFn::Rade => "RADE",
             ToolbarFn::ZoomIn => "ZOOM+",
             ToolbarFn::ZoomOut => "ZOOM-",
             ToolbarFn::ZoomReset => "ZOOM 1X",
@@ -136,6 +140,7 @@ impl ToolbarFn {
             ToolbarFn::None => "None".to_string(),
             ToolbarFn::Midi(a) => a.label().to_string(),
             ToolbarFn::TwoTone => "Two Tone".to_string(),
+            ToolbarFn::Rade => "RADE On/Off".to_string(),
             ToolbarFn::ZoomIn => "Zoom In".to_string(),
             ToolbarFn::ZoomOut => "Zoom Out".to_string(),
             ToolbarFn::ZoomReset => "Zoom 1x, Pan centered".to_string(),

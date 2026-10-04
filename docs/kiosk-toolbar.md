@@ -42,3 +42,14 @@ note 29 -> `Mox`) next to the new `ToolBar1` one, the old one fires and the tool
 That looked like "changing the function in Toolbar configuration does nothing". Adding a binding in
 Settings -> MIDI now replaces any older binding on the same control, but bindings made earlier have to
 be deleted (Settings -> MIDI, bindings table) or learned again.
+
+## Functions that only the toolbar has
+
+The toolbar list can grow beyond the MIDI list (that is why they are two lists). Today these exist
+only in the toolbar: Two Tone, zoom in/out/1x, pan left/right, and **RADE On/Off**. RADE On/Off does
+in one press what Digital -> RADE -> Hide does with the mouse (DIGU/DIGL for the band, voice processing
+off, RADE's passband, Digital window hidden, so the "RADE v1 mode" side panel shows the status) and the
+box stays lit while RADE runs; pressing it again does what closing the Digital window does (mode,
+filters, zoom/pan and passband back as before). Code: `toggle_rade_direct` in `src/main.rs`.
+To add a function, add a `ToolbarFn` variant in `src/toolbar.rs` (key, labels), run it in
+`run_toolbar_fn` and, if it has an on/off state, report it in `toolbar_fn_active`.

@@ -15908,6 +15908,7 @@ fn run_toolbar_fn(
             dispatch_midi_binding(connected, binding, ev, freq_hz, sample_rate, passband);
         }
         ToolbarFn::TwoTone => connected.toolbar_two_tone_request = true,
+        ToolbarFn::Rade => toggle_rade_direct(connected),
         ToolbarFn::ZoomIn => connected.spectrum_zoom = (connected.spectrum_zoom + 1).min(16),
         ToolbarFn::ZoomOut => connected.spectrum_zoom = (connected.spectrum_zoom - 1).max(1),
         ToolbarFn::ZoomReset => {
@@ -15928,11 +15929,65 @@ fn run_toolbar_fn(
     connected.settings_dirty.store(true, Ordering::Relaxed);
 }
 
+/// RADE is running: it is the digital mode and the dial mode is DIGU\/DIGL (the same test the
+/// per-frame engine check uses), whether or not the Digital window is open.
+fn rade_is_running(connected: &ConnectedState) -> bool {
+    connected.digital_mode == DigitalMode::Rade
+        && matches!(connected.spectrum.mode(), spectrum::Mode::Digu | spectrum::Mode::Digl)
+}
+
+/// The toolbar's RADE function: one press does what Digital -> RADE -> Hide does with the mouse
+/// (DIGU/DIGL for the band, voice processing off, RADE's passband, window hidden so the RADE side
+/// panel shows the status); pressing again does what closing the Digital window does (mode,
+/// filters and passband back as they were).
+fn toggle_rade_direct(connected: &mut ConnectedState) {
+    if rade_is_running(connected) {
+        // Same as the Digital window's own close path.
+        connected.spectrum.set_explicit_passband(None);
+        if let Some(tx) = &connected.tx_handle {
+            tx.set_explicit_passband(None);
+        }
+        connected.show_digital_window = false;
+        if let Some(prev) = connected.pre_digital_mode.take() {
+            connected.spectrum.set_mode(prev);
+        }
+        restore_pre_digital_filters(connected);
+    } else {
+        // Same as the Digital button's opening branch plus the RADE tab's Fit Filter (without the
+        // width rotation), then Hide.
+        connected.digital_mode = DigitalMode::Rade;
+        let current = connected.spectrum.mode();
+        if !matches!(current, spectrum::Mode::Digu | spectrum::Mode::Digl) {
+            let dial_hz = if connected.ctun {
+                connected.ctun_frequency_hz
+            } else {
+                connected.session.frequency_hz.load(Ordering::Relaxed)
+            };
+            connected.pre_digital_mode = Some(current);
+            connected.spectrum.set_mode(digi_mode_for_band(dial_hz));
+        }
+        enter_digital_mode_filters(connected);
+        let lsb = matches!(connected.spectrum.mode(), spectrum::Mode::Lsb | spectrum::Mode::Digl);
+        let tx_passband = if lsb { (-2300.0, -700.0) } else { (700.0, 2300.0) };
+        if let Some(tx) = &connected.tx_handle {
+            tx.set_explicit_passband(Some(tx_passband));
+        }
+        let (low, high) = if connected.rade_filter_wide { (300.0, 2700.0) } else { (700.0, 2300.0) };
+        let rx_passband = if lsb { (-high, -low) } else { (low, high) };
+        connected.spectrum.set_explicit_passband(Some(rx_passband));
+        connected.show_digital_window = false;
+    }
+}
+
 /// Whether a toolbar function is "on" right now (drawn lighter, like piHPSDR's lit buttons).
 fn toolbar_fn_active(connected: &ConnectedState, f: toolbar::ToolbarFn) -> bool {
     use toolbar::ToolbarFn;
     let ToolbarFn::Midi(action) = f else {
-        return matches!(f, ToolbarFn::TwoTone) && connected.two_tone_active;
+        return match f {
+            ToolbarFn::TwoTone => connected.two_tone_active,
+            ToolbarFn::Rade => rade_is_running(connected),
+            _ => false,
+        };
     };
     match action {
         MidiAction::Mox => connected.session.mox_active(),
