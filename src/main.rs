@@ -15562,11 +15562,11 @@ fn diag_text(connected: &ConnectedState, id: &str) -> Option<(String, u8)> {
 }
 
 /// Frame of the VFO A / VFO B boxes: the usual group frame; in the kiosk filled like the meter (grey 20) so the
-/// frequency boxes stand out from the window background, with a thin light-grey outline (125).
+/// frequency boxes stand out from the window background, without an outline.
 fn vfo_box_frame(ui: &egui::Ui) -> egui::Frame {
     let frame = egui::Frame::group(ui.style());
     if lcd_kiosk_mode() {
-        frame.fill(egui::Color32::from_gray(20)).stroke(egui::Stroke::new(1.0, egui::Color32::from_gray(125)))
+        frame.fill(egui::Color32::from_gray(20)).stroke(egui::Stroke::NONE)
     } else {
         frame
     }
