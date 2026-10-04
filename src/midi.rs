@@ -111,6 +111,11 @@ fn parse_midi_bytes(bytes: &[u8]) -> Option<RawMidiEvent> {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum MidiAction {
     Mox,
+    /// Signal-report recorder (the REC / PLAY buttons of the desktop window): temporary in-memory capture of the
+    /// RX audio, played back over TX. RecordWav is the other "Record" button: RX audio to a WAV file.
+    ReportRec,
+    ReportPlay,
+    RecordWav,
     Tune,
     Split,
     RitToggle,
@@ -124,6 +129,14 @@ pub enum MidiAction {
     ModeDown,
     BandUp,
     BandDown,
+    /// Opens the band chooser window (deskHPSDR's Band menu): a grid of band buttons in the middle of the screen.
+    BandMenu,
+    /// deskHPSDR's Mode menu: a grid of mode buttons in the middle of the screen.
+    ModeMenu,
+    /// deskHPSDR's "Set RX Filter" menu: the filter-width presets of the current mode.
+    FilterMenu,
+    /// RADE on/off in one press (same as the toolbar's RADE box).
+    Rade,
     FilterWidthUp,
     FilterWidthDown,
     VfoStepUp,
@@ -132,6 +145,9 @@ pub enum MidiAction {
     NoiseReductionCycle,
     AgcCycle,
     AfGain,
+    /// Squelch level 0..100 (knob or encoder), like piHPSDR's SQUELCH action; SquelchToggle switches it on/off.
+    Squelch,
+    SquelchToggle,
     AgcGain,
     MicGain,
     RfAttenuation,
@@ -204,6 +220,9 @@ impl MidiAction {
     pub fn label(self) -> &'static str {
         match self {
             MidiAction::Mox => "MOX (PTT)",
+            MidiAction::ReportRec => "REC (signal report)",
+            MidiAction::ReportPlay => "PLAY (signal report)",
+            MidiAction::RecordWav => "Record (WAV file)",
             MidiAction::Tune => "Tune",
             MidiAction::Split => "Split",
             MidiAction::RitToggle => "RIT On/Off",
@@ -217,6 +236,10 @@ impl MidiAction {
             MidiAction::ModeDown => "Mode Down",
             MidiAction::BandUp => "Band Up",
             MidiAction::BandDown => "Band Down",
+            MidiAction::BandMenu => "Band Menu",
+            MidiAction::ModeMenu => "Mode Menu",
+            MidiAction::FilterMenu => "RX Filter Menu",
+            MidiAction::Rade => "RADE On/Off",
             MidiAction::FilterWidthUp => "Filter Width Up",
             MidiAction::FilterWidthDown => "Filter Width Down",
             MidiAction::VfoStepUp => "VFO Step Up",
@@ -235,6 +258,8 @@ impl MidiAction {
             // switches would).
             MidiAction::AgcCycle => "AGC Cycle",
             MidiAction::AfGain => "AF Gain",
+            MidiAction::Squelch => "Squelch",
+            MidiAction::SquelchToggle => "Squelch On/Off",
             MidiAction::AgcGain => "AGC Gain",
             MidiAction::MicGain => "Mic Gain",
             MidiAction::RfAttenuation => "RF Attenuation",
@@ -291,6 +316,10 @@ impl MidiAction {
 /// Actions valid for a Key (button) binding.
 pub const KEY_ACTIONS: &[MidiAction] = &[
     MidiAction::Mox,
+    MidiAction::SquelchToggle,
+    MidiAction::ReportRec,
+    MidiAction::ReportPlay,
+    MidiAction::RecordWav,
     MidiAction::Tune,
     MidiAction::Split,
     MidiAction::RitToggle,
@@ -304,6 +333,10 @@ pub const KEY_ACTIONS: &[MidiAction] = &[
     MidiAction::ModeDown,
     MidiAction::BandUp,
     MidiAction::BandDown,
+    MidiAction::BandMenu,
+    MidiAction::ModeMenu,
+    MidiAction::FilterMenu,
+    MidiAction::Rade,
     MidiAction::FilterWidthUp,
     MidiAction::FilterWidthDown,
     MidiAction::VfoStepUp,
@@ -353,6 +386,7 @@ pub const KEY_ACTIONS: &[MidiAction] = &[
 /// Actions valid for a Knob (absolute value) binding.
 pub const KNOB_ACTIONS: &[MidiAction] = &[
     MidiAction::AfGain,
+    MidiAction::Squelch,
     MidiAction::AgcGain,
     MidiAction::MicGain,
     MidiAction::RfAttenuation,
@@ -384,6 +418,7 @@ pub const KNOB_ACTIONS: &[MidiAction] = &[
 /// time. See each action's own Wheel match arm (main.rs) for the
 /// relative-step handling this enables.
 pub const WHEEL_ACTIONS: &[MidiAction] = &[
+    MidiAction::Squelch,
     MidiAction::VfoTune,
     MidiAction::RitAdjust,
     MidiAction::XitAdjust,

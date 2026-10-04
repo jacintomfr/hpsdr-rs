@@ -577,6 +577,13 @@ pub struct DemodParams {
     /// normal mode-based behavior.
     pub explicit_passband: Option<(f64, f64)>,
     pub gain: f32,
+    /// Audio gain mute (click on the "Audio gain:" name in the kiosk): output is silent while the gain value is kept.
+    pub muted: bool,
+    /// DUP (deskHPSDR duplex): the RX path keeps running while transmitting instead of being muted/zeroed.
+    pub duplex: bool,
+    /// Squelch slider 0..=100 (0 = off) and its on/off switch -- piHPSDR mapping (rx_set_squelch), applied in demod().
+    pub squelch: f32,
+    pub squelch_enable: bool,
     pub agc: Agc,
     // Units assumed (not confirmed against your reference): attack/decay/
     // hang in milliseconds, top/slope in dB. Tune by ear/meter.
@@ -707,6 +714,10 @@ impl Default for DemodParams {
             // WDSP's RXA output is much hotter than typical audio-app
             // expectations (e.g. WSJT-X) -- starting well below unity.
             gain: 0.3,
+            muted: false,
+            duplex: false,
+            squelch: 0.0,
+            squelch_enable: false,
             // Off by default: AGC pumping works against the steady
             // levels digital-mode decoders like WSJT-X expect.
             agc: Agc::Off,
@@ -871,6 +882,7 @@ struct SpectrumAnalyzer {
     last_mode: Option<Mode>,
     last_passband: Option<(f64, f64)>,
     last_agc: Option<Agc>,
+    last_squelch: Option<(Mode, i32, bool)>,
     last_agc_params: Option<(i32, i32, i32, f64, i32)>,
     last_nb_enabled: Option<NoiseBlanker>,
     last_nb_threshold: Option<f64>,
@@ -1269,6 +1281,7 @@ impl SpectrumAnalyzer {
                 last_mode: None,
                 last_passband: None,
                 last_agc: None,
+                last_squelch: None,
                 last_agc_params: None,
                 last_nb_enabled: None,
                 last_nb_threshold: None,
@@ -1482,6 +1495,40 @@ impl SpectrumAnalyzer {
             self.last_passband = Some(passband);
         }
         { let n = Instant::now(); DSP_SET_GROUP[1].fetch_max(n.duration_since(set_last).as_micros() as u64, Ordering::Relaxed); set_last = n; }
+        // Squelch, same mapping as deskHPSDR rx_set_squelch (receiver.c): slider 0..100 -> AM/SAM/CW: AM squelch
+        // -160..0 dB; LSB/USB/DSB: voice squelch (SSQL) 0..0.75; FMN: FM squelch 1..0.01 (exponential);
+        // other (digital) modes: none. Only the matching one runs.
+        let sql = (params.mode, params.squelch.round() as i32, params.squelch_enable && params.squelch > 0.0);
+        if self.last_squelch != Some(sql) {
+            let level = params.squelch as f64;
+            let on = sql.2 as c_int;
+            let (am, voice, fm) = match params.mode {
+                Mode::Am | Mode::Sam | Mode::Cwl | Mode::Cwu => (on, 0, 0),
+                Mode::Lsb | Mode::Usb | Mode::Dsb => (0, on, 0),
+                Mode::Fmn => (0, 0, on),
+                _ => (0, 0, 0),
+            };
+            unsafe {
+                match params.mode {
+                    Mode::Am | Mode::Sam | Mode::Cwl | Mode::Cwu => {
+                        wdsp::SetRXAAMSQThreshold(self.channel, level / 100.0 * 160.0 - 160.0);
+                    }
+                    Mode::Lsb | Mode::Usb | Mode::Dsb => {
+                        wdsp::SetRXASSQLThreshold(self.channel, 0.0075 * level);
+                        wdsp::SetRXASSQLTauMute(self.channel, 0.1);
+                        wdsp::SetRXASSQLTauUnMute(self.channel, 0.1);
+                    }
+                    Mode::Fmn => {
+                        wdsp::SetRXAFMSQThreshold(self.channel, 10f64.powf(-2.0 * level / 100.0));
+                    }
+                    _ => {}
+                }
+                wdsp::SetRXAAMSQRun(self.channel, am);
+                wdsp::SetRXASSQLRun(self.channel, voice);
+                wdsp::SetRXAFMSQRun(self.channel, fm);
+            }
+            self.last_squelch = Some(sql);
+        }
         if self.last_agc != Some(params.agc) {
             unsafe {
                 wdsp::SetRXAAGCMode(self.channel, params.agc as c_int);
@@ -1987,7 +2034,8 @@ fn run(
             Mode::Am | Mode::Fmn => 0.031,
             _ => 0.016,
         };
-        let mox_now = mox.load(Ordering::Relaxed);
+        let duplex_now = demod_params.lock().unwrap().duplex;
+        let mox_now = mox.load(Ordering::Relaxed) && !duplex_now;
         if last_mox && !mox_now {
             let n = (sample_rate as f32 * txrx_silence_secs) as usize;
             txrx_silence_remaining = n;
@@ -2025,6 +2073,9 @@ fn run(
         // the analyzer -- a rare, edge-detected event, see its own doc
         // comment -- ahead of this iteration's Spectrum0/GetPixels call.
         let mut params = *demod_params.lock().unwrap();
+        if params.muted {
+            params.gain = 0.0;
+        }
         // BYPASS FIX for weak-signal RADE decode quality -- ported from a
         // real, measured finding in SDRoxide's own engine.rs (its
         // RxChain::process, tap_gain_for's own doc comment, issue #307):
@@ -2273,7 +2324,7 @@ fn run(
             // client to ask for it. Spectrum/waterfall display and
             // PureSignal's own feedback path are untouched -- this only
             // gates the post-demod AUDIO taps below.
-            let mox_active = mox.load(Ordering::Relaxed);
+            let mox_active = mox.load(Ordering::Relaxed) && !duplex_now;
             // See this function's own mute_local_for_tci param doc
             // comment -- read once per chunk, not per-sample, same as
             // mox_active above.
@@ -2856,6 +2907,33 @@ impl SpectrumHandle {
     pub fn set_gain(&self, gain: f32) {
         let mut p = self.demod_params.lock().unwrap();
         p.gain = gain.max(0.0);
+    }
+
+    pub fn squelch(&self) -> (f32, bool) {
+        let p = self.demod_params.lock().unwrap();
+        (p.squelch, p.squelch_enable)
+    }
+
+    pub fn set_squelch(&self, level: f32, enable: bool) {
+        let mut p = self.demod_params.lock().unwrap();
+        p.squelch = level.clamp(0.0, 100.0);
+        p.squelch_enable = enable;
+    }
+
+    pub fn duplex(&self) -> bool {
+        self.demod_params.lock().unwrap().duplex
+    }
+
+    pub fn set_duplex(&self, on: bool) {
+        self.demod_params.lock().unwrap().duplex = on;
+    }
+
+    pub fn muted(&self) -> bool {
+        self.demod_params.lock().unwrap().muted
+    }
+
+    pub fn set_muted(&self, muted: bool) {
+        self.demod_params.lock().unwrap().muted = muted;
     }
 
     pub fn agc(&self) -> Agc {

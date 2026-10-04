@@ -20,6 +20,11 @@ pub struct Config {
     pub mode: Option<Mode>,
     pub width_hz: Option<f64>,
     pub gain: Option<f32>,
+    /// Squelch (slider 0..=100, enabled) per mode label, like piHPSDR's per-mode RXTXprofile squelch.
+    #[serde(default)]
+    pub squelch_memory: std::collections::HashMap<String, (f32, bool)>,
+    /// DUP (duplex) switch, like deskHPSDR's "duplex" property.
+    pub duplex: Option<bool>,
     /// Digital Modes (RTTY) center/baud/shift/reverse/afc -- see
     /// rtty_link::RttySettings's own doc comment. None/missing (configs
     /// saved before this existed) falls back to RttySettings::default().
@@ -588,6 +593,9 @@ pub struct Config {
     pub toolbar_layers: Option<Vec<Vec<String>>>,
     #[serde(default)]
     pub toolbar_layer: Option<usize>,
+    /// Diagnostic values shown in the line above the spectrum (kiosk), picked in Settings -> Diagnostic.
+    #[serde(default)]
+    pub diag_items: Vec<String>,
     /// VFO B / Split -- see ConnectedState::vfo_b_frequency_hz/split's
     /// doc comments (main.rs). `None`/missing falls back to A's
     /// frequency and Split off, respectively -- same "never leave a

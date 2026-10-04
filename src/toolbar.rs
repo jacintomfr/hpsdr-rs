@@ -34,7 +34,7 @@ impl ToolbarFn {
     pub fn all() -> Vec<ToolbarFn> {
         let mut v = vec![ToolbarFn::TwoTone, ToolbarFn::Rade];
         // The Toolbar (F1-F8) MIDI actions press toolbar boxes, so they make no sense inside one.
-        v.extend(KEY_ACTIONS.iter().copied().filter(|a| !is_toolbar_action(*a)).map(ToolbarFn::Midi));
+        v.extend(KEY_ACTIONS.iter().copied().filter(|a| !is_toolbar_action(*a) && *a != MidiAction::Rade).map(ToolbarFn::Midi));
         v.extend([
             ToolbarFn::ZoomIn,
             ToolbarFn::ZoomOut,
@@ -80,6 +80,10 @@ impl ToolbarFn {
             ToolbarFn::PanRight => "PAN >",
             ToolbarFn::Midi(a) => match a {
                 MidiAction::Mox => "MOX",
+                MidiAction::SquelchToggle => "SQL",
+                MidiAction::ReportRec => "REC",
+                MidiAction::ReportPlay => "PLAY",
+                MidiAction::RecordWav => "RECORD",
                 MidiAction::Tune => "TUNE",
                 MidiAction::Split => "SPLIT",
                 MidiAction::RitToggle => "RIT",
@@ -93,6 +97,10 @@ impl ToolbarFn {
                 MidiAction::ModeDown => "MODE-",
                 MidiAction::BandUp => "BAND+",
                 MidiAction::BandDown => "BAND-",
+                MidiAction::BandMenu => "BAND",
+                MidiAction::ModeMenu => "MODE",
+                MidiAction::FilterMenu => "FILTER",
+                MidiAction::Rade => "RADE",
                 MidiAction::FilterWidthUp => "FILT+",
                 MidiAction::FilterWidthDown => "FILT-",
                 MidiAction::VfoStepUp => "STEP+",

@@ -975,6 +975,11 @@ fn dispatch_midi_binding(
                 connected.session.set_mox(want_on);
             }
         }
+        // Same gates as the REC / PLAY buttons of the desktop window (render of those: see "REC"/"PLAY").
+        MidiAction::ReportRec => report_rec_press(connected),
+        MidiAction::ReportPlay => report_play_press(connected),
+        // Same as the "Record" button: RX audio to a WAV file.
+        MidiAction::RecordWav => report_wav_press(connected),
         // Mirrors the TUNE button handler -- see its own comments for why
         // tune_may_start excludes Two-Tone/CW-text-sending and an
         // externally-keyed transmission.
@@ -1029,7 +1034,7 @@ fn dispatch_midi_binding(
         MidiAction::VfoAtoB => connected.vfo_b_frequency_hz = dial_freq_hz,
         MidiAction::VfoBtoA => {
             let (effective_freq, retune) =
-                resolve_tune(connected.ctun, freq_hz, sample_rate, passband, connected.vfo_b_frequency_hz);
+                resolve_tune_main(connected.ctun, freq_hz, sample_rate, passband, connected.vfo_b_frequency_hz);
             if let Some(lo) = retune {
                 connected.session.set_frequency(lo);
             } else {
@@ -1039,7 +1044,7 @@ fn dispatch_midi_binding(
         MidiAction::VfoSwap => {
             let new_b = dial_freq_hz;
             let (effective_freq, retune) =
-                resolve_tune(connected.ctun, freq_hz, sample_rate, passband, connected.vfo_b_frequency_hz);
+                resolve_tune_main(connected.ctun, freq_hz, sample_rate, passband, connected.vfo_b_frequency_hz);
             if let Some(lo) = retune {
                 connected.session.set_frequency(lo);
             } else {
@@ -1054,6 +1059,26 @@ fn dispatch_midi_binding(
                 if binding.action == MidiAction::ModeUp { (idx + 1) % len } else { (idx + len - 1) % len };
             apply_mode(connected, ALL_MODES[new_idx], dial_freq_hz);
         }
+        // One menu at a time, like deskHPSDR (opening one closes the other two).
+        MidiAction::BandMenu => {
+            let open = !connected.band_window_open;
+            connected.mode_window_open = false;
+            connected.filter_window_open = false;
+            connected.band_window_open = open;
+        }
+        MidiAction::ModeMenu => {
+            let open = !connected.mode_window_open;
+            connected.band_window_open = false;
+            connected.filter_window_open = false;
+            connected.mode_window_open = open;
+        }
+        MidiAction::FilterMenu => {
+            let open = !connected.filter_window_open;
+            connected.band_window_open = false;
+            connected.mode_window_open = false;
+            connected.filter_window_open = open;
+        }
+        MidiAction::Rade => toggle_rade_direct(connected),
         MidiAction::BandUp | MidiAction::BandDown => {
             let reachable: Vec<&'static Band> = BANDS
                 .iter()
@@ -1115,7 +1140,7 @@ fn dispatch_midi_binding(
             let step = scroll_tune_step_hz(connected.tune_step_hz, cw_mode, false, false);
             let signed_step = if binding.action == MidiAction::VfoStepUp { step } else { -step };
             let new_freq = (dial_freq_hz as i64 + signed_step).max(0) as u32;
-            let (effective_freq, retune) = resolve_tune(connected.ctun, freq_hz, sample_rate, passband, new_freq);
+            let (effective_freq, retune) = resolve_tune_main(connected.ctun, freq_hz, sample_rate, passband, new_freq);
             if let Some(lo) = retune {
                 connected.session.set_frequency(lo);
             } else {
@@ -1134,7 +1159,7 @@ fn dispatch_midi_binding(
         MidiAction::VfoTune => {
             let Some(step) = midi_wheel_step_hz(ev, &binding) else { return };
             let new_freq = (dial_freq_hz as i64 + step).max(0) as u32;
-            let (effective_freq, retune) = resolve_tune(connected.ctun, freq_hz, sample_rate, passband, new_freq);
+            let (effective_freq, retune) = resolve_tune_main(connected.ctun, freq_hz, sample_rate, passband, new_freq);
             if let Some(lo) = retune {
                 connected.session.set_frequency(lo);
             } else {
@@ -1271,6 +1296,24 @@ fn dispatch_midi_binding(
                 let db = midi_knob_range(ev.value, -100.0, 18.0);
                 connected.spectrum.set_gain(10f32.powf(db as f32 / 20.0));
             }
+        }
+        // piHPSDR's SQUELCH action (KnobOrWheel, 0..100): moving it above 0.5 switches the squelch on, below it off.
+        MidiAction::Squelch => {
+            let (level, _) = connected.spectrum.squelch();
+            let new_level = if binding.kind == MidiBindingKind::Wheel {
+                let Some(step) = midi_wheel_step(ev, &binding, 1.0) else { return };
+                (level as f64 + step).round().clamp(0.0, 100.0)
+            } else {
+                midi_knob_range(ev.value, 0.0, 100.0).round()
+            };
+            let on = new_level > 0.5;
+            connected.spectrum.set_squelch(new_level as f32, on);
+            connected.squelch_memory.insert(connected.spectrum.mode().label().to_string(), (new_level as f32, on));
+        }
+        MidiAction::SquelchToggle => {
+            let (level, enabled) = connected.spectrum.squelch();
+            connected.spectrum.set_squelch(level, !enabled);
+            connected.squelch_memory.insert(connected.spectrum.mode().label().to_string(), (level, !enabled));
         }
         MidiAction::AgcGain => {
             // Dual Knob/Wheel -- see WHEEL_ACTIONS' own doc comment
@@ -1535,6 +1578,7 @@ enum SettingsTab {
     Meter,
     Screen,
     Toolbar,
+    Diagnostic,
     About,
 }
 
@@ -2187,6 +2231,20 @@ struct ConnectedState {
     band_memory: std::collections::HashMap<String, BandSettings>,
     /// Last filter width used per mode -- see width_for_mode's doc
     /// comment. Keyed by Mode::label().
+    /// Squelch per mode (level, enabled), like piHPSDR's per-mode profile; swapped in when the mode changes.
+    squelch_memory: std::collections::HashMap<String, (f32, bool)>,
+    squelch_last_mode: Option<spectrum::Mode>,
+    /// Kiosk REC / PLAY buttons on the spectrum: shown after the first press, hidden by the third.
+    rec_visible: bool,
+    play_visible: bool,
+    /// The band chooser window (toolbar BAND / Band Menu MIDI action).
+    band_window_open: bool,
+    mode_window_open: bool,
+    /// Top (y) of the spectrum in the last frame: the band / mode / filter menus open right below it.
+    last_spectrum_top: f32,
+    filter_window_open: bool,
+    wav_visible: bool,
+    wav_hide_at: Option<Instant>,
     width_memory: std::collections::HashMap<String, f64>,
     /// CTUN ("Click to Tune"): when on, the hardware/LO frequency
     /// (session.frequency_hz) stays fixed and clicking/scrolling the
@@ -2215,6 +2273,8 @@ struct ConnectedState {
     /// button's own handler; `toolbar_choose` is the button being reassigned,.
     toolbar_layers: toolbar::Layers,
     toolbar_layer: usize,
+    /// Ids (DIAG_ITEMS) of the diagnostic values shown above the spectrum.
+    diag_items: Vec<String>,
     toolbar_pending: Option<toolbar::ToolbarFn>,
     /// When each toolbar box (F1-F7, FNC) was last pressed, so it can show "pressed" briefly -- also
     /// for a press that came from a MIDI key and not from the screen.
@@ -2935,6 +2995,11 @@ impl HpsdrApp {
         // See with_orange_selection's own doc comment.
         ctx.style_mut_of(egui::Theme::Dark, |style| {
             style.visuals = with_orange_selection(style.visuals.clone());
+            // Kiosk: the main window background a little lighter than egui's near-black (27), so the pure
+            // black spectrum/waterfall stand out from it.
+            if lcd_kiosk_mode() {
+                style.visuals.panel_fill = egui::Color32::from_gray(34);
+            }
         });
         // See config::load_kiosk_ui_scale's doc comment (Settings ->
         // Screen, kiosk mode only). Scales the STYLE's own text sizes,
@@ -3300,6 +3365,7 @@ fn connect_to_device(device: Device, cfg: &Config) -> Result<ConnectedState, Str
             if let Some(g) = cfg.gain {
                 spectrum.set_gain(g);
             }
+            spectrum.set_duplex(cfg.duplex.unwrap_or(false));
             if let Some(a) = cfg.agc {
                 spectrum.set_agc(a);
             }
@@ -3718,12 +3784,23 @@ fn connect_to_device(device: Device, cfg: &Config) -> Result<ConnectedState, Str
                 settings_dirty,
                 band_memory: cfg.band_settings.clone(),
                 width_memory: cfg.width_memory.clone(),
+                squelch_memory: cfg.squelch_memory.clone(),
+                squelch_last_mode: None,
+                rec_visible: false,
+                play_visible: false,
+                band_window_open: false,
+                mode_window_open: false,
+                last_spectrum_top: 240.0,
+                filter_window_open: false,
+                wav_visible: false,
+                wav_hide_at: None,
                 ctun,
                 ctun_frequency_hz,
                 tune_step_hz,
                 rit_step_hz,
                 toolbar_layers: toolbar::layers_from_config(cfg.toolbar_layers.as_ref()),
                 toolbar_layer: cfg.toolbar_layer.unwrap_or(0).min(toolbar::LAYERS - 1),
+                diag_items: cfg.diag_items.clone(),
                 toolbar_pending: None,
                 toolbar_flash: [None; 8],
                 align_x: (0.0, 0.0),
@@ -4153,6 +4230,53 @@ impl eframe::App for HpsdrApp {
                     .session
                     .frequency_hz
                     .load(std::sync::atomic::Ordering::Relaxed);
+                // Diagnostics (temporary): while /tmp/hpsdr_diag.enable exists, one line per second in /tmp/hpsdr_perf.log
+                // with the UI frame rate and the DSP / display counters.
+                {
+                    static PERF_LAST: Mutex<Option<(Instant, u64, u64)>> = Mutex::new(None);
+                    let mut g = PERF_LAST.lock().unwrap();
+                    let last = g.get_or_insert((Instant::now(), 0, 0));
+                    if last.0.elapsed().as_secs_f32() >= 1.0 {
+                        if std::path::Path::new("/tmp/hpsdr_diag.enable").exists() {
+                            use std::io::Write;
+                            let chunks = spectrum::DSP_CHUNKS.load(Ordering::Relaxed);
+                            let rev = connected.spectrum.display.lock().unwrap().revision;
+                            let (gap, proc_ms, q) = spectrum::dsp_stats_take();
+                            let (set, zp, feed) = spectrum::dsp_parts_take();
+                            let (ui_fps, ui_ms, _wf_ms, wf_n, passes) = ui_prof_snapshot();
+                            if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open("/tmp/hpsdr_perf.log") {
+                                let _ = writeln!(
+                                    f,
+                                    "ui_fps={ui_fps:.1} passes={passes:.1} ui_ms={ui_ms:.1} wf_rebuilds={wf_n:.1} | dsp_chunks/s={} disp_rev/s={} | gap={gap:.1} proc={proc_ms:.1} q={q} set={set:.1} zp={zp:.1} feed={feed:.1} | sr={} zoom={} mode={:?}",
+                                    chunks.wrapping_sub(last.1),
+                                    (rev as u64).wrapping_sub(last.2),
+                                    connected.sample_rate,
+                                    connected.spectrum_zoom,
+                                    connected.spectrum.mode(),
+                                );
+                            }
+                            last.1 = chunks;
+                            last.2 = rev as u64;
+                        }
+                        last.0 = Instant::now();
+                    }
+                }
+                {
+                    // piHPSDR: each mode has its own squelch setting, loaded when the mode changes.
+                    let mode_now = connected.spectrum.mode();
+                    if connected.squelch_last_mode != Some(mode_now) {
+                        let (level, on) =
+                            connected.squelch_memory.get(mode_now.label()).copied().unwrap_or((0.0, false));
+                        connected.spectrum.set_squelch(level, on);
+                        connected.squelch_last_mode = Some(mode_now);
+                    }
+                }
+                if !VFO_LOCKED.load(Ordering::Relaxed) {
+                    VFO_LOCK_DIAL_HZ.store(
+                        if connected.ctun { connected.ctun_frequency_hz } else { freq_hz },
+                        Ordering::Relaxed,
+                    );
+                }
                 // Used by both protocols -- see radio::drive_byte_for_watts.
                 // gain_db is the flat per-band base (pa_calibration,
                 // calibrated at max_tx_power_watts, i.e. 100% of the
@@ -4308,7 +4432,7 @@ impl eframe::App for HpsdrApp {
                     let requested_if_hz =
                         (requested_freq_hz as i64 - requested_offset_hz).clamp(0, u32::MAX as i64) as u32;
                     let (effective_freq, retune) =
-                        resolve_tune(connected.ctun, freq_hz, sample_rate, passband, requested_if_hz);
+                        resolve_tune_main(connected.ctun, freq_hz, sample_rate, passband, requested_if_hz);
                     if let Some(lo) = retune {
                         connected.session.set_frequency(lo);
                     } else {
@@ -4709,11 +4833,14 @@ impl eframe::App for HpsdrApp {
                 // signal clean" signal at all. No LO/CTUN translation
                 // applied to tx_spectrum -- it's raw generated baseband,
                 // not a wideband capture that needs retuning within.
-                let transmitting = connected.session.mox_active();
+                let mox_on_now = connected.session.mox_active();
                 // See step_autogain's own doc comment -- rate-limits its
                 // own real actions internally, cheap/harmless to call
                 // every frame.
-                step_autogain(connected, transmitting);
+                step_autogain(connected, mox_on_now);
+                // DUP (duplex): the RX analyzer, waterfall and CTUN view stay on screen while keyed, like
+                // deskHPSDR's duplex (where the TX display is a separate window).
+                let transmitting = mox_on_now && !connected.spectrum.duplex();
                 if transmitting && !connected.tx_spectrum_mox_was_active {
                     // Fresh PTT -- see SpectrumHandle::clear_display's
                     // doc comment for why this can't just be left to
@@ -4956,6 +5083,45 @@ impl eframe::App for HpsdrApp {
                 // range or a fixed offset applied at render time.
                 let (rx_low, rx_high) = (connected.db_low, connected.db_high);
                 let (tx_low, tx_high) = (connected.tx_db_low, connected.tx_db_high);
+                // DUP (piHPSDR duplex): while keyed, the TX panadapter lives in its own small "TX" window
+                // (piHPSDR's tx_create_dialog: 240x400, the central quarter of the TX spectrum) and the main
+                // window keeps showing the receiver.
+                if mox_on_now && connected.spectrum.duplex() {
+                    let row: Vec<f32> = connected.tx_spectrum.display.lock().unwrap().spectrum.clone();
+                    let (lo, hi) = if tx_low < tx_high { (tx_low, tx_high) } else { (tx_high, tx_high + 1.0) };
+                    egui::Window::new("TX")
+                        .id(egui::Id::new("duplex_tx_window"))
+                        .anchor(egui::Align2::RIGHT_TOP, egui::vec2(-8.0, 150.0))
+                        .collapsible(false)
+                        .resizable(false)
+                        .show(ui.ctx(), |ui| {
+                            let (rect, _) = ui.allocate_exact_size(egui::vec2(240.0, 230.0), egui::Sense::hover());
+                            let painter = ui.painter_at(rect);
+                            painter.rect_filled(rect, 0.0, egui::Color32::BLACK);
+                            for k in 1..4 {
+                                let y = rect.top() + rect.height() * k as f32 / 4.0;
+                                painter.line_segment(
+                                    [egui::pos2(rect.left(), y), egui::pos2(rect.right(), y)],
+                                    egui::Stroke::new(1.0, egui::Color32::from_gray(50)),
+                                );
+                            }
+                            let n = row.len();
+                            if n >= 8 {
+                                let width = (n / 4).max(2);
+                                let start = (n - width) / 2;
+                                let pts: Vec<egui::Pos2> = (0..width)
+                                    .map(|i| {
+                                        let db = row[start + i].clamp(lo, hi);
+                                        egui::pos2(
+                                            rect.left() + rect.width() * i as f32 / (width - 1) as f32,
+                                            rect.bottom() - rect.height() * (db - lo) / (hi - lo),
+                                        )
+                                    })
+                                    .collect();
+                                painter.add(egui::Shape::line(pts, egui::Stroke::new(1.0, egui::Color32::from_rgb(120, 220, 90))));
+                            }
+                        });
+                }
                 let (base_low, base_high) = if transmitting { (tx_low, tx_high) } else { (rx_low, rx_high) };
                 let (db_low, db_high) = if base_low < base_high {
                     (base_low, base_high)
@@ -5051,6 +5217,13 @@ impl eframe::App for HpsdrApp {
                 let mut restart_after_firmware_update: Option<Device> = None;
                 egui::CentralPanel::default().show(ui, |ui| {
                     ui.add_space(4.0);
+                    // Kiosk: the band row (indicators, SNB/ANF/BIN, RIT/XIT, AGC) is the first row of the screen.
+                    if lcd_kiosk_mode() {
+                        if render_kiosk_band_row(ui, connected, current_band_name, current_mode.label()) {
+                            settings_changed = true;
+                        }
+                        ui.add_space(4.0);
+                    }
                     // Red while transmitting -- a clear, glanceable
                     // "you're on the air" signal right where the eye
                     // already goes to read the frequency, not just the
@@ -5059,12 +5232,12 @@ impl eframe::App for HpsdrApp {
                     // (see ConnectedState::split's doc comment), so the
                     // red highlight follows VFO B instead of VFO A --
                     // otherwise it would point at the wrong box.
-                    let freq_a_color = if transmitting && !connected.split {
+                    let freq_a_color = if mox_on_now && !connected.split {
                         egui::Color32::RED
                     } else {
                         egui::Color32::GREEN
                     };
-                    let freq_b_color = if transmitting && connected.split {
+                    let freq_b_color = if mox_on_now && connected.split {
                         egui::Color32::RED
                     } else {
                         egui::Color32::GRAY
@@ -5077,6 +5250,10 @@ impl eframe::App for HpsdrApp {
                         false,
                         false,
                     ));
+                    if lcd_kiosk_mode() {
+                        let top = ui.cursor().top();
+                        ui.data_mut(|d| d.insert_temp(egui::Id::new("kiosk_top_y"), top));
+                    }
                     let (freq_label, vfo_b_label) = ui
                         .horizontal(|ui| {
                             // Kiosk: tighter gaps in this top row -- at 125% scale it is wider than the 1024 px
@@ -5090,6 +5267,9 @@ impl eframe::App for HpsdrApp {
                             // what the buttons between the two boxes do.
                             let freq_label = ui
                                 .group(|ui| {
+                                    if lcd_kiosk_mode() {
+                                        ui.set_min_height(60.0);
+                                    }
                                     ui.vertical(|ui| {
                                         ui.horizontal(|ui| {
                                             ui.label("VFO-A");
@@ -5204,11 +5384,12 @@ impl eframe::App for HpsdrApp {
                             let cw1 = chip_width(ui, &["A>B", "A<>B", "CTUN"]);
                             let cw2 = chip_width(ui, &["B>A", "Split"]);
                                 ui.horizontal(|ui| {
-                                    if ui
+                                    let a2b = ui
                                         .add(chip_button("A>B", flash_on(ui, "flash_a2b")).min_size(egui::vec2(cw1, 0.0)))
-                                        .on_hover_text("Copy VFO A's frequency to VFO B")
-                                        .clicked()
-                                    {
+                                        .on_hover_text("Copy VFO A's frequency to VFO B");
+                                    // Remembered so the rigctl/TCI/CAT chips (kiosk) are exactly this tall.
+                                    ui.data_mut(|d| d.insert_temp(egui::Id::new("kiosk_chip_h"), a2b.rect.height()));
+                                    if a2b.clicked() {
                                         flash_start(ui, "flash_a2b");
                                         connected.vfo_b_frequency_hz = dial_freq_hz;
                                         settings_changed = true;
@@ -5227,7 +5408,7 @@ impl eframe::App for HpsdrApp {
                                         // scroll-tuning) rather than
                                         // retuning the real hardware. See
                                         // resolve_tune's doc comment.
-                                        let (effective_freq, retune) = resolve_tune(
+                                        let (effective_freq, retune) = resolve_tune_main(
                                             connected.ctun,
                                             freq_hz,
                                             sample_rate,
@@ -5252,7 +5433,7 @@ impl eframe::App for HpsdrApp {
                                         // Same CTUN-aware handling as B>A
                                         // above.
                                         let new_b = dial_freq_hz;
-                                        let (effective_freq, retune) = resolve_tune(
+                                        let (effective_freq, retune) = resolve_tune_main(
                                             connected.ctun,
                                             freq_hz,
                                             sample_rate,
@@ -5346,7 +5527,8 @@ impl eframe::App for HpsdrApp {
                                     // re-enabling dumped whatever had
                                     // accumulated while hidden instead
                                     // of resuming cleanly.
-                                    if matches!(connected.spectrum.mode(), spectrum::Mode::Cwl | spectrum::Mode::Cwu)
+                                    if !lcd_kiosk_mode()
+                                        && matches!(connected.spectrum.mode(), spectrum::Mode::Cwl | spectrum::Mode::Cwu)
                                         && ui
                                             .add(egui::Button::selectable(
                                                 connected.cw_decode_enabled,
@@ -5364,7 +5546,13 @@ impl eframe::App for HpsdrApp {
                             // rigctl/TCI/CAT column, centred between the VFO-A buttons and the
                             // VFO-B box (equal gap on both sides). Kiosk: moved to the band row, and VFO-B
                             // sits right against the VFO-A buttons, with the same gap VFO-A has to its own.
-                            if !lcd_kiosk_mode() {
+                            if lcd_kiosk_mode() {
+                                // Kiosk: rigctl/TCI/CAT sit right against the B>A column, with no gap before them, so the
+                                // room goes to the PK/MIC/ALC and LEV/PROC/CFC columns after the VFO-B box.
+                                ui.vertical(|ui| {
+                                    render_net_status_column(ui, connected, rigctl_status, tci_status, cat_status);
+                                });
+                            } else {
                                 ui.add_space(8.0);
                                 ui.vertical(|ui| {
                                     render_net_status_column(ui, connected, rigctl_status, tci_status, cat_status);
@@ -5374,6 +5562,9 @@ impl eframe::App for HpsdrApp {
 
                             let vfo_b_label = ui
                                 .group(|ui| {
+                                    if lcd_kiosk_mode() {
+                                        ui.set_min_height(60.0);
+                                    }
                                     ui.vertical(|ui| {
                                         ui.horizontal(|ui| {
                                             ui.label("VFO-B");
@@ -5438,16 +5629,22 @@ impl eframe::App for HpsdrApp {
                             // for why mixing floating and normal-flow
                             // content in the same screen region is worth
                             // avoiding.
-                            ui.add_space(12.0);
-                            ui.vertical(|ui| {
+                            // Kiosk: this column (MENU, DIGITAL, EXIT) is drawn at the right edge, after the meter, so it takes
+                            // no room here; elsewhere it follows VFO-B as before.
+                            if !lcd_kiosk_mode() {
+                                ui.add_space(12.0);
+                            }
+                            let mut button_column = |ui: &mut egui::Ui| {
                                 // See kiosk_accent_button's own doc
                                 // comment -- uppercase label kept
                                 // kiosk-only (matches the rest of that
                                 // mode's own window-chrome controls);
                                 // desktop keeps normal case, just the
                                 // same yellow fill now (a real request).
+                                // Kiosk: MENU, DIGITAL and EXIT share one width (the widest of the three labels).
+                                let kiosk_btn_w = chip_width(ui, &["MENU", "DIGITAL", "EXIT"]);
                                 let settings_clicked = if lcd_kiosk_mode() {
-                                    solid_chip_text(ui, "SETTINGS...", egui::Color32::from_rgb(235, 195, 40), egui::Color32::BLACK, true).clicked()
+                                    solid_chip_text_w(ui, "MENU", egui::Color32::from_rgb(235, 195, 40), egui::Color32::BLACK, true, kiosk_btn_w).clicked()
                                 } else {
                                     solid_chip_text(ui, "Settings...", egui::Color32::from_rgb(235, 195, 40), egui::Color32::BLACK, true).clicked()
                                 };
@@ -5467,9 +5664,7 @@ impl eframe::App for HpsdrApp {
                                 // consequential action than SETTINGS/
                                 // Juice Console next to it.
                                 if lcd_kiosk_mode() {
-                                    if solid_chip(ui, "STOP", egui::Color32::from_rgb(210, 50, 50), true).clicked() {
-                                        stop_clicked = true;
-                                    }
+                                    // Kiosk: STOP is now EXIT, below DIGITAL.
                                 } else {
                                     // Used to be gated to protocol == 2 only -- P1
                                     // genuinely supports independent per-receiver
@@ -5518,12 +5713,13 @@ impl eframe::App for HpsdrApp {
                                 // Digital modes (RTTY for now) -- one
                                 // entry point for all of them, see
                                 // render_digital_window.
-                                if solid_chip_text(
+                                if solid_chip_text_w(
                                     ui,
-                                    if lcd_kiosk_mode() { "DIGITAL..." } else { "Digital..." },
+                                    if lcd_kiosk_mode() { "DIGITAL" } else { "Digital..." },
                                     egui::Color32::from_rgb(110, 190, 240),
                                     egui::Color32::BLACK,
                                     true,
+                                    if lcd_kiosk_mode() { kiosk_btn_w } else { 0.0 },
                                 )
                                 .on_hover_text("Digital modes: RTTY decoder/encoder")
                                 .clicked()
@@ -5586,7 +5782,29 @@ impl eframe::App for HpsdrApp {
                                         settings_changed = true;
                                     }
                                 }
-                            });
+                                if lcd_kiosk_mode() {
+                                    if solid_chip_w(ui, "EXIT", egui::Color32::from_rgb(210, 50, 50), true, kiosk_btn_w)
+                                        .on_hover_text("Disconnect from the radio")
+                                        .clicked()
+                                    {
+                                        stop_clicked = true;
+                                    }
+                                }
+                            };
+                            if lcd_kiosk_mode() {
+                                // Right edge of the window, top-aligned with the meter.
+                                let col_w = chip_width(ui, &["MENU", "DIGITAL", "EXIT"]);
+                                let right = ui.ctx().content_rect().right() - 6.0;
+                                let rect = egui::Rect::from_min_size(egui::pos2(right - col_w, 12.0), egui::vec2(col_w, 110.0));
+                                // Drawn outside the row's flow (new_child allocates nothing in it) and top-down, whatever
+                                // layout the row has -- scope_builder inherited the horizontal one and reserved space.
+                                let mut column_ui = ui.new_child(
+                                    egui::UiBuilder::new().max_rect(rect).layout(egui::Layout::top_down(egui::Align::Min)),
+                                );
+                                button_column(&mut column_ui);
+                            } else {
+                                ui.vertical(button_column);
+                            }
 
                             // Compact RADE status while the Digital window
                             // is hidden now lives as an overlay directly
@@ -5605,8 +5823,20 @@ impl eframe::App for HpsdrApp {
                                 let orange = egui::Color32::from_rgb(230, 150, 50);
                                 let mox = connected.session.mox_active();
                                 let disp = connected.tx_handle.as_ref().map(|tx| *tx.display.lock().unwrap());
-                                ui.add_space(12.0);
+                                if lcd_kiosk_mode() {
+                                    // PK/MIC/ALC and LEV/PROC/CFC are spread evenly between VFO-B and the meter: the same
+                                    // gap before PK, between PK and LEV, and between LEV and the meter.
+                                    let lev_present = connected.tx_enabled && connected.tx_handle.is_some();
+                                    let (w_pk, w_lev) = kiosk_top_column_widths(ui, lev_present);
+                                    // The rigctl/TCI/CAT column is already placed, so PK and LEV share what is left.
+                                    let gaps = if lev_present { 3.0 } else { 2.0 };
+                                    let free = meter_left_x(ui) - ui.next_widget_position().x - w_pk - w_lev;
+                                    ui.add_space((free / gaps - ui.spacing().item_spacing.x).max(2.0));
+                                } else {
+                                    ui.add_space(12.0);
+                                }
                                 ui.vertical(|ui| {
+                                    kiosk_align_rows_to_chips(ui);
                                     // Fixed width = the widest possible text, so the column never
                                     // resizes (and nothing shifts) as the digits change.
                                     let font = egui::TextStyle::Body.resolve(ui.style());
@@ -5659,6 +5889,7 @@ impl eframe::App for HpsdrApp {
                                         ui.add_space(12.0);
                                     }
                                     ui.vertical(|ui| {
+                                        kiosk_align_rows_to_chips(ui);
                                         if tx.leveler_enabled() {
                                             ui.colored_label(
                                                 egui::Color32::from_rgb(230, 150, 50),
@@ -5693,6 +5924,7 @@ impl eframe::App for HpsdrApp {
                         })
                         .inner;
 
+                    if !lcd_kiosk_mode() {
                     ui.add_space(8.0);
                     ui.horizontal_wrapped(|ui| {
                         // Suppressed (None) whenever an XVTR is active --
@@ -5807,11 +6039,116 @@ impl eframe::App for HpsdrApp {
                             ui.add_space((free / 2.0).clamp(16.0, 200.0));
                         }
                         if lcd_kiosk_mode() {
-                            render_net_status_column(ui, connected, rigctl_status, tci_status, cat_status);
+                            // Kiosk: rigctl/TCI/CAT live in the top row, RIT/XIT beside BIN.
                         } else if render_rit_xit(ui, connected) {
                             settings_changed = true;
                         }
                     });
+                    }
+
+                    // Mode menu (deskHPSDR mode_menu.c): one button per mode, the current one lit.
+                    if connected.mode_window_open {
+                        let cur = connected.spectrum.mode();
+                        let items: Vec<(String, bool)> = ALL_MODES.iter().map(|md| (md.label().to_string(), *md == cur)).collect();
+                        let (close_now, picked) = choice_window(ui, "mode_menu_window", "Mode (VFO-A)", &items, connected.last_spectrum_top);
+                        if let Some(i) = picked {
+                            apply_mode(connected, ALL_MODES[i], dial_freq_hz);
+                            settings_changed = true;
+                        }
+                        if close_now {
+                            connected.mode_window_open = false;
+                        }
+                    }
+                    // Set RX Filter (deskHPSDR filter_menu.c): the fixed filter presets of the current mode.
+                    if connected.filter_window_open {
+                        let mode = connected.spectrum.mode();
+                        let width = connected.spectrum.width_hz();
+                        let presets = rx_filter_presets(mode);
+                        let items: Vec<(String, bool)> =
+                            presets.iter().map(|(name, w)| (name.to_string(), (width - *w).abs() < 1.0)).collect();
+                        let heading = format!("Set RX Filter {}", mode.label());
+                        let (close_now, picked) = choice_window(ui, "filter_menu_window", &heading, &items, connected.last_spectrum_top);
+                        if let Some(i) = picked {
+                            let w = presets[i].1;
+                            connected.spectrum.set_width_hz(w);
+                            if let Some(tx) = &connected.tx_handle {
+                                tx.set_width_hz(w);
+                            }
+                            connected.width_memory.insert(mode.label().to_string(), w);
+                            settings_changed = true;
+                        }
+                        if close_now {
+                            connected.filter_window_open = false;
+                        }
+                    }
+                    // Band chooser (deskHPSDR band_menu.c): the band buttons, 5 per row, the current band lit. Opened by
+                    // the BAND toolbar function / Band Menu MIDI action; stays open until Close.
+                    if connected.band_window_open {
+                        // (label, kind, index): kind 0 = BANDS[index], 1 = Gen, 2 = XVTR slot
+                        let mut kinds: Vec<(u8, usize)> = Vec::new();
+                        let mut items: Vec<(String, bool)> = Vec::new();
+                        let current_band_sel: Option<&str> = if active_xvtr_name.is_none() {
+                            Some(band_for_frequency(dial_freq_hz).map(|b| b.name).unwrap_or("Gen"))
+                        } else {
+                            None
+                        };
+                        for (i, band) in BANDS.iter().enumerate() {
+                            if (band.low_hz as u64) < connected.device.frequency_min
+                                || band.high_hz as u64 > connected.device.frequency_max
+                            {
+                                continue;
+                            }
+                            kinds.push((0, i));
+                            items.push((band.name.to_string(), Some(band.name) == current_band_sel));
+                        }
+                        kinds.push((1, 0));
+                        items.push(("Gen".to_string(), current_band_sel == Some("Gen")));
+                        for (i, xvtr) in connected.xvtrs.iter().enumerate() {
+                            if xvtr.name.is_empty() {
+                                continue;
+                            }
+                            let offset = xvtr_rf_offset(xvtr);
+                            let if_low = xvtr.frequency_min_hz as i64 - offset;
+                            let if_high = xvtr.frequency_max_hz as i64 - offset;
+                            if if_low < connected.device.frequency_min as i64 || if_high > connected.device.frequency_max as i64 {
+                                continue;
+                            }
+                            kinds.push((2, i));
+                            items.push((xvtr.name.clone(), active_xvtr_name.as_deref() == Some(xvtr.name.as_str())));
+                        }
+                        let (close_now, picked) =
+                            choice_window(ui, "band_menu_window", "Band (VFO-A)", &items, connected.last_spectrum_top);
+                        if let Some(n) = picked {
+                            let (kind, idx) = kinds[n];
+                            match kind {
+                                0 => apply_band(connected, &BANDS[idx]),
+                                1 => {
+                                    let gen = gen_band(connected.device.frequency_min, connected.device.frequency_max);
+                                    apply_band(connected, &gen);
+                                }
+                                _ => {
+                                    let xvtr = connected.xvtrs[idx].clone();
+                                    let offset = xvtr_rf_offset(&xvtr);
+                                    let if_low = xvtr.frequency_min_hz as i64 - offset;
+                                    connected.active_xvtr = Some(xvtr.name.clone());
+                                    let target = if_low.clamp(0, u32::MAX as i64) as u32;
+                                    connected.session.set_frequency(target);
+                                    connected.ctun_frequency_hz = target;
+                                    connected.spectrum.set_mode(xvtr.default_mode);
+                                    let resolved_width_hz = width_for_mode(&connected.width_memory, xvtr.default_mode);
+                                    connected.spectrum.set_width_hz(resolved_width_hz);
+                                    if let Some(tx) = &connected.tx_handle {
+                                        tx.set_mode(xvtr.default_mode);
+                                        tx.set_width_hz(resolved_width_hz);
+                                    }
+                                }
+                            }
+                            settings_changed = true;
+                        }
+                        if close_now {
+                            connected.band_window_open = false;
+                        }
+                    }
 
                     // Right-click VFO -> keypad frequency-entry popup --
                     // real request. Opened by freq_label/vfo_b_label's
@@ -6084,7 +6421,11 @@ impl eframe::App for HpsdrApp {
                     // of each individual call, so nesting like this is
                     // fine.
 
+                    // Kiosk: no mode buttons (the band row has the mode indicator, the toolbar changes mode), so this
+                    // whole row goes away -- unless PureSignal needs its indicator here -- and everything below moves up.
+                    if !lcd_kiosk_mode() || connected.puresignal_enabled {
                     ui.horizontal_wrapped(|ui| {
+                        if !lcd_kiosk_mode() {
                         for mode in ALL_MODES {
                             let selected = mode == current_mode;
                             if toggle_chip(ui, mode.label(), selected, 0.0, "").clicked()
@@ -6093,6 +6434,7 @@ impl eframe::App for HpsdrApp {
                                 apply_mode(connected, mode, dial_freq_hz);
                                 settings_changed = true;
                             }
+                        }
                         }
                         // rigctl/TCI/CAT/PS -- appended here (after DRM)
                         // instead of their own row. No longer kiosk-only
@@ -6114,18 +6456,19 @@ impl eframe::App for HpsdrApp {
                             let meter_left = meter_left_x(ui);
                             let start = ui.cursor().left();
                             let free = (meter_left - start - group_w).max(16.0);
-                            ui.add_space((free / 2.0).clamp(16.0, 120.0));
+                            if !lcd_kiosk_mode() {
+                                ui.add_space((free / 2.0).clamp(16.0, 120.0));
+                            }
                         }
-                        if render_snb_anf_bin_chips(ui, connected) {
+                        if !lcd_kiosk_mode() && render_snb_anf_bin_chips(ui, connected) {
                             settings_changed = true;
                         }
                         }
-                        if lcd_kiosk_mode() && render_rit_xit_aligned(ui, connected) {
-                            settings_changed = true;
-                        }
+                        // (Kiosk: SNB/ANF/BIN, RIT/XIT and the AGC mode button now follow the mode indicator on the band row.)
                         ui.add_space(16.0);
                         render_status_row(ui, connected, rigctl_status, tci_status, cat_status);
                     });
+                    }
 
                     // NOTE: render_nb_nr/render_snb_anf_bin are standalone
                     // fns (see their definitions below the App impl, next
@@ -6206,11 +6549,86 @@ impl eframe::App for HpsdrApp {
                         // slider further down uses them too) for the
                         // actual fix and why.
 
+                        // Kiosk: Filter width and AGC Gain swap places (name, slider, value box together).
+                        macro_rules! agc_switch {
+                            ($ui:ident, $w:expr) => {{
+                                let ui = &mut *$ui;
+                                if ui
+                                    .add_sized(
+                                        [$w, ui.spacing().interact_size.y],
+                                        switch_button("AGC Gain:", connected.agc_auto),
+                                    )
+                                    .on_hover_text(
+                                        "Switch: continuously re-target AGC Gain from the tracked noise floor                                          instead of a fixed value (deskHPSDR's \"AGC Automatic\"). The slider                                          becomes read-only while this is on. Offset: Settings.",
+                                    )
+                                    .clicked()
+                                {
+                                    connected.agc_auto = !connected.agc_auto;
+                                    settings_changed = true;
+                                }
+                            }};
+                        }
+                        macro_rules! agc_slider {
+                            ($ui:ident) => {{
+                                let ui = &mut *$ui;
+                                let mut agc_top_db = connected.spectrum.agc_params().agc_top_db;
+                                if stable_f64_slider(ui, &mut connected.slider_scroll_accum, &mut agc_top_db, 0.0..=140.0, 2.0, " dB") {
+                                    connected.spectrum.set_agc_top_db(agc_top_db);
+                                    settings_changed = true;
+                                }
+                            }};
+                        }
+                        macro_rules! filter_slider {
+                            ($ui:ident) => {{
+                                let ui = &mut *$ui;
+                                let mut width = current_width;
+                                if stable_f64_slider(ui, &mut connected.slider_scroll_accum, &mut width, 50.0..=5000.0, 50.0, " Hz") {
+                                    connected.spectrum.set_width_hz(width);
+                                    if let Some(tx) = &connected.tx_handle {
+                                        tx.set_width_hz(width);
+                                    }
+                                    connected
+                                        .width_memory
+                                        .insert(current_mode.label().to_string(), width);
+                                    settings_changed = true;
+                                }
+                            }};
+                        }
                         egui::Grid::new("gain_filter_grid").num_columns(6).show(ui, |ui| {
                         let col0_w = label_box_width(ui, &["Audio gain:", "RxPGA:", "AGC Gain:", "RX Gain:"]);
-                        let col4_w = label_box_width(ui, &["Mic gain:", "TX Power:"]);
-                        let col6_w = label_box_width(ui, &["TCI TX gain:", "Filter width:"]);
-                        audio_gain_label_width = framed_label(ui, "Audio gain:", col0_w).rect.width();
+                        let col4_w = if lcd_kiosk_mode() {
+                            label_box_width(ui, &["TCI TX gain:", "TX Power:", "Filter width:"])
+                        } else {
+                            label_box_width(ui, &["Mic gain:", "TX Power:"])
+                        };
+                        let col6_w = if lcd_kiosk_mode() {
+                            label_box_width(ui, &["Mic gain:", "AGC Gain:"])
+                        } else {
+                            label_box_width(ui, &["TCI TX gain:", "Filter width:"])
+                        };
+                        audio_gain_label_width = if lcd_kiosk_mode() {
+                            // Kiosk: click the name to mute/unmute (the name turns grey while muted).
+                            let muted = connected.spectrum.muted();
+                            let resp = egui::Frame::new()
+                                .stroke(egui::Stroke::new(1.0, egui::Color32::from_gray(95)))
+                                .corner_radius(5.0)
+                                .inner_margin(egui::Margin::symmetric(6, 3))
+                                .show(ui, |ui| {
+                                    ui.set_min_width((col0_w - 14.0).max(0.0));
+                                    let color = if muted { egui::Color32::from_gray(110) } else { egui::Color32::WHITE };
+                                    ui.add(egui::Label::new(egui::RichText::new("Audio gain:").color(color)).selectable(false));
+                                })
+                                .response;
+                            let click = ui
+                                .interact(resp.rect, ui.id().with("audio_gain_mute"), egui::Sense::click())
+                                .on_hover_text("Click to mute/unmute the audio");
+                            if click.clicked() {
+                                connected.spectrum.set_muted(!muted);
+                            }
+                            resp.rect.width()
+                        } else {
+                            framed_label(ui, "Audio gain:", col0_w).rect.width()
+                        };
                         let mut gain = current_gain;
                         // ROOT CAUSE FIX: max raised from 1.5 -- a real
                         // report needed more than that even with the
@@ -6249,8 +6667,24 @@ impl eframe::App for HpsdrApp {
                         }
 
                         if connected.tx_enabled {
-                            if connected.tx_handle.is_some() {
-                                framed_label(ui, "Mic gain:", col4_w);
+                            // Kiosk: TCI TX gain and Mic gain swap places (name, slider and value box together).
+                            macro_rules! mic_cell {
+                                ($w:expr, $grouped:expr) => {{
+                                framed_label(ui, "Mic gain:", $w);
+                                if $grouped {
+                                    ui.horizontal(|ui| {
+                                        // Same row height as the value box, so the cell is not pushed down.
+                                        ui.set_min_height(stable_value_box_height(ui));
+                                        mic_body!(ui);
+                                    });
+                                } else {
+                                    mic_body!(ui);
+                                }
+                                }};
+                            }
+                            macro_rules! mic_body {
+                                ($ui:ident) => {{
+                                let ui = &mut *$ui;
                                 let mut mic_gain = connected.mic_gain;
                                 // Displayed/dragged in dB (see
                                 // scroll_slider_f32_db's doc comment) --
@@ -6263,23 +6697,20 @@ impl eframe::App for HpsdrApp {
                                     }
                                     settings_changed = true;
                                 }
-
-                                // Separate from Mic gain above -- a real
-                                // test against WSJT-X found its TCI TX
-                                // audio arriving at roughly 1/700th the
-                                // amplitude Mic gain's 0.0..=2.0 range is
-                                // calibrated for (confirmed via WSJT-X's
-                                // own source, not an hpsdr-rs decode bug
-                                // -- see radio::RadioSession::
-                                // tci_tx_gain's doc comment). Displayed/
-                                // dragged in dB for the same reason Audio
-                                // Gain needed it: this needs to cover a
-                                // couple orders of magnitude, dialed in by
-                                // ear/meter against real traffic -- +60dB
-                                // ceiling matches the old 1000.0 linear
-                                // max exactly, -60dB floor matches Audio
-                                // gain's own.
-                                framed_label(ui, "TCI TX gain:", col6_w);
+                                }};
+                            }
+                            macro_rules! tci_cell {
+                                ($w:expr, $grouped:expr) => {{
+                                framed_label(ui, "TCI TX gain:", $w);
+                                if !$grouped {
+                                    // Kiosk, first slot: slider and value box as separate grid cells.
+                                    let mut tci_tx_gain = connected.tci_tx_gain;
+                                    if stable_db_slider(ui, &mut connected.slider_scroll_accum, &mut tci_tx_gain, -60.0, 60.0, 1.0) {
+                                        connected.tci_tx_gain = tci_tx_gain;
+                                        *connected.session.tci_tx_gain.lock().unwrap() = tci_tx_gain;
+                                        settings_changed = true;
+                                    }
+                                } else {
                                 ui.horizontal(|ui| {
                                     let mut tci_tx_gain = connected.tci_tx_gain;
                                     if stable_db_slider(ui, &mut connected.slider_scroll_accum, &mut tci_tx_gain, -60.0, 60.0, 1.0) {
@@ -6309,7 +6740,8 @@ impl eframe::App for HpsdrApp {
                                     // below, so the two line up vertically).
                                     ui.add_space(6.0);
                                     connected.align_x.1 = ui.next_widget_position().x + nb_nr_chip_width(ui) / 2.0;
-                                    if render_nb_chip(ui, connected) {
+                                    // Kiosk: NB and NR live on the first row, after BIN.
+                                    if !lcd_kiosk_mode() && render_nb_chip(ui, connected) {
                                         settings_changed = true;
                                     }
                                     // REC/PLAY are not shown in the kiosk layout (they made this row wider than the screen).
@@ -6344,6 +6776,33 @@ impl eframe::App for HpsdrApp {
                                     }
                                     }
                                 });
+                                }
+                                }};
+                            }
+                            if connected.tx_handle.is_some() {
+                                if lcd_kiosk_mode() {
+                                    tci_cell!(col4_w, false);
+                                    mic_cell!(col6_w, false);
+                                    } else {
+                                    mic_cell!(col4_w, false);
+                                    tci_cell!(col6_w, true);
+                                }
+
+                                // Separate from Mic gain above -- a real
+                                // test against WSJT-X found its TCI TX
+                                // audio arriving at roughly 1/700th the
+                                // amplitude Mic gain's 0.0..=2.0 range is
+                                // calibrated for (confirmed via WSJT-X's
+                                // own source, not an hpsdr-rs decode bug
+                                // -- see radio::RadioSession::
+                                // tci_tx_gain's doc comment). Displayed/
+                                // dragged in dB for the same reason Audio
+                                // Gain needed it: this needs to cover a
+                                // couple orders of magnitude, dialed in by
+                                // ear/meter against real traffic -- +60dB
+                                // ceiling matches the old 1000.0 linear
+                                // max exactly, -60dB floor matches Audio
+                                // gain's own.
                             }
                         }
                         // SNB/ANF/BIN used to be appended here (kiosk
@@ -6590,6 +7049,20 @@ impl eframe::App for HpsdrApp {
                         // a real request: grouped with RX Gain/TX Power
                         // as "how much signal in/out" rather than sharing
                         // a row with the mode buttons.
+                        if lcd_kiosk_mode() {
+                            agc_switch!(ui, col6_w);
+                            agc_slider!(ui);
+                            // AGC mode sits right after the AGC Gain value box (kiosk).
+                            let agc_w = chip_width(ui, &["AGC Medium"]);
+                            if ui
+                                .add(chip_button(current_agc.label(), current_agc != spectrum::Agc::Off).min_size(egui::vec2(agc_w, 0.0)))
+                                .on_hover_text("Click to cycle: Off -> Long -> Slow -> Medium -> Fast -> Off")
+                                .clicked()
+                            {
+                                connected.spectrum.set_agc(current_agc.next());
+                                settings_changed = true;
+                            }
+                        } else {
                         framed_label(ui, "Filter width:", col6_w);
                         ui.horizontal(|ui| {
                             let mut width = current_width;
@@ -6612,7 +7085,7 @@ impl eframe::App for HpsdrApp {
                             // report you could never transmit.
                             if connected.tx_enabled && connected.tx_handle.is_some() {
                                 ui.add_space(6.0);
-                                if render_nr_chip(ui, connected) {
+                                if !lcd_kiosk_mode() && render_nr_chip(ui, connected) {
                                     settings_changed = true;
                                 }
                                 if !lcd_kiosk_mode() {
@@ -6647,12 +7120,60 @@ impl eframe::App for HpsdrApp {
                                 }
                             }
                         });
+                        }
                         // NB/NR used to be appended here (kiosk mode) --
                         // moved to the AGC row instead, same reasoning as
                         // SNB/ANF/BIN's own comment above (this row plus
                         // 2 more buttons was too wide for the fixed
                         // 1024px kiosk window).
                         ui.end_row();
+                        if lcd_kiosk_mode() {
+                            // Squelch (piHPSDR): the name toggles it (grey = off); slider 0..100, stored per mode like piHPSDR's profiles.
+                            {
+                                let (level, enabled) = connected.spectrum.squelch();
+                                let resp = egui::Frame::new()
+                                    .stroke(egui::Stroke::new(1.0, egui::Color32::from_gray(95)))
+                                    .corner_radius(5.0)
+                                    .inner_margin(egui::Margin::symmetric(6, 3))
+                                    .show(ui, |ui| {
+                                        ui.set_min_width((col0_w - 14.0).max(0.0));
+                                        let color = if enabled { egui::Color32::WHITE } else { egui::Color32::from_gray(110) };
+                                        ui.add(egui::Label::new(egui::RichText::new("Squelch:").color(color)).selectable(false));
+                                    })
+                                    .response;
+                                let click = ui
+                                    .interact(resp.rect, ui.id().with("squelch_toggle"), egui::Sense::click())
+                                    .on_hover_text("Click to turn the squelch on/off (grey = off)");
+                                if click.clicked() {
+                                    // As in piHPSDR: the check box enables/disables independently of the slider.
+                                    connected.spectrum.set_squelch(level, !enabled);
+                                    connected
+                                        .squelch_memory
+                                        .insert(connected.spectrum.mode().label().to_string(), (level, !enabled));
+                                    settings_changed = true;
+                                }
+                                let mut sql = level.round() as i32;
+                                if stable_i32_slider_enabled(
+                                    ui,
+                                    &mut connected.slider_scroll_accum,
+                                    &mut sql,
+                                    0..=100,
+                                    1,
+                                    "",
+                                    true,
+                                ) {
+                                    // As in piHPSDR (radio_set_squelch): moving the slider enables it when above 0.5.
+                                    connected.spectrum.set_squelch(sql as f32, sql as f32 > 0.5);
+                                    connected
+                                        .squelch_memory
+                                        .insert(connected.spectrum.mode().label().to_string(), (sql as f32, sql as f32 > 0.5));
+                                    settings_changed = true;
+                                }
+                            }
+                            framed_label(ui, "Filter width:", col4_w);
+                            filter_slider!(ui);
+                            ui.end_row();
+                        }
 
                         // NB/NR was the last thing appended to THIS row
                         // -- AGC Gain/AGC mode/NB/NR/SNB/ANF/BIN all live
@@ -6697,6 +7218,7 @@ impl eframe::App for HpsdrApp {
                         // row sat about 3px lower than RX Gain's own row
                         // right above it (outside gain_filter_grid, so it
                         // doesn't inherit that Grid's own row spacing).
+                        if !lcd_kiosk_mode() || (connected.tx_enabled && connected.tx_handle.is_none()) {
                         ui.add_space(-3.0);
                         ui.horizontal(|ui| {
                             // Fixed width -- a real report: this row is
@@ -6763,7 +7285,8 @@ impl eframe::App for HpsdrApp {
                             // slider value boxes elsewhere (see
                             // STABLE_SLIDER_TRACK_WIDTH), sized for the
                             // longest label ("AGC Medium").
-                            if ui
+                            if !lcd_kiosk_mode()
+                                && ui
                                 .add_sized(
                                     [100.0, ui.spacing().interact_size.y],
                                     chip_button(current_agc.label(), current_agc != spectrum::Agc::Off),
@@ -6804,6 +7327,7 @@ impl eframe::App for HpsdrApp {
                                 }
                             }
                         });
+                        }
                     }
 
                     // show_status_row's definition moved up, right before
@@ -6850,6 +7374,8 @@ impl eframe::App for HpsdrApp {
                                 settings_changed = true;
                             }
                             ui.add_space(8.0);
+                            // Record is hidden in the kiosk for now (its new place is still open).
+                            if false {
                             let recording = connected.spectrum.recorder.is_enabled();
                             let (rec_label, rec_color) = if recording {
                                 ("Recording", egui::Color32::from_rgb(210, 50, 50))
@@ -6883,6 +7409,7 @@ impl eframe::App for HpsdrApp {
                                         ),
                                     }
                                 }
+                            }
                             }
                         });
                     }
@@ -7134,78 +7661,10 @@ impl eframe::App for HpsdrApp {
                             // Two-Tone, can't hijack an externally-keyed
                             // transmission or run concurrently with
                             // either of them.
-                            let cw_text_mode_selected =
-                                matches!(connected.spectrum.mode(), spectrum::Mode::Cwl | spectrum::Mode::Cwu);
-                            // Once already sending, the button must
-                            // stay clickable (to STOP) regardless of
-                            // mode/mox/Tune/Two-Tone changing under it
-                            // -- only the conditions for STARTING a new
-                            // send require CW mode/nothing else already
-                            // using mox.
-                            // Real request -- also covers the remote
-                            // CAT "KY"/rigctl "send_morse" CW-text path
-                            // further below, which reuses this SAME gate
-                            // (see its own comment). See
-                            // tx_frequency_allowed's own doc comment.
-                            let cw_text_may_start = connected.cw_text_sending
-                                || (cw_text_mode_selected
-                                    && !mox_now
-                                    && !connected.tune_active
-                                    && !connected.two_tone_active
-                                    && tx_frequency_allowed(
-                                        connected.session.tx_frequency_hz.load(Ordering::Relaxed),
-                                        connected.allow_out_of_band_tx.load(Ordering::Relaxed),
-                                    ));
-                            egui::ComboBox::from_id_salt("cw_text_message_select")
-                                .selected_text(format!("{}", connected.cw_text_selected + 1))
-                                .show_ui(ui, |ui| {
-                                    for i in 0..connected.cw_text_messages.len() {
-                                        let preview = connected.cw_text_messages[i].chars().take(20).collect::<String>();
-                                        let label = if preview.is_empty() {
-                                            format!("{} (empty)", i + 1)
-                                        } else {
-                                            format!("{}: {}", i + 1, preview)
-                                        };
-                                        ui.selectable_value(&mut connected.cw_text_selected, i, label);
-                                    }
-                                })
-                                .response
-                                .on_hover_text("Which of Settings -> CW's 5 saved messages to send");
-                            let cw_text_label = if connected.cw_text_sending { "STOP" } else { "SEND CW" };
-                            let cw_text_color = if connected.cw_text_sending {
-                                egui::Color32::from_rgb(210, 50, 50)
-                            } else {
-                                egui::Color32::from_gray(60)
-                            };
-                            let cw_text_resp = ui
-                                .add_enabled(
-                                    cw_text_may_start,
-                                    chip_button(cw_text_label, connected.cw_text_sending)
-                                        .min_size(egui::vec2(chip_width(ui, &["SEND CW"]), 0.0)),
-                                )
-                                .on_hover_text(
-                                    "Send the selected message (Settings -> CW) as real CW, at \
-                                     the Speed/Weight set there -- click again to stop mid-message.",
-                                );
-                            if cw_text_resp.clicked() {
-                                if connected.cw_text_sending {
-                                    if let Some(tx) = &connected.tx_handle {
-                                        tx.stop_cw_text();
-                                    }
-                                } else {
-                                    let text = connected.cw_text_messages[connected.cw_text_selected].clone();
-                                    if !text.trim().is_empty() {
-                                        if let Some(tx) = &connected.tx_handle {
-                                            let speed_wpm =
-                                                connected.session.cw_keyer.speed_wpm.load(Ordering::Relaxed);
-                                            let weight = connected.session.cw_keyer.weight.load(Ordering::Relaxed);
-                                            tx.send_cw_text(&text, speed_wpm, weight);
-                                            connected.session.set_mox(true);
-                                            connected.cw_text_sending = true;
-                                        }
-                                    }
-                                }
+                            if !lcd_kiosk_mode() {
+                                render_cw_text_send(ui, connected);
                             }
+                            let cw_text_may_start = cw_text_may_start(connected);
                             // Per-frame poll: drop mox/reset the button
                             // once tx_handle reports done (message
                             // fully sent, Stop finished its ramp-down),
@@ -7379,7 +7838,8 @@ impl eframe::App for HpsdrApp {
                             // own doc comment for why it used to live
                             // there). No longer kiosk-only (a real
                             // request): both modes now show it here.
-                            {
+                            // Kiosk: Record is hidden for now (its new place is still open).
+                            if !lcd_kiosk_mode() {
                                 ui.add_space(12.0);
                                 let recording = connected.spectrum.recorder.is_enabled();
                                 let (rec_label, rec_color) = if recording {
@@ -7467,7 +7927,7 @@ impl eframe::App for HpsdrApp {
                     // so it reverts to its normal share the instant mox
                     // drops.
                     let waterfall_effectively_enabled =
-                        connected.waterfall_enabled && !connected.session.mox_active();
+                        connected.waterfall_enabled && (!connected.session.mox_active() || connected.spectrum.duplex());
                     let spectrum_height = if waterfall_effectively_enabled {
                         (spectrum_waterfall_height * connected.spectrum_waterfall_ratio).max(80.0)
                     } else {
@@ -7497,6 +7957,8 @@ impl eframe::App for HpsdrApp {
                         egui::vec2(ui.available_width() - cw_panel_reserved_width, spectrum_height),
                         egui::Sense::click_and_drag(),
                     );
+                    let spectrum_rect = rect;
+                    connected.last_spectrum_top = rect.top();
                     let spectrum_top = rect.top();
                     let spectrum_right = rect.right();
 
@@ -7542,6 +8004,31 @@ impl eframe::App for HpsdrApp {
                         let outer_rect = above_rect.expand(WF_MARGIN);
                         draw_audio_waveform(ui.painter(), outer_rect, &samples);
                     }
+                    // Diagnostic line (Settings -> Diagnostic): the ticked values in the free line above the spectrum,
+                    // from the left edge up to the audio scope; whatever does not fit is left out.
+                    if lcd_kiosk_mode() && !connected.diag_items.is_empty() {
+                        const WF_W: f32 = 160.0;
+                        let limit = rect.right() + cw_panel_reserved_width - 8.0 - WF_W - 16.0;
+                        let font = egui::FontId::monospace(13.0);
+                        let y = rect.top() - 15.0;
+                        let mut x = rect.left() + 2.0;
+                        let painter = ui.painter().clone();
+                        for id in connected.diag_items.clone() {
+                            let Some((text, level)) = diag_text(connected, &id) else { continue };
+                            let color = match level {
+                                2 => egui::Color32::from_rgb(235, 60, 60),
+                                1 => egui::Color32::from_rgb(235, 150, 50),
+                                _ => egui::Color32::from_gray(190),
+                            };
+                            let galley = painter.layout_no_wrap(text, font.clone(), color);
+                            if x + galley.size().x > limit {
+                                break;
+                            }
+                            let w = galley.size().x;
+                            painter.galley(egui::pos2(x, y - galley.size().y / 2.0), galley, color);
+                            x += w + 14.0;
+                        }
+                    }
                     // Used as the CW panel's bottom edge when the
                     // waterfall is disabled (see waterfall_enabled below)
                     // -- otherwise the waterfall rect's own bottom is used
@@ -7556,7 +8043,7 @@ impl eframe::App for HpsdrApp {
                             let new_freq = freq_at_x(pos.x, rect, freq_hz, sample_rate, connected.spectrum_zoom, pan_offset_hz);
                             let new_freq = cw_center_click_freq(current_mode, new_freq);
                             let (effective_freq, retune) =
-                                resolve_tune(connected.ctun, freq_hz, sample_rate, passband, new_freq);
+                                resolve_tune_main(connected.ctun, freq_hz, sample_rate, passband, new_freq);
                             if let Some(lo) = retune {
                                 connected.session.set_frequency(lo);
                             } else {
@@ -7615,7 +8102,7 @@ impl eframe::App for HpsdrApp {
                         new_freq = new_freq.max(0);
                         if new_freq as u32 != dial_freq_hz {
                             let (effective_freq, retune) =
-                                resolve_tune(connected.ctun, freq_hz, sample_rate, passband, new_freq as u32);
+                                resolve_tune_main(connected.ctun, freq_hz, sample_rate, passband, new_freq as u32);
                             if let Some(lo) = retune {
                                 connected.session.set_frequency(lo);
                             } else {
@@ -7676,7 +8163,7 @@ impl eframe::App for HpsdrApp {
 
                             if new_freq as u32 != dial_freq_hz {
                                 let (effective_freq, retune) =
-                                    resolve_tune(connected.ctun, freq_hz, sample_rate, passband, new_freq as u32);
+                                    resolve_tune_main(connected.ctun, freq_hz, sample_rate, passband, new_freq as u32);
                                 if let Some(lo) = retune {
                                     connected.session.set_frequency(lo);
                                 } else {
@@ -7713,7 +8200,7 @@ impl eframe::App for HpsdrApp {
 
                             if new_freq as u32 != dial_freq_hz {
                                 let (effective_freq, retune) =
-                                    resolve_tune(connected.ctun, freq_hz, sample_rate, passband, new_freq as u32);
+                                    resolve_tune_main(connected.ctun, freq_hz, sample_rate, passband, new_freq as u32);
                                 if let Some(lo) = retune {
                                     connected.session.set_frequency(lo);
                                 } else {
@@ -8322,6 +8809,32 @@ impl eframe::App for HpsdrApp {
                         draw_freq_hover_tooltip(ui.painter(), pos, hover_freq_shown);
                     }
 
+                    // PA temperature and current (Settings -> Diagnostic -> PA), like piHPSDR's rx_panadapter: yellow, top
+                    // left inside the spectrum (drawn after the spectrum, or it would be painted over), only while transmitting, the maximum of each half second (no flicker).
+                    if lcd_kiosk_mode()
+                        && connected.diag_items.iter().any(|s| s == "pa")
+                        && matches!(connected.device.board, Boards::HermesLite2)
+                        && connected.session.mox_active()
+                    {
+                        static PA_HELD: Mutex<Option<(Instant, f64, f64, f64, f64)>> = Mutex::new(None);
+                        let t = (0.0795898 * connected.session.hl2_pa_temp_raw.load(Ordering::Relaxed) as f64 - 50.0).max(0.0);
+                        let i = (0.505396 * connected.session.hl2_pa_current_raw.load(Ordering::Relaxed) as f64).max(0.0);
+                        let (shown_t, shown_i) = {
+                            let mut g = PA_HELD.lock().unwrap();
+                            let h = g.get_or_insert((Instant::now(), t, i, t, i));
+                            h.3 = h.3.max(t);
+                            h.4 = h.4.max(i);
+                            if h.0.elapsed().as_millis() >= 500 {
+                                *h = (Instant::now(), h.3, h.4, t, i);
+                            }
+                            (h.1, h.2)
+                        };
+                        let font = egui::FontId::proportional(16.0);
+                        let yellow = egui::Color32::from_rgb(255, 255, 0);
+                        let p = ui.painter().clone();
+                        p.text(egui::pos2(rect.left() + 100.0, rect.top() + 6.0), egui::Align2::LEFT_TOP, format!("{shown_t:.0}°C"), font.clone(), yellow);
+                        p.text(egui::pos2(rect.left() + 160.0, rect.top() + 6.0), egui::Align2::LEFT_TOP, format!("{shown_i:.0}mA"), font, yellow);
+                    }
                     // Waterfall disabled (Settings -> Spectrum): skip the
                     // divider, the whole waterfall pane, and its click/
                     // drag/scroll/zoom/texture handling entirely -- the
@@ -8348,7 +8861,7 @@ impl eframe::App for HpsdrApp {
                                 let new_freq = freq_at_x(pos.x, rect, freq_hz, sample_rate, connected.spectrum_zoom, pan_offset_hz);
                                 let new_freq = cw_center_click_freq(current_mode, new_freq);
                                 let (effective_freq, retune) =
-                                    resolve_tune(connected.ctun, freq_hz, sample_rate, passband, new_freq);
+                                    resolve_tune_main(connected.ctun, freq_hz, sample_rate, passband, new_freq);
                                 if let Some(lo) = retune {
                                     connected.session.set_frequency(lo);
                                 } else {
@@ -8376,7 +8889,7 @@ impl eframe::App for HpsdrApp {
                             new_freq = new_freq.max(0);
                             if new_freq as u32 != dial_freq_hz {
                                 let (effective_freq, retune) =
-                                    resolve_tune(connected.ctun, freq_hz, sample_rate, passband, new_freq as u32);
+                                    resolve_tune_main(connected.ctun, freq_hz, sample_rate, passband, new_freq as u32);
                                 if let Some(lo) = retune {
                                     connected.session.set_frequency(lo);
                                 } else {
@@ -8420,7 +8933,7 @@ impl eframe::App for HpsdrApp {
 
                                 if new_freq as u32 != dial_freq_hz {
                                     let (effective_freq, retune) =
-                                        resolve_tune(connected.ctun, freq_hz, sample_rate, passband, new_freq as u32);
+                                        resolve_tune_main(connected.ctun, freq_hz, sample_rate, passband, new_freq as u32);
                                     if let Some(lo) = retune {
                                         connected.session.set_frequency(lo);
                                     } else {
@@ -8450,7 +8963,7 @@ impl eframe::App for HpsdrApp {
 
                                 if new_freq as u32 != dial_freq_hz {
                                     let (effective_freq, retune) =
-                                        resolve_tune(connected.ctun, freq_hz, sample_rate, passband, new_freq as u32);
+                                        resolve_tune_main(connected.ctun, freq_hz, sample_rate, passband, new_freq as u32);
                                     if let Some(lo) = retune {
                                         connected.session.set_frequency(lo);
                                     } else {
@@ -8580,10 +9093,89 @@ impl eframe::App for HpsdrApp {
                     } else {
                         spectrum_bottom
                     };
+                    // Kiosk: REC and its progress bar sit inside the spectrum, top right, drawn after it (part of the
+                    // spectrum pane, not a separate row and not a floating window). Only with TX available.
+                    if let Some(t) = connected.wav_hide_at {
+                        if Instant::now() >= t {
+                            connected.wav_visible = false;
+                            connected.wav_hide_at = None;
+                        } else {
+                            ui.ctx().request_repaint_after(Duration::from_millis(100));
+                        }
+                    }
+                    if lcd_kiosk_mode()
+                        && (connected.rec_visible || connected.play_visible || connected.wav_visible)
+                        && (connected.tx_handle.is_some() || connected.wav_visible)
+                    {
+                        let h = ui.spacing().interact_size.y;
+                        let btn_w = chip_width(ui, &["PLAY", "Record"]) + 8.0;
+                        let w = btn_w + 6.0 + 80.0;
+                        let r = egui::Rect::from_min_size(
+                            egui::pos2(spectrum_rect.right() - w - 6.0, spectrum_rect.top() + 4.0),
+                            egui::vec2(w, h),
+                        );
+                        let mut strip = ui.new_child(
+                            egui::UiBuilder::new().max_rect(r).layout(egui::Layout::left_to_right(egui::Align::Center)),
+                        );
+                        let rr = connected.spectrum.report_recorder.clone();
+                        let recording = rr.is_recording();
+                        let playing = rr.is_playing();
+                                                // One slot: REC and PLAY take turns in the same place.
+                        let (rec_slot, _) = strip.allocate_exact_size(egui::vec2(btn_w, h), egui::Sense::hover());
+                        let play_slot = rec_slot;
+                        strip.add_space(6.0);
+                        if connected.rec_visible {
+                            let fill = if recording { egui::Color32::from_rgb(210, 40, 40) } else { egui::Color32::from_rgb(120, 30, 30) };
+                            let mut b = strip.new_child(egui::UiBuilder::new().max_rect(rec_slot));
+                            if b.add_sized(
+                                [btn_w, h],
+                                egui::Button::new(egui::RichText::new("REC").color(egui::Color32::WHITE)).fill(fill),
+                            )
+                            .on_hover_text("Signal report recorder: press to record, again to stop, again to hide (REC MIDI key)")
+                            .clicked()
+                            {
+                                report_rec_press(connected);
+                            }
+                        }
+                        if connected.wav_visible {
+                            let on = connected.spectrum.recorder.is_enabled();
+                            let fill = if on { egui::Color32::from_rgb(210, 40, 40) } else { egui::Color32::from_rgb(120, 30, 30) };
+                            let mut b = strip.new_child(egui::UiBuilder::new().max_rect(rec_slot));
+                            if b.add_sized(
+                                [btn_w, h],
+                                egui::Button::new(egui::RichText::new("Record").color(egui::Color32::WHITE)).fill(fill),
+                            )
+                            .on_hover_text("Records the RX audio to a WAV file: press to stop, it disappears a second later (Record MIDI key)")
+                            .clicked()
+                            {
+                                report_wav_press(connected);
+                            }
+                        }
+                        if connected.play_visible {
+                            let fill = if playing { egui::Color32::from_rgb(40, 160, 60) } else { egui::Color32::from_rgb(30, 90, 40) };
+                            let mut b = strip.new_child(egui::UiBuilder::new().max_rect(play_slot));
+                            if b.add_sized(
+                                [btn_w, h],
+                                egui::Button::new(egui::RichText::new("PLAY").color(egui::Color32::WHITE)).fill(fill),
+                            )
+                            .on_hover_text("Plays the recording while MOX is on: press to play, again to stop, again to hide (PLAY MIDI key)")
+                            .clicked()
+                            {
+                                report_play_press(connected);
+                            }
+                        }
+                        let (slot, _) = strip.allocate_exact_size(egui::vec2(80.0, h), egui::Sense::hover());
+                        let mut bar_ui = strip.new_child(egui::UiBuilder::new().max_rect(slot));
+                        if let Some(progress) = rr.record_progress() {
+                            action_progress_bar(&mut bar_ui, progress, format!("{:.0}s", progress * report_recorder::MAX_SECONDS));
+                        } else if let Some(progress) = rr.play_progress() {
+                            action_progress_bar(&mut bar_ui, progress, format!("{:.0}%", progress * 100.0));
+                        }
+                    }
                     if cw_panel_visible {
-                        render_cw_decoder_panel_beside(
+                        render_cw_decoder_panel_main(
                             ui,
-                            &connected.spectrum,
+                            connected,
                             egui::Id::new("cw_decoder_panel_main"),
                             egui::Rect::from_min_max(
                                 egui::pos2(spectrum_right + CW_PANEL_GAP, spectrum_top),
@@ -8945,7 +9537,7 @@ Waterfall rebuilds: {prof_wf_n:.0}/s, {prof_wf_ms:.1} ms each."
                 egui::Area::new(egui::Id::new("s_meter_area"))
                     // -40 (was -10) -- a real report: the panel sat flush
                     // against the window's right edge, moved ~30px left.
-                    .anchor(egui::Align2::RIGHT_TOP, egui::vec2(-20.0, 10.0))
+                    .anchor(egui::Align2::RIGHT_TOP, egui::vec2(-kiosk_meter_right_margin(ui), 10.0))
                     // The meter area is drawn scaled up in kiosk mode (see below); its
                     // enlarged, invisible hit-rect sat on top of the REC/PLAY buttons and
                     // swallowed the mouse. It has nothing clickable, so make it inert.
@@ -9603,6 +10195,7 @@ Waterfall rebuilds: {prof_wf_n:.0}/s, {prof_wf_ms:.1} ms each."
                                     (SettingsTab::Antenna, "Antenna"),
                                     (SettingsTab::Audio, "Audio"),
                                     (SettingsTab::Cw, "CW"),
+                                    (SettingsTab::Diagnostic, "Diagnostic"),
                                     (SettingsTab::Diversity, "Diversity"),
                                     (SettingsTab::Equalizer, "Equalizer"),
                                     (SettingsTab::Firmware, "Firmware"),
@@ -9636,6 +10229,9 @@ Waterfall rebuilds: {prof_wf_n:.0}/s, {prof_wf_ms:.1} ms each."
                                     // window already lets the OS/user resize
                                     // freely, so this tab would be a no-op
                                     // (and confusing) there.
+                                    if tab == SettingsTab::Diagnostic && !lcd_kiosk_mode() {
+                                        continue;
+                                    }
                                     if tab == SettingsTab::Screen && !lcd_kiosk_mode() {
                                         continue;
                                     }
@@ -10533,6 +11129,25 @@ Waterfall rebuilds: {prof_wf_n:.0}/s, {prof_wf_ms:.1} ms each."
                                         }
                                         if let Some(i) = delete_index {
                                             connected.midi_bindings.remove(i);
+                                            settings_changed = true;
+                                        }
+                                    }
+                                }
+
+                                SettingsTab::Diagnostic => {
+                                    ui.add_space(4.0);
+                                    ui.label(
+                                        "Tick the values to show in the line above the spectrum (kiosk). Values that \
+                                         do not fit before the audio scope are left out.",
+                                    );
+                                    ui.add_space(6.0);
+                                    for (id, label, hint) in DIAG_ITEMS {
+                                        let mut on = connected.diag_items.iter().any(|s| s == id);
+                                        if ui.checkbox(&mut on, format!("{label}  --  {hint}")).changed() {
+                                            connected.diag_items.retain(|s| s != id);
+                                            if on {
+                                                connected.diag_items.push(id.to_string());
+                                            }
                                             settings_changed = true;
                                         }
                                     }
@@ -14085,6 +14700,8 @@ Waterfall rebuilds: {prof_wf_n:.0}/s, {prof_wf_ms:.1} ms each."
                         rtty: Some(connected.rtty.settings()),
                         rade_callsign: Some(connected.rade_callsign.clone()),
                         gain: Some(connected.spectrum.gain()),
+                        squelch_memory: connected.squelch_memory.clone(),
+                        duplex: Some(connected.spectrum.duplex()),
                         audio_output_device: connected.audio_output_device.clone(),
                         mic_input_device: connected.mic_input_device.clone(),
                         cw_pitch_hz: Some(spectrum::cw_pitch_hz()),
@@ -14270,6 +14887,7 @@ Waterfall rebuilds: {prof_wf_n:.0}/s, {prof_wf_ms:.1} ms each."
                         rit_step_hz: Some(connected.rit_step_hz),
                         toolbar_layers: Some(toolbar::layers_to_config(&connected.toolbar_layers)),
                         toolbar_layer: Some(connected.toolbar_layer),
+                        diag_items: connected.diag_items.clone(),
                         vfo_b_frequency_hz: Some(connected.vfo_b_frequency_hz),
                         split: Some(connected.split),
                         cw_decode_enabled: Some(connected.cw_decode_enabled),
@@ -14675,6 +15293,324 @@ fn peek_recent_samples(buf: &Arc<Mutex<VecDeque<f32>>>, max_samples: usize) -> V
     let b = buf.lock().unwrap();
     let skip = b.len().saturating_sub(max_samples);
     b.iter().skip(skip).copied().collect()
+}
+
+/// Whether a new CW message may start now (see render_cw_text_send); also gates the remote CAT KY / rigctl path.
+fn cw_text_may_start(connected: &ConnectedState) -> bool {
+    let mox_now = connected.session.mox_active();
+    let cw_text_mode_selected =
+            matches!(connected.spectrum.mode(), spectrum::Mode::Cwl | spectrum::Mode::Cwu);
+        // Once already sending, the button must
+        // stay clickable (to STOP) regardless of
+        // mode/mox/Tune/Two-Tone changing under it
+        // -- only the conditions for STARTING a new
+        // send require CW mode/nothing else already
+        // using mox.
+        // Real request -- also covers the remote
+        // CAT "KY"/rigctl "send_morse" CW-text path
+        // further below, which reuses this SAME gate
+        // (see its own comment). See
+        // tx_frequency_allowed's own doc comment.
+        let cw_text_may_start = connected.cw_text_sending
+            || (cw_text_mode_selected
+                && !mox_now
+                && !connected.tune_active
+                && !connected.two_tone_active
+                && tx_frequency_allowed(
+                    connected.session.tx_frequency_hz.load(Ordering::Relaxed),
+                    connected.allow_out_of_band_tx.load(Ordering::Relaxed),
+                ));
+    cw_text_may_start
+}
+
+/// Kiosk Record button (RX audio to a WAV file; on screen and the Record MIDI key): shows in the same place as
+/// REC / PLAY and starts recording; pressing again stops it and the button disappears one second later.
+fn report_wav_press(connected: &mut ConnectedState) {
+    let rec = &connected.spectrum.recorder;
+    if connected.wav_visible && rec.is_enabled() {
+        rec.stop();
+        connected.wav_hide_at = Some(Instant::now() + Duration::from_secs(1));
+        return;
+    }
+    // Takes the place of REC / PLAY.
+    connected.wav_visible = true;
+    connected.wav_hide_at = None;
+    if connected.rec_visible || connected.play_visible {
+        let rr = connected.spectrum.report_recorder.clone();
+        if rr.is_recording() {
+            rr.toggle_record();
+        }
+        if rr.is_playing() {
+            rr.toggle_play();
+        }
+        connected.rec_visible = false;
+        connected.play_visible = false;
+    }
+    match audio_recorder::recording_path("main") {
+        Some(path) => {
+            if let Err(e) = connected.spectrum.recorder.start(&path) {
+                eprintln!("failed to start recording: {e}");
+            }
+        }
+        None => eprintln!("failed to start recording: could not determine the recordings folder"),
+    }
+}
+
+/// REC / PLAY take the place of the Record button (stopping a WAV recording in progress).
+fn wav_yield_to_report(connected: &mut ConnectedState) {
+    if connected.wav_visible {
+        if connected.spectrum.recorder.is_enabled() {
+            connected.spectrum.recorder.stop();
+        }
+        connected.wav_visible = false;
+        connected.wav_hide_at = None;
+    }
+}
+
+/// Kiosk REC button (on screen and the REC MIDI key): first press shows it and starts recording, second press
+/// stops, third press hides it.
+fn report_rec_press(connected: &mut ConnectedState) {
+    let rr = connected.spectrum.report_recorder.clone();
+    if !connected.rec_visible {
+        // Only one of REC / PLAY is on screen, in the same place: REC takes over from PLAY.
+        wav_yield_to_report(connected);
+        connected.rec_visible = true;
+        connected.play_visible = false;
+        if rr.is_playing() {
+            rr.toggle_play();
+        }
+        if !rr.is_recording() {
+            rr.toggle_record();
+        }
+    } else if rr.is_recording() {
+        rr.toggle_record();
+    } else {
+        connected.rec_visible = false;
+    }
+}
+
+/// Kiosk PLAY button (on screen and the PLAY MIDI key): first press shows it and starts playing (the recording is
+/// sent while MOX is on), second press stops, third press hides it.
+fn report_play_press(connected: &mut ConnectedState) {
+    let rr = connected.spectrum.report_recorder.clone();
+    if !connected.play_visible {
+        // PLAY takes over from REC (stopping a recording in progress).
+        wav_yield_to_report(connected);
+        connected.play_visible = true;
+        connected.rec_visible = false;
+        if rr.is_recording() {
+            rr.toggle_record();
+        }
+        if connected.tx_enabled && connected.tx_handle.is_some() && !rr.is_recording() && rr.has_recording() {
+            rr.toggle_play();
+        }
+    } else if rr.is_playing() {
+        rr.toggle_play();
+    } else {
+        connected.play_visible = false;
+    }
+}
+
+/// RX filter presets of a mode, as the width this app uses (see spectrum::passband_for), from deskHPSDR's filter.c
+/// tables (the fixed filters; no Var1/Var2, ESSB or RTTY/FreeDV edge presets).
+fn rx_filter_presets(mode: spectrum::Mode) -> &'static [(&'static str, f64)] {
+    use spectrum::Mode;
+    match mode {
+        Mode::Lsb | Mode::Usb => &[
+            ("5.0k", 5150.0), ("4.4k", 4550.0), ("3.8k", 3950.0), ("3.3k", 3450.0), ("2.9k", 3050.0),
+            ("2.7k", 2850.0), ("2.4k", 2550.0), ("2.1k", 2250.0), ("1.8k", 1950.0), ("1.0k", 1150.0),
+        ],
+        Mode::Digl | Mode::Digu => &[
+            ("5.0k", 5000.0), ("4.0k", 4000.0), ("3.0k", 3000.0), ("2.5k", 2750.0), ("2.0k", 2500.0),
+            ("1.5k", 2250.0), ("1.0k", 2000.0), ("750", 1875.0), ("500", 1750.0), ("250", 1625.0),
+        ],
+        Mode::Cwl | Mode::Cwu => &[
+            ("1.0k", 1000.0), ("800", 800.0), ("750", 750.0), ("600", 600.0), ("500", 500.0),
+            ("400", 400.0), ("250", 250.0), ("100", 100.0), ("50", 50.0), ("25", 25.0),
+        ],
+        Mode::Dsb | Mode::Am | Mode::Sam | Mode::Spec | Mode::Drm => &[
+            ("16k", 8000.0), ("12k", 6000.0), ("10k", 5000.0), ("8k", 4000.0), ("6.6k", 3300.0),
+            ("5.2k", 2600.0), ("4.0k", 2000.0), ("3.1k", 1550.0), ("2.9k", 1450.0), ("2.4k", 1200.0),
+        ],
+        Mode::Fmn => &[],
+    }
+}
+
+/// A deskHPSDR-style menu window (band / mode / RX filter): centred, "Close" at the top left, a grid of 5 toggle
+/// buttons per row with the current one lit, stays open until Close. Returns (close requested, button picked).
+fn choice_window(ui: &mut egui::Ui, id: &str, heading: &str, items: &[(String, bool)], top_y: f32) -> (bool, Option<usize>) {
+    let cols = 5usize;
+    let key_w = 92.0f32;
+    let key_h = 46.0f32;
+    let gap = 6.0f32;
+    let win_w = cols as f32 * key_w + (cols as f32 - 1.0) * gap + 24.0;
+    let screen_w = ui.ctx().content_rect().width();
+    let mut close_now = false;
+    let mut picked = None;
+    // An ordinary egui window inside the main window (not a separate OS window): a second window means a second
+    // surface to render and present every frame, which slows the spectrum/waterfall of the main window down.
+    egui::Window::new(heading.to_string())
+        .id(egui::Id::new(("choice_window", id.to_string())))
+        .title_bar(false)
+        .collapsible(false)
+        .resizable(false)
+        .fixed_pos(egui::pos2(((screen_w - win_w) / 2.0).max(0.0), top_y))
+        .show(ui.ctx(), |ui| {
+            if ui.input(|i| i.key_pressed(egui::Key::Escape)) {
+                close_now = true;
+            }
+            ui.spacing_mut().item_spacing = egui::vec2(gap, gap);
+            ui.horizontal(|ui| {
+                if ui.add(chip_button("Close", false).min_size(egui::vec2(2.0 * key_w + gap, key_h))).clicked() {
+                    close_now = true;
+                }
+                ui.label(heading);
+            });
+            egui::Grid::new(("choice_window_grid", id.to_string())).num_columns(cols).spacing([gap, gap]).show(ui, |ui| {
+                for (n, (label, selected)) in items.iter().enumerate() {
+                    if ui.add(chip_button(label, *selected).min_size(egui::vec2(key_w, key_h))).clicked() && !*selected {
+                        picked = Some(n);
+                    }
+                    if (n + 1) % cols == 0 {
+                        ui.end_row();
+                    }
+                }
+            });
+        });
+    (close_now, picked)
+}
+
+/// Diagnostic values that can be shown above the spectrum (Settings -> Diagnostic): (id, name, what it is).
+const DIAG_ITEMS: [(&str, &str, &str); 11] = [
+    ("sr", "Sample rate", "RX sample rate"),
+    ("ui_fps", "UI fps", "interface frames per second"),
+    ("ui_ms", "UI ms", "CPU time per interface frame"),
+    ("wf", "Waterfall", "waterfall rebuilds per second"),
+    ("dsp_gap", "DSP gap", "worst time between two DSP blocks"),
+    ("dsp_proc", "DSP proc", "worst time to process one DSP block"),
+    ("dsp_q", "DSP queue", "IQ samples waiting for the DSP"),
+    ("rx_jitter", "RX jitter", "largest gap between radio packets"),
+    ("tx_jitter", "TX jitter", "largest gap between mic callbacks"),
+    ("audio", "Audio", "glitches per minute and lowest buffer"),
+    ("pa", "PA", "HL2 PA temperature and current, in yellow inside the spectrum (top left) while transmitting, like piHPSDR"),
+];
+
+/// The text of one diagnostic value, in a fixed number of characters so the line does not jump around, and its
+/// level: 0 = normal, 1 = alert (orange), 2 = critical (red).
+fn diag_text(connected: &ConnectedState, id: &str) -> Option<(String, u8)> {
+    // Worst DSP figures over the last second, refreshed once a second (the counters reset when read).
+    static DSP_HELD: Mutex<Option<(Instant, f32, f32, u64)>> = Mutex::new(None);
+    let dsp = || {
+        let mut g = DSP_HELD.lock().unwrap();
+        let h = g.get_or_insert((Instant::now() - Duration::from_secs(2), 0.0, 0.0, 0));
+        if h.0.elapsed().as_secs_f32() >= 1.0 {
+            let (gap, proc_ms, q) = spectrum::dsp_stats_take();
+            *h = (Instant::now(), gap, proc_ms, q);
+        }
+        (h.1, h.2, h.3)
+    };
+    // level: value above `orange` / `red` (or below, for `low` values) -> alert / critical.
+    let high = |v: f64, orange: f64, red: f64| if v > red { 2u8 } else if v > orange { 1 } else { 0 };
+    let low = |v: f64, orange: f64, red: f64| if v < red { 2u8 } else if v < orange { 1 } else { 0 };
+    let block_ms = 1024.0 * 1000.0 / connected.sample_rate.max(1) as f64;
+    Some(match id {
+        "sr" => (format!("SR {:>3}k", connected.sample_rate / 1000), 0),
+        "ui_fps" => {
+            let v = ui_prof_snapshot().0;
+            (format!("UI {:>2.0}fps", v), low(v as f64, 12.0, 5.0))
+        }
+        "ui_ms" => {
+            let v = ui_prof_snapshot().1;
+            (format!("UI {:>4.1}ms", v), high(v as f64, 30.0, 60.0))
+        }
+        "wf" => {
+            let v = ui_prof_snapshot().3;
+            (format!("WF {:>2.0}/s", v), low(v as f64, 8.0, 3.0))
+        }
+        "dsp_gap" => {
+            let v = dsp().0;
+            (format!("gap {:>4.1}ms", v), high(v as f64, 20.0, 40.0))
+        }
+        "dsp_proc" => {
+            let v = dsp().1;
+            (format!("proc {:>4.1}ms", v), high(v as f64, block_ms * 0.5, block_ms * 0.9))
+        }
+        "dsp_q" => {
+            let v = dsp().2;
+            (format!("q {:>5}", v), high(v as f64, 6000.0, 16000.0))
+        }
+        "rx_jitter" => {
+            let v = connected.session.rx_max_gap_us.load(Ordering::Relaxed) as f64 / 1000.0;
+            (format!("RX {:>4.1}ms", v), high(v, 15.0, 40.0))
+        }
+        "tx_jitter" => {
+            let v = connected.mic_input.as_ref()?.jitter().max_gap_ms as f64;
+            (format!("TX {:>4.1}ms", v), high(v, 15.0, 40.0))
+        }
+        "audio" => {
+            let buf = connected.audio_output.as_ref().map(|a| a.min_queue_depth() as f64 / 48.0).unwrap_or(0.0);
+            let g = connected.underrun_rate_per_min as f64;
+            let level = high(g, 0.5, 9.5).max(low(buf, 10.0, 3.0));
+            (format!("Aud {:>2.0}/min {:>3.0}ms", g, buf), level)
+        }
+        _ => return None,
+    })
+}
+
+/// CW message picker plus the SEND CW / STOP button. On the desktop it sits in the TX row; in the kiosk it is the
+/// first line of the CW Decoder panel.
+fn render_cw_text_send(ui: &mut egui::Ui, connected: &mut ConnectedState) {
+        let cw_text_may_start = cw_text_may_start(connected);
+egui::ComboBox::from_id_salt("cw_text_message_select")
+            .selected_text(format!("{}", connected.cw_text_selected + 1))
+            .show_ui(ui, |ui| {
+                for i in 0..connected.cw_text_messages.len() {
+                    let preview = connected.cw_text_messages[i].chars().take(20).collect::<String>();
+                    let label = if preview.is_empty() {
+                        format!("{} (empty)", i + 1)
+                    } else {
+                        format!("{}: {}", i + 1, preview)
+                    };
+                    ui.selectable_value(&mut connected.cw_text_selected, i, label);
+                }
+            })
+            .response
+            .on_hover_text("Which of Settings -> CW's 5 saved messages to send");
+        let cw_text_label = if connected.cw_text_sending { "STOP" } else { "SEND CW" };
+        let cw_text_color = if connected.cw_text_sending {
+            egui::Color32::from_rgb(210, 50, 50)
+        } else {
+            egui::Color32::from_gray(60)
+        };
+        let cw_text_resp = ui
+            .add_enabled(
+                cw_text_may_start,
+                chip_button(cw_text_label, connected.cw_text_sending)
+                    .min_size(egui::vec2(chip_width(ui, &["SEND CW"]), 0.0)),
+            )
+            .on_hover_text(
+                "Send the selected message (Settings -> CW) as real CW, at \
+                 the Speed/Weight set there -- click again to stop mid-message.",
+            );
+        if cw_text_resp.clicked() {
+            if connected.cw_text_sending {
+                if let Some(tx) = &connected.tx_handle {
+                    tx.stop_cw_text();
+                }
+            } else {
+                let text = connected.cw_text_messages[connected.cw_text_selected].clone();
+                if !text.trim().is_empty() {
+                    if let Some(tx) = &connected.tx_handle {
+                        let speed_wpm =
+                            connected.session.cw_keyer.speed_wpm.load(Ordering::Relaxed);
+                        let weight = connected.session.cw_keyer.weight.load(Ordering::Relaxed);
+                        tx.send_cw_text(&text, speed_wpm, weight);
+                        connected.session.set_mox(true);
+                        connected.cw_text_sending = true;
+                    }
+                }
+            }
+        }
 }
 
 /// Content of the CW decoder's side panel (see
@@ -15891,6 +16827,30 @@ fn render_rade_panel(
     (fit_filter_clicked, quick_tune_hz, mox_request, eq_monitor_request, hide_clicked)
 }
 
+/// The main window's CW decoder panel: in the kiosk the message picker and SEND CW come first, then the decoder.
+fn render_cw_decoder_panel_main(ui: &mut egui::Ui, connected: &mut ConnectedState, id: egui::Id, rect: egui::Rect) {
+    egui::Area::new(id).fixed_pos(rect.min).show(ui, |ui| {
+        let frame = egui::Frame::group(ui.style());
+        // Kiosk: the frame's own margins come on top of the size set inside it, which pushed the bottom of the
+        // panel under the toolbar; take them off (and 2 px more) so the outer edge ends at `rect`.
+        let (inner_w, inner_h) = if lcd_kiosk_mode() {
+            let margin = frame.total_margin().sum();
+            (rect.width() - margin.x, rect.height() - margin.y - 2.0)
+        } else {
+            (rect.width(), rect.height())
+        };
+        frame.show(ui, |ui| {
+            ui.set_width(inner_w);
+            ui.set_height(inner_h);
+            if lcd_kiosk_mode() && connected.tx_enabled {
+                ui.horizontal(|ui| render_cw_text_send(ui, connected));
+                ui.separator();
+            }
+            render_cw_decoder_panel(ui, &connected.spectrum);
+        });
+    });
+}
+
 /// Draws the CW decoder panel pinned to exactly `rect` (the caller
 /// works out `rect` from the spectrum/waterfall rects it already has
 /// -- see the two call sites) via an `Area` rather than a `SidePanel`,
@@ -15904,9 +16864,18 @@ fn render_rade_panel(
 /// doc comment.
 fn render_cw_decoder_panel_beside(ui: &mut egui::Ui, spectrum: &SpectrumHandle, id: egui::Id, rect: egui::Rect) {
     egui::Area::new(id).fixed_pos(rect.min).show(ui, |ui| {
-        egui::Frame::group(ui.style()).show(ui, |ui| {
-            ui.set_width(rect.width());
-            ui.set_height(rect.height());
+        let frame = egui::Frame::group(ui.style());
+        // Kiosk: the frame's own margins come on top of the size set inside it, which pushed the bottom of the
+        // panel under the toolbar; take them off (and 2 px more) so the outer edge ends at `rect`.
+        let (inner_w, inner_h) = if lcd_kiosk_mode() {
+            let margin = frame.total_margin().sum();
+            (rect.width() - margin.x, rect.height() - margin.y - 2.0)
+        } else {
+            (rect.width(), rect.height())
+        };
+        frame.show(ui, |ui| {
+            ui.set_width(inner_w);
+            ui.set_height(inner_h);
             render_cw_decoder_panel(ui, spectrum);
         });
     });
@@ -15986,9 +16955,18 @@ fn render_rade_side_panel_beside(
     rect: egui::Rect,
 ) {
     egui::Area::new(egui::Id::new("rade_side_panel_main")).fixed_pos(rect.min).show(ui, |ui| {
-        egui::Frame::group(ui.style()).show(ui, |ui| {
-            ui.set_width(rect.width());
-            ui.set_height(rect.height());
+        let frame = egui::Frame::group(ui.style());
+        // Kiosk: the frame's own margins come on top of the size set inside it, which pushed the bottom of the
+        // panel under the toolbar; take them off (and 2 px more) so the outer edge ends at `rect`.
+        let (inner_w, inner_h) = if lcd_kiosk_mode() {
+            let margin = frame.total_margin().sum();
+            (rect.width() - margin.x, rect.height() - margin.y - 2.0)
+        } else {
+            (rect.width(), rect.height())
+        };
+        frame.show(ui, |ui| {
+            ui.set_width(inner_w);
+            ui.set_height(inner_h);
             render_rade_side_panel(ui, rade, fit_clicked, quick_tune);
         });
     });
@@ -16108,7 +17086,12 @@ fn toolbar_fn_active(connected: &ConnectedState, f: toolbar::ToolbarFn) -> bool 
     match f {
         ToolbarFn::TwoTone => connected.two_tone_active,
         ToolbarFn::Rade => rade_is_running(connected),
+        ToolbarFn::Midi(MidiAction::Rade) => rade_is_running(connected),
         ToolbarFn::Midi(MidiAction::Mox) => connected.session.mox_active(),
+        // REC/PLAY/Record have no indicator in the kiosk window, so their boxes stay lit while active.
+        ToolbarFn::Midi(MidiAction::ReportRec) => connected.spectrum.report_recorder.is_recording(),
+        ToolbarFn::Midi(MidiAction::ReportPlay) => connected.spectrum.report_recorder.is_playing(),
+        ToolbarFn::Midi(MidiAction::RecordWav) => connected.spectrum.recorder.is_enabled(),
         ToolbarFn::Midi(MidiAction::Tune) => connected.tune_active,
         ToolbarFn::Midi(MidiAction::RxEqToggle) => connected.spectrum.eq().enabled,
         _ => false,
@@ -16517,12 +17500,20 @@ fn render_net_status_column(
     }
     // Kiosk: the standard chip (grey, thin outline, rounded; orange fill with black text when on).
     // On = the server is running, with or without a client; the hover text says which.
-    let w = chip_width(ui, &["rigctl"]);
+    let w = chip_width(ui, &["RIGCTL"]);
     let chip = |ui: &mut egui::Ui, name: &str, status: Option<bool>, hover: String| {
-        ui.add(chip_button(name, status.is_some()).min_size(egui::vec2(w, 0.0)).sense(egui::Sense::hover()))
-            .on_hover_text(hover);
+        // Exact size (not just a minimum), so the three chips are identical -- and the same height as the other
+        // chips (text + button padding; interact_size.y is smaller and made these 2 px shorter).
+        let h = ui
+            .data(|d| d.get_temp::<f32>(egui::Id::new("kiosk_chip_h")))
+            .unwrap_or(ui.spacing().interact_size.y);
+        ui.add_sized(
+            [w, h],
+            chip_button(name, status.is_some()).sense(egui::Sense::hover()),
+        )
+        .on_hover_text(hover);
     };
-    chip(ui, "rigctl", rigctl_status, network_status_hover("rigctl", rigctl_status, &connected.rigctl_addr));
+    chip(ui, "RIGCTL", rigctl_status, network_status_hover("rigctl", rigctl_status, &connected.rigctl_addr));
     chip(
         ui,
         "TCI",
@@ -16905,6 +17896,29 @@ fn render_rit_xit(ui: &mut egui::Ui, connected: &mut ConnectedState) -> bool {
             "Transmitter Incremental Tuning -- nudges your actual TX frequency without moving VFO A's (or VFO B's, if Split is on) displayed frequency.",
         );
     }
+    // LOCK (deskHPSDR "Locked") freezes the tuning; DUP (deskHPSDR duplex) keeps the receiver running while transmitting.
+    if !lcd_kiosk_mode() {
+        return changed;
+    }
+    let locked = VFO_LOCKED.load(Ordering::Relaxed);
+    if ui
+        .add(chip_button("LOCK", locked))
+        .on_hover_text("Lock the VFO: tuning by click, wheel, MIDI or remote does nothing while on")
+        .clicked()
+    {
+        VFO_LOCKED.store(!locked, Ordering::Relaxed);
+    }
+    if connected.tx_enabled {
+        let dup = connected.spectrum.duplex();
+        if ui
+            .add(chip_button("DUP", dup))
+            .on_hover_text("Duplex: keep receiving while transmitting")
+            .clicked()
+        {
+            connected.spectrum.set_duplex(!dup);
+            changed = true;
+        }
+    }
     changed
 }
 
@@ -16922,7 +17936,70 @@ fn kiosk_meter_scaled() -> bool {
 /// right edge, 180 px wide (drawn KIOSK_METER_SCALE times larger in kiosk mode).
 fn meter_left_x(ui: &egui::Ui) -> f32 {
     let width = if lcd_kiosk_mode() { 180.0 * KIOSK_METER_SCALE } else { 180.0 };
-    ui.ctx().content_rect().right() - 20.0 - width
+    ui.ctx().content_rect().right() - kiosk_meter_right_margin(ui) - width
+}
+
+/// Kiosk: lays the three text lines of a column on the same three rows as the chips of the neighbouring
+/// columns (chip height, same pitch), so everything in the top row lines up.
+fn kiosk_align_rows_to_chips(ui: &mut egui::Ui) {
+    if !lcd_kiosk_mode() {
+        return;
+    }
+    let chip_h = ui.text_style_height(&egui::TextStyle::Button) + 2.0 * ui.spacing().button_padding.y;
+    let pitch = chip_h + ui.spacing().item_spacing.y;
+    let text_h = ui.text_style_height(&egui::TextStyle::Body);
+    ui.spacing_mut().item_spacing.y = pitch - text_h;
+    ui.add_space((chip_h - text_h) / 2.0);
+}
+
+/// Widths of the PK/MIC/ALC and LEV/PROC/CFC columns of the top row (the latter 0 without a TX chain), measured
+/// with the widest text each can show so their positions do not move as the numbers change.
+fn kiosk_top_column_widths(ui: &egui::Ui, lev_present: bool) -> (f32, f32) {
+    let font = egui::TextStyle::Body.resolve(ui.style());
+    let text_w = |s: &str| ui.painter().layout_no_wrap(s.to_string(), font.clone(), egui::Color32::WHITE).size().x;
+    let w_pk = text_w("CLIP -99.9");
+    let w_lev = if lev_present { ["LEV +99", "PROC +99", "CFC"].iter().map(|s| text_w(s)).fold(0.0_f32, f32::max) } else { 0.0 };
+    (w_pk, w_lev)
+}
+
+/// Where the VFO row starts (y), recorded each frame; the meter and the right-hand button column are
+/// positioned by hand and follow it, so they stay level with that row whatever is drawn above it.
+fn kiosk_top_y(ui: &egui::Ui) -> f32 {
+    ui.data(|d| d.get_temp::<f32>(egui::Id::new("kiosk_top_y"))).unwrap_or(12.0)
+}
+
+/// Kiosk: the first row of the screen -- indicators of the active band and mode, each as wide as the widest
+/// label it can show, then SNB/ANF/BIN, RIT/XIT and the AGC mode button. Returns whether something changed.
+fn render_kiosk_band_row(ui: &mut egui::Ui, connected: &mut ConnectedState, band: &str, mode: &str) -> bool {
+    let mut changed = false;
+    ui.horizontal(|ui| {
+        // One equal gap between every box of the row (the groups used to add their own on top of the natural
+        // spacing, which left 7-15 px gaps and pushed AGC against the meter).
+        ui.spacing_mut().item_spacing.x = 8.0;
+        let band_names: Vec<&str> = BANDS.iter().map(|b| b.name).chain(["Gen"]).collect();
+        let band_w = chip_width(ui, &band_names);
+        let mode_labels: Vec<&str> = ALL_MODES.iter().map(|m| m.label()).collect();
+        let mode_w = chip_width(ui, &mode_labels);
+        ui.add(chip_button(band, true).min_size(egui::vec2(band_w, 0.0)).sense(egui::Sense::hover()))
+            .on_hover_text("Active band");
+        ui.add(chip_button(mode, true).min_size(egui::vec2(mode_w, 0.0)).sense(egui::Sense::hover()))
+            .on_hover_text("Active mode");
+        changed |= render_snb_anf_bin_chips(ui, connected);
+        changed |= render_nb_chip(ui, connected);
+        changed |= render_nr_chip(ui, connected);
+        changed |= render_rit_xit(ui, connected);
+    });
+    changed
+}
+
+/// Gap from the right edge of the window to the meter: 20 px, or in kiosk mode room for the MENU/DIGITAL/EXIT
+/// column at the right edge (6 px margin, the column, 8 px gap).
+fn kiosk_meter_right_margin(ui: &egui::Ui) -> f32 {
+    if lcd_kiosk_mode() {
+        chip_width(ui, &["MENU", "DIGITAL", "EXIT"]) + 14.0
+    } else {
+        20.0
+    }
 }
 
 /// Brief orange flash for action buttons (A>B, B>A, A<>B): they have no
@@ -17011,6 +18088,11 @@ fn solid_chip(ui: &mut egui::Ui, label: &str, fill: egui::Color32, enabled: bool
     solid_chip_text(ui, label, fill, egui::Color32::WHITE, enabled)
 }
 
+/// `solid_chip` with a minimum width, so several chips can share one size.
+fn solid_chip_w(ui: &mut egui::Ui, label: &str, fill: egui::Color32, enabled: bool, min_w: f32) -> egui::Response {
+    solid_chip_text_w(ui, label, fill, egui::Color32::WHITE, enabled, min_w)
+}
+
 /// `solid_chip` with an explicit text color (dark text on the yellow/blue chips).
 fn solid_chip_text(
     ui: &mut egui::Ui,
@@ -17018,6 +18100,18 @@ fn solid_chip_text(
     fill: egui::Color32,
     text: egui::Color32,
     enabled: bool,
+) -> egui::Response {
+    solid_chip_text_w(ui, label, fill, text, enabled, 0.0)
+}
+
+/// `solid_chip_text` with a minimum width.
+fn solid_chip_text_w(
+    ui: &mut egui::Ui,
+    label: &str,
+    fill: egui::Color32,
+    text: egui::Color32,
+    enabled: bool,
+    min_w: f32,
 ) -> egui::Response {
     let lighten = |c: egui::Color32, k: f32| {
         let f = |v: u8| (v as f32 + (255.0 - v as f32) * k).round() as u8;
@@ -17033,7 +18127,10 @@ fn solid_chip_text(
         w.active.fg_stroke.color = text;
         ui.add_enabled(
             enabled,
-            egui::Button::new(label).stroke(egui::Stroke::new(1.0, lighten(fill, 0.35))).corner_radius(5.0),
+            egui::Button::new(label)
+                .stroke(egui::Stroke::new(1.0, lighten(fill, 0.35)))
+                .corner_radius(5.0)
+                .min_size(egui::vec2(min_w, 0.0)),
         )
     })
     .inner
@@ -17273,6 +18370,12 @@ fn alex_att_combo(ui: &mut egui::Ui, alex_atten: &mut usize) -> bool {
 fn stable_value_box_width(ui: &egui::Ui) -> f32 {
     let font = egui::TextStyle::Monospace.resolve(ui.style());
     ui.painter().layout_no_wrap("-100 dB ".to_string(), font, egui::Color32::WHITE).size().x + 10.0
+}
+
+/// Height of the box stable_value_box draws.
+fn stable_value_box_height(ui: &egui::Ui) -> f32 {
+    let font = egui::TextStyle::Monospace.resolve(ui.style());
+    ui.painter().layout_no_wrap("-100 dB ".to_string(), font, egui::Color32::WHITE).size().y + 10.0
 }
 
 fn stable_value_box(ui: &mut egui::Ui, text: String) {
@@ -19490,6 +20593,7 @@ fn render_extra_receiver_settings(ui: &mut egui::Ui, rx: &Arc<Mutex<ExtraReceive
         // from the main Settings window -- no separate copy of it for
         // extra receivers, same redirect-if-somehow-selected pattern.
         SettingsTab::Screen => rx.settings_tab = SettingsTab::Agc,
+        SettingsTab::Diagnostic => rx.settings_tab = SettingsTab::Agc,
 
         // TX (and PA Calibration/PureSignal, split out of it) are all
         // global (one radio, one PA/mic path), not per-receiver -- no
@@ -20111,6 +21215,26 @@ fn freq_at_x(
     let freq =
         center_freq_hz as f64 + pan_offset_hz - visible_half_span_hz + frac * (2.0 * visible_half_span_hz);
     freq.max(0.0) as u32
+}
+
+/// VFO LOCK (deskHPSDR "Locked"): while on, every main-window tuning action (click, scroll, MIDI wheel, remote)
+/// resolves to the dial frequency captured at the start of the frame, i.e. nothing moves.
+static VFO_LOCKED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+static VFO_LOCK_DIAL_HZ: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
+fn resolve_tune_main(
+    ctun: bool,
+    lo_freq_hz: u32,
+    sample_rate: u32,
+    passband: (f64, f64),
+    new_freq: u32,
+) -> (u32, Option<u32>) {
+    let new_freq = if VFO_LOCKED.load(Ordering::Relaxed) {
+        VFO_LOCK_DIAL_HZ.load(Ordering::Relaxed)
+    } else {
+        new_freq
+    };
+    resolve_tune(ctun, lo_freq_hz, sample_rate, passband, new_freq)
 }
 
 /// Decides what a tuning request (from a spectrum/waterfall click,
