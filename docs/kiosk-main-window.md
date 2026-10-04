@@ -87,7 +87,7 @@ For deeper checks, while `/tmp/hpsdr_diag.enable` exists the app appends one lin
 ## Look
 
 * Main window background grey 34 (egui's default is 27) so the black spectrum/waterfall stands out.
-* Toolbar names use font size 23 (shrunk further if a name does not fit the box).
+* Toolbar names use font size 22 (shrunk further if a name does not fit the box).
 
 ## Where kiosk code touches shared code (desktop)
 
