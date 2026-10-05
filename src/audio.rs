@@ -45,36 +45,130 @@ const OUTPUT_CHANNELS: u16 = 2; // interleaved stereo, matches fexchange0's outp
 const INPUT_SAMPLE_RATE: u32 = 48_000;
 const INPUT_CHANNELS: u16 = 1;
 
-/// Names of every currently available output-capable device (e.g. real
-/// speakers/headphones, and on Windows, virtual devices like "CABLE
-/// Input (VB-Audio Virtual Cable)" if installed) -- for the RX output
-/// device picker in Settings -> Audio (main and extra receivers each
-/// have their own). Skips any device whose name can't be queried (a
-/// disconnected/erroring device) rather than failing the whole list
-/// over one bad entry.
-pub fn list_output_devices() -> Vec<String> {
+/// The audio devices of one direction as the pickers show them: (label, device), one entry per sound card.
+///
+/// On Linux/ALSA cpal reports every PCM alias of a card as a separate device, and they all share the same
+/// description ("iMic USB audio system, USB Audio" for hw:, plughw:, sysdefault:, front:, surround*, iec958:, dmix:,
+/// dsnoop:, usbstream: ...), so the pickers showed each card ten times and opening one "by name" picked the first alias,
+/// usually the raw, exclusive `hw:` one (which fails while PipeWire holds the card, and then silently fell back to the
+/// default device). Here each card keeps one entry, the shared `sysdefault:` alias (or `plughw:`, or `hw:` if that is all
+/// there is), plus the `default` and `pulse` devices; the aliases that only make sense for multichannel/digital/special
+/// use are dropped. The label is the card's description, so saved selections (which are labels) keep working.
+fn enumerate_devices(output: bool) -> Vec<(String, cpal::Device)> {
     let host = cpal::default_host();
-    match host.output_devices() {
-        Ok(devices) => devices.filter_map(|d| d.description().ok().map(|desc| desc.name().to_string())).collect(),
-        Err(e) => {
-            eprintln!("audio: failed to enumerate output devices: {e}");
-            Vec::new()
+    let raw: Vec<cpal::Device> = if output {
+        host.output_devices().map(|d| d.collect()).unwrap_or_default()
+    } else {
+        host.input_devices().map(|d| d.collect()).unwrap_or_default()
+    };
+    let label_of = |d: &cpal::Device| d.description().ok().map(|desc| desc.name().to_string());
+    if std::env::var_os("HPSDR_RS_AUDIO_DEBUG").is_some() {
+        use cpal::traits::DeviceTrait as _;
+        for d in &raw {
+            eprintln!(
+                "audio-debug: {} raw: {} | {:?}",
+                if output { "out" } else { "in" },
+                d.id().map(|i| i.1).unwrap_or_default(),
+                label_of(d)
+            );
         }
+    }
+    #[cfg(target_os = "linux")]
+    {
+        use cpal::traits::DeviceTrait as _;
+        // (key, rank, pcm id, label, device); lower rank wins for the same key. cpal reports each card twice (the ALSA
+        // hint names "CARD=system" and its own numeric "CARD=0" aliases) with the same description, so the key is the label.
+        let mut kept: Vec<(String, u8, String, String, cpal::Device)> = Vec::new();
+        for d in raw {
+            let Ok(id) = d.id() else { continue };
+            let pcm = id.1.clone();
+            let Some(mut label) = label_of(&d) else { continue };
+            let (kind, rest) = match pcm.split_once(':') {
+                Some((k, r)) => (k.to_string(), r.to_string()),
+                None => (pcm.clone(), String::new()),
+            };
+            let card = rest.split(',').find_map(|p| p.strip_prefix("CARD=")).map(|c| c.to_string());
+            match card {
+                None => {
+                    // Virtual devices: the PulseAudio/PipeWire one is worth offering ("(System Default)" already is the
+                    // default); "default"/"sysdefault" duplicate it and the rest are rate converters, JACK, OSS...
+                    if kind == "pulse" || kind == "pipewire" {
+                        label = "PulseAudio / PipeWire".to_string();
+                        kept.push((label.clone(), 0, pcm, label, d));
+                    }
+                }
+                Some(card) => {
+                    let rank = match kind.as_str() {
+                        "sysdefault" => 0,
+                        "plughw" => 1,
+                        "hw" => 2,
+                        _ => continue,
+                    };
+                    // Some cards only have the generic description ("Default Audio Device"): say which card it is.
+                    if label == "Default Audio Device" {
+                        label = format!("{card}: {label}");
+                    }
+                    match kept.iter_mut().find(|k| k.0 == label) {
+                        Some(k) => {
+                            if rank < k.1 {
+                                *k = (label.clone(), rank, pcm, label, d);
+                            }
+                        }
+                        None => kept.push((label.clone(), rank, pcm, label, d)),
+                    }
+                }
+            }
+        }
+        // Two different cards can still share a label: tell them apart with the PCM id.
+        let mut out: Vec<(String, cpal::Device)> = Vec::new();
+        for (_, _, pcm, label, d) in kept {
+            let clash = out.iter().any(|(l, _)| *l == label);
+            out.push((if clash { format!("{label} ({pcm})") } else { label }, d));
+        }
+        out
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        // Windows/macOS: the names are already unique per device; just never show one twice.
+        let mut out: Vec<(String, cpal::Device)> = Vec::new();
+        for d in raw {
+            if let Some(label) = label_of(&d) {
+                if !out.iter().any(|(l, _)| *l == label) {
+                    out.push((label, d));
+                }
+            }
+        }
+        out
     }
 }
 
-/// Same as list_output_devices, for input-capable devices (e.g. a real
-/// mic, or on Windows, "CABLE Output (VB-Audio Virtual Cable)" if
-/// installed) -- for the TX audio source picker in Settings -> Audio.
-pub fn list_input_devices() -> Vec<String> {
-    let host = cpal::default_host();
-    match host.input_devices() {
-        Ok(devices) => devices.filter_map(|d| d.description().ok().map(|desc| desc.name().to_string())).collect(),
-        Err(e) => {
-            eprintln!("audio: failed to enumerate input devices: {e}");
-            Vec::new()
-        }
+/// The device whose label is `name` (see `enumerate_devices`), falling back to the first raw device with that description
+/// (a selection saved by an older version).
+fn find_device(name: &str, output: bool) -> Option<cpal::Device> {
+    if let Some((_, d)) = enumerate_devices(output).into_iter().find(|(l, _)| l == name) {
+        return Some(d);
     }
+    let host = cpal::default_host();
+    let devices: Vec<cpal::Device> = if output {
+        host.output_devices().map(|d| d.collect()).unwrap_or_default()
+    } else {
+        host.input_devices().map(|d| d.collect()).unwrap_or_default()
+    };
+    let found = devices.into_iter().find(|d| d.description().is_ok_and(|desc| desc.name() == name));
+    found
+}
+
+/// Names of every available output-capable device, one per sound card (e.g. real speakers/headphones, and on Windows,
+/// virtual devices like "CABLE Input (VB-Audio Virtual Cable)" if installed) -- for the RX output device picker in
+/// Settings -> Audio (main and extra receivers each have their own). Skips any device whose name can't be queried.
+pub fn list_output_devices() -> Vec<String> {
+    enumerate_devices(true).into_iter().map(|(label, _)| label).collect()
+}
+
+/// Same as list_output_devices, for input-capable devices (e.g. a real mic, or on Windows,
+/// "CABLE Output (VB-Audio Virtual Cable)" if installed) -- for the TX audio source picker in Settings -> Audio.
+pub fn list_input_devices() -> Vec<String> {
+    enumerate_devices(false).into_iter().map(|(label, _)| label).collect()
 }
 
 pub struct AudioOutput {
@@ -126,12 +220,7 @@ impl AudioOutput {
     ) -> Result<Self, String> {
         let host = cpal::default_host();
         let device = match device_name {
-            Some(name) => host
-                .output_devices()
-                .ok()
-                .and_then(|mut devices| {
-                    devices.find(|d| d.description().is_ok_and(|desc| desc.name() == name))
-                })
+            Some(name) => find_device(name, true)
                 .or_else(|| {
                     eprintln!(
                         "audio: output device \"{name}\" not found -- falling back to the system default"
@@ -1169,10 +1258,7 @@ impl MicInput {
     pub fn start(buffer: Arc<Mutex<VecDeque<f32>>>, selected_device_name: Option<&str>) -> Result<Self, String> {
         let host = cpal::default_host();
         let device = match selected_device_name {
-            Some(name) => host
-                .input_devices()
-                .ok()
-                .and_then(|mut devices| devices.find(|d| d.description().is_ok_and(|desc| desc.name() == name)))
+            Some(name) => find_device(name, false)
                 .or_else(|| {
                     eprintln!(
                         "audio: input device \"{name}\" not found -- falling back to the system default"
