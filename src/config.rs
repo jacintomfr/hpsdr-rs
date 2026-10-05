@@ -593,6 +593,11 @@ pub struct Config {
     pub toolbar_layers: Option<Vec<Vec<String>>>,
     #[serde(default)]
     pub toolbar_layer: Option<usize>,
+    /// VFO step per mode label (deskHPSDR/piHPSDR keep the step of each mode).
+    #[serde(default)]
+    pub step_memory: std::collections::HashMap<String, i64>,
+    /// Encoder ticks per VFO step (piHPSDR's "VFO encoder divisor").
+    pub vfo_encoder_divisor: Option<f32>,
     /// Diagnostic values shown in the line above the spectrum (kiosk), picked in Settings -> Diagnostic.
     #[serde(default)]
     pub diag_items: Vec<String>,

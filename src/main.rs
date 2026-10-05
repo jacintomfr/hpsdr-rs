@@ -832,6 +832,23 @@ fn midi_action_label(action: MidiAction, connected: &ConnectedState) -> &'static
 /// sends many messages even for a slight touch.
 const MIDI_WHEEL_HZ_PER_MESSAGE: i64 = 10;
 
+/// Encoder ticks for one VFO-encoder message, with "dynamic tune". This encoder reports how far it turned since its
+/// last message as the distance from 64 (measured on the Arduino Due: 65 = 1 tick slowly, up to 82 = 18 ticks
+/// fast), so the rotation speed is in the value itself. In the Fixed accel mode that distance is used: slow turns
+/// give 1 tick per message, faster turns give the ticks it reports plus a gentle extra gain
+/// (ticks * (1 + (ticks - 1) / 12)). The ValueBased mode keeps its own tiers (`mult`). The result is divided by
+/// the VFO encoder divisor (ticks per step, Settings -> MIDI), so one step needs several ticks.
+fn vfo_encoder_ticks(connected: &mut ConnectedState, mult: i64, ev: RawMidiEvent, binding: &MidiBinding) -> f64 {
+    let divisor = connected.vfo_encoder_divisor.max(1.0) as f64;
+    if binding.accel_mode == WheelAccelMode::Fixed {
+        let delta = ev.value as i64 - 64;
+        let n = delta.abs() as f64;
+        let gain = 1.0 + (n - 1.0).max(0.0) / 12.0;
+        return delta.signum() as f64 * n * gain * binding.sensitivity as f64 / divisor;
+    }
+    mult as f64 * binding.sensitivity as f64 / divisor
+}
+
 /// Signed step for a Wheel binding: a fixed `MIDI_WHEEL_HZ_PER_MESSAGE`
 /// in the direction `ev.value - 64` (piHPSDR's own centered-at-64
 /// relative-encoder convention) indicates, scaled by the binding's own
@@ -946,7 +963,13 @@ fn dispatch_midi_binding(
     // touch than any per-message step size alone can stay controllable
     // against). Checked/updated here, once, rather than duplicated in
     // each of VfoTune/RitAdjust/XitAdjust's own match arms below.
-    if binding.kind == MidiBindingKind::Wheel && binding.debounce_ms > 0 {
+    // Not for the VFO encoders: dropping messages sent faster than the debounce time capped them at 1000/debounce_ms
+    // ticks a second whatever the rotation speed, which defeated dynamic tune (vfo_encoder_ticks); the speed itself
+    // is what scales their step now.
+    if binding.kind == MidiBindingKind::Wheel
+        && binding.debounce_ms > 0
+        && !matches!(binding.action, MidiAction::VfoTune | MidiAction::VfoBTune)
+    {
         let key = (binding.event, binding.channel, binding.number);
         let now = Instant::now();
         if let Some(last) = connected.midi_wheel_last_step.get(&key) {
@@ -1160,8 +1183,21 @@ fn dispatch_midi_binding(
             );
         }
         MidiAction::VfoTune => {
-            let Some(step) = midi_wheel_step_hz(ev, &binding) else { return };
-            let new_freq = (dial_freq_hz as i64 + step).max(0) as u32;
+            // piHPSDR's VFO action: every encoder tick moves the frequency by the selected VFO step (the yellow
+            // `step:` value / the VFO window's Step), rounded to a multiple of it. The Sensitivity of the binding
+            // scales the ticks (0.1 = 10 ticks per step, like piHPSDR's encoder divisor for high-resolution encoders).
+            let Some(mult) = midi_wheel_multiplier(ev, &binding) else { return };
+            let ticks = vfo_encoder_ticks(connected, mult, ev, &binding);
+            connected.vfo_encoder_acc += ticks;
+            let steps = connected.vfo_encoder_acc.trunc();
+            if steps == 0.0 {
+                return;
+            }
+            connected.vfo_encoder_acc -= steps;
+            let cw_mode = matches!(current_mode, spectrum::Mode::Cwl | spectrum::Mode::Cwu);
+            let step_hz = scroll_tune_step_hz(connected.tune_step_hz, cw_mode, false, false);
+            let raw = (dial_freq_hz as i64 + steps as i64 * step_hz).max(0) as u32;
+            let new_freq = round_to_step_hz(raw, step_hz);
             let (effective_freq, retune) = resolve_tune_main(connected.ctun, freq_hz, sample_rate, passband, new_freq);
             if let Some(lo) = retune {
                 connected.session.set_frequency(lo);
@@ -1184,8 +1220,18 @@ fn dispatch_midi_binding(
             // of its own. tx_dial_freq_hz's own per-frame reconciliation
             // (just above this dispatch call site) already reads this
             // field fresh every frame, so nothing else needs to react.
-            let Some(step) = midi_wheel_step_hz(ev, &binding) else { return };
-            connected.vfo_b_frequency_hz = (connected.vfo_b_frequency_hz as i64 + step).max(0) as u32;
+            let Some(mult) = midi_wheel_multiplier(ev, &binding) else { return };
+            let ticks = vfo_encoder_ticks(connected, mult, ev, &binding);
+            connected.vfo_encoder_acc += ticks;
+            let steps = connected.vfo_encoder_acc.trunc();
+            if steps == 0.0 {
+                return;
+            }
+            connected.vfo_encoder_acc -= steps;
+            let cw_mode = matches!(current_mode, spectrum::Mode::Cwl | spectrum::Mode::Cwu);
+            let step_hz = scroll_tune_step_hz(connected.tune_step_hz, cw_mode, false, false);
+            let raw = (connected.vfo_b_frequency_hz as i64 + steps as i64 * step_hz).max(0) as u32;
+            connected.vfo_b_frequency_hz = round_to_step_hz(raw, step_hz);
         }
         MidiAction::CtunToggle => {
             // Mirrors the on-screen CTUN button's click handler exactly
@@ -2269,6 +2315,13 @@ struct ConnectedState {
     /// existing zoom-notch repurposed as a coarse-tune alias) are
     /// unaffected by this -- see scroll_tune_step_hz's own doc comment.
     tune_step_hz: i64,
+    /// Fractional encoder ticks not yet turned into VFO steps (MIDI VfoTune/VfoBTune), like piHPSDR's accumulator.
+    vfo_encoder_acc: f64,
+    /// Encoder ticks needed for one VFO step (Settings -> MIDI), like piHPSDR's vfo_encoder_divisor.
+    vfo_encoder_divisor: f32,
+    /// VFO step of each mode, loaded when the mode changes (like deskHPSDR's per-mode step).
+    step_memory: std::collections::HashMap<String, i64>,
+    step_last_mode: Option<spectrum::Mode>,
     /// RIT/XIT scroll step (1, 10 or 100 Hz) -- picked in the VFO window.
     rit_step_hz: i32,
     /// Kiosk bottom toolbar -- see toolbar.rs. `toolbar_pending` is a button press waiting to be
@@ -3800,6 +3853,10 @@ fn connect_to_device(device: Device, cfg: &Config) -> Result<ConnectedState, Str
                 ctun,
                 ctun_frequency_hz,
                 tune_step_hz,
+                vfo_encoder_acc: 0.0,
+                vfo_encoder_divisor: cfg.vfo_encoder_divisor.unwrap_or(10.0).clamp(1.0, 50.0),
+                step_memory: cfg.step_memory.clone(),
+                step_last_mode: None,
                 rit_step_hz,
                 toolbar_layers: toolbar::layers_from_config(cfg.toolbar_layers.as_ref()),
                 toolbar_layer: cfg.toolbar_layer.unwrap_or(0).min(toolbar::LAYERS - 1),
@@ -4267,6 +4324,13 @@ impl eframe::App for HpsdrApp {
                 {
                     // piHPSDR: each mode has its own squelch setting, loaded when the mode changes.
                     let mode_now = connected.spectrum.mode();
+                    // The VFO step is kept per mode too: the one stored for the new mode comes back.
+                    if connected.step_last_mode != Some(mode_now) {
+                        if let Some(&hz) = connected.step_memory.get(mode_now.label()) {
+                            connected.tune_step_hz = hz;
+                        }
+                        connected.step_last_mode = Some(mode_now);
+                    }
                     if connected.squelch_last_mode != Some(mode_now) {
                         let (level, on) =
                             connected.squelch_memory.get(mode_now.label()).copied().unwrap_or((0.0, false));
@@ -10607,6 +10671,18 @@ Waterfall rebuilds: {prof_wf_n:.0}/s, {prof_wf_ms:.1} ms each."
                                 SettingsTab::Midi => {
                                     ui.label("MIDI control surface:");
                                     ui.horizontal(|ui| {
+                                        ui.label("VFO encoder: ticks per step");
+                                        if ui
+                                            .add(egui::Slider::new(&mut connected.vfo_encoder_divisor, 1.0..=50.0).integer())
+                                            .on_hover_text(
+                                                "How many encoder ticks make one VFO step (piHPSDR's VFO encoder                                                  divisor). Higher = slower tuning when turning slowly; turning                                                  faster still speeds it up.",
+                                            )
+                                            .changed()
+                                        {
+                                            settings_changed = true;
+                                        }
+                                    });
+                                    ui.horizontal(|ui| {
                                         let mut midi_enabled_ui = connected.midi.enabled.load(Ordering::Relaxed);
                                         if ui.checkbox(&mut midi_enabled_ui, "Enable MIDI control").changed() {
                                             connected.midi.enabled.store(midi_enabled_ui, Ordering::Relaxed);
@@ -14892,6 +14968,8 @@ Waterfall rebuilds: {prof_wf_n:.0}/s, {prof_wf_ms:.1} ms each."
                         rit_step_hz: Some(connected.rit_step_hz),
                         toolbar_layers: Some(toolbar::layers_to_config(&connected.toolbar_layers)),
                         toolbar_layer: Some(connected.toolbar_layer),
+                        vfo_encoder_divisor: Some(connected.vfo_encoder_divisor),
+                        step_memory: connected.step_memory.clone(),
                         diag_items: connected.diag_items.clone(),
                         vfo_b_frequency_hz: Some(connected.vfo_b_frequency_hz),
                         split: Some(connected.split),
@@ -17667,12 +17745,14 @@ fn render_status_row(
 fn render_step_combo_only(ui: &mut egui::Ui, connected: &mut ConnectedState) -> bool {
     let mut changed = false;
     egui::ComboBox::from_id_salt("tune_step_hz")
-        .width(60.0)
+        .width(70.0)
         .selected_text(tune_step_label(connected.tune_step_hz))
         .show_ui(ui, |ui| {
             for hz in ALL_TUNE_STEPS_HZ {
                 if ui.selectable_label(connected.tune_step_hz == hz, tune_step_label(hz)).clicked() {
                     connected.tune_step_hz = hz;
+                    let mode_label = connected.spectrum.mode().label().to_string();
+                    connected.step_memory.insert(mode_label, hz);
                     changed = true;
                 }
             }
@@ -21001,15 +21081,41 @@ fn scroll_tune_step_hz(base_step_hz: i64, cw_mode: bool, shift: bool, ctrl: bool
 /// Presets offered by the "Step" popup next to CTUN -- same 1Hz..1MHz
 /// decade spread piHPSDR's own Step menu offers (the explicit reference
 /// this was modeled on).
-const ALL_TUNE_STEPS_HZ: [i64; 7] = [1, 10, 100, 1_000, 10_000, 100_000, 1_000_000];
+const ALL_TUNE_STEPS_HZ: [i64; 17] = [
+    1, 10, 25, 50, 100, 250, 500, 1_000, 5_000, 6_250, 9_000, 10_000, 12_500, 100_000, 250_000, 500_000, 1_000_000,
+];
+
+/// The step sizes and their names, exactly deskHPSDR's/piHPSDR's `steps[]` / `step_labels[]` (vfo.c).
+const TUNE_STEP_LABELS: [(i64, &str); 17] = [
+    (1, "1Hz"),
+    (10, "10Hz"),
+    (25, "25Hz"),
+    (50, "50Hz"),
+    (100, "100Hz"),
+    (250, "250Hz"),
+    (500, "500Hz"),
+    (1_000, "1kHz"),
+    (5_000, "5kHz"),
+    (6_250, "6.25k"),
+    (9_000, "9kHz"),
+    (10_000, "10kHz"),
+    (12_500, "12.5k"),
+    (100_000, "100kHz"),
+    (250_000, "250kHz"),
+    (500_000, "500kHz"),
+    (1_000_000, "1MHz"),
+];
 
 fn tune_step_label(hz: i64) -> String {
+    if let Some((_, label)) = TUNE_STEP_LABELS.iter().find(|(step, _)| *step == hz) {
+        return label.to_string();
+    }
     if hz >= 1_000_000 {
-        format!("{} MHz", hz / 1_000_000)
+        format!("{}MHz", hz / 1_000_000)
     } else if hz >= 1_000 {
-        format!("{} kHz", hz / 1_000)
+        format!("{}kHz", hz / 1_000)
     } else {
-        format!("{hz} Hz")
+        format!("{hz}Hz")
     }
 }
 
