@@ -100,6 +100,104 @@ pub enum DiscoveryAction {
     Start(Device, Option<crate::radioberry_juice::JuiceHandle>, Option<crate::hpsdrsim::SimHandle>),
 }
 
+/// Touch-friendly vertical scroll area: the content on the left, on the right a wide bar with an up button, a
+/// draggable thumb on a track and a down button (tap or hold to scroll). Dragging the content also scrolls it.
+/// `height` None = all the height left in `ui`; `stick_bottom` keeps a log scrolled to its end while it grows.
+fn touch_scroll(
+    ui: &mut egui::Ui,
+    id_salt: &str,
+    height: Option<f32>,
+    stick_bottom: bool,
+    contents: &mut dyn FnMut(&mut egui::Ui),
+) {
+    const BAR_W: f32 = 30.0;
+    const GAP: f32 = 6.0;
+    const BTN_H: f32 = 34.0;
+    let id = egui::Id::new(("touch_scroll", id_salt));
+    let height = height.unwrap_or_else(|| ui.available_height()).max(3.0 * BTN_H);
+    let width = ui.available_width();
+    let (mut offset, prev_max): (f32, f32) = ui.data(|d| d.get_temp(id)).unwrap_or((0.0, 0.0));
+    let was_at_bottom = prev_max - offset < 2.0;
+
+    let (outer, _) = ui.allocate_exact_size(egui::vec2(width, height), egui::Sense::hover());
+    let area_rect = egui::Rect::from_min_size(outer.min, egui::vec2((width - BAR_W - GAP).max(50.0), height));
+    let mut area_ui = ui.new_child(egui::UiBuilder::new().max_rect(area_rect).layout(egui::Layout::top_down(egui::Align::Min)));
+    area_ui.set_clip_rect(area_rect.intersect(ui.clip_rect()));
+    let out = egui::ScrollArea::vertical()
+        .id_salt(id)
+        .max_height(height)
+        .auto_shrink([false, false])
+        .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysHidden)
+        .vertical_scroll_offset(offset)
+        .show(&mut area_ui, |ui| contents(ui));
+    let view_h = out.inner_rect.height();
+    let max_off = (out.content_size.y - view_h).max(0.0);
+    offset = out.state.offset.y;
+    if stick_bottom && was_at_bottom {
+        offset = max_off;
+    }
+
+    // The bar.
+    let bar = egui::Rect::from_min_size(egui::pos2(outer.right() - BAR_W, outer.top()), egui::vec2(BAR_W, height));
+    let up_rect = egui::Rect::from_min_size(bar.min, egui::vec2(BAR_W, BTN_H));
+    let down_rect = egui::Rect::from_min_size(egui::pos2(bar.left(), bar.bottom() - BTN_H), egui::vec2(BAR_W, BTN_H));
+    let track = egui::Rect::from_min_max(egui::pos2(bar.left(), up_rect.bottom() + 4.0), egui::pos2(bar.right(), down_rect.top() - 4.0));
+    let dt = ui.input(|i| i.stable_dt).min(0.1);
+    let stroke = egui::Stroke::new(1.0, egui::Color32::from_gray(95));
+    let mut held = false;
+    for (rect, dir) in [(up_rect, -1.0f32), (down_rect, 1.0f32)] {
+        let resp = ui.interact(rect, id.with(("btn", dir as i32)), egui::Sense::click_and_drag());
+        let down = resp.is_pointer_button_down_on();
+        if down {
+            offset += dir * 600.0 * dt;
+            held = true;
+        } else if resp.clicked() {
+            offset += dir * 60.0;
+        }
+        ui.painter().rect(
+            rect,
+            5.0,
+            if down { egui::Color32::from_gray(80) } else { egui::Color32::from_gray(50) },
+            stroke,
+            egui::StrokeKind::Inside,
+        );
+        let c = rect.center();
+        let tri = if dir < 0.0 {
+            vec![c + egui::vec2(0.0, -6.0), c + egui::vec2(-7.0, 5.0), c + egui::vec2(7.0, 5.0)]
+        } else {
+            vec![c + egui::vec2(0.0, 6.0), c + egui::vec2(-7.0, -5.0), c + egui::vec2(7.0, -5.0)]
+        };
+        ui.painter().add(egui::Shape::convex_polygon(tri, egui::Color32::from_gray(210), egui::Stroke::NONE));
+    }
+    ui.painter().rect(track, 5.0, egui::Color32::from_gray(30), stroke, egui::StrokeKind::Inside);
+    if max_off > 0.5 {
+        let thumb_len = (track.height() * view_h / (view_h + max_off)).clamp(40.0, track.height());
+        let travel = (track.height() - thumb_len).max(1.0);
+        let resp = ui.interact(track, id.with("track"), egui::Sense::click_and_drag());
+        if let Some(p) = resp.interact_pointer_pos() {
+            if resp.dragged() || resp.is_pointer_button_down_on() {
+                offset = ((p.y - track.top() - thumb_len / 2.0) / travel).clamp(0.0, 1.0) * max_off;
+            }
+        }
+        offset = offset.clamp(0.0, max_off);
+        let top = track.top() + travel * offset / max_off;
+        let thumb = egui::Rect::from_min_size(egui::pos2(track.left() + 2.0, top), egui::vec2(BAR_W - 4.0, thumb_len));
+        ui.painter().rect(
+            thumb,
+            5.0,
+            if resp.dragged() { egui::Color32::from_gray(150) } else { egui::Color32::from_gray(115) },
+            egui::Stroke::NONE,
+            egui::StrokeKind::Inside,
+        );
+    } else {
+        offset = 0.0;
+    }
+    if held {
+        ui.ctx().request_repaint();
+    }
+    ui.data_mut(|d| d.insert_temp(id, (offset.clamp(0.0, max_off), max_off)));
+}
+
 pub struct DiscoveryWindow {
     pub open: bool,
     devices: Arc<Mutex<Vec<Device>>>,
@@ -393,7 +491,13 @@ impl DiscoveryWindow {
         // device table's trailing Status column still clipped off the
         // right edge on the fixed kiosk window. Plain 900x500 outside
         // kiosk mode, unchanged.
-        let discovery_size = if kiosk { [1000.0, 580.0] } else { [900.0, 500.0] };
+        // 550 high: the window manager adds ~28 px above an undecorated window, so 580 ran off the bottom of the 600 px panel.
+        let discovery_size = if kiosk { [1000.0, 550.0] } else { [900.0, 500.0] };
+        // Viewport sizes and positions are in points and the window system multiplies them by its own scale
+        // (1.33 on the kiosk): a "1000x580" request became a 1333x773 px window, bigger than the 1024x600 panel, so
+        // the right and bottom of this screen were off the screen. Ask for the size in pixels divided by that scale.
+        let native_scale = if kiosk { ui.ctx().native_pixels_per_point().unwrap_or(1.0).max(0.5) } else { 1.0 };
+        let discovery_size_pts = [discovery_size[0] / native_scale, discovery_size[1] / native_scale];
         let mut discovery_viewport = egui::ViewportBuilder::default()
             .with_title("Discover HPSDR Radios")
             // Widened from 700 -- the Interface column now shows the
@@ -401,7 +505,7 @@ impl DiscoveryWindow {
             // (192.168.1.50)"), which combined with the MAC column's
             // own width was pushing the trailing Status column past
             // the fixed window edge and clipping it.
-            .with_inner_size(discovery_size)
+            .with_inner_size(discovery_size_pts)
             .with_active(true)
             .with_window_level(window_level);
         if kiosk {
@@ -414,8 +518,11 @@ impl DiscoveryWindow {
             // added below) already covers dismissing this window, so no
             // separate on-screen Close is needed here.
             discovery_viewport = discovery_viewport
-                .with_position(crate::kiosk_centered_pos(discovery_size))
-                .with_max_inner_size(discovery_size)
+                .with_position({
+                    let p = crate::kiosk_centered_pos(discovery_size);
+                    egui::pos2(p[0] / native_scale, p[1] / native_scale)
+                })
+                .with_max_inner_size(discovery_size_pts)
                 .with_resizable(false)
                 .with_decorations(false);
         }
@@ -457,6 +564,18 @@ impl DiscoveryWindow {
                     ui,
                     |ui| {
                 ui.visuals_mut().clone_from(&light_visuals);
+                if kiosk {
+                    // Kiosk: this screen's text is 3 points larger than the default.
+                    for font_id in ui.style_mut().text_styles.values_mut() {
+                        font_id.size += 3.0;
+                    }
+                    // Buttons and fields: rounded corners and a thin line around.
+                    let w = &mut ui.visuals_mut().widgets;
+                    for st in [&mut w.inactive, &mut w.hovered, &mut w.active, &mut w.open] {
+                        st.corner_radius = egui::CornerRadius::same(5);
+                        st.bg_stroke = egui::Stroke::new(1.0, egui::Color32::from_gray(95));
+                    }
+                }
                 let discovering = *self.discovering.lock().unwrap();
 
                 if discovering {
@@ -488,6 +607,12 @@ impl DiscoveryWindow {
                     }
                 }
 
+                let list_frame = if kiosk {
+                    egui::Frame::NONE.stroke(egui::Stroke::new(1.0, egui::Color32::from_gray(95))).corner_radius(6.0).inner_margin(6.0)
+                } else {
+                    egui::Frame::NONE
+                };
+                list_frame.show(ui, |ui| {
                 egui::Grid::new("discovery_grid")
                     .num_columns(7)
                     .striped(true)
@@ -615,7 +740,10 @@ impl DiscoveryWindow {
                             ui.end_row();
                         }
                     });
+                });
 
+                // The list stays fixed on top; the rest of the page scrolls (touch).
+                let mut rest = |ui: &mut egui::Ui| {
                 if devices_snapshot.is_empty() && !discovering {
                     ui.add_space(8.0);
                     ui.weak("No radios found. Try Rediscover or add one manually below.");
@@ -975,17 +1103,37 @@ impl DiscoveryWindow {
                     if let Some(console) = &self.juice_console {
                         ui.add_space(4.0);
                         ui.label("Juice output:");
-                        egui::ScrollArea::vertical().max_height(120.0).stick_to_bottom(true).show(
-                            ui,
-                            |ui| {
+                        let log_text = console.snapshot().join("\n");
+                        if kiosk {
+                            egui::Frame::NONE
+                                .stroke(egui::Stroke::new(1.0, egui::Color32::from_gray(95)))
+                                .corner_radius(6.0)
+                                .inner_margin(4.0)
+                                .show(ui, |ui| {
+                                    touch_scroll(ui, "juice_log", Some(120.0), true, &mut |ui: &mut egui::Ui| {
+                                        // The log keeps the original size, not the larger one of the rest of this screen.
+                                        if let Some(f) = ui.style_mut().text_styles.get_mut(&egui::TextStyle::Monospace) {
+                                            f.size -= 3.0;
+                                        }
+                                        ui.add(
+                                            egui::TextEdit::multiline(&mut log_text.as_str())
+                                                .desired_width(f32::INFINITY)
+                                                .font(egui::TextStyle::Monospace)
+                                                .frame(egui::Frame::NONE)
+                                                .interactive(false),
+                                        );
+                                    });
+                                });
+                        } else {
+                            egui::ScrollArea::vertical().max_height(120.0).stick_to_bottom(true).show(ui, |ui| {
                                 ui.add(
-                                    egui::TextEdit::multiline(&mut console.snapshot().join("\n"))
+                                    egui::TextEdit::multiline(&mut log_text.clone())
                                         .desired_width(f32::INFINITY)
                                         .font(egui::TextStyle::Monospace)
                                         .interactive(false),
                                 );
-                            },
-                        );
+                            });
+                        }
                         // Keeps this panel live-updating while juice is
                         // producing output, without needing the reader
                         // threads themselves to know about egui at all
@@ -1102,6 +1250,13 @@ impl DiscoveryWindow {
                         ui.colored_label(egui::Color32::RED, err);
                     }
                 });
+                }
+                };
+                if kiosk {
+                    // Touch: everything under the device list scrolls, with a wide bar and up/down buttons on the right.
+                    touch_scroll(ui, "discovery_page", None, false, &mut rest);
+                } else {
+                    rest(ui);
                 }
                 });
             },
