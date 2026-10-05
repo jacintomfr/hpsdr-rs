@@ -171,7 +171,8 @@ fn touch_scroll(
     }
     ui.painter().rect(track, 5.0, egui::Color32::from_gray(30), stroke, egui::StrokeKind::Inside);
     if max_off > 0.5 {
-        let thumb_len = (track.height() * view_h / (view_h + max_off)).clamp(40.0, track.height());
+        // f32::clamp panics if min > max: with a short track (a tall list leaves little room) 40 px may not fit.
+        let thumb_len = (track.height() * view_h / (view_h + max_off)).clamp(40.0f32.min(track.height()), track.height());
         let travel = (track.height() - thumb_len).max(1.0);
         let resp = ui.interact(track, id.with("track"), egui::Sense::click_and_drag());
         if let Some(p) = resp.interact_pointer_pos() {
@@ -218,6 +219,11 @@ pub struct DiscoveryWindow {
     /// window stops stealing focus back if the user deliberately clicks
     /// the main window during that window.
     focus_deadline: Option<Instant>,
+    /// Kiosk window-size correction (see the code at the top of the viewport closure): the size last requested in
+    /// points, how many corrections were sent and frames to wait for the next one.
+    size_req: [f32; 2],
+    size_attempts: u8,
+    size_wait: u8,
     /// Bootloader-mode radios never answer normal discovery (see
     /// bootloader.rs's own doc comment), so this is a standalone entry
     /// point independent of the `devices` list -- same
@@ -342,6 +348,9 @@ impl DiscoveryWindow {
             manual_ip: crate::config::load_last_manual_ip().unwrap_or_default(),
             manual_error: None,
             focus_deadline: Some(Instant::now() + std::time::Duration::from_millis(1500)),
+            size_req: [0.0, 0.0],
+            size_attempts: 0,
+            size_wait: 0,
             firmware_update: None,
             ozy_firmware_path: ozy_cfg.ozy_firmware_path,
             ozy_fpga_path: ozy_cfg.ozy_fpga_path,
@@ -530,6 +539,33 @@ impl DiscoveryWindow {
             egui::ViewportId::from_hash_of("discovery_window"),
             discovery_viewport,
             |ui, _class| {
+                if kiosk {
+                    // The window system scales viewport sizes by a factor that is not always the one egui reports
+                    // (1.33 at start, 1.0 after coming back from the radio screen), so the 1000x550 px window came out
+                    // 750x412 px. Measure what we got and re-request the size and position corrected by the real factor.
+                    if self.size_req == [0.0, 0.0] {
+                        self.size_req = discovery_size_pts;
+                    }
+                    if self.size_wait > 0 {
+                        self.size_wait -= 1;
+                    } else if self.size_attempts < 4 {
+                        if let Some(r) = ui.input(|i| i.viewport().inner_rect) {
+                            let actual = [r.width(), r.height()];
+                            if actual[0] > 1.0 && (actual[0] - discovery_size[0]).abs() > 3.0 {
+                                let s = actual[0] / self.size_req[0].max(1.0);
+                                let req = [discovery_size[0] / s, discovery_size[1] / s];
+                                let p = crate::kiosk_centered_pos(discovery_size);
+                                ui.ctx().send_viewport_cmd(egui::ViewportCommand::InnerSize(egui::vec2(req[0], req[1])));
+                                ui.ctx().send_viewport_cmd(egui::ViewportCommand::OuterPosition(egui::pos2(p[0] / s, p[1] / s)));
+                                self.size_req = req;
+                                self.size_attempts += 1;
+                                self.size_wait = 6;
+                            } else {
+                                self.size_attempts = 4;
+                            }
+                        }
+                    }
+                }
                 if let Some(deadline) = self.focus_deadline {
                     let focused = ui.input(|i| i.viewport().focused).unwrap_or(false);
                     if focused || Instant::now() >= deadline {
@@ -569,6 +605,10 @@ impl DiscoveryWindow {
                     for font_id in ui.style_mut().text_styles.values_mut() {
                         font_id.size += 3.0;
                     }
+                    // Touch: taller targets (rows, buttons, fields) so a finger hits the first time.
+                    ui.spacing_mut().interact_size.y = 36.0;
+                    ui.spacing_mut().button_padding = egui::vec2(4.0, 7.0);
+                    ui.spacing_mut().item_spacing = egui::vec2(8.0, 8.0);
                     // Buttons and fields: rounded corners and a thin line around.
                     let w = &mut ui.visuals_mut().widgets;
                     for st in [&mut w.inactive, &mut w.hovered, &mut w.active, &mut w.open] {
