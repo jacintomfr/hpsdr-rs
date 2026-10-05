@@ -10115,8 +10115,15 @@ Waterfall rebuilds: {prof_wf_n:.0}/s, {prof_wf_ms:.1} ms each."
                             // The reflection coefficient is capped at 0.95 (SWR 39) so the average can always recover.
                             let swr = {
                                 let prev = connected.smoothed_swr;
-                                let next = if watts > 0.25 {
-                                    let gamma = (reverse_watts / watts).sqrt().min(0.95);
+                                // Readings above the detectors' no-RF level (see power_detector_offsets).
+                                let (off_fwd, off_rev) = power_detector_offsets(connected.device.board, connected.device.mac);
+                                let (watts_above, reverse_above, _) = power_watts_and_swr(
+                                    (connected.smoothed_fwd_power as u32).saturating_sub(off_fwd),
+                                    (connected.smoothed_rev_power as u32).saturating_sub(off_rev),
+                                    power_meter_board(connected.device.board, connected.device.mac),
+                                );
+                                let next = if watts_above > 0.25 {
+                                    let gamma = (reverse_above / watts_above).sqrt().min(0.95);
                                     0.7 * (1.0 + gamma) / (1.0 - gamma) + 0.3 * prev
                                 } else {
                                     0.7 + 0.3 * prev
@@ -20183,6 +20190,15 @@ const HL2_PA30_MAC: [u8; 6] = [0x00, 0x1C, 0xC0, 0xA2, 0x13, 0xDD];
 /// substituting Boards::Hermes for its own Boards::HermesLite2 whenever
 /// the connected MAC matches. Every other radio (including every other
 /// real HermesLite2) passes `board` through unchanged.
+/// Raw readings (0..4095) of the forward / reverse power detectors with the transmitter keyed and NO RF, for the one HL2-PA30
+/// in `HL2_PA30_MAC`: measured on the Pi (about 261 and 255-262 in every session with the PA on, against 8 and 9 in RX).
+/// Used only to compute the SWR from the readings above these levels (the displayed power keeps its calibration, which
+/// matches an external wattmeter with the offset included). Without it the reverse offset looked like reflected power:
+/// 13 W into a 1.0:1 load showed SWR 1.6 and SSB silence showed 39. Every other radio: (0, 0).
+fn power_detector_offsets(board: Boards, mac: [u8; 6]) -> (u32, u32) {
+    if board == Boards::HermesLite2 && mac == HL2_PA30_MAC { (258, 253) } else { (0, 0) }
+}
+
 fn power_meter_board(board: Boards, mac: [u8; 6]) -> Boards {
     if board == Boards::HermesLite2 && mac == HL2_PA30_MAC { Boards::Hermes } else { board }
 }
