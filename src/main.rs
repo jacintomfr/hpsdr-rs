@@ -1111,6 +1111,7 @@ fn dispatch_midi_binding(
             connected.filter_window_open = open;
         }
         MidiAction::Rade => toggle_rade_direct(connected),
+        MidiAction::DigitalMenu => toggle_digital_window(connected),
         MidiAction::BandUp | MidiAction::BandDown => {
             let reachable: Vec<&'static Band> = BANDS
                 .iter()
@@ -5926,7 +5927,19 @@ impl eframe::App for HpsdrApp {
                                 // Kiosk: MENU, DIGITAL and EXIT share one width (the widest of the three labels).
                                 let kiosk_btn_w = chip_width(ui, &["MENU", "DIGITAL", "EXIT"]);
                                 let settings_clicked = if lcd_kiosk_mode() {
-                                    solid_chip_text_w(ui, "MENU", egui::Color32::from_rgb(235, 195, 40), egui::Color32::BLACK, true, kiosk_btn_w).clicked()
+                                    // Kiosk: two big touch buttons, MENU and EXIT, that together are as tall as the meter
+                                    // (85 x KIOSK_METER_SCALE), with a small gap between them.
+                                    column_ui_gap(ui);
+                                    solid_chip_text_wh(
+                                        ui,
+                                        "MENU",
+                                        egui::Color32::from_rgb(235, 195, 40),
+                                        egui::Color32::BLACK,
+                                        true,
+                                        kiosk_btn_w,
+                                        kiosk_big_button_h(),
+                                    )
+                                    .clicked()
                                 } else {
                                     solid_chip_text(ui, "Settings...", egui::Color32::from_rgb(235, 195, 40), egui::Color32::BLACK, true).clicked()
                                 };
@@ -5995,7 +6008,8 @@ impl eframe::App for HpsdrApp {
                                 // Digital modes (RTTY for now) -- one
                                 // entry point for all of them, see
                                 // render_digital_window.
-                                if solid_chip_text_w(
+                                // Kiosk: no DIGITAL button here any more (it is the `Digital Menu` MIDI/toolbar function).
+                                if !lcd_kiosk_mode() && solid_chip_text_w(
                                     ui,
                                     if lcd_kiosk_mode() { "DIGITAL" } else { "Digital..." },
                                     egui::Color32::from_rgb(110, 190, 240),
@@ -6006,66 +6020,19 @@ impl eframe::App for HpsdrApp {
                                 .on_hover_text("Digital modes: RTTY decoder/encoder")
                                 .clicked()
                                 {
-                                    let opening = !connected.show_digital_window;
-                                    connected.show_digital_window = opening;
-                                    // See ConnectedState::pre_digital_mode's
-                                    // own doc comment -- auto-switch to
-                                    // DIGU/DIGL on open, restore on close,
-                                    // via this same button (the window's
-                                    // own X/close-requested path does the
-                                    // restore half too, for the case the
-                                    // operator closes it that way instead).
-                                    if opening {
-                                        let current = connected.spectrum.mode();
-                                        if !matches!(current, spectrum::Mode::Digu | spectrum::Mode::Digl) {
-                                            let dial_hz = if connected.ctun {
-                                                connected.ctun_frequency_hz
-                                            } else {
-                                                connected.session.frequency_hz.load(Ordering::Relaxed)
-                                            };
-                                            connected.pre_digital_mode = Some(current);
-                                            connected.spectrum.set_mode(digi_mode_for_band(dial_hz));
-                                            settings_changed = true;
-                                        }
-                                        // See digital_fit_passband's own doc
-                                        // comment -- applies automatically on
-                                        // entry, whichever tab was last
-                                        // selected, instead of requiring a
-                                        // manual Fit Filter click first.
-                                        let s = connected.rtty.settings();
-                                        let passband = digital_fit_passband(
-                                            connected.digital_mode,
-                                            connected.spectrum.mode(),
-                                            s.center_hz,
-                                            s.shift_hz,
-                                        );
-                                        connected.spectrum.set_explicit_passband(Some(passband));
-                                        if let Some(tx) = &connected.tx_handle {
-                                            tx.set_explicit_passband(Some(passband));
-                                        }
-                                        // See ConnectedState::pre_digital_filters'
-                                        // own doc comment.
-                                        enter_digital_mode_filters(connected);
-                                        settings_changed = true;
-                                    } else {
-                                        // Same restore as the window's own
-                                        // X/close-requested path -- needed
-                                        // here too since this button is
-                                        // itself a second way to close the
-                                        // window, not just open it.
-                                        connected.spectrum.set_explicit_passband(None);
-                                        if let Some(tx) = &connected.tx_handle {
-                                            tx.set_explicit_passband(None);
-                                        }
-                                        if let Some(prev) = connected.pre_digital_mode.take() {
-                                            connected.spectrum.set_mode(prev);
-                                        }
-                                        restore_pre_digital_filters(connected);
-                                        settings_changed = true;
-                                    }
+                                    toggle_digital_window(connected);
+                                    settings_changed = true;
                                 }
                                 if lcd_kiosk_mode() {
-                                    if solid_chip_w(ui, "EXIT", egui::Color32::from_rgb(210, 50, 50), true, kiosk_btn_w)
+                                    if solid_chip_text_wh(
+                                        ui,
+                                        "EXIT",
+                                        egui::Color32::from_rgb(210, 50, 50),
+                                        egui::Color32::WHITE,
+                                        true,
+                                        kiosk_btn_w,
+                                        kiosk_big_button_h(),
+                                    )
                                         .on_hover_text("Disconnect from the radio")
                                         .clicked()
                                     {
@@ -6077,7 +6044,7 @@ impl eframe::App for HpsdrApp {
                                 // Right edge of the window, top-aligned with the meter.
                                 let col_w = chip_width(ui, &["MENU", "DIGITAL", "EXIT"]);
                                 let right = ui.ctx().content_rect().right() - 6.0;
-                                let rect = egui::Rect::from_min_size(egui::pos2(right - col_w, 12.0), egui::vec2(col_w, 110.0));
+                                let rect = egui::Rect::from_min_size(egui::pos2(right - col_w, 10.0), egui::vec2(col_w, 85.0 * KIOSK_METER_SCALE));
                                 // Drawn outside the row's flow (new_child allocates nothing in it) and top-down, whatever
                                 // layout the row has -- scope_builder inherited the horizontal one and reserved space.
                                 let mut column_ui = ui.new_child(
@@ -17037,6 +17004,21 @@ fn render_sstv_panel(
 /// "starting point, not a standard" caveat as SSTV_QUICK_TUNE_HZ.
 /// Sourced from evoham.com's own FreeDV frequency list and FreeDV
 /// Reporter's documented activity centers.
+/// A button of the RADE panel: in the kiosk it is a taller, rounded touch target with a thin line; elsewhere an ordinary
+/// button.
+fn touch_button(ui: &mut egui::Ui, label: &str) -> egui::Response {
+    if lcd_kiosk_mode() {
+        ui.add(
+            egui::Button::new(label)
+                .min_size(egui::vec2(64.0, 40.0))
+                .corner_radius(5.0)
+                .stroke(egui::Stroke::new(1.0, egui::Color32::from_gray(95))),
+        )
+    } else {
+        ui.button(label)
+    }
+}
+
 const RADE_QUICK_TUNE_HZ: [(&str, u32); 5] =
     [("80m", 3_630_000), ("40m", 7_180_000), ("20m", 14_236_000), ("15m", 21_180_000), ("10m", 28_330_000)];
 
@@ -17265,8 +17247,7 @@ fn render_rade_panel(
         // place while on the air, rather than relying on the button's
         // own logic to leave TX alone.
         if !mox {
-            if ui
-                .button("Fit Filter")
+            if touch_button(ui, "Fit Filter")
                 .on_hover_text(
                     "Narrow the RX filter to RADE V1's tone band. Rotates between \
                      deskHPSDR's own figure (700-2300 Hz) and SDRoxide's wider one \
@@ -17289,11 +17270,10 @@ fn render_rade_panel(
             }
         }
     });
-    ui.horizontal(|ui| {
+    let quick_tune_row = |ui: &mut egui::Ui| {
         ui.label("Quick Tune:");
         for &(label, hz) in &RADE_QUICK_TUNE_HZ {
-            if ui
-                .button(label)
+            if touch_button(ui, label)
                 .on_hover_text(format!(
                     "{:.3} MHz -- a community-adopted FreeDV/RADE calling frequency, a \
                      starting point to listen/call on, not a protocol standard",
@@ -17304,7 +17284,12 @@ fn render_rade_panel(
                 quick_tune_hz = Some(hz);
             }
         }
-    });
+    };
+    if lcd_kiosk_mode() {
+        ui.horizontal_wrapped(quick_tune_row);
+    } else {
+        ui.horizontal(quick_tune_row);
+    }
 
     // Mic-side leveler/compressor -- rade_mic_agc.rs, modeled on FreeDV
     // GUI's own mic conditioning (see that module's doc comment: it acts
@@ -17617,11 +17602,26 @@ fn render_rade_side_panel(
     let blank = |sync: bool, s: String| if sync { s } else { String::new() };
     ui.label(egui::RichText::new(blank(st.sync, format!("SNR    {:>4.0} dB", st.snr_db))).monospace());
     ui.label(egui::RichText::new(blank(st.sync, format!("Offset {:>+4.0} Hz", st.freq_offset_hz))).monospace());
-    ui.horizontal(|ui| {
+    let kiosk = lcd_kiosk_mode();
+    let buttons = |ui: &mut egui::Ui| {
+        if kiosk {
+            // Touch: taller, rounded buttons with a thin line (the menu of Quick Tune follows the same look).
+            ui.spacing_mut().button_padding = egui::vec2(10.0, 11.0);
+            ui.spacing_mut().item_spacing = egui::vec2(8.0, 8.0);
+            let w = &mut ui.visuals_mut().widgets;
+            for st in [&mut w.inactive, &mut w.hovered, &mut w.active, &mut w.open] {
+                st.corner_radius = egui::CornerRadius::same(5);
+                st.bg_stroke = egui::Stroke::new(1.0, egui::Color32::from_gray(95));
+            }
+        }
         if ui.button("Fit Filter").on_hover_text("Narrow the RX filter to RADE V1's tone band").clicked() {
             *fit_clicked = true;
         }
         ui.menu_button("Quick Tune", |ui| {
+            if kiosk {
+                ui.spacing_mut().button_padding = egui::vec2(14.0, 11.0);
+                ui.spacing_mut().item_spacing.y = 8.0;
+            }
             for &(label, hz) in &RADE_QUICK_TUNE_HZ {
                 if ui
                     .button(label)
@@ -17633,7 +17633,12 @@ fn render_rade_side_panel(
                 }
             }
         });
-    });
+    };
+    if kiosk {
+        ui.horizontal_wrapped(buttons);
+    } else {
+        ui.horizontal(buttons);
+    }
     ui.separator();
     ui.strong("Received callsigns");
     // Anchored to the bottom of the panel; the list grows upward as callsigns arrive.
@@ -17798,6 +17803,7 @@ fn toolbar_fn_active(connected: &ConnectedState, f: toolbar::ToolbarFn) -> bool 
         ToolbarFn::Midi(MidiAction::RecordWav) => connected.spectrum.recorder.is_enabled(),
         ToolbarFn::Midi(MidiAction::Tune) => connected.tune_active,
         ToolbarFn::Midi(MidiAction::Vox) => connected.vox_enabled,
+        ToolbarFn::Midi(MidiAction::DigitalMenu) => connected.show_digital_window,
         ToolbarFn::Midi(MidiAction::VoxMenu) => connected.vox_window_open,
         ToolbarFn::Midi(MidiAction::RxEqToggle) => connected.spectrum.eq().enabled,
         _ => false,
@@ -18659,6 +18665,20 @@ fn render_rit_xit(ui: &mut egui::Ui, connected: &mut ConnectedState) -> bool {
     changed
 }
 
+/// Gap between the two big kiosk buttons at the top right (MENU, EXIT).
+const KIOSK_BIG_BUTTON_GAP: f32 = 6.0;
+
+/// Height of each of the two big touch buttons: together with the gap they are as tall as the meter (85 px drawn
+/// KIOSK_METER_SCALE times larger).
+fn kiosk_big_button_h() -> f32 {
+    (85.0 * KIOSK_METER_SCALE - KIOSK_BIG_BUTTON_GAP) / 2.0
+}
+
+/// Sets the small gap between the two big buttons in their column.
+fn column_ui_gap(ui: &mut egui::Ui) {
+    ui.spacing_mut().item_spacing.y = KIOSK_BIG_BUTTON_GAP;
+}
+
 /// How much larger the RX/TX meter is drawn in kiosk mode (1.0 = the normal size). It was 1.4 and then 1.7
 /// while the Pi ran its 1024x600 panel at 1280x720; back to 1.0 at the native 1024x600 and now 1.3,
 /// the most that fits beside LEV/PROC/CFC and above the RIT/XIT row. Everything that only exists because the meter is enlarged (small ADC/FIFO warning
@@ -18850,6 +18870,19 @@ fn solid_chip_text_w(
     enabled: bool,
     min_w: f32,
 ) -> egui::Response {
+    solid_chip_text_wh(ui, label, fill, text, enabled, min_w, 0.0)
+}
+
+/// `solid_chip_text_w` with a minimum height too (the big touch buttons at the top right).
+fn solid_chip_text_wh(
+    ui: &mut egui::Ui,
+    label: &str,
+    fill: egui::Color32,
+    text: egui::Color32,
+    enabled: bool,
+    min_w: f32,
+    min_h: f32,
+) -> egui::Response {
     let lighten = |c: egui::Color32, k: f32| {
         let f = |v: u8| (v as f32 + (255.0 - v as f32) * k).round() as u8;
         egui::Color32::from_rgb(f(c.r()), f(c.g()), f(c.b()))
@@ -18862,13 +18895,22 @@ fn solid_chip_text_w(
         w.inactive.fg_stroke.color = text;
         w.hovered.fg_stroke.color = text;
         w.active.fg_stroke.color = text;
-        ui.add_enabled(
-            enabled,
-            egui::Button::new(label)
-                .stroke(egui::Stroke::new(1.0, lighten(fill, 0.35)))
-                .corner_radius(5.0)
-                .min_size(egui::vec2(min_w, 0.0)),
-        )
+        let button = egui::Button::new(label)
+            .stroke(egui::Stroke::new(1.0, lighten(fill, 0.35)))
+            .corner_radius(5.0)
+            .min_size(egui::vec2(min_w, min_h));
+        if min_h > 0.0 {
+            // A button's text follows the layout it is added in (left-aligned in a top-down column), so the big touch
+            // buttons are added in a centred, justified cell: the button fills it and its text is centred both ways.
+            ui.allocate_ui_with_layout(
+                egui::vec2(min_w, min_h),
+                egui::Layout::centered_and_justified(egui::Direction::LeftToRight),
+                |ui| ui.add_enabled(enabled, button),
+            )
+            .inner
+        } else {
+            ui.add_enabled(enabled, button)
+        }
     })
     .inner
 }
@@ -21863,6 +21905,68 @@ fn vox_tick(ctx: &egui::Context, connected: &mut ConnectedState) {
         let level = vox::take_level();
         connected.vox_level_shown = level.max(connected.vox_level_shown * 0.9);
         ctx.request_repaint_after(Duration::from_millis(50));
+    }
+}
+
+/// Opens or closes the Digital window (the DIGITAL button and the MIDI/toolbar `Digital` function): auto-switches to
+/// DIGU/DIGL on open and restores mode, passband and filters on close.
+fn toggle_digital_window(connected: &mut ConnectedState) {
+    let opening = !connected.show_digital_window;
+    connected.show_digital_window = opening;
+    // See ConnectedState::pre_digital_mode's
+    // own doc comment -- auto-switch to
+    // DIGU/DIGL on open, restore on close,
+    // via this same button (the window's
+    // own X/close-requested path does the
+    // restore half too, for the case the
+    // operator closes it that way instead).
+    if opening {
+        let current = connected.spectrum.mode();
+        if !matches!(current, spectrum::Mode::Digu | spectrum::Mode::Digl) {
+            let dial_hz = if connected.ctun {
+                connected.ctun_frequency_hz
+            } else {
+                connected.session.frequency_hz.load(Ordering::Relaxed)
+            };
+            connected.pre_digital_mode = Some(current);
+            connected.spectrum.set_mode(digi_mode_for_band(dial_hz));
+            connected.settings_dirty.store(true, std::sync::atomic::Ordering::Relaxed);
+        }
+        // See digital_fit_passband's own doc
+        // comment -- applies automatically on
+        // entry, whichever tab was last
+        // selected, instead of requiring a
+        // manual Fit Filter click first.
+        let s = connected.rtty.settings();
+        let passband = digital_fit_passband(
+            connected.digital_mode,
+            connected.spectrum.mode(),
+            s.center_hz,
+            s.shift_hz,
+        );
+        connected.spectrum.set_explicit_passband(Some(passband));
+        if let Some(tx) = &connected.tx_handle {
+            tx.set_explicit_passband(Some(passband));
+        }
+        // See ConnectedState::pre_digital_filters'
+        // own doc comment.
+        enter_digital_mode_filters(connected);
+        connected.settings_dirty.store(true, std::sync::atomic::Ordering::Relaxed);
+    } else {
+        // Same restore as the window's own
+        // X/close-requested path -- needed
+        // here too since this button is
+        // itself a second way to close the
+        // window, not just open it.
+        connected.spectrum.set_explicit_passband(None);
+        if let Some(tx) = &connected.tx_handle {
+            tx.set_explicit_passband(None);
+        }
+        if let Some(prev) = connected.pre_digital_mode.take() {
+            connected.spectrum.set_mode(prev);
+        }
+        restore_pre_digital_filters(connected);
+        connected.settings_dirty.store(true, std::sync::atomic::Ordering::Relaxed);
     }
 }
 

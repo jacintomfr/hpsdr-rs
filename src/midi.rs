@@ -137,6 +137,8 @@ pub enum MidiAction {
     FilterMenu,
     /// RADE on/off in one press (same as the toolbar's RADE box).
     Rade,
+    /// Opens/closes the Digital window (the DIGITAL button at the top right).
+    DigitalMenu,
     FilterWidthUp,
     FilterWidthDown,
     VfoStepUp,
@@ -241,6 +243,7 @@ impl MidiAction {
             MidiAction::BandUp => "Band Up",
             MidiAction::BandDown => "Band Down",
             MidiAction::BandMenu => "Band Menu",
+            MidiAction::DigitalMenu => "Digital Menu",
             MidiAction::ModeMenu => "Mode Menu",
             MidiAction::FilterMenu => "RX Filter Menu",
             MidiAction::Rade => "RADE On/Off",
@@ -343,6 +346,7 @@ pub const KEY_ACTIONS: &[MidiAction] = &[
     MidiAction::BandUp,
     MidiAction::BandDown,
     MidiAction::BandMenu,
+    MidiAction::DigitalMenu,
     MidiAction::ModeMenu,
     MidiAction::FilterMenu,
     MidiAction::Rade,

@@ -100,6 +100,7 @@ impl ToolbarFn {
                 MidiAction::BandUp => "BAND+",
                 MidiAction::BandDown => "BAND-",
                 MidiAction::BandMenu => "BAND",
+                MidiAction::DigitalMenu => "DIGITAL",
                 MidiAction::ModeMenu => "MODE",
                 MidiAction::FilterMenu => "FILTER",
                 MidiAction::Rade => "RADE",
