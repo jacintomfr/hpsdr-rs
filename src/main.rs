@@ -2910,6 +2910,9 @@ struct ConnectedState {
     /// ballistic damping for exactly this reason.
     smoothed_fwd_power: f32,
     smoothed_rev_power: f32,
+    /// SWR shown by the TX meter, updated like piHPSDR/deskHPSDR's `tx->swr`: only while the forward power is above 0.25 W
+    /// (otherwise it moves back towards 1.0), reflection coefficient capped at 0.95 (SWR 39), light smoothing.
+    smoothed_swr: f32,
     /// Status bar's "Audio glitches" reading -- AudioOutput::
     /// underrun_count() is a lifetime cumulative total (see its own doc
     /// comment), which isn't actually readable at a glance ("4896 --
@@ -4127,6 +4130,7 @@ fn connect_to_device(device: Device, cfg: &Config) -> Result<ConnectedState, Str
                 cw_text_sending: false,
                 smoothed_fwd_power: 0.0,
                 smoothed_rev_power: 0.0,
+                smoothed_swr: 1.0,
                 underrun_rate_per_min: 0.0,
                 underrun_rate_baseline: 0,
                 underrun_rate_checked_at: Instant::now(),
@@ -4450,7 +4454,7 @@ impl eframe::App for HpsdrApp {
                             if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open("/tmp/hpsdr_perf.log") {
                                 let _ = writeln!(
                                     f,
-                                    "ui_fps={ui_fps:.1} passes={passes:.1} ui_ms={ui_ms:.1} wf_rebuilds={wf_n:.1} | dsp_chunks/s={} disp_rev/s={} | gap={gap:.1} proc={proc_ms:.1} q={q} set={set:.1} zp={zp:.1} feed={feed:.1} | sr={} zoom={} mode={:?} | mox={} audio_underruns={}",
+                                    "ui_fps={ui_fps:.1} passes={passes:.1} ui_ms={ui_ms:.1} wf_rebuilds={wf_n:.1} | dsp_chunks/s={} disp_rev/s={} | gap={gap:.1} proc={proc_ms:.1} q={q} set={set:.1} zp={zp:.1} feed={feed:.1} | sr={} zoom={} mode={:?} | mox={} audio_underruns={} fwd_raw={} rev_raw={} fwd_sm={:.0} rev_sm={:.0} swr={:.2}",
                                     chunks.wrapping_sub(last.1),
                                     (rev as u64).wrapping_sub(last.2),
                                     connected.sample_rate,
@@ -4458,6 +4462,11 @@ impl eframe::App for HpsdrApp {
                                     connected.spectrum.mode(),
                                     connected.session.mox_active() as u8,
                                     connected.audio_output.as_ref().map(|a| a.underrun_count()).unwrap_or(0),
+                                    connected.session.tx_forward_power.load(Ordering::Relaxed),
+                                    connected.session.tx_reverse_power.load(Ordering::Relaxed),
+                                    connected.smoothed_fwd_power,
+                                    connected.smoothed_rev_power,
+                                    connected.smoothed_swr,
                                 );
                             }
                             last.1 = chunks;
@@ -10094,11 +10103,28 @@ Waterfall rebuilds: {prof_wf_n:.0}/s, {prof_wf_ms:.1} ms each."
                                 connected.smoothed_rev_power
                                     + SMOOTHING_ALPHA * (raw_rev as f32 - connected.smoothed_rev_power)
                             };
-                            let (watts, reverse_watts, swr) = power_watts_and_swr(
+                            let (watts, reverse_watts, _swr_unguarded) = power_watts_and_swr(
                                 connected.smoothed_fwd_power as u32,
                                 connected.smoothed_rev_power as u32,
                                 power_meter_board(connected.device.board, connected.device.mac),
                             );
+                            // SWR the way piHPSDR/deskHPSDR do it (transmitter.c, tx->swr). The raw ratio rev/fwd is
+                            // meaningless without RF: in SSB silence both detectors read their noise floor, the ratio goes
+                            // to ~1 and the SWR to 100+ ("173"), then drops back to 1.5 on each syllable. So it is only
+                            // updated while the forward power is above 0.25 W; below that it moves back towards 1.0.
+                            // The reflection coefficient is capped at 0.95 (SWR 39) so the average can always recover.
+                            let swr = {
+                                let prev = connected.smoothed_swr;
+                                let next = if watts > 0.25 {
+                                    let gamma = (reverse_watts / watts).sqrt().min(0.95);
+                                    0.7 * (1.0 + gamma) / (1.0 - gamma) + 0.3 * prev
+                                } else {
+                                    0.7 + 0.3 * prev
+                                };
+                                let next = if next.is_finite() { next.max(1.0) } else { 1.0 };
+                                connected.smoothed_swr = next;
+                                next
+                            };
                             // SWR protection: cut drive to a safe 10W the
                             // moment SWR reaches/exceeds Max SWR while
                             // actually running more than 35W -- a bad
@@ -10142,6 +10168,7 @@ Waterfall rebuilds: {prof_wf_n:.0}/s, {prof_wf_ms:.1} ms each."
                             // at.
                             connected.smoothed_fwd_power = 0.0;
                             connected.smoothed_rev_power = 0.0;
+                            connected.smoothed_swr = 1.0;
                             match connected.meter_style {
                                 MeterStyle::Analog => draw_s_meter(ui, meter_rect, meter_db),
                                 MeterStyle::Digital => draw_digital_s_meter(ui, meter_rect, meter_db),
