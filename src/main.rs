@@ -43,6 +43,7 @@ mod sysstats;
 mod tci;
 mod toolbar;
 mod tx;
+mod vox;
 mod wdsp_sys;
 
 use audio::{AudioOutput, MicInput};
@@ -1364,6 +1365,19 @@ fn dispatch_midi_binding(
             connected.spectrum.set_squelch(new_level as f32, on);
             connected.squelch_memory.insert(connected.spectrum.mode().label().to_string(), (new_level as f32, on));
         }
+        MidiAction::Vox => {
+            connected.vox_enabled = !connected.vox_enabled;
+        }
+        MidiAction::VoxMenu => connected.vox_window_open = !connected.vox_window_open,
+        // deskHPSDR: KnobOrWheel(vox_threshold, 0.0, 1.0, 0.01).
+        MidiAction::VoxLevel => {
+            connected.vox_threshold = if binding.kind == MidiBindingKind::Wheel {
+                let Some(step) = midi_wheel_step(ev, &binding, 0.01) else { return };
+                (connected.vox_threshold + step).clamp(0.0, 1.0)
+            } else {
+                midi_knob_range(ev.value, 0.0, 1.0)
+            };
+        }
         MidiAction::SquelchToggle => {
             let (level, enabled) = connected.spectrum.squelch();
             connected.spectrum.set_squelch(level, !enabled);
@@ -2332,8 +2346,21 @@ struct ConnectedState {
     vfo_b_step_hz: i64,
     /// Set when the TX window was just moved, so the next settings save includes it.
     tx_window_pos_dirty: bool,
+    /// Frames the TX window has been on screen since it last appeared (0 = it appears now): it is moved to the saved position each time it appears (like
+    /// piHPSDR's gtk_window_move when its TX dialog is shown), not only the first time.
+    tx_window_frames_shown: u32,
     /// Frequency calibration (ppm factor), Settings -> RX; applied in radio.rs to the frequencies sent to the radio.
     freq_cal_ppm: f64,
+    /// VOX (deskHPSDR vox_menu): enable, threshold 0..1, hang ms, side channel filter (+ cut-offs Hz); see vox.rs.
+    vox_enabled: bool,
+    vox_threshold: f64,
+    vox_hang_ms: f64,
+    vox_filter: bool,
+    vox_filter_low_hz: f64,
+    vox_filter_high_hz: f64,
+    vox_window_open: bool,
+    /// Detector level for the meter in the VOX window (peak with slow decay).
+    vox_level_shown: f32,
     /// VFO step of each mode, loaded when the mode changes (like deskHPSDR's per-mode step).
     step_memory: std::collections::HashMap<String, i64>,
     step_last_mode: Option<spectrum::Mode>,
@@ -3880,7 +3907,16 @@ fn connect_to_device(device: Device, cfg: &Config) -> Result<ConnectedState, Str
                 tx_window_pos: cfg.tx_window_pos,
                 vfo_b_step_hz: cfg.vfo_b_step_hz.filter(|s| ALL_TUNE_STEPS_HZ.contains(s)).unwrap_or(1_000),
                 tx_window_pos_dirty: false,
+                tx_window_frames_shown: 0,
                 freq_cal_ppm: cfg.freq_cal_ppm.unwrap_or(0.0).clamp(-100.0, 100.0),
+                vox_enabled: cfg.vox_enabled.unwrap_or(false),
+                vox_threshold: cfg.vox_threshold.unwrap_or(0.001).clamp(0.0, 1.0),
+                vox_hang_ms: cfg.vox_hang_ms.unwrap_or(250.0).clamp(0.0, 1000.0),
+                vox_filter: cfg.vox_filter.unwrap_or(false),
+                vox_filter_low_hz: cfg.vox_filter_low_hz.unwrap_or(1000.0).clamp(0.0, 4000.0),
+                vox_filter_high_hz: cfg.vox_filter_high_hz.unwrap_or(2000.0).clamp(0.0, 4000.0),
+                vox_window_open: false,
+                vox_level_shown: 0.0,
                 step_memory: cfg.step_memory.clone(),
                 step_last_mode: None,
                 rit_step_hz,
@@ -4334,12 +4370,14 @@ impl eframe::App for HpsdrApp {
                             if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open("/tmp/hpsdr_perf.log") {
                                 let _ = writeln!(
                                     f,
-                                    "ui_fps={ui_fps:.1} passes={passes:.1} ui_ms={ui_ms:.1} wf_rebuilds={wf_n:.1} | dsp_chunks/s={} disp_rev/s={} | gap={gap:.1} proc={proc_ms:.1} q={q} set={set:.1} zp={zp:.1} feed={feed:.1} | sr={} zoom={} mode={:?}",
+                                    "ui_fps={ui_fps:.1} passes={passes:.1} ui_ms={ui_ms:.1} wf_rebuilds={wf_n:.1} | dsp_chunks/s={} disp_rev/s={} | gap={gap:.1} proc={proc_ms:.1} q={q} set={set:.1} zp={zp:.1} feed={feed:.1} | sr={} zoom={} mode={:?} | mox={} audio_underruns={}",
                                     chunks.wrapping_sub(last.1),
                                     (rev as u64).wrapping_sub(last.2),
                                     connected.sample_rate,
                                     connected.spectrum_zoom,
                                     connected.spectrum.mode(),
+                                    connected.session.mox_active() as u8,
+                                    connected.audio_output.as_ref().map(|a| a.underrun_count()).unwrap_or(0),
                                 );
                             }
                             last.1 = chunks;
@@ -4764,6 +4802,7 @@ impl eframe::App for HpsdrApp {
                         connected.rade_drained_at = None;
                     }
                 }
+                vox_tick(ui.ctx(), connected);
                 // Zoom should keep the CTUN'd listen frequency (where the
                 // filter/passband actually is) centered, not the parked
                 // hardware LO -- otherwise the filter drifts toward one
@@ -5198,12 +5237,22 @@ impl eframe::App for HpsdrApp {
                     let row: Vec<f32> = connected.tx_spectrum.display.lock().unwrap().spectrum.clone();
                     let (lo, hi) = if tx_low < tx_high { (tx_low, tx_high) } else { (tx_high, tx_high + 1.0) };
                     let tx_mode_now = connected.spectrum.mode();
-                    let tx_win = egui::Window::new("TX")
-                        .id(egui::Id::new("duplex_tx_window"))
+                    let just_shown = connected.tx_window_frames_shown == 0;
+                    // egui measures a new window first (its size is unknown for a frame or two) and `constrain` then pushes it
+                    // up by that unknown size: a saved y=295 came back as y=200. So no constraining while it settles.
+                    let settled = connected.tx_window_frames_shown >= 3;
+                    connected.tx_window_frames_shown = connected.tx_window_frames_shown.saturating_add(1);
+                    let mut tx_win_builder = egui::Window::new("TX").id(egui::Id::new("duplex_tx_window"));
+                    if just_shown {
+                        if let Some([x, y]) = connected.tx_window_pos {
+                            tx_win_builder = tx_win_builder.current_pos(egui::pos2(x, y));
+                        }
+                    }
+                    let tx_win = tx_win_builder
                         // Movable by touch (drag the window background); the last position is saved and comes back. Default:
                         // left, below the start of the spectrum (the CW decoder / RADE panels are on the right).
                         .movable(true)
-                        .constrain(true)
+                        .constrain(settled)
                         .default_pos(match connected.tx_window_pos {
                             Some([x, y]) => egui::pos2(x, y),
                             None => egui::pos2(8.0, connected.last_spectrum_top + 2.0),
@@ -5251,13 +5300,34 @@ impl eframe::App for HpsdrApp {
                             }
                         });
                     if let Some(w) = tx_win {
-                        // Saved once a drag ends, not on every frame of it.
-                        if w.response.drag_stopped() {
-                            let p = w.response.rect.min;
+                        // Saved once a drag ends (pointer released with the window somewhere new), not on every frame of it.
+                        let p = w.response.rect.min;
+                        let moved = connected.tx_window_pos.is_none_or(|[x, y]| (x - p.x).abs() > 0.5 || (y - p.y).abs() > 0.5);
+                        // Diagnostics (only while /tmp/hpsdr_diag.enable exists): where the window really is vs. what is saved.
+                        if just_shown || w.response.drag_stopped() {
+                            if std::path::Path::new("/tmp/hpsdr_diag.enable").exists() {
+                                use std::io::Write;
+                                if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open("/tmp/hpsdr_perf.log") {
+                                    let _ = writeln!(
+                                        f,
+                                        "tx_window: just_shown={just_shown} drag_stopped={} saved={:?} rect_min=({:.1},{:.1}) screen={:?}",
+                                        w.response.drag_stopped(),
+                                        connected.tx_window_pos,
+                                        p.x,
+                                        p.y,
+                                        ui.ctx().content_rect()
+                                    );
+                                }
+                            }
+                        }
+                        if w.response.drag_stopped() && moved {
                             connected.tx_window_pos = Some([p.x, p.y]);
                             connected.tx_window_pos_dirty = true;
+                            eprintln!("[tx-window] position saved: {} {}", p.x, p.y);
                         }
                     }
+                } else {
+                    connected.tx_window_frames_shown = 0;
                 }
                 let (base_low, base_high) = if transmitting { (tx_low, tx_high) } else { (rx_low, rx_high) };
                 let (db_low, db_high) = if base_low < base_high {
@@ -6360,6 +6430,86 @@ impl eframe::App for HpsdrApp {
                         }
                         if close_now {
                             connected.band_window_open = false;
+                        }
+                    }
+
+                    // VOX window (deskHPSDR vox_menu.c): Close, level bar + enable, mic level, threshold, hang, side channel filter.
+                    if connected.vox_window_open {
+                        let screen_w = ui.ctx().content_rect().width();
+                        let win_w = 520.0f32.min(screen_w - 8.0);
+                        let mut close_now = false;
+                        let mut vox_changed = false;
+                        egui::Window::new("VOX")
+                            .id(egui::Id::new("vox_window"))
+                            .title_bar(false)
+                            .collapsible(false)
+                            .resizable(false)
+                            .fixed_pos(egui::pos2(((screen_w - win_w) / 2.0).max(0.0), connected.last_spectrum_top))
+                            .fixed_size(egui::vec2(win_w, 0.0))
+                            .show(ui.ctx(), |ui| {
+                                if ui.input(|i| i.key_pressed(egui::Key::Escape)) {
+                                    close_now = true;
+                                }
+                                ui.spacing_mut().item_spacing = egui::vec2(8.0, 8.0);
+                                ui.horizontal(|ui| {
+                                    if ui.add(chip_button("Close", false).min_size(egui::vec2(100.0, 40.0))).clicked() {
+                                        close_now = true;
+                                    }
+                                    // Level LED: red above the threshold, green below.
+                                    let (led, _) = ui.allocate_exact_size(egui::vec2(120.0, 40.0), egui::Sense::hover());
+                                    let hot = connected.vox_level_shown as f64 > connected.vox_threshold;
+                                    ui.painter().rect_filled(
+                                        led,
+                                        3.0,
+                                        if hot { egui::Color32::from_rgb(230, 30, 30) } else { egui::Color32::from_rgb(0, 220, 0) },
+                                    );
+                                    if ui.checkbox(&mut connected.vox_enabled, "VOX Enable").changed() {
+                                        vox_changed = true;
+                                    }
+                                });
+                                ui.horizontal(|ui| {
+                                    ui.add_sized([110.0, 20.0], egui::Label::new("Mic Level:"));
+                                    ui.add(
+                                        egui::ProgressBar::new(connected.vox_level_shown.clamp(0.0, 1.0))
+                                            .desired_width(ui.available_width()),
+                                    );
+                                });
+                                ui.horizontal(|ui| {
+                                    ui.add_sized([110.0, 20.0], egui::Label::new("VOX Threshold:"));
+                                    let mut thr = connected.vox_threshold * 1000.0;
+                                    ui.spacing_mut().slider_width = ui.available_width() - 70.0;
+                                    if ui.add(egui::Slider::new(&mut thr, 0.0..=1000.0).step_by(1.0)).changed() {
+                                        connected.vox_threshold = thr / 1000.0;
+                                        vox_changed = true;
+                                    }
+                                });
+                                ui.horizontal(|ui| {
+                                    ui.add_sized([110.0, 20.0], egui::Label::new("VOX Hang (ms):"));
+                                    if spin_buttons_dec(ui, "vox_hang", &mut connected.vox_hang_ms, 0.0, 1000.0, 50.0, 0).changed() {
+                                        vox_changed = true;
+                                    }
+                                });
+                                if ui.checkbox(&mut connected.vox_filter, "Use Side Channel Filter").changed() {
+                                    vox_changed = true;
+                                }
+                                ui.horizontal(|ui| {
+                                    ui.label("Filter Low-Cut (Hz):");
+                                    if spin_buttons_dec(ui, "vox_low", &mut connected.vox_filter_low_hz, 0.0, 4000.0, 50.0, 0).changed() {
+                                        vox_changed = true;
+                                    }
+                                });
+                                ui.horizontal(|ui| {
+                                    ui.label("Filter High-Cut (Hz):");
+                                    if spin_buttons_dec(ui, "vox_high", &mut connected.vox_filter_high_hz, 0.0, 4000.0, 50.0, 0).changed() {
+                                        vox_changed = true;
+                                    }
+                                });
+                            });
+                        if vox_changed {
+                            settings_changed = true;
+                        }
+                        if close_now {
+                            connected.vox_window_open = false;
                         }
                     }
 
@@ -15247,6 +15397,12 @@ Waterfall rebuilds: {prof_wf_n:.0}/s, {prof_wf_ms:.1} ms each."
                         tx_window_pos: connected.tx_window_pos,
                         vfo_b_step_hz: Some(connected.vfo_b_step_hz),
                         freq_cal_ppm: Some(connected.freq_cal_ppm),
+                        vox_enabled: Some(connected.vox_enabled),
+                        vox_threshold: Some(connected.vox_threshold),
+                        vox_hang_ms: Some(connected.vox_hang_ms),
+                        vox_filter: Some(connected.vox_filter),
+                        vox_filter_low_hz: Some(connected.vox_filter_low_hz),
+                        vox_filter_high_hz: Some(connected.vox_filter_high_hz),
                         step_memory: connected.step_memory.clone(),
                         diag_items: connected.diag_items.clone(),
                         vfo_b_frequency_hz: Some(connected.vfo_b_frequency_hz),
@@ -15932,6 +16088,10 @@ fn vfo_box_frame(ui: &egui::Ui) -> egui::Frame {
 /// A value box with "-" and "+" buttons (deskHPSDR's GTK spin button): a tap changes it by `step`, holding repeats.
 /// The response is marked changed when the value changed.
 fn spin_buttons(ui: &mut egui::Ui, id: &str, value: &mut f64, min: f64, max: f64, step: f64) -> egui::Response {
+    spin_buttons_dec(ui, id, value, min, max, step, 1)
+}
+
+fn spin_buttons_dec(ui: &mut egui::Ui, id: &str, value: &mut f64, min: f64, max: f64, step: f64, decimals: usize) -> egui::Response {
     let mut changed = false;
     let size = egui::vec2(40.0, 34.0);
     let mut response = ui
@@ -15948,7 +16108,7 @@ fn spin_buttons(ui: &mut egui::Ui, id: &str, value: &mut f64, min: f64, max: f64
             ui.painter().text(
                 rect.left_center() + egui::vec2(10.0, 0.0),
                 egui::Align2::LEFT_CENTER,
-                format!("{value:.1}"),
+                format!("{:.*}", decimals, *value),
                 font,
                 ui.visuals().text_color(),
             );
@@ -17637,6 +17797,8 @@ fn toolbar_fn_active(connected: &ConnectedState, f: toolbar::ToolbarFn) -> bool 
         ToolbarFn::Midi(MidiAction::ReportPlay) => connected.spectrum.report_recorder.is_playing(),
         ToolbarFn::Midi(MidiAction::RecordWav) => connected.spectrum.recorder.is_enabled(),
         ToolbarFn::Midi(MidiAction::Tune) => connected.tune_active,
+        ToolbarFn::Midi(MidiAction::Vox) => connected.vox_enabled,
+        ToolbarFn::Midi(MidiAction::VoxMenu) => connected.vox_window_open,
         ToolbarFn::Midi(MidiAction::RxEqToggle) => connected.spectrum.eq().enabled,
         _ => false,
     }
@@ -21688,6 +21850,19 @@ fn set_rade_aware_mox(connected: &mut ConnectedState, want_on: bool) {
         connected.rade_pending_unkey = Some(Instant::now());
     } else {
         connected.session.set_mox(want_on);
+    }
+}
+
+/// VOX: the decision (threshold, hang, keying) runs in the TX thread (tx.rs / vox.rs), so nothing is redrawn for it.
+/// Each frame this only hands it the settings and keeps the meter of the VOX window; the window itself redraws
+/// while it is open.
+fn vox_tick(ctx: &egui::Context, connected: &mut ConnectedState) {
+    vox::set_params(connected.vox_enabled && connected.tx_handle.is_some(), connected.vox_threshold, connected.vox_hang_ms);
+    vox::configure(connected.vox_filter, connected.vox_filter_low_hz as u32, connected.vox_filter_high_hz as u32);
+    if connected.vox_window_open {
+        let level = vox::take_level();
+        connected.vox_level_shown = level.max(connected.vox_level_shown * 0.9);
+        ctx.request_repaint_after(Duration::from_millis(50));
     }
 }
 

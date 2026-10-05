@@ -1987,6 +1987,9 @@ fn run(
     let mut demod_scratch: Vec<IqSample> = Vec::with_capacity(BUFFER_SIZE);
 
     let mut last_chunk_at = Instant::now();
+    // When the input queue first ran dry. The TX spectrum (and extra receivers) only get data while they are in use, so the
+    // first chunk after a long pause is not a DSP stall and must not show up as a huge "gap" (VOX/MOX keying every few seconds).
+    let mut starved_since: Option<Instant> = None;
     while !stop.load(Ordering::Relaxed) {
         chunk.clear();
         {
@@ -1998,12 +2001,17 @@ fn run(
         }
 
         if chunk.len() < BUFFER_SIZE {
+            starved_since.get_or_insert_with(Instant::now);
             thread::sleep(Duration::from_millis(5));
             continue;
         }
+        let idle_pause = channel != 0 && starved_since.is_some_and(|t| t.elapsed() > Duration::from_millis(200));
+        starved_since = None;
         let _tick = DspTick(Instant::now());
         DSP_CHUNKS.fetch_add(1, Ordering::Relaxed);
-        DSP_MAX_GAP_US.fetch_max(last_chunk_at.elapsed().as_micros() as u64, Ordering::Relaxed);
+        if !idle_pause {
+            DSP_MAX_GAP_US.fetch_max(last_chunk_at.elapsed().as_micros() as u64, Ordering::Relaxed);
+        }
         last_chunk_at = Instant::now();
 
         // Zero the first few ms of RX IQ right after a TX->RX transition

@@ -81,6 +81,8 @@ impl ToolbarFn {
             ToolbarFn::Midi(a) => match a {
                 MidiAction::Mox => "MOX",
                 MidiAction::SquelchToggle => "SQL",
+                MidiAction::Vox => "VOX",
+                MidiAction::VoxMenu => "VOX SET",
                 MidiAction::ReportRec => "REC",
                 MidiAction::ReportPlay => "PLAY",
                 MidiAction::RecordWav => "RECORD",

@@ -148,6 +148,10 @@ pub enum MidiAction {
     /// Squelch level 0..100 (knob or encoder), like piHPSDR's SQUELCH action; SquelchToggle switches it on/off.
     Squelch,
     SquelchToggle,
+    /// VOX on/off, and the VOX window (deskHPSDR's VOX / VOXLEVEL / VOX menu actions); VoxLevel is the threshold (0..1).
+    Vox,
+    VoxMenu,
+    VoxLevel,
     AgcGain,
     MicGain,
     RfAttenuation,
@@ -260,6 +264,9 @@ impl MidiAction {
             MidiAction::AfGain => "AF Gain",
             MidiAction::Squelch => "Squelch",
             MidiAction::SquelchToggle => "Squelch On/Off",
+            MidiAction::Vox => "VOX On/Off",
+            MidiAction::VoxMenu => "VOX Menu",
+            MidiAction::VoxLevel => "VOX Level",
             MidiAction::AgcGain => "AGC Gain",
             MidiAction::MicGain => "Mic Gain",
             MidiAction::RfAttenuation => "RF Attenuation",
@@ -316,6 +323,8 @@ impl MidiAction {
 /// Actions valid for a Key (button) binding.
 pub const KEY_ACTIONS: &[MidiAction] = &[
     MidiAction::Mox,
+    MidiAction::Vox,
+    MidiAction::VoxMenu,
     MidiAction::SquelchToggle,
     MidiAction::ReportRec,
     MidiAction::ReportPlay,
@@ -387,6 +396,7 @@ pub const KEY_ACTIONS: &[MidiAction] = &[
 pub const KNOB_ACTIONS: &[MidiAction] = &[
     MidiAction::AfGain,
     MidiAction::Squelch,
+    MidiAction::VoxLevel,
     MidiAction::AgcGain,
     MidiAction::MicGain,
     MidiAction::RfAttenuation,
@@ -419,6 +429,7 @@ pub const KNOB_ACTIONS: &[MidiAction] = &[
 /// relative-step handling this enables.
 pub const WHEEL_ACTIONS: &[MidiAction] = &[
     MidiAction::Squelch,
+    MidiAction::VoxLevel,
     MidiAction::VfoTune,
     MidiAction::RitAdjust,
     MidiAction::XitAdjust,

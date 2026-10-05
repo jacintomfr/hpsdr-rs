@@ -601,6 +601,13 @@ pub struct Config {
     pub pa_enabled: Option<bool>,
     /// Frequency calibration in ppm (-100..100), deskHPSDR's ppm_factor.
     pub freq_cal_ppm: Option<f64>,
+    /// VOX (deskHPSDR's vox_menu): enable, threshold 0..1, hang in ms, side channel filter and its cut-offs in Hz.
+    pub vox_enabled: Option<bool>,
+    pub vox_threshold: Option<f64>,
+    pub vox_hang_ms: Option<f64>,
+    pub vox_filter: Option<bool>,
+    pub vox_filter_low_hz: Option<f64>,
+    pub vox_filter_high_hz: Option<f64>,
     /// VFO step per mode label (deskHPSDR/piHPSDR keep the step of each mode).
     #[serde(default)]
     pub step_memory: std::collections::HashMap<String, i64>,

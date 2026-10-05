@@ -2250,9 +2250,23 @@ fn run(
     // edge-triggered on ps.enabled's value, not on time or on whether
     // the previous attempt actually took).
     const PS_ENABLE_SETTLE: Duration = Duration::from_millis(100);
+    // VOX level (see vox.rs): fed from the idle mic/radio-mic buffers below and from each keyed chunk.
+    let mut vox_detector = crate::vox::VoxDetector::new();
 
     while !stop.load(Ordering::Relaxed) {
         if !mox.load(Ordering::Relaxed) {
+            // VOX: measure what the microphone hears while idle, before the buffers are dropped.
+            {
+                let (gain, vox_allowed) = {
+                    let p = params.lock().unwrap();
+                    (p.mic_gain, !p.tune && !p.two_tone && !matches!(p.mode, Mode::Cwl | Mode::Cwu))
+                };
+                let mut heard: Vec<f32> = mic_buffer.lock().unwrap().iter().copied().collect();
+                heard.extend(radio_mic_audio.lock().unwrap().iter().copied());
+                let peak = vox_detector.feed(&heard, gain, mic_rate as f64);
+                let digital = rade.tx_armed() || rtty.tx_armed() || sstv.tx_armed() || cw_text_active.load(Ordering::Relaxed);
+                vox_detector.decide(peak, &mox, vox_allowed && !digital);
+            }
             // Not transmitting -- drop any mic/TCI audio that
             // accumulated while idle so the next PTT doesn't start by
             // replaying a backlog of stale audio, and don't burn CPU
@@ -2312,6 +2326,14 @@ fn run(
                         mon.push_back((sample, sample));
                     }
                 }
+            } else if crate::vox::enabled() {
+                // VOX: keep the last 300 ms instead of dropping everything, so the speech that triggered the
+                // keying (and the 250 ms priming cushion below) is already there when MOX goes on -- otherwise
+                // the first syllables are lost and TX start waits for the cushion to refill.
+                let keep = (mic_rate as f64 * 0.3) as usize;
+                let mut buf = mic_buffer.lock().unwrap();
+                let excess = buf.len().saturating_sub(keep);
+                buf.drain(..excess);
             } else {
                 mic_buffer.lock().unwrap().clear();
             }
@@ -2941,6 +2963,13 @@ fn run(
         // is no separate user-facing toggle for it in any mode; it is
         // always on except while a digital mode is armed.
         let alc_enabled = !digital_tx_armed;
+        // VOX keeps its hang timer alive from the keyed audio too.
+        let vox_peak = vox_detector.feed(&chunk, p.mic_gain, mic_rate as f64);
+        let vox_allowed = !p.tune
+            && !p.two_tone
+            && !matches!(p.mode, Mode::Cwl | Mode::Cwu)
+            && !(rade.tx_armed() || rtty.tx_armed() || sstv.tx_armed());
+        vox_detector.decide(vox_peak, &mox, vox_allowed);
         let (iq, exch_error) = processor.process(
             &chunk,
             p.mode,
