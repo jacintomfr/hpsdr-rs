@@ -16127,12 +16127,28 @@ fn spin_buttons(ui: &mut egui::Ui, id: &str, value: &mut f64, min: f64, max: f64
 }
 
 fn spin_buttons_dec(ui: &mut egui::Ui, id: &str, value: &mut f64, min: f64, max: f64, step: f64, decimals: usize) -> egui::Response {
+    spin_buttons_full(ui, id, value, min, max, step, decimals, None, 88.0)
+}
+
+/// `spin_buttons_dec` with an optional middle button that sets the value to `reset` ("-  0  +": three touch zones), and a
+/// choice of the width of the value box.
+fn spin_buttons_full(
+    ui: &mut egui::Ui,
+    id: &str,
+    value: &mut f64,
+    min: f64,
+    max: f64,
+    step: f64,
+    decimals: usize,
+    reset: Option<f64>,
+    box_w: f32,
+) -> egui::Response {
     let mut changed = false;
     let size = egui::vec2(40.0, 34.0);
     let mut response = ui
         .horizontal(|ui| {
             let font = egui::TextStyle::Monospace.resolve(ui.style());
-            let (rect, resp) = ui.allocate_exact_size(egui::vec2(88.0, size.y), egui::Sense::hover());
+            let (rect, resp) = ui.allocate_exact_size(egui::vec2(box_w, size.y), egui::Sense::hover());
             ui.painter().rect(
                 rect,
                 5.0,
@@ -16147,8 +16163,25 @@ fn spin_buttons_dec(ui: &mut egui::Ui, id: &str, value: &mut f64, min: f64, max:
                 font,
                 ui.visuals().text_color(),
             );
-            for (label, dir) in [("−", -1.0), ("+", 1.0)] {
+            let mut buttons: Vec<(&str, f64)> = vec![("−", -1.0)];
+            if reset.is_some() {
+                buttons.push(("0", 0.0));
+            }
+            buttons.push(("+", 1.0));
+            for (label, dir) in buttons {
                 let btn = ui.add_sized(size, egui::Button::new(egui::RichText::new(label).size(20.0)).corner_radius(5.0));
+                if dir == 0.0 {
+                    // The middle button: one tap puts the value back to its reset value.
+                    if btn.clicked() {
+                        if let Some(r) = reset {
+                            if (*value - r).abs() > 1e-9 {
+                                *value = r;
+                                changed = true;
+                            }
+                        }
+                    }
+                    continue;
+                }
                 // Fire on press, then repeat while held (after 0.5 s, every 80 ms), like the GTK spin button.
                 let key = egui::Id::new((id, label));
                 let now = ui.input(|i| i.time);
@@ -16897,18 +16930,24 @@ fn render_sstv_panel(
                 sstv.set_tx_fsk_id_enabled(fsk_id);
             }
             ui.add_space(8.0);
-            ui.label("TX Lead:");
+            let lead_tip = "Silence sent after keying and before the picture's leader/VIS code -- covers the gap between asking the rig for PTT and it really being on the air. 0 for an SDR that keys instantly.";
             let mut lead_ms = sstv.tx_lead_ms();
-            if ui
-                .add(egui::DragValue::new(&mut lead_ms).range(0..=3000).speed(10.0).suffix(" ms"))
-                .on_hover_text(
-                    "Silence sent after keying and before the picture's leader/VIS code \
-                     -- covers the gap between asking the rig for PTT and it really \
-                     being on the air. 0 for an SDR that keys instantly.",
-                )
-                .changed()
-            {
-                sstv.set_tx_lead_ms(lead_ms);
+            if lcd_kiosk_mode() {
+                // Touch: a value box with - and + buttons (tap, hold repeats), not a drag value.
+                ui.label("Lead (ms):").on_hover_text(lead_tip);
+                let mut v = lead_ms as f64;
+                if spin_buttons_full(ui, "sstv_tx_lead", &mut v, 0.0, 3000.0, 10.0, 0, None, 64.0).changed() {
+                    sstv.set_tx_lead_ms(v.round() as u32);
+                }
+            } else {
+                ui.label("TX Lead:");
+                if ui
+                    .add(egui::DragValue::new(&mut lead_ms).range(0..=3000).speed(10.0).suffix(" ms"))
+                    .on_hover_text(lead_tip)
+                    .changed()
+                {
+                    sstv.set_tx_lead_ms(lead_ms);
+                }
             }
         }};
     }
@@ -16917,22 +16956,32 @@ fn render_sstv_panel(
     macro_rules! sstv_slant_controls {
         ($ui:ident) => {{
             let ui = &mut *$ui;
-            ui.label("TX Slant:");
-            let mut ppm = sstv.tx_ppm();
-            if ui
-                .add(egui::Slider::new(&mut ppm, -5000.0..=5000.0).suffix(" ppm"))
-                .on_hover_text(
-                    "Transmit clock trim to remove slant on the far-end decoder -- a \
-                     receiving sound card's clock a little off from this station's \
-                     stretches every line by a tiny, cumulative amount.",
-                )
-                .changed()
-            {
-                sstv.set_tx_ppm(ppm);
-            }
-            if ui.small_button("0").on_hover_text("Reset to 0 ppm").clicked() {
-                sstv.set_tx_ppm(0.0);
-            }
+            let slant_tip = "Transmit clock trim to remove slant on the far-end decoder -- a receiving sound card's clock a little off from this station's stretches every line by a tiny, cumulative amount.";
+            if lcd_kiosk_mode() {
+                // Touch: [ value ] [-] [0] [+]; the middle button puts it back to 0 ppm.
+                ui.label("Slant (ppm):").on_hover_text(slant_tip);
+                let mut v = sstv.tx_ppm() as f64;
+                if spin_buttons_full(ui, "sstv_tx_slant", &mut v, -5000.0, 5000.0, 5.0, 0, Some(0.0), 64.0).changed() {
+                    sstv.set_tx_ppm(v as _);
+                }
+            } else {
+    ui.label("TX Slant:");
+                let mut ppm = sstv.tx_ppm();
+                if ui
+                    .add(egui::Slider::new(&mut ppm, -5000.0..=5000.0).suffix(" ppm"))
+                    .on_hover_text(
+                        "Transmit clock trim to remove slant on the far-end decoder -- a \
+                         receiving sound card's clock a little off from this station's \
+                         stretches every line by a tiny, cumulative amount.",
+                    )
+                    .changed()
+                {
+                    sstv.set_tx_ppm(ppm);
+                }
+                if ui.small_button("0").on_hover_text("Reset to 0 ppm").clicked() {
+                    sstv.set_tx_ppm(0.0);
+                }
+                }
         }};
     }
     // Send / Abort TX / progress bar. Kiosk: on the Load Picture line, right after Callsign banner; elsewhere on their own line below
@@ -16975,7 +17024,10 @@ fn render_sstv_panel(
         let first_tx_row = |ui: &mut egui::Ui| {
             let armed = sstv.tx_armed();
             if ui
-                .add(egui::Button::selectable(armed, "SSTV TX"))
+                .add(egui::Button::selectable(
+                    armed,
+                    if lcd_kiosk_mode() { egui::RichText::new("TX").strong() } else { egui::RichText::new("SSTV TX") },
+                ))
                 .on_hover_text(
                     "While on, keying MOX/PTT transmits the loaded picture (silence once \
                      fully sent) instead of the microphone",
@@ -17003,9 +17055,9 @@ fn render_sstv_panel(
                 *tx_prepared = None;
             }
             if lcd_kiosk_mode() {
-                ui.add_space(16.0);
+                ui.add_space(8.0);
                 sstv_fsk_lead_controls!(ui);
-                ui.add_space(16.0);
+                ui.add_space(8.0);
                 sstv_slant_controls!(ui);
             }
         };
