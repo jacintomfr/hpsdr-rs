@@ -432,6 +432,10 @@ pub struct Config {
     pub spectrum_gradient: Option<bool>,
     #[serde(default)]
     pub band_settings: std::collections::HashMap<String, BandSettings>,
+    /// Last frequency (IF) and mode of each transverter slot, by its name: selecting the slot again returns there
+    /// instead of to the start of its range.
+    #[serde(default)]
+    pub xvtr_settings: std::collections::HashMap<String, BandSettings>,
     /// Last filter width used per mode, keyed by Mode::label() (e.g.
     /// "USB") -- see main.rs's width_for_mode. A mode with no entry
     /// here (never used yet, or a config saved before this existed)

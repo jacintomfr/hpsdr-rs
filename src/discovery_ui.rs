@@ -103,7 +103,7 @@ pub enum DiscoveryAction {
 /// Touch-friendly vertical scroll area: the content on the left, on the right a wide bar with an up button, a
 /// draggable thumb on a track and a down button (tap or hold to scroll). Dragging the content also scrolls it.
 /// `height` None = all the height left in `ui`; `stick_bottom` keeps a log scrolled to its end while it grows.
-fn touch_scroll(
+pub(crate) fn touch_scroll(
     ui: &mut egui::Ui,
     id_salt: &str,
     height: Option<f32>,
@@ -539,6 +539,7 @@ impl DiscoveryWindow {
             egui::ViewportId::from_hash_of("discovery_window"),
             discovery_viewport,
             |ui, _class| {
+                crate::kiosk_keyboard::begin(ui.ctx());
                 if kiosk {
                     // The window system scales viewport sizes by a factor that is not always the one egui reports
                     // (1.33 at start, 1.0 after coming back from the radio screen), so the 1000x550 px window came out

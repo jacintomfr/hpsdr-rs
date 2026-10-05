@@ -43,6 +43,7 @@ mod sysstats;
 mod tci;
 mod toolbar;
 mod tx;
+mod kiosk_keyboard;
 mod vox;
 mod wdsp_sys;
 
@@ -741,6 +742,59 @@ fn apply_band(connected: &mut ConnectedState, band: &Band) {
         tx.set_mode(resolved_mode);
         tx.set_width_hz(resolved_width_hz);
     }
+}
+
+/// Selects a transverter slot (Band menu / XVTR button): returns to the frequency and mode it had when it was left
+/// (`xvtr_memory`, updated while the slot is active by `xvtr_remember`), or to the start of its range the first time.
+fn select_xvtr(connected: &mut ConnectedState, xvtr: &Xvtr) {
+    let offset = xvtr_rf_offset(xvtr);
+    let if_low = (xvtr.frequency_min_hz as i64 - offset).clamp(0, u32::MAX as i64);
+    let if_high = (xvtr.frequency_max_hz as i64 - offset).clamp(0, u32::MAX as i64);
+    let saved = connected
+        .xvtr_memory
+        .get(&xvtr.name)
+        .copied()
+        .filter(|s| (s.frequency_hz as i64) >= if_low && (s.frequency_hz as i64) <= if_high);
+    connected.active_xvtr = Some(xvtr.name.clone());
+    let target = saved.map(|s| s.frequency_hz).unwrap_or(if_low as u32);
+    let mode = saved.and_then(|s| s.mode).unwrap_or(xvtr.default_mode);
+    connected.session.set_frequency(target);
+    connected.ctun_frequency_hz = target;
+    connected.spectrum.set_mode(mode);
+    let resolved_width_hz = width_for_mode(&connected.width_memory, mode);
+    connected.spectrum.set_width_hz(resolved_width_hz);
+    if let Some(tx) = &connected.tx_handle {
+        tx.set_mode(mode);
+        tx.set_width_hz(resolved_width_hz);
+    }
+}
+
+/// While a transverter slot is active, keeps its last frequency and mode (called every frame). Returns true when
+/// something changed (the config must then be saved).
+fn xvtr_remember(connected: &mut ConnectedState) -> bool {
+    let Some(name) = connected.active_xvtr.clone() else { return false };
+    let hz = if connected.ctun {
+        connected.ctun_frequency_hz
+    } else {
+        connected.session.frequency_hz.load(Ordering::Relaxed)
+    };
+    let mode = connected.spectrum.mode();
+    let same = connected.xvtr_memory.get(&name).is_some_and(|s| s.frequency_hz == hz && s.mode == Some(mode));
+    if same {
+        return false;
+    }
+    connected.xvtr_memory.insert(
+        name,
+        BandSettings {
+            frequency_hz: hz,
+            db_low: connected.db_low,
+            db_high: connected.db_high,
+            waterfall_db_low: connected.waterfall_db_low,
+            waterfall_db_high: connected.waterfall_db_high,
+            mode: Some(mode),
+        },
+    );
+    true
 }
 
 /// Same as `apply_band` above, but for an `ExtraReceiver` -- no XVTR/TX
@@ -2297,6 +2351,8 @@ struct ConnectedState {
     rade_callsign: String,
     extra_receivers: Vec<Arc<Mutex<ExtraReceiver>>>,
     settings_dirty: Arc<std::sync::atomic::AtomicBool>,
+    /// Last frequency (IF) and mode of each transverter slot (by name), see Config::xvtr_settings.
+    xvtr_memory: std::collections::HashMap<String, BandSettings>,
     band_memory: std::collections::HashMap<String, BandSettings>,
     /// Last filter width used per mode -- see width_for_mode's doc
     /// comment. Keyed by Mode::label().
@@ -3057,10 +3113,23 @@ pub(crate) fn with_orange_selection(mut visuals: egui::Visuals) -> egui::Visuals
 /// it would be low-contrast, unlike the red/orange fills those other
 /// buttons use.
 pub(crate) fn kiosk_accent_button(ui: &mut egui::Ui, label: &str) -> egui::Response {
-    ui.add(
-        egui::Button::new(egui::RichText::new(label).strong().color(egui::Color32::BLACK))
-            .fill(egui::Color32::from_rgb(235, 195, 40)),
-    )
+    let button = egui::Button::new(egui::RichText::new(label).strong().color(egui::Color32::BLACK))
+        .fill(egui::Color32::from_rgb(235, 195, 40));
+    if lcd_kiosk_mode() {
+        // Touch: a big rounded button with a thin line, label centred (CLOSE of the kiosk windows).
+        let size = egui::vec2(96.0, 46.0);
+        ui.allocate_ui_with_layout(size, egui::Layout::centered_and_justified(egui::Direction::LeftToRight), |ui| {
+            ui.add(
+                button
+                    .min_size(size)
+                    .corner_radius(5.0)
+                    .stroke(egui::Stroke::new(1.0, egui::Color32::from_rgb(250, 225, 120))),
+            )
+        })
+        .inner
+    } else {
+        ui.add(button)
+    }
 }
 
 /// Same idea as kiosk_accent_button, but red -- specifically for STOP
@@ -3082,6 +3151,7 @@ pub(crate) fn kiosk_stop_button(ui: &mut egui::Ui, label: &str) -> egui::Respons
 
 impl HpsdrApp {
     fn new(ctx: &egui::Context) -> Self {
+        kiosk_keyboard::install(ctx);
         // Pin the app to dark, rather than leaving egui's default
         // ThemePreference::System in effect. This app's whole design
         // assumes dark by default -- the Settings/extra-receiver-settings
@@ -3888,6 +3958,7 @@ fn connect_to_device(device: Device, cfg: &Config) -> Result<ConnectedState, Str
                 extra_receivers,
                 settings_dirty,
                 band_memory: cfg.band_settings.clone(),
+                xvtr_memory: cfg.xvtr_settings.clone(),
                 width_memory: cfg.width_memory.clone(),
                 squelch_memory: cfg.squelch_memory.clone(),
                 squelch_last_mode: None,
@@ -4070,6 +4141,7 @@ impl eframe::App for HpsdrApp {
     // https://github.com/emilk/egui/blob/main/CHANGELOG.md (0.35.0).
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let _prof = UiProfGuard(Instant::now(), ui.ctx().current_pass_index() == 0);
+        kiosk_keyboard::begin(ui.ctx());
         // Kiosk mode assumes an exact 1024x600 PHYSICAL pixel panel (see
         // main()'s ViewportBuilder::with_inner_size for that mode) --
         // this counteracts whatever HiDPI scale factor the OS/window
@@ -4804,6 +4876,9 @@ impl eframe::App for HpsdrApp {
                     }
                 }
                 vox_tick(ui.ctx(), connected);
+                if xvtr_remember(connected) {
+                    connected.settings_dirty.store(true, Ordering::Relaxed);
+                }
                 // Zoom should keep the CTUN'd listen frequency (where the
                 // filter/passband actually is) centered, not the parked
                 // hardware LO -- otherwise the filter drifts toward one
@@ -6242,7 +6317,7 @@ impl eframe::App for HpsdrApp {
                         // selections don't participate in band_memory --
                         // clicking always applies the slot's own
                         // configured default frequency/mode.
-                        for xvtr in &connected.xvtrs {
+                        for xvtr in connected.xvtrs.clone().iter() {
                             if xvtr.name.is_empty() {
                                 continue;
                             }
@@ -6259,18 +6334,8 @@ impl eframe::App for HpsdrApp {
                                 // Explicit selection -- see
                                 // ConnectedState::active_xvtr's doc
                                 // comment.
-                                connected.active_xvtr = Some(xvtr.name.clone());
-                                let target = if_low.clamp(0, u32::MAX as i64) as u32;
-                                connected.session.set_frequency(target);
-                                connected.ctun_frequency_hz = target;
-                                connected.spectrum.set_mode(xvtr.default_mode);
-                                let resolved_width_hz =
-                                    width_for_mode(&connected.width_memory, xvtr.default_mode);
-                                connected.spectrum.set_width_hz(resolved_width_hz);
-                                if let Some(tx) = &connected.tx_handle {
-                                    tx.set_mode(xvtr.default_mode);
-                                    tx.set_width_hz(resolved_width_hz);
-                                }
+                                let xvtr_sel = xvtr.clone();
+                                select_xvtr(connected, &xvtr_sel);
                                 settings_changed = true;
                             }
                         }
@@ -6378,19 +6443,7 @@ impl eframe::App for HpsdrApp {
                                 }
                                 _ => {
                                     let xvtr = connected.xvtrs[idx].clone();
-                                    let offset = xvtr_rf_offset(&xvtr);
-                                    let if_low = xvtr.frequency_min_hz as i64 - offset;
-                                    connected.active_xvtr = Some(xvtr.name.clone());
-                                    let target = if_low.clamp(0, u32::MAX as i64) as u32;
-                                    connected.session.set_frequency(target);
-                                    connected.ctun_frequency_hz = target;
-                                    connected.spectrum.set_mode(xvtr.default_mode);
-                                    let resolved_width_hz = width_for_mode(&connected.width_memory, xvtr.default_mode);
-                                    connected.spectrum.set_width_hz(resolved_width_hz);
-                                    if let Some(tx) = &connected.tx_handle {
-                                        tx.set_mode(xvtr.default_mode);
-                                        tx.set_width_hz(resolved_width_hz);
-                                    }
+                                    select_xvtr(connected, &xvtr);
                                 }
                             }
                             settings_changed = true;
@@ -10304,7 +10357,7 @@ Waterfall rebuilds: {prof_wf_n:.0}/s, {prof_wf_ms:.1} ms each."
                                     .anchor(egui::Align2::RIGHT_BOTTOM, egui::vec2(-6.0, -6.0))
                                     .show(ui, |ui| {
                                         ui.horizontal(|ui| {
-                                            if kiosk_accent_button(ui, "\u{2715} CLOSE").clicked() {
+                                            if kiosk_accent_button(ui, "CLOSE").clicked() {
                                                 let mut rx = rx_for_closure.lock().unwrap();
                                                 rx.open = false;
                                                 rx.settings_dirty.store(true, Ordering::Relaxed);
@@ -10392,7 +10445,7 @@ Waterfall rebuilds: {prof_wf_n:.0}/s, {prof_wf_ms:.1} ms each."
                                             .anchor(egui::Align2::RIGHT_BOTTOM, egui::vec2(-6.0, -6.0))
                                             .show(ui.ctx(), |ui| {
                                                 ui.horizontal(|ui| {
-                                                    if kiosk_accent_button(ui, "\u{2715} CLOSE").clicked() {
+                                                    if kiosk_accent_button(ui, "CLOSE").clicked() {
                                                         rx_for_settings.lock().unwrap().show_settings_window =
                                                             false;
                                                     }
@@ -10510,6 +10563,7 @@ Waterfall rebuilds: {prof_wf_n:.0}/s, {prof_wf_ms:.1} ms each."
                                 egui::WindowLevel::AlwaysOnTop
                             }),
                         |ui, _class| {
+                            kiosk_keyboard::begin(ui.ctx());
                             if ui.input(|i| i.viewport().close_requested()) {
                                 close_requested = true;
                                 return;
@@ -10556,7 +10610,7 @@ Waterfall rebuilds: {prof_wf_n:.0}/s, {prof_wf_ms:.1} ms each."
                                     .anchor(egui::Align2::RIGHT_BOTTOM, egui::vec2(-6.0, -6.0))
                                     .show(ui.ctx(), |ui| {
                                         ui.horizontal(|ui| {
-                                            if kiosk_accent_button(ui, "\u{2715} CLOSE").clicked() {
+                                            if kiosk_accent_button(ui, "CLOSE").clicked() {
                                                 close_requested = true;
                                             }
                                         });
@@ -14687,6 +14741,7 @@ Waterfall rebuilds: {prof_wf_n:.0}/s, {prof_wf_ms:.1} ms each."
                         egui::ViewportId::from_hash_of("digital_modes_window"),
                         digital_viewport,
                         |ui, _class| {
+                            kiosk_keyboard::begin(ui.ctx());
                             if !digital_kiosk {
                                 if let (Some(outer), Some(inner)) = (
                                     ui.input(|i| i.viewport().outer_rect),
@@ -14710,7 +14765,7 @@ Waterfall rebuilds: {prof_wf_n:.0}/s, {prof_wf_ms:.1} ms each."
                                 egui::Area::new(egui::Id::new("kiosk_close_digital"))
                                     .anchor(egui::Align2::RIGHT_BOTTOM, egui::vec2(-6.0, -6.0))
                                     .show(ui.ctx(), |ui| {
-                                        if kiosk_accent_button(ui, "\u{2715} CLOSE").clicked() {
+                                        if kiosk_accent_button(ui, "CLOSE").clicked() {
                                             close_requested = true;
                                         }
                                     });
@@ -14719,6 +14774,9 @@ Waterfall rebuilds: {prof_wf_n:.0}/s, {prof_wf_ms:.1} ms each."
                                 .frame(egui::Frame::central_panel(&light_style))
                                 .show(ui, |ui| {
                                     ui.visuals_mut().clone_from(&light_visuals);
+                                    if digital_kiosk {
+                                        apply_kiosk_touch_style(ui);
+                                    }
                                     ui.horizontal(|ui| {
                                         ui.label("Mode:");
                                         if ui
@@ -14771,6 +14829,7 @@ Waterfall rebuilds: {prof_wf_n:.0}/s, {prof_wf_ms:.1} ms each."
                                     // false before it was ever read below. OR'd in now
                                     // instead of assigned, so a tab-switch's own true
                                     // survives regardless of what the panel returns.
+                                    let mut panels = |ui: &mut egui::Ui| {
                                     match digital_mode {
                                         DigitalMode::Rtty => {
                                             let (clicked, mox_request) = render_digital_panel(
@@ -14823,6 +14882,14 @@ Waterfall rebuilds: {prof_wf_n:.0}/s, {prof_wf_ms:.1} ms each."
                                             rade_eq_monitor_request = rade_eq_monitor_request.or(eq_monitor_request);
                                             rade_hide_clicked |= hide_clicked;
                                         }
+                                    }
+                                    };
+                                    if digital_kiosk {
+                                        // Touch: the panel scrolls with a wide bar and up/down buttons (room kept for CLOSE).
+                                        let h = (ui.available_height() - 58.0).max(150.0);
+                                        discovery_ui::touch_scroll(ui, "digital_panel", Some(h), false, &mut panels);
+                                    } else {
+                                        panels(ui);
                                     }
                                 });
                         },
@@ -15277,6 +15344,7 @@ Waterfall rebuilds: {prof_wf_n:.0}/s, {prof_wf_ms:.1} ms each."
                         // is the real per-band table now.
                         antenna: None,
                         band_settings: connected.band_memory.clone(),
+                        xvtr_settings: connected.xvtr_memory.clone(),
                         width_memory: connected.width_memory.clone(),
                         pa_calibration: connected.pa_calibration.clone(),
                         pa_drive_adjust: connected.pa_drive_adjust.clone(),
@@ -16335,7 +16403,10 @@ fn render_digital_panel(
     let green = egui::Color32::from_rgb(40, 190, 70);
 
     let mut s = rtty.settings();
-    ui.horizontal(|ui| {
+    let st = rtty.rx_status();
+    // Kiosk: the lock status joins the first line after the baud choices -- Clear RX, then the lock dot and confidence bar,
+    // and only then the AFC offset. Elsewhere it keeps its own line below (see further down).
+    let first_row = |ui: &mut egui::Ui| {
         ui.label("Center:");
         ui.add(egui::DragValue::new(&mut s.center_hz).range(300.0..=3000.0).speed(5.0).suffix(" Hz"));
         ui.add_space(8.0);
@@ -16345,7 +16416,36 @@ fn render_digital_panel(
                 s.baud = b;
             }
         }
-    });
+        if lcd_kiosk_mode() {
+            ui.add_space(16.0);
+            if ui.button("Clear RX").clicked() {
+                rtty.clear_rx_text();
+            }
+            let (rect, _) = ui.allocate_exact_size(egui::vec2(14.0, 14.0), egui::Sense::hover());
+            let color = if st.lock >= 1.0 {
+                green
+            } else if st.lock > 0.0 {
+                amber
+            } else {
+                red
+            };
+            ui.painter().circle_filled(rect.center(), 6.0, color);
+            ui.label(if st.lock >= 1.0 { "LOCK" } else { "no lock" });
+            ui.add(
+                egui::ProgressBar::new(st.confidence.clamp(0.0, 1.0))
+                    .desired_width(120.0)
+                    .text(format!("conf {:.0}%", st.confidence * 100.0)),
+            );
+            if s.afc {
+                ui.label(format!("AFC {:+.0} Hz", st.afc_offset_hz));
+            }
+        }
+    };
+    if lcd_kiosk_mode() {
+        ui.horizontal_wrapped(first_row);
+    } else {
+        ui.horizontal(first_row);
+    }
     ui.horizontal(|ui| {
         ui.label("Shift:");
         for sh in rtty_link::SHIFT_CHOICES {
@@ -16398,7 +16498,7 @@ fn render_digital_panel(
         ));
     });
 
-    let st = rtty.rx_status();
+    if !lcd_kiosk_mode() {
     ui.horizontal(|ui| {
         let (rect, _) = ui.allocate_exact_size(egui::vec2(14.0, 14.0), egui::Sense::hover());
         let color = if st.lock >= 1.0 {
@@ -16422,6 +16522,7 @@ fn render_digital_panel(
             rtty.clear_rx_text();
         }
     });
+    }
     if !matches!(mode, spectrum::Mode::Usb | spectrum::Mode::Digu | spectrum::Mode::Lsb | spectrum::Mode::Digl) {
         ui.colored_label(amber, "RTTY needs USB/DIGU (or LSB/DIGL with Reverse) selected.");
     }
@@ -16635,6 +16736,42 @@ fn render_sstv_panel(
     // pinned to one specific mode (matches sdroxide's own Auto + explicit
     // mode convention).
     let mut expected = sstv.expected();
+    let snap = sstv.snapshot();
+    // Status ("hunting for a header..." / progress / level) and the Sync meter. Kiosk: they share a line with Quick Tune and
+    // Auto-save to save two lines; elsewhere they keep their own lines.
+    let status_row = |ui: &mut egui::Ui| {
+        let (rect, _) = ui.allocate_exact_size(egui::vec2(14.0, 14.0), egui::Sense::hover());
+        let color = if snap.receiving { green } else { amber };
+        ui.painter().circle_filled(rect.center(), 6.0, color);
+        ui.label(match snap.detected {
+            Some(m) => {
+                format!("{} {}", m.label(), if snap.receiving { "(receiving)" } else { "(last)" })
+            }
+            None => "hunting for a header...".to_string(),
+        });
+        ui.add(
+            egui::ProgressBar::new(snap.progress.clamp(0.0, 1.0))
+                .desired_width(120.0)
+                .text(format!("{:.0}%", snap.progress * 100.0)),
+        );
+        ui.label(format!("Level {:.0}%", (snap.level * 100.0).clamp(0.0, 100.0)));
+    };
+    let sync_row = |ui: &mut egui::Ui| {
+        ui.label("Sync:");
+        let sync_color = if snap.sync_quality > 0.7 {
+            green
+        } else if snap.sync_quality > 0.3 {
+            amber
+        } else {
+            egui::Color32::from_rgb(140, 140, 140)
+        };
+        ui.add(
+            egui::ProgressBar::new(snap.sync_quality.clamp(0.0, 1.0))
+                .desired_width(120.0)
+                .fill(sync_color)
+                .text(format!("{:.0}%", snap.sync_quality * 100.0)),
+        );
+    };
     ui.horizontal(|ui| {
         ui.label("Decode:");
         if ui.add(egui::Button::selectable(expected.is_none(), "Auto")).clicked() {
@@ -16690,8 +16827,12 @@ fn render_sstv_panel(
         {
             sstv.set_rx_auto_save(auto_save);
         }
+        if lcd_kiosk_mode() {
+            ui.add_space(8.0);
+            sync_row(ui);
+        }
     });
-    ui.horizontal(|ui| {
+    let quick_tune_row = |ui: &mut egui::Ui| {
         ui.label("Quick Tune:");
         for &(label, hz) in &SSTV_QUICK_TUNE_HZ {
             if ui
@@ -16706,51 +16847,22 @@ fn render_sstv_panel(
                 quick_tune_hz = Some(hz);
             }
         }
-    });
+            if lcd_kiosk_mode() {
+            ui.add_space(8.0);
+            status_row(ui);
+        }
+    };
+    if lcd_kiosk_mode() {
+        ui.horizontal_wrapped(quick_tune_row);
+    } else {
+        ui.horizontal(quick_tune_row);
+    }
     sstv.set_expected(expected);
 
-    let snap = sstv.snapshot();
-    ui.horizontal(|ui| {
-        let (rect, _) = ui.allocate_exact_size(egui::vec2(14.0, 14.0), egui::Sense::hover());
-        let color = if snap.receiving { green } else { amber };
-        ui.painter().circle_filled(rect.center(), 6.0, color);
-        ui.label(match snap.detected {
-            Some(m) => {
-                format!("{} {}", m.label(), if snap.receiving { "(receiving)" } else { "(last)" })
-            }
-            None => "hunting for a header...".to_string(),
-        });
-        ui.add(
-            egui::ProgressBar::new(snap.progress.clamp(0.0, 1.0))
-                .desired_width(120.0)
-                .text(format!("{:.0}%", snap.progress * 100.0)),
-        );
-        ui.label(format!("Level {:.0}%", (snap.level * 100.0).clamp(0.0, 100.0)));
-    });
-    // Sync-pulse quality -- the same tuning aid QSSTV's own "Sync" meter
-    // on its receive window is: how much of each line's sync pulse (the
-    // reference tone at 1200 Hz -- the purple lines on the panadapter/
-    // waterfall) actually showed up right where a line's decode expected
-    // it. A weak/absent bar while a picture is otherwise decoding usually
-    // means mistuned dial frequency or a passband cutting into the sync
-    // tone -- nudge a few Hz either way and watch which direction this
-    // climbs, the same way you'd read QSSTV's meter.
-    ui.horizontal(|ui| {
-        ui.label("Sync:");
-        let sync_color = if snap.sync_quality > 0.7 {
-            green
-        } else if snap.sync_quality > 0.3 {
-            amber
-        } else {
-            egui::Color32::from_rgb(140, 140, 140)
-        };
-        ui.add(
-            egui::ProgressBar::new(snap.sync_quality.clamp(0.0, 1.0))
-                .desired_width(120.0)
-                .fill(sync_color)
-                .text(format!("{:.0}%", snap.sync_quality * 100.0)),
-        );
-    });
+    if !lcd_kiosk_mode() {
+        ui.horizontal(status_row);
+        ui.horizontal(sync_row);
+    }
     if let Some(u) = &snap.unsupported {
         ui.colored_label(amber, format!("Header seen for {u}, which this build does not decode."));
     }
@@ -16768,8 +16880,99 @@ fn render_sstv_panel(
     if !tx_available {
         ui.weak("TX unavailable (transmit disabled or no mic input device).");
     }
+    // FSK ID and TX Lead. Kiosk: on the first TX line between My Call and TX Slant; elsewhere in the row below.
+    macro_rules! sstv_fsk_lead_controls {
+        ($ui:ident) => {{
+            let ui = &mut *$ui;
+            let mut fsk_id = sstv.tx_fsk_id_enabled();
+            if ui
+                .checkbox(&mut fsk_id, "FSK ID")
+                .on_hover_text(
+                    "Send \"My Call\" in tones after each picture -- the identification \
+                     SSTV repeaters and other programs read. Adds ~2.5 seconds, and \
+                     sends nothing until you've set a callsign.",
+                )
+                .changed()
+            {
+                sstv.set_tx_fsk_id_enabled(fsk_id);
+            }
+            ui.add_space(8.0);
+            ui.label("TX Lead:");
+            let mut lead_ms = sstv.tx_lead_ms();
+            if ui
+                .add(egui::DragValue::new(&mut lead_ms).range(0..=3000).speed(10.0).suffix(" ms"))
+                .on_hover_text(
+                    "Silence sent after keying and before the picture's leader/VIS code \
+                     -- covers the gap between asking the rig for PTT and it really \
+                     being on the air. 0 for an SDR that keys instantly.",
+                )
+                .changed()
+            {
+                sstv.set_tx_lead_ms(lead_ms);
+            }
+        }};
+    }
+    // TX Slant label, slider and reset button. Kiosk: on the first TX line right after My Call; elsewhere in the row
+    // with FSK ID and TX Lead.
+    macro_rules! sstv_slant_controls {
+        ($ui:ident) => {{
+            let ui = &mut *$ui;
+            ui.label("TX Slant:");
+            let mut ppm = sstv.tx_ppm();
+            if ui
+                .add(egui::Slider::new(&mut ppm, -5000.0..=5000.0).suffix(" ppm"))
+                .on_hover_text(
+                    "Transmit clock trim to remove slant on the far-end decoder -- a \
+                     receiving sound card's clock a little off from this station's \
+                     stretches every line by a tiny, cumulative amount.",
+                )
+                .changed()
+            {
+                sstv.set_tx_ppm(ppm);
+            }
+            if ui.small_button("0").on_hover_text("Reset to 0 ppm").clicked() {
+                sstv.set_tx_ppm(0.0);
+            }
+        }};
+    }
+    // Send / Abort TX / progress bar. Kiosk: on the Load Picture line, right after Callsign banner; elsewhere on their own line below
+    // the picture. A macro (not a closure) so it can borrow what the rows around it also use.
+    macro_rules! sstv_send_controls {
+        ($ui:ident) => {{
+            let ui = &mut *$ui;
+            let ready = tx_prepared.is_some();
+            if ui
+                .add_enabled(ready && tx_available && !sstv.tx_active(), egui::Button::new("Send"))
+                .on_hover_text(
+                    "Queue the picture above and key MOX/PTT for the whole transmission -- \
+                     dropped automatically once the picture is fully sent",
+                )
+                .clicked()
+            {
+                if let Some((w, h, rgb)) = tx_prepared.as_ref() {
+                    sstv.set_image(*tx_mode, rgb, *w, *h, callsign.as_str());
+                    sstv.set_tx_armed(true);
+                    mox_request = Some(true);
+                }
+            }
+            if ui
+                .add_enabled(sstv.tx_active(), egui::Button::new("Abort TX"))
+                .clicked()
+            {
+                sstv.abort_tx();
+                mox_request = Some(false);
+            }
+            if sstv.tx_active() {
+                ui.add(
+                    egui::ProgressBar::new(sstv.tx_progress().clamp(0.0, 1.0))
+                        .desired_width(120.0)
+                        .text(format!("{:.0}%", sstv.tx_progress() * 100.0)),
+                );
+            }
+        }};
+    }
     ui.add_enabled_ui(tx_available, |ui| {
-        ui.horizontal(|ui| {
+        let first_tx_row = |ui: &mut egui::Ui| {
             let armed = sstv.tx_armed();
             if ui
                 .add(egui::Button::selectable(armed, "SSTV TX"))
@@ -16789,7 +16992,7 @@ fn render_sstv_panel(
             let callsign_changed = ui
                 .add(
                     egui::TextEdit::singleline(callsign)
-                        .desired_width(90.0)
+                        .desired_width(if lcd_kiosk_mode() { 100.0 } else { 90.0 })
                         .char_limit(12)
                         .hint_text("(none)"),
                 )
@@ -16799,7 +17002,18 @@ fn render_sstv_panel(
             if callsign_changed && *tx_banner && tx_source.is_some() {
                 *tx_prepared = None;
             }
-        });
+            if lcd_kiosk_mode() {
+                ui.add_space(16.0);
+                sstv_fsk_lead_controls!(ui);
+                ui.add_space(16.0);
+                sstv_slant_controls!(ui);
+            }
+        };
+        if lcd_kiosk_mode() {
+            ui.horizontal_wrapped(first_tx_row);
+        } else {
+            ui.horizontal(first_tx_row);
+        }
         ui.horizontal(|ui| {
             if ui.button("Load Picture...").clicked() {
                 if let Some(path) = rfd::FileDialog::new()
@@ -16841,56 +17055,26 @@ fn render_sstv_panel(
             if (mode_changed || banner_changed) && tx_source.is_some() {
                 *tx_prepared = None; // Re-derived below from tx_source.
             }
+            if lcd_kiosk_mode() {
+                ui.add_space(16.0);
+                sstv_send_controls!(ui);
+            }
         });
+        if !lcd_kiosk_mode() {
         ui.horizontal(|ui| {
-            // A real request, matching SDRoxide's own SSTV panel (TX
-            // slant/FSK ID/TX lead) -- see sstv_link.rs's own doc
-            // comments on tx_ppm/tx_fsk_id_enabled/tx_lead_ms for the
-            // full reasoning behind each.
-            ui.label("TX Slant:");
-            let mut ppm = sstv.tx_ppm();
-            if ui
-                .add(egui::Slider::new(&mut ppm, -5000.0..=5000.0).suffix(" ppm"))
-                .on_hover_text(
-                    "Transmit clock trim to remove slant on the far-end decoder -- a \
-                     receiving sound card's clock a little off from this station's \
-                     stretches every line by a tiny, cumulative amount.",
-                )
-                .changed()
-            {
-                sstv.set_tx_ppm(ppm);
-            }
-            if ui.small_button("0").on_hover_text("Reset to 0 ppm").clicked() {
-                sstv.set_tx_ppm(0.0);
-            }
-            ui.add_space(8.0);
-            let mut fsk_id = sstv.tx_fsk_id_enabled();
-            if ui
-                .checkbox(&mut fsk_id, "FSK ID")
-                .on_hover_text(
-                    "Send \"My Call\" in tones after each picture -- the identification \
-                     SSTV repeaters and other programs read. Adds ~2.5 seconds, and \
-                     sends nothing until you've set a callsign.",
-                )
-                .changed()
-            {
-                sstv.set_tx_fsk_id_enabled(fsk_id);
-            }
-            ui.add_space(8.0);
-            ui.label("TX Lead:");
-            let mut lead_ms = sstv.tx_lead_ms();
-            if ui
-                .add(egui::DragValue::new(&mut lead_ms).range(0..=3000).speed(10.0).suffix(" ms"))
-                .on_hover_text(
-                    "Silence sent after keying and before the picture's leader/VIS code \
-                     -- covers the gap between asking the rig for PTT and it really \
-                     being on the air. 0 for an SDR that keys instantly.",
-                )
-                .changed()
-            {
-                sstv.set_tx_lead_ms(lead_ms);
-            }
-        });
+                // A real request, matching SDRoxide's own SSTV panel (TX
+                // slant/FSK ID/TX lead) -- see sstv_link.rs's own doc
+                // comments on tx_ppm/tx_fsk_id_enabled/tx_lead_ms for the
+                // full reasoning behind each.
+                if !lcd_kiosk_mode() {
+                    sstv_slant_controls!(ui);
+                }
+                ui.add_space(8.0);
+                if !lcd_kiosk_mode() {
+                    sstv_fsk_lead_controls!(ui);
+                }
+            });
+        }
         // Re-derive tx_prepared (resize/crop to tx_mode's own exact
         // dimensions, then the callsign banner if enabled) whenever a new
         // picture was just loaded or the mode/banner selection changed --
@@ -16922,37 +17106,11 @@ fn render_sstv_panel(
                 ui.image((tex.id(), egui::vec2(*w as f32 * scale, *h as f32 * scale)));
             }
         }
-        ui.horizontal(|ui| {
-            let ready = tx_prepared.is_some();
-            if ui
-                .add_enabled(ready && tx_available && !sstv.tx_active(), egui::Button::new("Send"))
-                .on_hover_text(
-                    "Queue the picture above and key MOX/PTT for the whole transmission -- \
-                     dropped automatically once the picture is fully sent",
-                )
-                .clicked()
-            {
-                if let Some((w, h, rgb)) = tx_prepared.as_ref() {
-                    sstv.set_image(*tx_mode, rgb, *w, *h, callsign.as_str());
-                    sstv.set_tx_armed(true);
-                    mox_request = Some(true);
-                }
-            }
-            if ui
-                .add_enabled(sstv.tx_active(), egui::Button::new("Abort TX"))
-                .clicked()
-            {
-                sstv.abort_tx();
-                mox_request = Some(false);
-            }
-            if sstv.tx_active() {
-                ui.add(
-                    egui::ProgressBar::new(sstv.tx_progress().clamp(0.0, 1.0))
-                        .desired_width(120.0)
-                        .text(format!("{:.0}%", sstv.tx_progress() * 100.0)),
-                );
-            }
-        });
+        if !lcd_kiosk_mode() {
+            ui.horizontal(|ui| {
+                sstv_send_controls!(ui);
+            });
+        }
     });
     ui.separator();
 
@@ -17004,6 +17162,23 @@ fn render_sstv_panel(
 /// "starting point, not a standard" caveat as SSTV_QUICK_TUNE_HZ.
 /// Sourced from evoham.com's own FreeDV frequency list and FreeDV
 /// Reporter's documented activity centers.
+/// Touch look for a kiosk window (the model approved on the Discovery screen): taller targets for buttons, fields and
+/// checkboxes, rounded widgets with a thin line around.
+fn apply_kiosk_touch_style(ui: &mut egui::Ui) {
+    let sp = ui.spacing_mut();
+    sp.interact_size.y = 36.0;
+    sp.button_padding = egui::vec2(8.0, 7.0);
+    sp.item_spacing = egui::vec2(8.0, 8.0);
+    sp.icon_width = 24.0;
+    sp.icon_width_inner = 14.0;
+    sp.icon_spacing = 8.0;
+    let w = &mut ui.visuals_mut().widgets;
+    for st in [&mut w.inactive, &mut w.hovered, &mut w.active, &mut w.open] {
+        st.corner_radius = egui::CornerRadius::same(5);
+        st.bg_stroke = egui::Stroke::new(1.0, egui::Color32::from_gray(95));
+    }
+}
+
 /// A button of the RADE panel: in the kiosk it is a taller, rounded touch target with a thin line; elsewhere an ordinary
 /// button.
 fn touch_button(ui: &mut egui::Ui, label: &str) -> egui::Response {
