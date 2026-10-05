@@ -4420,7 +4420,14 @@ fn p1_build_packet(
             // use the discrete ALEX attenuator relay instead, frame0's
             // construction below).
             if is_hermes_lite {
-                let clamped = lna_tx_db.clamp(-12, 48);
+                // Without the PA (PA enable off / transverter) the HL2 must keep receiving while it transmits (duplex): the
+                // TX LNA then follows the RX gain instead of the usual -12 dB, which the gateware applies the moment MOX is
+                // set and which took ~30 dB off the receiver in duplex (piHPSDR never programs this register at all).
+                let clamped = if disable_pa {
+                    (rx_attenuation as i32 - 12).clamp(-12, 48)
+                } else {
+                    lna_tx_db.clamp(-12, 48)
+                };
                 let c3 = (((clamped + 12) as u8) & 0x3F) | 0xC0;
                 (0x1C, 0x00, 0x00, c3, 0x00)
             } else {

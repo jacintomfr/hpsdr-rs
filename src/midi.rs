@@ -631,6 +631,22 @@ impl Drop for MidiWorker {
 /// Settings -> MIDI device dropdown. Queried fresh on demand (cheap, and
 /// a controller can appear/disappear between frames), same idea as this
 /// app's other device-listing helpers (e.g. audio output device names).
+/// A MIDI port name without the trailing ALSA "client:port" id (e.g. "Arduino Due:Arduino Due MIDI 1 20:0" ->
+/// "Arduino Due:Arduino Due MIDI 1"): that id changes whenever the controller is re-enumerated (20:0 one day, 28:0 the
+/// next), so a saved device must be matched without it or it is never found again.
+pub fn port_key(name: &str) -> String {
+    let t = name.trim_end();
+    if let Some(i) = t.rfind(' ') {
+        let tail = &t[i + 1..];
+        if let Some((a, b)) = tail.split_once(':') {
+            if !a.is_empty() && !b.is_empty() && a.bytes().all(|c| c.is_ascii_digit()) && b.bytes().all(|c| c.is_ascii_digit()) {
+                return t[..i].to_string();
+            }
+        }
+    }
+    t.to_string()
+}
+
 pub fn list_port_names() -> Vec<String> {
     let Ok(input) = midir::MidiInput::new(CLIENT_NAME) else { return Vec::new() };
     input.ports().iter().filter_map(|p| input.port_name(p).ok()).collect()
@@ -659,7 +675,7 @@ fn run(
             continue;
         }
 
-        let wanted = device_names.lock().unwrap().clone();
+        let wanted: Vec<String> = device_names.lock().unwrap().iter().map(|n| port_key(n)).collect();
         if wanted.is_empty() {
             if !connections.is_empty() {
                 connections.clear();
@@ -674,14 +690,22 @@ fn run(
         // (re)appeared or a connected one that vanished (no unplug event
         // exists on any of ALSA/CoreMIDI/WinMM/midir itself, see this
         // module's own doc comment).
-        let present: std::collections::HashSet<String> = midir::MidiInput::new(CLIENT_NAME)
-            .map(|probe| probe.ports().iter().filter_map(|p| probe.port_name(p).ok()).collect())
+        // key (name without the ALSA id) -> the full name to connect to
+        let present: std::collections::HashMap<String, String> = midir::MidiInput::new(CLIENT_NAME)
+            .map(|probe| {
+                probe
+                    .ports()
+                    .iter()
+                    .filter_map(|p| probe.port_name(p).ok())
+                    .map(|full| (port_key(&full), full))
+                    .collect()
+            })
             .unwrap_or_default();
 
         // Drop anything no longer wanted (user unchecked it) or no
         // longer present (unplugged) -- a later tick reconnects it once
         // both are true again.
-        connections.retain(|name, _| wanted.contains(name) && present.contains(name));
+        connections.retain(|name, _| wanted.contains(name) && present.contains_key(name));
 
         // Connect anything wanted, present, and not already connected.
         // A connect error (a real port name suddenly unopenable, e.g.
@@ -691,10 +715,11 @@ fn run(
         // whatever caused it clears up.
         let mut connect_error: Option<String> = None;
         for name in &wanted {
-            if !present.contains(name) || connections.contains_key(name) {
+            let Some(full) = present.get(name) else { continue };
+            if connections.contains_key(name) {
                 continue;
             }
-            match connect(name, Arc::clone(&events)) {
+            match connect(full, Arc::clone(&events)) {
                 Ok(conn) => {
                     connections.insert(name.clone(), conn);
                 }
@@ -835,5 +860,21 @@ mod tests {
         };
         let ev = RawMidiEvent { kind: MidiEventKind::ControlChange, channel: 5, number: 20, value: 100, off: false };
         assert!(!binding.matches(&ev));
+    }
+}
+
+#[cfg(test)]
+mod port_key_tests {
+    use super::port_key;
+
+    #[test]
+    fn strips_the_alsa_client_port_id() {
+        assert_eq!(port_key("Arduino Due:Arduino Due MIDI 1 20:0"), "Arduino Due:Arduino Due MIDI 1");
+        assert_eq!(port_key("Arduino Due:Arduino Due MIDI 1 28:0"), "Arduino Due:Arduino Due MIDI 1");
+        assert_eq!(port_key("Arduino Due:Arduino Due MIDI 1"), "Arduino Due:Arduino Due MIDI 1");
+        assert_eq!(port_key("Midi Through:Midi Through Port-0 14:0"), "Midi Through:Midi Through Port-0");
+        // Names that merely end in numbers are left alone.
+        assert_eq!(port_key("USB MIDI 2"), "USB MIDI 2");
+        assert_eq!(port_key("Port 3:1x"), "Port 3:1x");
     }
 }

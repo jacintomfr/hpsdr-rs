@@ -593,6 +593,10 @@ pub struct Config {
     pub toolbar_layers: Option<Vec<Vec<String>>>,
     #[serde(default)]
     pub toolbar_layer: Option<usize>,
+    /// VFO B's own step (the step of VFO A is tune_step_hz).
+    pub vfo_b_step_hz: Option<i64>,
+    /// Last position of the duplex TX window (x, y), moved by touch; None = default (below the start of the spectrum).
+    pub tx_window_pos: Option<[f32; 2]>,
     /// "PA enable" (piHPSDR radio menu): off = TX on the low-power output, TR relay stays in RX (duplex).
     pub pa_enabled: Option<bool>,
     /// Frequency calibration in ppm (-100..100), deskHPSDR's ppm_factor.
@@ -1017,6 +1021,94 @@ pub fn ps_corr_path(mac: [u8; 6]) -> Option<PathBuf> {
     Some(path)
 }
 
+/// The controls that belong to the operator's hardware, not to one radio: MIDI on/off, devices and bindings, and
+/// the toolbar layout. They are kept in one shared file next to the per-radio configs, so switching radios (HL2,
+/// Radioberry ...) does not start again from an empty MIDI/toolbar setup.
+#[derive(serde::Serialize, serde::Deserialize, Default)]
+struct SharedControls {
+    #[serde(default)]
+    midi_enabled: Option<bool>,
+    #[serde(default)]
+    midi_device_names: Vec<String>,
+    #[serde(default)]
+    midi_bindings: Vec<crate::midi::MidiBinding>,
+    #[serde(default)]
+    toolbar_layers: Option<Vec<Vec<String>>>,
+    #[serde(default)]
+    toolbar_layer: Option<usize>,
+}
+
+fn shared_controls_path() -> Option<PathBuf> {
+    let mut p = settings_dir()?;
+    p.push("shared-controls.json");
+    Some(p)
+}
+
+impl Config {
+    /// Overlays the shared controls (if any) on a radio's own config; the first time (no shared file yet) the
+    /// newest per-radio config that has MIDI bindings or a toolbar layout seeds it.
+    fn apply_shared_controls(&mut self) {
+        let Some(path) = shared_controls_path() else { return };
+        let read = |p: &std::path::Path| std::fs::read_to_string(p).ok().and_then(|s| serde_json::from_str::<SharedControls>(&s).ok());
+        let shared = read(&path).or_else(|| {
+            // Seed from the most recently saved radio config that has something to share.
+            let dir = settings_dir()?;
+            let mut best: Option<(std::time::SystemTime, SharedControls)> = None;
+            for entry in std::fs::read_dir(dir).ok()?.flatten() {
+                let p = entry.path();
+                let name = p.file_name()?.to_string_lossy().to_string();
+                if !(name.starts_with("config-") && name.ends_with(".json")) {
+                    continue;
+                }
+                let Some(cfg) = std::fs::read_to_string(&p).ok().and_then(|s| serde_json::from_str::<Config>(&s).ok()) else { continue };
+                if cfg.midi_bindings.is_empty() && cfg.toolbar_layers.is_none() {
+                    continue;
+                }
+                let t = entry.metadata().and_then(|m| m.modified()).unwrap_or(std::time::UNIX_EPOCH);
+                if best.as_ref().is_none_or(|(bt, _)| t > *bt) {
+                    best = Some((
+                        t,
+                        SharedControls {
+                            midi_enabled: cfg.midi_enabled,
+                            midi_device_names: cfg.midi_device_names.clone(),
+                            midi_bindings: cfg.midi_bindings.clone(),
+                            toolbar_layers: cfg.toolbar_layers.clone(),
+                            toolbar_layer: cfg.toolbar_layer,
+                        },
+                    ));
+                }
+            }
+            best.map(|(_, s)| s)
+        });
+        if let Some(s) = shared {
+            self.midi_enabled = s.midi_enabled;
+            self.midi_device_names = s.midi_device_names;
+            self.midi_bindings = s.midi_bindings;
+            self.toolbar_layers = s.toolbar_layers;
+            self.toolbar_layer = s.toolbar_layer;
+        }
+    }
+
+    fn save_shared_controls(&self) {
+        // Nothing worth sharing yet: do not create (or blank) the file from an unconfigured radio.
+        if self.midi_bindings.is_empty() && self.toolbar_layers.is_none() {
+            return;
+        }
+        let Some(path) = shared_controls_path() else { return };
+        let s = SharedControls {
+            midi_enabled: self.midi_enabled,
+            midi_device_names: self.midi_device_names.clone(),
+            midi_bindings: self.midi_bindings.clone(),
+            toolbar_layers: self.toolbar_layers.clone(),
+            toolbar_layer: self.toolbar_layer,
+        };
+        if let Ok(json) = serde_json::to_string_pretty(&s) {
+            let tmp = path.with_extension("json.tmp");
+            let _ = std::fs::write(&tmp, json).and_then(|_| std::fs::rename(&tmp, &path));
+        }
+    }
+}
+
 impl Config {
     /// Loads the saved config for this specific radio (by MAC address),
     /// or a blank/default one if there isn't one yet (first run for
@@ -1030,15 +1122,24 @@ impl Config {
         };
         // A missing/corrupt main file falls back to the copy taken at the start
         // of the previous run (see save) instead of silently resetting everything.
-        parse(&path)
+        let mut cfg = parse(&path)
             .or_else(|| parse(&path.with_extension("json.bak")))
-            .unwrap_or_default()
+            .unwrap_or_default();
+        // MIDI and the toolbar are the operator's, shared by every radio (see SharedControls). Skipped for the
+        // sentinel configs that hold no radio settings (Ozy / Radioberry Juice setup, RX-888).
+        if mac != [0; 6] && mac != [0, 0, 0, 0, 0, 1] {
+            cfg.apply_shared_controls();
+        }
+        cfg
     }
 
     pub fn save(&self, mac: [u8; 6]) {
         let Some(path) = config_path(mac) else {
             return;
         };
+        if mac != [0; 6] && mac != [0, 0, 0, 0, 0, 1] {
+            self.save_shared_controls();
+        }
         if let Ok(json) = serde_json::to_string_pretty(self) {
             // Once per run, keep the file as it was when the program started
             // (valid JSON only) as <config>.json.bak -- a safety net against any

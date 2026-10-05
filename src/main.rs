@@ -1234,7 +1234,7 @@ fn dispatch_midi_binding(
             }
             connected.vfo_encoder_acc -= steps;
             let cw_mode = matches!(current_mode, spectrum::Mode::Cwl | spectrum::Mode::Cwu);
-            let step_hz = scroll_tune_step_hz(connected.tune_step_hz, cw_mode, false, false);
+            let step_hz = scroll_tune_step_hz(connected.vfo_b_step_hz, cw_mode, false, false);
             let raw = (connected.vfo_b_frequency_hz as i64 + steps as i64 * step_hz).max(0) as u32;
             connected.vfo_b_frequency_hz = round_to_step_hz(raw, step_hz);
         }
@@ -2326,6 +2326,12 @@ struct ConnectedState {
     vfo_encoder_divisor: f32,
     /// Settings -> TX "PA enable" (piHPSDR): off keeps the HL2's TR relay in the RX position and the RX gain while keyed.
     pa_enabled: bool,
+    /// Where the user left the duplex TX window (saved; None = default position).
+    tx_window_pos: Option<[f32; 2]>,
+    /// VFO B's own step size, independent from VFO A's (tune_step_hz); set in the VFO window opened from VFO B.
+    vfo_b_step_hz: i64,
+    /// Set when the TX window was just moved, so the next settings save includes it.
+    tx_window_pos_dirty: bool,
     /// Frequency calibration (ppm factor), Settings -> RX; applied in radio.rs to the frequencies sent to the radio.
     freq_cal_ppm: f64,
     /// VFO step of each mode, loaded when the mode changes (like deskHPSDR's per-mode step).
@@ -3742,6 +3748,8 @@ fn connect_to_device(device: Device, cfg: &Config) -> Result<ConnectedState, Str
             } else {
                 cfg.midi_device_names.clone()
             };
+            // Saved without the ALSA client:port id (see midi::port_key).
+            let initial_devices: Vec<String> = initial_devices.iter().map(|n| midi::port_key(n)).collect();
             *midi.device_names.lock().unwrap() = initial_devices;
             let midi_bindings = cfg.midi_bindings.clone();
             Ok(ConnectedState {
@@ -3869,6 +3877,9 @@ fn connect_to_device(device: Device, cfg: &Config) -> Result<ConnectedState, Str
                 vfo_encoder_acc: 0.0,
                 vfo_encoder_divisor: cfg.vfo_encoder_divisor.unwrap_or(10.0).clamp(1.0, 50.0),
                 pa_enabled: cfg.pa_enabled.unwrap_or(!lcd_kiosk_mode()),
+                tx_window_pos: cfg.tx_window_pos,
+                vfo_b_step_hz: cfg.vfo_b_step_hz.filter(|s| ALL_TUNE_STEPS_HZ.contains(s)).unwrap_or(1_000),
+                tx_window_pos_dirty: false,
                 freq_cal_ppm: cfg.freq_cal_ppm.unwrap_or(0.0).clamp(-100.0, 100.0),
                 step_memory: cfg.step_memory.clone(),
                 step_last_mode: None,
@@ -4917,6 +4928,13 @@ impl eframe::App for HpsdrApp {
                 // applied to tx_spectrum -- it's raw generated baseband,
                 // not a wideband capture that needs retuning within.
                 let mox_on_now = connected.session.mox_active();
+                // piHPSDR duplex (transmitter.c: can_tx_audio = xmit && !duplex): no local TX audio while duplex is on, so
+                // the TX monitor never mixes your own voice into the receiver audio coming out of the same speakers.
+                if connected.spectrum.duplex() {
+                    if let Some(tx) = &connected.tx_handle {
+                        tx.tx_audio_monitor.lock().unwrap().clear();
+                    }
+                }
                 // See step_autogain's own doc comment -- rate-limits its
                 // own real actions internally, cheap/harmless to call
                 // every frame.
@@ -5180,9 +5198,16 @@ impl eframe::App for HpsdrApp {
                     let row: Vec<f32> = connected.tx_spectrum.display.lock().unwrap().spectrum.clone();
                     let (lo, hi) = if tx_low < tx_high { (tx_low, tx_high) } else { (tx_high, tx_high + 1.0) };
                     let tx_mode_now = connected.spectrum.mode();
-                    egui::Window::new("TX")
+                    let tx_win = egui::Window::new("TX")
                         .id(egui::Id::new("duplex_tx_window"))
-                        .anchor(egui::Align2::LEFT_TOP, egui::vec2(8.0, connected.last_spectrum_top + 2.0)) // left: the CW decoder / RADE panels are on the right
+                        // Movable by touch (drag the window background); the last position is saved and comes back. Default:
+                        // left, below the start of the spectrum (the CW decoder / RADE panels are on the right).
+                        .movable(true)
+                        .constrain(true)
+                        .default_pos(match connected.tx_window_pos {
+                            Some([x, y]) => egui::pos2(x, y),
+                            None => egui::pos2(8.0, connected.last_spectrum_top + 2.0),
+                        })
                         .collapsible(false)
                         .resizable(false)
                         // No window title bar (it left a gap on its right): the "TX" caption is drawn inside, full width.
@@ -5225,6 +5250,14 @@ impl eframe::App for HpsdrApp {
                                 painter.add(egui::Shape::line(pts, egui::Stroke::new(1.0, egui::Color32::from_rgb(120, 220, 90))));
                             }
                         });
+                    if let Some(w) = tx_win {
+                        // Saved once a drag ends, not on every frame of it.
+                        if w.response.drag_stopped() {
+                            let p = w.response.rect.min;
+                            connected.tx_window_pos = Some([p.x, p.y]);
+                            connected.tx_window_pos_dirty = true;
+                        }
+                    }
                 }
                 let (base_low, base_high) = if transmitting { (tx_low, tx_high) } else { (rx_low, rx_high) };
                 let (db_low, db_high) = if base_low < base_high {
@@ -5310,7 +5343,7 @@ impl eframe::App for HpsdrApp {
                 let waterfall_texture_id = connected.waterfall_texture.as_ref().map(|t| t.id());
 
                 let mut stop_clicked = false;
-                let mut settings_changed = false;
+                let mut settings_changed = std::mem::take(&mut connected.tx_window_pos_dirty);
                 // Set from deep inside the Settings window's nested
                 // closure (same capture-a-local-flag pattern as
                 // close_requested/settings_changed) once an in-app
@@ -5383,6 +5416,17 @@ impl eframe::App for HpsdrApp {
                                         ui.set_min_width(widest);
                                     }
                                     ui.vertical(|ui| {
+                                        if lcd_kiosk_mode() {
+                                            kiosk_vfo_header(
+                                                ui,
+                                                "A:",
+                                                freq_a_color,
+                                                current_band_name,
+                                                connected.spectrum.mode().label(),
+                                                &vfo_step_label,
+                                                38.0,
+                                            );
+                                        } else {
                                         ui.horizontal(|ui| {
                                             ui.label("VFO-A");
                                             // RX/TX badge, next to the
@@ -5437,6 +5481,7 @@ impl eframe::App for HpsdrApp {
                                                 ui.colored_label(freq_a_color, rx_tx_label);
                                             }
                                         });
+                                        }
                                         let resp = ui
                                             .add(
                                                 egui::Label::new(
@@ -5712,6 +5757,24 @@ impl eframe::App for HpsdrApp {
                                         ui.set_min_width(widest);
                                     }
                                     ui.vertical(|ui| {
+                                        if lcd_kiosk_mode() {
+                                            // VFO B has no mode or step of its own yet: it shows the current ones.
+                                            let b_band: String = match active_xvtr_name.as_deref() {
+                                                Some(name) => name.to_string(),
+                                                None => band_for_frequency(connected.vfo_b_frequency_hz)
+                                                    .map(|b| b.name.to_string())
+                                                    .unwrap_or_else(|| "Gen".to_string()),
+                                            };
+                                            kiosk_vfo_header(
+                                                ui,
+                                                "B:",
+                                                freq_b_color,
+                                                &b_band,
+                                                connected.spectrum.mode().label(),
+                                                &tune_step_label(connected.vfo_b_step_hz),
+                                                28.0,
+                                            );
+                                        } else {
                                         ui.horizontal(|ui| {
                                             ui.label("VFO-B");
                                             // See VFO-A's own RX/TX badge
@@ -5740,11 +5803,14 @@ impl eframe::App for HpsdrApp {
                                                 ui.colored_label(freq_b_color, rx_tx_label);
                                             }
                                         });
+                                        }
                                         let resp = ui
                                             .add(
                                                 egui::Label::new(
                                                     egui::RichText::new(kiosk_freq_text(format_frequency(
-                                                        connected.vfo_b_frequency_hz,
+                                                        // RF frequency while a transverter is active, like VFO A.
+                                                        (connected.vfo_b_frequency_hz as i64 + xvtr_rf_offset_hz)
+                                                            .clamp(0, u32::MAX as i64) as u32,
                                                     )))
                                                     .monospace()
                                                     .size(28.0)
@@ -6030,7 +6096,8 @@ impl eframe::App for HpsdrApp {
                                             .fold(0.0_f32, f32::max)
                                     };
                                     let free = meter_left_x(ui) - ui.next_widget_position().x - lev_w;
-                                    ui.add_space((free / 2.0 - ui.spacing().item_spacing.x).max(2.0));
+                                    // A little left of centre (14 px): the second digit of PROC +10 must not go under the meter.
+                                    ui.add_space((free / 2.0 - ui.spacing().item_spacing.x - 14.0).max(2.0));
                                     } else {
                                         ui.add_space(12.0);
                                     }
@@ -6383,6 +6450,10 @@ impl eframe::App for HpsdrApp {
                                     ui.horizontal(|ui| {
                                         // Kiosk: which VFO this edits is fixed by how the window was opened (right-click on
                                         // VFO A or VFO B), so the A/B chips make way for a tighter window.
+                                        if lcd_kiosk_mode() {
+                                            // Which VFO the keypad and the step apply to.
+                                            ui.label(egui::RichText::new(if vfo_b { "VFO B" } else { "VFO A" }).strong());
+                                        }
                                         if !lcd_kiosk_mode() {
                                         if toggle_chip(ui, "VFO A", !vfo_b, 0.0, "").clicked() {
                                             vfo_b = false;
@@ -6495,7 +6566,7 @@ impl eframe::App for HpsdrApp {
                                                 });
                                             ui.add_space(h);
                                             ui.label("VFO step");
-                                            if render_step_combo_only(ui, connected) {
+                                            if render_step_combo_only(ui, connected, vfo_b) {
                                                 settings_changed = true;
                                             }
                                             // deskHPSDR's VFO menu check boxes: Lock VFOs, Duplex, CTUN, Split.
@@ -6548,6 +6619,9 @@ impl eframe::App for HpsdrApp {
                                         // intended (e.g. Enter on an empty entry), so ignore.
                                         let hz = (digits.parse::<f64>().unwrap_or(0.0) * apply_mult + 0.5) as i64;
                                         if hz >= 10_000 {
+                                            // With a transverter active the typed frequency is the RF one (what the VFO
+                                            // box shows): take its offset off to get the IF the radio really tunes.
+                                            let hz = (hz - xvtr_rf_offset_hz).max(0);
                                             let clamped = (hz as u32).clamp(
                                                 connected.device.frequency_min as u32,
                                                 connected.device.frequency_max as u32,
@@ -7235,6 +7309,9 @@ impl eframe::App for HpsdrApp {
                         if lcd_kiosk_mode() {
                             agc_switch!(ui, col6_w);
                             agc_slider!(ui);
+                            if let Some(x) = ui.data(|d| d.get_temp::<f32>(egui::Id::new("last_value_box_left"))) {
+                                ui.ctx().data_mut(|d| d.insert_temp(egui::Id::new("agc_value_box_left"), x));
+                            }
                             // AGC mode sits right after the AGC Gain value box (kiosk).
                             let agc_w = chip_width(ui, &["AGC Medium"]);
                             if ui
@@ -7355,37 +7432,6 @@ impl eframe::App for HpsdrApp {
                             }
                             framed_label(ui, "Filter width:", col4_w);
                             filter_slider!(ui);
-                            // CTUN and Split indicators (not buttons: they are set from MIDI / the VFO window), right after
-                            // the Filter width value box. One grid cell each, narrower than the cells above them (the
-                            // Mic gain / AGC Gain name and slider columns), so they do not push those columns apart.
-                            {
-                                let _black_chips = IdleChipsBlack::new();
-                                let ctun = ui
-                                    .add(chip_button("CTUN", connected.ctun).sense(egui::Sense::hover()))
-                                    .on_hover_text("CTUN: on while Click-to-Tune is active");
-                                // Split is painted 8 px to the right of CTUN (like the chips of the first row) instead of in
-                                // the next grid cell, whose column is far wider and left a big gap.
-                                let w = chip_width(ui, &["Split"]);
-                                let rect = egui::Rect::from_min_size(
-                                    egui::pos2(ctun.rect.right() + 8.0, ctun.rect.top()),
-                                    egui::vec2(w, ctun.rect.height()),
-                                );
-                                let on = connected.split;
-                                let orange = egui::Color32::from_rgb(232, 150, 46);
-                                let (fill, text, stroke) = if on {
-                                    (orange, egui::Color32::from_gray(15), egui::Stroke::new(1.0, orange))
-                                } else {
-                                    (egui::Color32::BLACK, egui::Color32::from_gray(205), egui::Stroke::new(1.0, egui::Color32::from_gray(95)))
-                                };
-                                ui.painter().rect(rect, 5.0, fill, stroke, egui::StrokeKind::Inside);
-                                ui.painter().text(
-                                    rect.center(),
-                                    egui::Align2::CENTER_CENTER,
-                                    "Split",
-                                    egui::TextStyle::Button.resolve(ui.style()),
-                                    text,
-                                );
-                            }
                             ui.end_row();
                         }
 
@@ -8200,30 +8246,36 @@ impl eframe::App for HpsdrApp {
                         Some(peek_recent_samples(&connected.spectrum.waveform_out, WAVEFORM_WINDOW_SAMPLES))
                     };
                     if let Some(samples) = waveform_samples {
-                        const WF_WIDTH: f32 = 160.0;
                         const WF_HEIGHT: f32 = 50.0;
                         const WF_MARGIN: f32 = 8.0;
+                        let right_edge = rect.right() + cw_panel_reserved_width - WF_MARGIN;
+                        // Kiosk: the scope grows to the left until its left edge lines up with the AGC Gain value box.
+                        let wf_width = match ui.ctx().data(|d| d.get_temp::<f32>(egui::Id::new("agc_value_box_left"))) {
+                            Some(x) if lcd_kiosk_mode() && right_edge - x >= 160.0 => right_edge - x,
+                            _ => 160.0,
+                        };
+                        ui.ctx().data_mut(|d| d.insert_temp(egui::Id::new("wf_scope_width"), wf_width));
                         let above_rect = egui::Rect::from_min_size(
                             egui::pos2(
                                 // Right edge of the full width, not of the (narrower) plot, so
                                 // the scope stays put when a side panel (CW decoder, RADE) opens.
-                                rect.right() + cw_panel_reserved_width - WF_MARGIN - WF_WIDTH,
+                                right_edge - wf_width,
                                 rect.top() - WF_MARGIN - WF_HEIGHT,
                             ),
-                            egui::vec2(WF_WIDTH, WF_HEIGHT),
+                            egui::vec2(wf_width, WF_HEIGHT),
                         );
                         // draw_audio_waveform insets its own panel by
                         // WF_MARGIN from whatever rect it's given, so
                         // pass it one WF_MARGIN bigger on every side to
                         // get the intended WF_WIDTHxWF_HEIGHT box back.
                         let outer_rect = above_rect.expand(WF_MARGIN);
-                        draw_audio_waveform(ui.painter(), outer_rect, &samples);
+                        draw_audio_waveform(ui.painter(), outer_rect, &samples, wf_width);
                     }
                     // Diagnostic line (Settings -> Diagnostic): the ticked values in the free line above the spectrum,
                     // from the left edge up to the audio scope; whatever does not fit is left out.
                     if lcd_kiosk_mode() && !connected.diag_items.is_empty() {
-                        const WF_W: f32 = 160.0;
-                        let limit = rect.right() + cw_panel_reserved_width - 8.0 - WF_W - 16.0;
+                        let wf_w = ui.ctx().data(|d| d.get_temp::<f32>(egui::Id::new("wf_scope_width"))).unwrap_or(160.0);
+                        let limit = rect.right() + cw_panel_reserved_width - 8.0 - wf_w - 16.0;
                         let font = egui::FontId::monospace(13.0);
                         let y = rect.top() - 15.0;
                         let mut x = rect.left() + 2.0;
@@ -8447,7 +8499,7 @@ impl eframe::App for HpsdrApp {
                             // above.
                             const NOTCH: f32 = 100.0;
                             let shift = ui.input(|i| i.modifiers.shift);
-                            let step: i64 = if shift { 100 } else { 1_000 };
+                            let step: i64 = if shift { 100 } else { connected.vfo_b_step_hz };
 
                             let mut new_freq = connected.vfo_b_frequency_hz as i64;
                             while connected.vfo_b_scroll_accum.abs() >= NOTCH {
@@ -10942,13 +10994,16 @@ Waterfall rebuilds: {prof_wf_n:.0}/s, {prof_wf_ms:.1} ms each."
                                     if ports.is_empty() {
                                         ui.weak("(none detected)");
                                     }
-                                    for name in &ports {
-                                        let mut on = wanted.contains(name);
+                                    let port_keys: Vec<String> = ports.iter().map(|p| midi::port_key(p)).collect();
+                                    for (name, key) in ports.iter().zip(port_keys.iter()) {
+                                        let mut on = wanted.contains(key);
                                         if ui.checkbox(&mut on, name).changed() {
                                             if on {
-                                                wanted.push(name.clone());
+                                                if !wanted.contains(key) {
+                                                    wanted.push(key.clone());
+                                                }
                                             } else {
-                                                wanted.retain(|n| n != name);
+                                                wanted.retain(|n| n != key);
                                             }
                                             *connected.midi.device_names.lock().unwrap() = wanted.clone();
                                             settings_changed = true;
@@ -10958,7 +11013,7 @@ Waterfall rebuilds: {prof_wf_n:.0}/s, {prof_wf_ms:.1} ms each."
                                     // see (unplugged, or just not enumerated yet) --
                                     // still shown, checked, so it isn't silently dropped
                                     // from the config the moment it's unplugged.
-                                    for name in wanted.iter().filter(|n| !ports.contains(n)).cloned().collect::<Vec<_>>() {
+                                    for name in wanted.iter().filter(|n| !port_keys.contains(n)).cloned().collect::<Vec<_>>() {
                                         let mut on = true;
                                         if ui.checkbox(&mut on, format!("{name} (not currently detected)")).changed()
                                             && !on
@@ -15189,6 +15244,8 @@ Waterfall rebuilds: {prof_wf_n:.0}/s, {prof_wf_ms:.1} ms each."
                         toolbar_layer: Some(connected.toolbar_layer),
                         vfo_encoder_divisor: Some(connected.vfo_encoder_divisor),
                         pa_enabled: Some(connected.pa_enabled),
+                        tx_window_pos: connected.tx_window_pos,
+                        vfo_b_step_hz: Some(connected.vfo_b_step_hz),
                         freq_cal_ppm: Some(connected.freq_cal_ppm),
                         step_memory: connected.step_memory.clone(),
                         diag_items: connected.diag_items.clone(),
@@ -15987,6 +16044,61 @@ fn kiosk_freq_text(text: String) -> String {
     } else {
         text
     }
+}
+
+/// Kiosk: the line above the digits of a VFO box -- "A:" / "B:" in the colour of the digits (green/grey receiving, red
+/// transmitting), then the band, the mode and "step: ..." in yellow, plain text (no chips). Each part has a fixed slot
+/// as wide as its widest possible text, so the line never changes width and nothing jumps.
+fn kiosk_vfo_header(ui: &mut egui::Ui, who: &str, who_color: egui::Color32, band: &str, mode: &str, step: &str, digits_size: f32) {
+    let yellow = egui::Color32::from_rgb(235, 195, 40);
+    let mut font = egui::TextStyle::Body.resolve(ui.style());
+    if digits_size <= 30.0 {
+        // VFO B (smaller digits): a slightly smaller header, so it is not wider than its digits.
+        font.size *= 0.88;
+    }
+    let width_of = |ui: &egui::Ui, s: &str| ui.painter().layout_no_wrap(s.to_string(), font.clone(), egui::Color32::WHITE).size().x;
+    let band_w = BANDS.iter().map(|b| b.name).chain(["Gen"]).map(|s| width_of(ui, s)).fold(0.0_f32, f32::max);
+    let mode_w = ALL_MODES.iter().map(|md| width_of(ui, md.label())).fold(0.0_f32, f32::max);
+    let step_w = ALL_TUNE_STEPS_HZ
+        .iter()
+        .map(|hz| width_of(ui, &format!("step: {}", tune_step_label(*hz))))
+        .fold(0.0_f32, f32::max);
+    let who_w = width_of(ui, "B:");
+    let h = ui.painter().layout_no_wrap("Ag".to_string(), font.clone(), egui::Color32::WHITE).size().y;
+    // The box is as wide as its digits (000.000.000 in `digits_size`): the group "band mode step" is centred
+    // between the "A:" / "B:" and the right end of the box, with the same gap between its parts.
+    // VFO B's box is narrower (smaller digits): tighter gaps, so the header does not make the box wider than its digits.
+    let gap = if digits_size > 30.0 { 8.0 } else { 3.0 };
+    let box_w = ui
+        .painter()
+        .layout_no_wrap("000.000.000".to_string(), egui::FontId::monospace(digits_size), egui::Color32::WHITE)
+        .size()
+        .x;
+    let group_w = band_w + mode_w + step_w + 2.0 * gap;
+    // The group "band mode step" is flush to the right end of the box (not centred).
+    let lead = (box_w - who_w - gap - group_w).max(0.0);
+    ui.horizontal(|ui| {
+        ui.spacing_mut().item_spacing.x = gap;
+        let mut parts: Vec<(String, egui::Color32, f32, bool)> = Vec::new();
+        parts.push((who.to_string(), who_color, who_w, true));
+        if lead > 0.5 {
+            parts.push((String::new(), yellow, lead, false)); // centring space
+        }
+        parts.push((band.to_string(), yellow, band_w, true));
+        parts.push((mode.to_string(), yellow, mode_w, true));
+        parts.push((format!("step: {step}"), yellow, step_w, false));
+        for (text, color, w, bold) in parts {
+            let (rect, _) = ui.allocate_exact_size(egui::vec2(w, h), egui::Sense::hover());
+            if text.is_empty() {
+                continue;
+            }
+            ui.painter().text(rect.left_center(), egui::Align2::LEFT_CENTER, text.clone(), font.clone(), color);
+            // Bold: egui has no bold face, so the text is drawn twice, a hair apart.
+            if bold {
+                ui.painter().text(rect.left_center() + egui::vec2(0.7, 0.0), egui::Align2::LEFT_CENTER, text, font.clone(), color);
+            }
+        }
+    });
 }
 
 /// CW message picker plus the SEND CW / STOP button. On the desktop it sits in the TX row; in the kiosk it is the
@@ -17768,13 +17880,13 @@ fn render_toolbar_config(ui: &mut egui::Ui, connected: &mut ConnectedState) {
 /// voice/mic audio, since a peak trace touches close to full-scale on
 /// nearly every column once each column spans more than about one pitch
 /// period; see the per-column comment below for the full reasoning).
-fn draw_audio_waveform(painter: &egui::Painter, rect: egui::Rect, samples: &[f32]) {
+fn draw_audio_waveform(painter: &egui::Painter, rect: egui::Rect, samples: &[f32], width: f32) {
     const MARGIN: f32 = 8.0;
-    const WIDTH: f32 = 160.0;
+    let width_px = width;
     const HEIGHT: f32 = 50.0;
     let panel = egui::Rect::from_min_size(
-        egui::pos2(rect.right() - MARGIN - WIDTH, rect.top() + MARGIN),
-        egui::vec2(WIDTH, HEIGHT),
+        egui::pos2(rect.right() - MARGIN - width_px, rect.top() + MARGIN),
+        egui::vec2(width_px, HEIGHT),
     );
     painter.rect_filled(panel, 3.0, egui::Color32::from_rgba_unmultiplied(20, 20, 20, 220));
     painter.rect_stroke(panel, 3.0, egui::Stroke::new(1.0, egui::Color32::WHITE), egui::StrokeKind::Inside);
@@ -18080,17 +18192,22 @@ fn render_status_row(
 /// Plain (no-modifier) scroll/drag tuning step picker -- see
 /// ConnectedState::tune_step_hz's own doc comment. Used by the VFO window.
 /// Returns whether the step changed.
-fn render_step_combo_only(ui: &mut egui::Ui, connected: &mut ConnectedState) -> bool {
+fn render_step_combo_only(ui: &mut egui::Ui, connected: &mut ConnectedState, for_b: bool) -> bool {
     let mut changed = false;
-    egui::ComboBox::from_id_salt("tune_step_hz")
+    let current = if for_b { connected.vfo_b_step_hz } else { connected.tune_step_hz };
+    egui::ComboBox::from_id_salt(if for_b { "tune_step_hz_b" } else { "tune_step_hz" })
         .width(70.0)
-        .selected_text(tune_step_label(connected.tune_step_hz))
+        .selected_text(tune_step_label(current))
         .show_ui(ui, |ui| {
             for hz in ALL_TUNE_STEPS_HZ {
-                if ui.selectable_label(connected.tune_step_hz == hz, tune_step_label(hz)).clicked() {
-                    connected.tune_step_hz = hz;
-                    let mode_label = connected.spectrum.mode().label().to_string();
-                    connected.step_memory.insert(mode_label, hz);
+                if ui.selectable_label(current == hz, tune_step_label(hz)).clicked() {
+                    if for_b {
+                        connected.vfo_b_step_hz = hz;
+                    } else {
+                        connected.tune_step_hz = hz;
+                        let mode_label = connected.spectrum.mode().label().to_string();
+                        connected.step_memory.insert(mode_label, hz);
+                    }
                     changed = true;
                 }
             }
@@ -18372,6 +18489,10 @@ fn render_rit_xit(ui: &mut egui::Ui, connected: &mut ConnectedState) -> bool {
             ui.add(chip_button("DUP", connected.spectrum.duplex()).sense(egui::Sense::hover()))
                 .on_hover_text("Duplex: on while the receiver keeps running during TX (set it in the VFO window)");
         }
+        ui.add(chip_button("CTUN", connected.ctun).sense(egui::Sense::hover()))
+            .on_hover_text("CTUN: on while Click-to-Tune is active (set it in the VFO window)");
+        ui.add(chip_button("Split", connected.split).sense(egui::Sense::hover()))
+            .on_hover_text("Split: transmitting on VFO B (set it in the VFO window)");
     }
     changed
 }
@@ -18435,10 +18556,8 @@ fn render_kiosk_band_row(ui: &mut egui::Ui, connected: &mut ConnectedState, band
         let band_w = chip_width(ui, &band_names);
         let mode_labels: Vec<&str> = ALL_MODES.iter().map(|m| m.label()).collect();
         let mode_w = chip_width(ui, &mode_labels);
-        ui.add(chip_button(band, true).min_size(egui::vec2(band_w, 0.0)).sense(egui::Sense::hover()))
-            .on_hover_text("Active band");
-        ui.add(chip_button(mode, true).min_size(egui::vec2(mode_w, 0.0)).sense(egui::Sense::hover()))
-            .on_hover_text("Active mode");
+        // (band and mode are now in the VFO A / VFO B boxes' header lines.)
+        let _ = (band, mode, band_w, mode_w);
         changed |= render_snb_anf_bin_chips(ui, connected);
         changed |= render_nb_chip(ui, connected);
         changed |= render_nr_chip(ui, connected);
@@ -18850,6 +18969,7 @@ fn stable_value_box(ui: &mut egui::Ui, text: String) {
     );
     let size = reference.size() + egui::vec2(2.0 * MARGIN, 2.0 * MARGIN);
     let (rect, _) = ui.allocate_exact_size(size, egui::Sense::hover());
+    ui.data_mut(|d| d.insert_temp(egui::Id::new("last_value_box_left"), rect.left()));
     let visuals = ui.visuals().widgets.inactive;
     ui.painter().rect(
         rect,
@@ -20799,7 +20919,7 @@ fn render_extra_receiver_ui(ui: &mut egui::Ui, rx: &Arc<Mutex<ExtraReceiver>>) {
     // receiver's RX case (extra receivers never transmit, so there's no
     // TX case to switch on here).
     let waveform_samples = peek_recent_samples(&rx.spectrum.waveform_out, WAVEFORM_WINDOW_SAMPLES);
-    draw_audio_waveform(ui.painter(), rect, &waveform_samples);
+    draw_audio_waveform(ui.painter(), rect, &waveform_samples, 160.0);
 
     if let Some(pos) = spectrum_resp.hover_pos() {
         let hover_freq = round_to_step_hz(freq_at_x(pos.x, rect, freq_hz, sample_rate, rx.spectrum_zoom, pan_offset_hz), scroll_tune_step_hz(1_000, cw_mode, ui.input(|i| i.modifiers.shift), ui.input(|i| i.modifiers.ctrl)));
