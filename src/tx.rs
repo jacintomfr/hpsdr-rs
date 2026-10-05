@@ -79,6 +79,13 @@ use std::ffi::CString;
 use std::os::raw::c_int;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
+
+/// ALC reading: 0 = peak, 1 = average, 2 = gain (deskHPSDR's meter menu), set from the UI every frame.
+static ALC_MODE: AtomicU8 = AtomicU8::new(1);
+
+pub fn set_alc_mode(mode: u8) {
+    ALC_MODE.store(mode, Ordering::Relaxed);
+}
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
@@ -3049,7 +3056,11 @@ fn run(
         }
 
         let mic_pk = processor.meter(wdsp::txaMeterType_TXA_MIC_PK);
-        let alc_av = processor.meter(wdsp::txaMeterType_TXA_ALC_AV);
+        let alc_av = processor.meter(match ALC_MODE.load(Ordering::Relaxed) {
+            0 => wdsp::txaMeterType_TXA_ALC_PK,
+            2 => wdsp::txaMeterType_TXA_ALC_GAIN,
+            _ => wdsp::txaMeterType_TXA_ALC_AV,
+        });
         *display.lock().unwrap() = TxDisplay { mic_pk, alc_av };
 
         next_chunk += chunk_interval;

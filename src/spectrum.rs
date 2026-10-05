@@ -25,6 +25,13 @@ use std::time::{Duration, Instant};
 // status bar's audio tooltip to find out what starves the audio output.
 /// Total DSP blocks processed (for the diagnostics log).
 pub static DSP_CHUNKS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// S-meter reading: true = peak, false = average (deskHPSDR's meter menu), set from the UI every frame.
+static SMETER_PEAK: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+pub fn set_smeter_peak(peak: bool) {
+    SMETER_PEAK.store(peak, std::sync::atomic::Ordering::Relaxed);
+}
+
 static DSP_MAX_GAP_US: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 static DSP_MAX_PROC_US: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 static DSP_MAX_BACKLOG: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -1821,7 +1828,12 @@ impl SpectrumAnalyzer {
     /// confirmed thread-safe for concurrent access from multiple
     /// threads, so this can't be polled directly from the UI thread.
     fn meter_db(&self) -> f64 {
-        unsafe { wdsp::GetRXAMeter(self.channel, wdsp::rxaMeterType_RXA_S_AV as c_int) }
+        let kind = if SMETER_PEAK.load(std::sync::atomic::Ordering::Relaxed) {
+            wdsp::rxaMeterType_RXA_S_PK
+        } else {
+            wdsp::rxaMeterType_RXA_S_AV
+        };
+        unsafe { wdsp::GetRXAMeter(self.channel, kind as c_int) }
     }
 }
 

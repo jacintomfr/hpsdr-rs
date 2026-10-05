@@ -142,6 +142,11 @@ pub struct Config {
     /// Analog, this project's original S-meter style.
     #[serde(default)]
     pub meter_style: Option<MeterStyle>,
+    /// S-meter reading (peak / average) and TX ALC reading (peak / average / gain), deskHPSDR's meter menu.
+    #[serde(default)]
+    pub smeter_mode: Option<crate::SMeterMode>,
+    #[serde(default)]
+    pub alc_mode: Option<crate::AlcMode>,
     /// Spectrum's share (0.0-1.0) of the combined spectrum+waterfall
     /// height -- draggable via the divider between them. Missing falls
     /// back to their old fixed 150/350 proportions.

@@ -2200,6 +2200,10 @@ struct ConnectedState {
     /// S-meter style (Settings -> Meter) -- see MeterStyle's own doc
     /// comment.
     meter_style: MeterStyle,
+    /// S-meter / ALC reading and the kiosk window that picks them (tap on the meter), see `meter_options_window`.
+    smeter_mode: SMeterMode,
+    alc_mode: AlcMode,
+    meter_window_open: bool,
     /// Spectrum's share (0.0-1.0) of the combined spectrum+waterfall
     /// height, adjustable via the drag handle between them -- see
     /// Config::spectrum_waterfall_ratio's doc comment.
@@ -3910,6 +3914,9 @@ fn connect_to_device(device: Device, cfg: &Config) -> Result<ConnectedState, Str
                 spectrum_gradient: cfg.spectrum_gradient.unwrap_or(false),
                 waterfall_palette: cfg.waterfall_palette.unwrap_or(Palette::Ocean),
                 meter_style: cfg.meter_style.unwrap_or(MeterStyle::Analog),
+                smeter_mode: cfg.smeter_mode.unwrap_or(SMeterMode::Average),
+                alc_mode: cfg.alc_mode.unwrap_or(AlcMode::Average),
+                meter_window_open: false,
                 spectrum_waterfall_ratio: cfg
                     .spectrum_waterfall_ratio
                     .unwrap_or(150.0 / 350.0),
@@ -4876,6 +4883,12 @@ impl eframe::App for HpsdrApp {
                     }
                 }
                 vox_tick(ui.ctx(), connected);
+                spectrum::set_smeter_peak(connected.smeter_mode == SMeterMode::Peak);
+                tx::set_alc_mode(match connected.alc_mode {
+                    AlcMode::Peak => 0,
+                    AlcMode::Average => 1,
+                    AlcMode::Gain => 2,
+                });
                 if xvtr_remember(connected) {
                     connected.settings_dirty.store(true, Ordering::Relaxed);
                 }
@@ -6394,6 +6407,16 @@ impl eframe::App for HpsdrApp {
                         }
                         if close_now {
                             connected.filter_window_open = false;
+                        }
+                    }
+                    // Meter options (deskHPSDR meter_menu.c), opened by a tap on the meter (kiosk).
+                    if connected.meter_window_open {
+                        let (close_now, changed) = meter_options_window(ui, connected);
+                        if changed {
+                            settings_changed = true;
+                        }
+                        if close_now {
+                            connected.meter_window_open = false;
                         }
                     }
                     // Band chooser (deskHPSDR band_menu.c): the band buttons, 5 per row, the current band lit. Opened by
@@ -9988,6 +10011,19 @@ Waterfall rebuilds: {prof_wf_n:.0}/s, {prof_wf_ms:.1} ms each."
                         // the actual space math).
                         let (meter_rect, _resp) =
                             ui.allocate_exact_size(egui::vec2(180.0, 85.0), egui::Sense::hover());
+                        // Kiosk: a tap on the (enlarged) meter opens the meter options window, like deskHPSDR. The area
+                        // itself is inert (its enlarged hit rect used to swallow the REC/PLAY buttons), so the tap is
+                        // tested against the drawn rectangle only.
+                        if lcd_kiosk_mode() {
+                            let drawn = egui::Rect::from_min_max(
+                                egui::pos2(meter_rect.right() - 180.0 * KIOSK_METER_SCALE, meter_rect.top()),
+                                egui::pos2(meter_rect.right(), meter_rect.top() + 85.0 * KIOSK_METER_SCALE),
+                            );
+                            let tapped = ui.input(|i| i.pointer.primary_clicked() && i.pointer.interact_pos().is_some_and(|p| drawn.contains(p)));
+                            if tapped {
+                                connected.meter_window_open = !connected.meter_window_open;
+                            }
+                        }
                         // Kiosk (1024x600 panel) only: the meter reads small there, so the
                         // whole area is drawn scaled up about its top-right corner. The
                         // desktop layout is untouched.
@@ -15334,6 +15370,8 @@ Waterfall rebuilds: {prof_wf_n:.0}/s, {prof_wf_ms:.1} ms each."
                         spectrum_gradient: Some(connected.spectrum_gradient),
                         waterfall_palette: Some(connected.waterfall_palette),
                         meter_style: Some(connected.meter_style),
+                        smeter_mode: Some(connected.smeter_mode),
+                        alc_mode: Some(connected.alc_mode),
                         spectrum_waterfall_ratio: Some(connected.spectrum_waterfall_ratio),
                         waterfall_enabled: Some(connected.waterfall_enabled),
                         spectrum_zoom: Some(connected.spectrum_zoom),
@@ -16013,7 +16051,7 @@ fn choice_window(ui: &mut egui::Ui, id: &str, heading: &str, items: &[(String, b
             }
             ui.spacing_mut().item_spacing = egui::vec2(gap, gap);
             ui.horizontal(|ui| {
-                if ui.add(chip_button("Close", false).min_size(egui::vec2(2.0 * key_w + gap, key_h))).clicked() {
+                if touch_close_button(ui, key_h).clicked() {
                     close_now = true;
                 }
                 ui.label(heading);
@@ -23039,6 +23077,100 @@ impl MeterStyle {
 }
 
 const ALL_METER_STYLES: [MeterStyle; 2] = [MeterStyle::Analog, MeterStyle::Digital];
+
+/// What the S-meter shows: the peak or the average of the signal (deskHPSDR's "S-Meter Reading").
+#[derive(Copy, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum SMeterMode {
+    Peak,
+    Average,
+}
+
+/// What the TX ALC reading shows (deskHPSDR's "TX ALC Reading").
+#[derive(Copy, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum AlcMode {
+    Peak,
+    Average,
+    Gain,
+}
+
+/// The "Close" button of the in-app kiosk windows (Band/Mode/Filter menus, meter options): as wide as its label needs
+/// plus a little, the label centred in it.
+fn touch_close_button(ui: &mut egui::Ui, height: f32) -> egui::Response {
+    let size = egui::vec2(110.0, height);
+    ui.allocate_ui_with_layout(size, egui::Layout::centered_and_justified(egui::Direction::LeftToRight), |ui| {
+        ui.add(chip_button("Close", false).min_size(size))
+    })
+    .inner
+}
+
+/// Kiosk: the window opened by a tap on the meter (deskHPSDR's meter menu): meter type, S-meter reading and, with a TX
+/// chain, the ALC reading, as big touch buttons. Returns (close, something changed).
+fn meter_options_window(ui: &mut egui::Ui, connected: &mut ConnectedState) -> (bool, bool) {
+    let key_w = 120.0f32;
+    let key_h = 46.0f32;
+    let gap = 8.0f32;
+    let label_w = 150.0f32;
+    let has_tx = connected.tx_enabled && connected.tx_handle.is_some();
+    let win_w = label_w + 3.0 * key_w + 3.0 * gap + 24.0;
+    let screen_w = ui.ctx().content_rect().width();
+    let mut close_now = false;
+    let mut changed = false;
+    egui::Window::new("Meter")
+        .id(egui::Id::new("meter_options_window"))
+        .title_bar(false)
+        .collapsible(false)
+        .resizable(false)
+        .fixed_pos(egui::pos2(((screen_w - win_w) / 2.0).max(0.0), connected.last_spectrum_top))
+        .show(ui.ctx(), |ui| {
+            if ui.input(|i| i.key_pressed(egui::Key::Escape)) {
+                close_now = true;
+            }
+            ui.spacing_mut().item_spacing = egui::vec2(gap, gap);
+            if touch_close_button(ui, key_h).clicked() {
+                close_now = true;
+            }
+            let row_label = |ui: &mut egui::Ui, text: &str| {
+                let (rect, _) = ui.allocate_exact_size(egui::vec2(label_w, key_h), egui::Sense::hover());
+                ui.painter().text(
+                    rect.left_center(),
+                    egui::Align2::LEFT_CENTER,
+                    text,
+                    egui::TextStyle::Body.resolve(ui.style()),
+                    ui.visuals().text_color(),
+                );
+            };
+            ui.horizontal(|ui| {
+                row_label(ui, "Meter type");
+                for style in ALL_METER_STYLES {
+                    if ui.add(chip_button(style.label(), connected.meter_style == style).min_size(egui::vec2(key_w, key_h))).clicked() {
+                        connected.meter_style = style;
+                        changed = true;
+                    }
+                }
+            });
+            ui.horizontal(|ui| {
+                row_label(ui, "S-meter reading");
+                for (mode, label) in [(SMeterMode::Peak, "Peak"), (SMeterMode::Average, "Average")] {
+                    if ui.add(chip_button(label, connected.smeter_mode == mode).min_size(egui::vec2(key_w, key_h))).clicked() {
+                        connected.smeter_mode = mode;
+                        changed = true;
+                    }
+                }
+            });
+            if has_tx {
+                ui.horizontal(|ui| {
+                    row_label(ui, "TX ALC reading");
+                    for (mode, label) in [(AlcMode::Peak, "Peak"), (AlcMode::Average, "Average"), (AlcMode::Gain, "Gain")] {
+                        if ui.add(chip_button(label, connected.alc_mode == mode).min_size(egui::vec2(key_w, key_h))).clicked() {
+                            connected.alc_mode = mode;
+                            changed = true;
+                        }
+                    }
+                });
+            }
+        });
+    (close_now, changed)
+}
 
 #[derive(Copy, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum Palette {
