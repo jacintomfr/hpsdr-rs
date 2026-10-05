@@ -158,6 +158,8 @@ pub struct DiscoveryWindow {
     /// remember to click Refresh themselves. `None` the rest of the
     /// time -- a manual Refresh is unaffected either way.
     juice_refresh_at: Option<Instant>,
+    /// Automatic juice restarts already followed by a rediscovery (see JuiceHandle::auto_restart_count).
+    juice_auto_restarts_seen: u32,
     /// RX-888 Mk2's own user-supplied FX3 RAM image path -- same
     /// "set here, not post-connect Settings" reasoning as the Ozy paths
     /// above (needed just to complete the very first connect). See
@@ -249,6 +251,7 @@ impl DiscoveryWindow {
             radioberry_juice_fpga,
             juice_launch_error: None,
             juice_refresh_at: None,
+            juice_auto_restarts_seen: 0,
             juice_console,
             rx888_firmware_path: rx888_cfg.rx888_firmware_path,
             sim_handle: None,
@@ -320,6 +323,15 @@ impl DiscoveryWindow {
         // regardless of what's currently shown, so it still fires even
         // if the user has since collapsed the "Radioberry Juice setup"
         // section or switched focus elsewhere within this window.
+        // After the automatic stuck-FPGA recovery restarted juice, look for the board again by itself, like after
+        // the Launch / Restart / Reset USB buttons.
+        if let Some(console) = &self.juice_console {
+            let restarts = console.auto_restart_count();
+            if restarts != self.juice_auto_restarts_seen {
+                self.juice_auto_restarts_seen = restarts;
+                self.juice_refresh_at = Some(Instant::now() + JUICE_REFRESH_DELAY);
+            }
+        }
         if let Some(at) = self.juice_refresh_at {
             let now = Instant::now();
             if now >= at {
@@ -761,16 +773,8 @@ impl DiscoveryWindow {
                 });
 
                 ui.add_space(8.0);
-                egui::CollapsingHeader::new("Radioberry Juice setup").show(ui, |ui| {
-                    ui.label(
-                        "Radioberry boards are driven by a separate program, \"Juice\" \
-                         (radioberry-juice), which talks to the board over USB and then \
-                         exposes it here over normal openHPSDR discovery, same as any \
-                         Metis/Hermes-family board once it's running. Point this at your \
-                         built juice executable, launch it, and pick the FPGA variant \
-                         fitted to your board.",
-                    );
-
+                // The help text is a tooltip on the header (three lines of it under the header got in the way every time).
+                let juice_header = egui::CollapsingHeader::new("Radioberry Juice setup").show(ui, |ui| {
                     ui.horizontal(|ui| {
                         ui.label("Juice executable:");
                         ui.label(
@@ -990,6 +994,16 @@ impl DiscoveryWindow {
                         ui.ctx().request_repaint_after(Duration::from_millis(300));
                     }
                 });
+                // The help is a tooltip on the header (it used to be three lines under it, in the way every time).
+                juice_header.header_response.on_hover_text(
+                    "Radioberry boards are driven by a separate program, \"Juice\"\n\
+                     (radioberry-juice), which talks to the board over USB and then\n\
+                     exposes it here over normal openHPSDR discovery, same as any\n\
+                     Metis/Hermes-family board once it's running.\n\
+                     \n\
+                     Point this at your built juice executable, launch it, and pick\n\
+                     the FPGA variant fitted to your board.",
+                );
 
                 egui::CollapsingHeader::new("RX-888 USB setup").show(ui, |ui| {
                     ui.label(

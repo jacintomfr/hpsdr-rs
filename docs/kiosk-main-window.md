@@ -103,3 +103,16 @@ Behaviour on the desktop is meant to be identical, but these are shared, so chec
 * MIDI `Mox` and the Space PTT unkey through `set_rade_aware_mox` (as the on-screen MOX button always did): with RADE
   armed the End-of-Over burst goes out and the RADE engine learns the over ended; cutting mox directly left RADE's
   receiver without sync after each transmission (confirmed fixed on the Pi).
+
+## Other kiosk-related changes
+
+* **Freq. Calibration (ppm factor)** (Settings -> RX, deskHPSDR's `ppm_factor`): -100.0..+100.0 in 0.1 steps, applied only to the frequencies sent to
+  the radio (`apply_ppm` in `src/radio.rs`: P2 `phase_word`, P1 RX/TX frequency bytes), not to the display or band/filter decisions. It uses a value box
+  with - and + buttons (`spin_buttons`, tap or hold) because dragging a value is impractical on the touch screen.
+* **Radioberry Juice (Linux):** juice now writes to `~/.config/hpsdr-rs/radioberry-juice.log` (not a pipe: a pipe made juice die by SIGPIPE when hpsdr-rs
+  exited and left the FPGA stuck), the console follows the file and a running juice is adopted live; the real-time priority is given only after
+  "FPGA gateware activated"; 3 s of "NSTATUS and NCONF_DONE must be low..." start an automatic USB reset and restart (and a rediscovery). The root
+  cause is not proven yet.
+* **VFO encoder:** each tick moves the selected step, dynamic tune from the distance to 64 in the MIDI value, Settings -> MIDI "ticks per step" (default 10),
+  17 steps (deskHPSDR's list) stored per mode.
+* Discover: the Radioberry Juice setup help is a tooltip on its header.

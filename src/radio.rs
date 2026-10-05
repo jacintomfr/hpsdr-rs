@@ -3908,7 +3908,8 @@ fn p1_build_packet(
             // transmits where you're actually listening. See
             // RadioSession::tx_frequency_hz's doc comment. No per-band
             // LO offset applied (not tracked here).
-            (0x02, (tx_freq >> 24) as u8, (tx_freq >> 16) as u8, (tx_freq >> 8) as u8, tx_freq as u8)
+            let tx_wire = apply_ppm(tx_freq as i64) as i32; // calibrated, wire only
+            (0x02, (tx_wire >> 24) as u8, (tx_wire >> 16) as u8, (tx_wire >> 8) as u8, tx_wire as u8)
         }
         2 => {
             // RX frequency for current_receiver. ROOT CAUSE FIX:
@@ -3942,7 +3943,8 @@ fn p1_build_packet(
                     .map(|f| f.load(Ordering::Relaxed) as i32)
                     .unwrap_or(freq)
             };
-            (c0, (rx_freq >> 24) as u8, (rx_freq >> 16) as u8, (rx_freq >> 8) as u8, rx_freq as u8)
+            let rx_wire = apply_ppm(rx_freq as i64) as i32; // calibrated, wire only
+            (c0, (rx_wire >> 24) as u8, (rx_wire >> 16) as u8, (rx_wire >> 8) as u8, rx_wire as u8)
         }
         3 => {
             // Drive level (while transmitting) + mic boost. Confirmed
@@ -5838,9 +5840,25 @@ fn push_audio_sample(buf: &Arc<Mutex<VecDeque<f32>>>, s: f32, capacity: usize) {
 // to standby if it doesn't see a C&C packet within ~1 second.
 // ---------------------------------------------------------------------
 
+/// Frequency calibration in 0.1 ppm (deskHPSDR's `ppm_factor`, radio_menu.c "Freq. Calibration (ppm factor)",
+/// -100.0..+100.0 in 0.1 steps): the radio's reference oscillator error, applied only to the frequencies that go to
+/// the radio (RX DDCs and TX DUC), never to what is displayed or to the band/filter decisions.
+static FREQ_CAL_0P1_PPM: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(0);
+
+pub fn set_freq_cal_ppm(ppm: f64) {
+    FREQ_CAL_0P1_PPM.store((ppm * 10.0).round() as i64, Ordering::Relaxed);
+}
+
+/// deskHPSDR's `apply_ppm_ll`: f * (1e7 + round(ppm * 10)) / 1e7, in integer arithmetic.
+fn apply_ppm(f_hz: i64) -> i64 {
+    let cal = FREQ_CAL_0P1_PPM.load(Ordering::Relaxed);
+    ((f_hz as i128 * (10_000_000i128 + cal as i128)) / 10_000_000i128) as i64
+}
+
 /// phase_word[31:0] = 2^32 * frequency(Hz) / DSP clock frequency (Hz)
 fn phase_word(freq_hz: u32) -> u32 {
-    ((4294967296.0_f64 * freq_hz as f64) / P2_DSP_CLOCK_HZ) as u32
+    let freq_hz = apply_ppm(freq_hz as i64).max(0) as f64;
+    ((4294967296.0_f64 * freq_hz) / P2_DSP_CLOCK_HZ) as u32
 }
 
 fn start_protocol2(

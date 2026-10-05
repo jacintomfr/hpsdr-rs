@@ -29,6 +29,7 @@ use std::io;
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 
 /// The two FPGA variants juice's `radioberry.props` supports (see
@@ -95,6 +96,18 @@ pub struct JuiceHandle {
     lines: Arc<Mutex<VecDeque<String>>>,
     process: Arc<Mutex<Option<Child>>>,
     exe_path: PathBuf,
+    /// Consecutive "NSTATUS and NCONF_DONE must be low..." lines and automatic USB resets so far (see `auto_recover`).
+    stuck_lines: Arc<AtomicU32>,
+    auto_resets: Arc<AtomicU32>,
+    /// When the current run of "must be low" lines began, and whether an automatic reset is under way.
+    stuck_since: Arc<Mutex<Option<std::time::Instant>>>,
+    recovering: Arc<AtomicBool>,
+    /// Which launch's output the log-tail thread follows (Linux: juice writes to a log file, see `spawn_into`).
+    tail_gen: Arc<AtomicU32>,
+    /// Counts automatic restarts (the stuck-FPGA recovery), so the Discover window can look for the board again.
+    auto_restarts: Arc<AtomicU32>,
+    /// Set once juice printed "FPGA gateware activated" (the real-time priority is only given after that).
+    gateware_activated: Arc<AtomicBool>,
 }
 
 impl JuiceHandle {
@@ -139,10 +152,9 @@ impl JuiceHandle {
                     lines.push_back((*line).to_string());
                 }
                 lines.push_back(format!(
-                    "--- adopted an already-running juice (from an earlier session) -- the lines \
-                     above are its log file ({}) as of just now, not live; new output won't appear \
-                     here unless you Restart it ---",
-                    log_path.display()
+                    "--- adopted an already-running juice (from an earlier session) -- the lines above are its log file ({}) as of just now{} ---",
+                    log_path.display(),
+                    if cfg!(target_os = "linux") { ", new output follows live" } else { ", not live; new output will not appear here unless you Restart it" }
                 ));
             }
             Err(_) => {
@@ -154,11 +166,85 @@ impl JuiceHandle {
                 );
             }
         }
-        Self {
+        let adopted = Self {
             lines: Arc::new(Mutex::new(lines)),
             process: Arc::new(Mutex::new(None)),
             exe_path: exe_path.to_path_buf(),
+            stuck_lines: Arc::new(AtomicU32::new(0)),
+            auto_resets: Arc::new(AtomicU32::new(0)),
+            stuck_since: Arc::new(Mutex::new(None)),
+            recovering: Arc::new(AtomicBool::new(false)),
+        tail_gen: Arc::new(AtomicU32::new(0)),
+        auto_restarts: Arc::new(AtomicU32::new(0)),
+            gateware_activated: Arc::new(AtomicBool::new(false)),
+        };
+        #[cfg(target_os = "linux")]
+        {
+            let gen = adopted.tail_gen.fetch_add(1, Ordering::Relaxed) + 1;
+            let handle = adopted.clone();
+            let path = log_path.clone();
+            std::thread::spawn(move || tail_log(handle, path, gen, true));
         }
+        adopted
+    }
+
+    /// juice's gateware activation (firmware/gateware.c `activate_gateware`) loops printing "NSTATUS and NCONF_DONE
+    /// must be low..." about 1000 times a second for as long as the FPGA does not answer; once stuck like that it
+    /// never leaves it, and only a USB reset of the FT2232H helped (the "Reset USB & Restart" button). So after a few
+    /// thousand of those lines in a row do that automatically, up to 3 times in a row (the count starts again once
+    /// juice reports "FPGA gateware activated").
+    fn watch_for_stuck_fpga(&self, line: &str) {
+        // The loop prints this many times a second but how many depends on the USB read timeouts, so judge by time:
+        // 3 seconds of nothing else.
+        const STUCK_FOR: std::time::Duration = std::time::Duration::from_secs(3);
+        if line.contains("NSTATUS and NCONF_DONE must be low") {
+            self.stuck_lines.fetch_add(1, Ordering::Relaxed);
+            let mut since = self.stuck_since.lock().unwrap();
+            let t0 = *since.get_or_insert_with(std::time::Instant::now);
+            if t0.elapsed() >= STUCK_FOR && !self.recovering.swap(true, Ordering::Relaxed) {
+                drop(since);
+                self.auto_recover();
+            }
+            return;
+        }
+        self.stuck_lines.store(0, Ordering::Relaxed);
+        *self.stuck_since.lock().unwrap() = None;
+        if line.contains("FPGA gateware activated") {
+            self.auto_resets.store(0, Ordering::Relaxed);
+            self.recovering.store(false, Ordering::Relaxed);
+            self.gateware_activated.store(true, Ordering::Relaxed);
+        }
+    }
+
+    fn auto_recover(&self) {
+        let attempt = self.auto_resets.fetch_add(1, Ordering::Relaxed) + 1;
+        if attempt > 3 {
+            // Stays "recovering" (no more automatic attempts) until juice reports a loaded FPGA.
+            self.push_line(
+                "--- juice is still stuck waiting for the FPGA after 3 automatic USB resets: use Reset USB &                  Restart, check the FPGA variant (CL016/CL025) and the board's power ---"
+                    .to_string(),
+            );
+            return;
+        }
+        self.push_line(format!(
+            "--- juice is stuck waiting for the FPGA (NSTATUS/NCONF_DONE): resetting the USB device and restarting              automatically (attempt {attempt} of 3) ---"
+        ));
+        let handle = self.clone();
+        std::thread::spawn(move || {
+            if let Err(e) = handle.reset_usb_and_restart() {
+                handle.push_line(format!("--- automatic USB reset failed: {e} ---"));
+            }
+            handle.auto_restarts.fetch_add(1, Ordering::Relaxed);
+            // The old process's last lines are gone by now: count the new one's from zero.
+            handle.stuck_lines.store(0, Ordering::Relaxed);
+            *handle.stuck_since.lock().unwrap() = None;
+            handle.recovering.store(false, Ordering::Relaxed);
+        });
+    }
+
+    /// How many times juice was restarted automatically (see `auto_recover`).
+    pub fn auto_restart_count(&self) -> u32 {
+        self.auto_restarts.load(Ordering::Relaxed)
     }
 
     fn push_line(&self, line: String) {
@@ -297,12 +383,48 @@ impl JuiceHandle {
     /// handle, same console/log) -- starts the child process itself
     /// and its two output-reader threads.
     fn spawn_into(&self) -> io::Result<()> {
+        // Line-buffered output where `stdbuf` exists (juice's printf to a file or pipe is otherwise block-buffered,
+        // so the console would lag behind by up to 4 kB).
+        #[cfg(target_os = "linux")]
+        let mut cmd = if Path::new("/usr/bin/stdbuf").exists() {
+            let mut c = Command::new("/usr/bin/stdbuf");
+            c.args(["-oL", "-eL"]).arg(&self.exe_path);
+            c
+        } else {
+            Command::new(&self.exe_path)
+        };
+        #[cfg(not(target_os = "linux"))]
         let mut cmd = Command::new(&self.exe_path);
         if let Some(dir) = self.exe_path.parent() {
             cmd.current_dir(dir);
         }
-        cmd.stdout(Stdio::piped());
-        cmd.stderr(Stdio::piped());
+        // Linux: juice writes straight to its log file instead of a pipe to hpsdr-rs, and the console follows the
+        // file. With a pipe, juice was killed by SIGPIPE the moment hpsdr-rs exited (its next printf), without
+        // closing the FTDI device -- which left the FPGA in a state where the next start hung or looped on
+        // "NSTATUS and NCONF_DONE must be low..." until the USB device was reset. A file also lets a juice that
+        // outlives hpsdr-rs keep running, and the next hpsdr-rs session adopt it with a live console.
+        #[cfg(target_os = "linux")]
+        let tail_path: Option<PathBuf> = {
+            let path = log_path_for(&self.exe_path);
+            match std::fs::File::create(&path).and_then(|f| f.try_clone().map(|f2| (f, f2))) {
+                Ok((f, f2)) => {
+                    cmd.stdin(Stdio::null());
+                    cmd.stdout(Stdio::from(f));
+                    cmd.stderr(Stdio::from(f2));
+                    Some(path)
+                }
+                Err(_) => {
+                    cmd.stdout(Stdio::piped());
+                    cmd.stderr(Stdio::piped());
+                    None
+                }
+            }
+        };
+        #[cfg(not(target_os = "linux"))]
+        {
+            cmd.stdout(Stdio::piped());
+            cmd.stderr(Stdio::piped());
+        }
         // juice is a plain console app -- without this, Windows pops up
         // its own separate console window for it (since hpsdr-rs itself
         // has none to inherit). That window is outside hpsdr-rs's
@@ -320,7 +442,18 @@ impl JuiceHandle {
 
         let mut child = cmd.spawn()?;
         #[cfg(target_os = "linux")]
-        boost_juice_priority(child.id());
+        {
+            self.gateware_activated.store(false, Ordering::Relaxed);
+            boost_juice_priority(child.id(), Arc::clone(&self.gateware_activated), Arc::clone(&self.stuck_lines));
+        }
+        #[cfg(target_os = "linux")]
+        if let Some(path) = tail_path {
+            let gen = self.tail_gen.fetch_add(1, Ordering::Relaxed) + 1;
+            let handle = self.clone();
+            std::thread::spawn(move || tail_log(handle, path, gen, false));
+            *self.process.lock().unwrap() = Some(child);
+            return Ok(());
+        }
         let log_file = Arc::new(Mutex::new(open_log_file(&self.exe_path)));
 
         if let Some(stdout) = child.stdout.take() {
@@ -343,10 +476,31 @@ impl JuiceHandle {
 /// priority its USB reads were delayed whenever the UI was busy (dragging the spectrum), losing
 /// 2-3% of the samples and causing audio clicks at 192 kHz. Needs the sudoers rule installed by
 /// the kiosk package (/etc/sudoers.d/hpsdr-rs-rt); without it this silently does nothing.
-/// Runs a few passes because juice starts some of its threads a moment after launch.
+/// Runs a few passes because juice starts some of its threads a moment after launch; it only starts once the
+/// FPGA gateware is activated (see the comment inside).
 #[cfg(target_os = "linux")]
-fn boost_juice_priority(pid: u32) {
+fn boost_juice_priority(pid: u32, activated: Arc<AtomicBool>, stuck_lines: Arc<AtomicU32>) {
     std::thread::spawn(move || {
+        // Not while juice is still loading the FPGA: its gateware upload/activation is a timing-sensitive loop
+        // over the FT2232H, and real-time threads started during it left the board stuck ("NSTATUS and
+        // NCONF_DONE must be low..." for ever, needing a USB reset). Wait for "FPGA gateware activated" (or 25 s
+        // without that line and without being stuck, for a board whose gateware was already loaded).
+        let started = std::time::Instant::now();
+        loop {
+            std::thread::sleep(std::time::Duration::from_millis(300));
+            if !std::path::Path::new(&format!("/proc/{pid}")).exists() {
+                return;
+            }
+            if activated.load(Ordering::Relaxed) {
+                break;
+            }
+            if started.elapsed() > std::time::Duration::from_secs(25) && stuck_lines.load(Ordering::Relaxed) == 0 {
+                break;
+            }
+            if started.elapsed() > std::time::Duration::from_secs(60) {
+                return;
+            }
+        }
         let mut done: std::collections::HashSet<String> = std::collections::HashSet::new();
         for _ in 0..8 {
             std::thread::sleep(std::time::Duration::from_millis(700));
@@ -806,6 +960,46 @@ fn open_log_file(exe_path: &Path) -> std::fs::File {
     })
 }
 
+/// Follows juice's log file (Linux) and feeds each new line to the console and the stuck-FPGA watch, like
+/// `pump_lines` does for a pipe. Stops when a newer launch takes over (`gen` no longer current). `from_end`: start at
+/// the end of the file (adopting a running juice, whose history is already in the console).
+#[cfg(target_os = "linux")]
+fn tail_log(handle: JuiceHandle, path: PathBuf, gen: u32, from_end: bool) {
+    use std::io::{Read, Seek, SeekFrom};
+    let mut pos: u64 = if from_end { std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0) } else { 0 };
+    let mut partial = String::new();
+    loop {
+        std::thread::sleep(std::time::Duration::from_millis(150));
+        if handle.tail_gen.load(Ordering::Relaxed) != gen {
+            return;
+        }
+        let Ok(mut file) = std::fs::File::open(&path) else { continue };
+        let len = file.metadata().map(|m| m.len()).unwrap_or(0);
+        if len < pos {
+            pos = 0; // the file was truncated (a new launch)
+            partial.clear();
+        }
+        if len == pos {
+            continue;
+        }
+        if file.seek(SeekFrom::Start(pos)).is_err() {
+            continue;
+        }
+        let mut buf = Vec::new();
+        if file.take(len - pos).read_to_end(&mut buf).is_err() {
+            continue;
+        }
+        pos += buf.len() as u64;
+        partial.push_str(&String::from_utf8_lossy(&buf));
+        while let Some(i) = partial.find('\n') {
+            let line: String = partial.drain(..=i).collect();
+            let trimmed = line.trim_end_matches(['\r', '\n']).to_string();
+            handle.push_line(trimmed.clone());
+            handle.watch_for_stuck_fpga(&trimmed);
+        }
+    }
+}
+
 /// Reads `reader` line by line until juice exits (or its pipe otherwise
 /// closes), mirroring each line into both the shared live buffer and
 /// the on-disk log file -- run on its own thread (one per stream) so
@@ -822,6 +1016,7 @@ fn pump_lines<R: io::Read>(reader: R, handle: JuiceHandle, log_file: Arc<Mutex<s
             Ok(_) => {
                 let trimmed = line.trim_end_matches(['\r', '\n']).to_string();
                 handle.push_line(trimmed.clone());
+                handle.watch_for_stuck_fpga(&trimmed);
                 if let Ok(mut f) = log_file.lock() {
                     let _ = writeln!(f, "{trimmed}");
                 }
@@ -938,6 +1133,13 @@ pub fn launch(exe_path: &Path) -> io::Result<JuiceHandle> {
         lines: Arc::new(Mutex::new(VecDeque::with_capacity(MAX_CONSOLE_LINES))),
         process: Arc::new(Mutex::new(None)),
         exe_path: exe_path.to_path_buf(),
+        stuck_lines: Arc::new(AtomicU32::new(0)),
+        auto_resets: Arc::new(AtomicU32::new(0)),
+        stuck_since: Arc::new(Mutex::new(None)),
+        recovering: Arc::new(AtomicBool::new(false)),
+        tail_gen: Arc::new(AtomicU32::new(0)),
+        auto_restarts: Arc::new(AtomicU32::new(0)),
+        gateware_activated: Arc::new(AtomicBool::new(false)),
     };
     handle.spawn_into()?;
     Ok(handle)
@@ -947,8 +1149,21 @@ pub fn launch(exe_path: &Path) -> io::Result<JuiceHandle> {
 /// executable, same directory as radioberry.props, so it's easy to
 /// find without hpsdr-rs having to display it itself.
 pub fn log_path_for(exe_path: &Path) -> PathBuf {
-    exe_path
+    let beside = exe_path
         .parent()
         .map(|dir| dir.join("radioberry-juice.log"))
-        .unwrap_or_else(|| PathBuf::from("radioberry-juice.log"))
+        .unwrap_or_else(|| PathBuf::from("radioberry-juice.log"));
+    // Linux package installs put juice in /usr/local/bin or /opt, where the user cannot write: the log (which
+    // the console follows live) then lives in hpsdr-rs's settings folder.
+    #[cfg(not(windows))]
+    {
+        let writable = std::fs::OpenOptions::new().create(true).append(true).open(&beside).is_ok();
+        if !writable {
+            if let Some(dir) = crate::config::settings_dir() {
+                let _ = std::fs::create_dir_all(&dir);
+                return dir.join("radioberry-juice.log");
+            }
+        }
+    }
+    beside
 }

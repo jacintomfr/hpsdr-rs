@@ -593,6 +593,8 @@ pub struct Config {
     pub toolbar_layers: Option<Vec<Vec<String>>>,
     #[serde(default)]
     pub toolbar_layer: Option<usize>,
+    /// Frequency calibration in ppm (-100..100), deskHPSDR's ppm_factor.
+    pub freq_cal_ppm: Option<f64>,
     /// VFO step per mode label (deskHPSDR/piHPSDR keep the step of each mode).
     #[serde(default)]
     pub step_memory: std::collections::HashMap<String, i64>,

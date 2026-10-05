@@ -2319,6 +2319,8 @@ struct ConnectedState {
     vfo_encoder_acc: f64,
     /// Encoder ticks needed for one VFO step (Settings -> MIDI), like piHPSDR's vfo_encoder_divisor.
     vfo_encoder_divisor: f32,
+    /// Frequency calibration (ppm factor), Settings -> RX; applied in radio.rs to the frequencies sent to the radio.
+    freq_cal_ppm: f64,
     /// VFO step of each mode, loaded when the mode changes (like deskHPSDR's per-mode step).
     step_memory: std::collections::HashMap<String, i64>,
     step_last_mode: Option<spectrum::Mode>,
@@ -3422,6 +3424,7 @@ fn connect_to_device(device: Device, cfg: &Config) -> Result<ConnectedState, Str
                 spectrum.set_gain(g);
             }
             spectrum.set_duplex(cfg.duplex.unwrap_or(false));
+            radio::set_freq_cal_ppm(cfg.freq_cal_ppm.unwrap_or(0.0).clamp(-100.0, 100.0));
             if let Some(a) = cfg.agc {
                 spectrum.set_agc(a);
             }
@@ -3855,6 +3858,7 @@ fn connect_to_device(device: Device, cfg: &Config) -> Result<ConnectedState, Str
                 tune_step_hz,
                 vfo_encoder_acc: 0.0,
                 vfo_encoder_divisor: cfg.vfo_encoder_divisor.unwrap_or(10.0).clamp(1.0, 50.0),
+                freq_cal_ppm: cfg.freq_cal_ppm.unwrap_or(0.0).clamp(-100.0, 100.0),
                 step_memory: cfg.step_memory.clone(),
                 step_last_mode: None,
                 rit_step_hz,
@@ -11696,6 +11700,30 @@ Waterfall rebuilds: {prof_wf_n:.0}/s, {prof_wf_ms:.1} ms each."
                                 }
 
                                 SettingsTab::Agc => {
+                                    // deskHPSDR's "Freq. Calibration (ppm factor)": a value with - and + buttons (a spin
+                                    // button, tap or hold), not a drag value.
+                                    ui.horizontal(|ui| {
+                                        ui.vertical(|ui| {
+                                            ui.label("Freq. Calibration");
+                                            ui.label("(ppm factor):");
+                                        });
+                                        let changed = spin_buttons(ui, "freq_cal_ppm", &mut connected.freq_cal_ppm, -100.0, 100.0, 0.1)
+                                            .on_hover_text(
+                                                "Frequency calibration as pure ppm factor
+                                                 with range -100.0..+100.0 in 0.1 steps,
+                                                 because in this case we don't need
+                                                 the exact calibration frequency.
+
+                                                 Use a high-precision RF generator and
+                                                 adjust a possible frequency inaccuracy.",
+                                            )
+                                            .changed();
+                                        if changed {
+                                            radio::set_freq_cal_ppm(connected.freq_cal_ppm);
+                                            settings_changed = true;
+                                        }
+                                    });
+                                    ui.add_space(4.0);
                                     ui.label("Sample Rate:");
                                     ui.horizontal_wrapped(|ui| {
                                         // RX-888: its own NCO+CIC software DDC (rx888.rs) can
@@ -14969,6 +14997,7 @@ Waterfall rebuilds: {prof_wf_n:.0}/s, {prof_wf_ms:.1} ms each."
                         toolbar_layers: Some(toolbar::layers_to_config(&connected.toolbar_layers)),
                         toolbar_layer: Some(connected.toolbar_layer),
                         vfo_encoder_divisor: Some(connected.vfo_encoder_divisor),
+                        freq_cal_ppm: Some(connected.freq_cal_ppm),
                         step_memory: connected.step_memory.clone(),
                         diag_items: connected.diag_items.clone(),
                         vfo_b_frequency_hz: Some(connected.vfo_b_frequency_hz),
@@ -15649,6 +15678,67 @@ fn vfo_box_frame(ui: &egui::Ui) -> egui::Frame {
     } else {
         frame
     }
+}
+
+/// A value box with "-" and "+" buttons (deskHPSDR's GTK spin button): a tap changes it by `step`, holding repeats.
+/// The response is marked changed when the value changed.
+fn spin_buttons(ui: &mut egui::Ui, id: &str, value: &mut f64, min: f64, max: f64, step: f64) -> egui::Response {
+    let mut changed = false;
+    let size = egui::vec2(40.0, 34.0);
+    let mut response = ui
+        .horizontal(|ui| {
+            let font = egui::TextStyle::Monospace.resolve(ui.style());
+            let (rect, resp) = ui.allocate_exact_size(egui::vec2(88.0, size.y), egui::Sense::hover());
+            ui.painter().rect(
+                rect,
+                5.0,
+                ui.visuals().extreme_bg_color,
+                egui::Stroke::new(1.0, egui::Color32::from_gray(95)),
+                egui::StrokeKind::Inside,
+            );
+            ui.painter().text(
+                rect.left_center() + egui::vec2(10.0, 0.0),
+                egui::Align2::LEFT_CENTER,
+                format!("{value:.1}"),
+                font,
+                ui.visuals().text_color(),
+            );
+            for (label, dir) in [("−", -1.0), ("+", 1.0)] {
+                let btn = ui.add_sized(size, egui::Button::new(egui::RichText::new(label).size(20.0)).corner_radius(5.0));
+                // Fire on press, then repeat while held (after 0.5 s, every 80 ms), like the GTK spin button.
+                let key = egui::Id::new((id, label));
+                let now = ui.input(|i| i.time);
+                if btn.is_pointer_button_down_on() {
+                    let (start, last): (f64, f64) = ui.data_mut(|d| d.get_temp(key)).unwrap_or((-1.0, -1.0));
+                    let fire = if start < 0.0 {
+                        ui.data_mut(|d| d.insert_temp(key, (now, now)));
+                        true
+                    } else if now - start > 0.5 && now - last > 0.08 {
+                        ui.data_mut(|d| d.insert_temp(key, (start, now)));
+                        true
+                    } else {
+                        false
+                    };
+                    ui.ctx().request_repaint();
+                    if fire {
+                        let v = ((*value + dir * step) / step).round() * step;
+                        let v = v.clamp(min, max);
+                        if (v - *value).abs() > 1e-9 {
+                            *value = v;
+                            changed = true;
+                        }
+                    }
+                } else {
+                    ui.data_mut(|d| d.remove::<(f64, f64)>(key));
+                }
+            }
+            resp
+        })
+        .inner;
+    if changed {
+        response.mark_changed();
+    }
+    response
 }
 
 /// CW message picker plus the SEND CW / STOP button. On the desktop it sits in the TX row; in the kiosk it is the
