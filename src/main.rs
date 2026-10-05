@@ -214,7 +214,7 @@ fn resolved_pa_drive_adjust_db(
 /// Maximum number of transverter (XVTR) slots -- matches what was asked
 /// for (piHPSDR itself currently allows 10, but there's nothing special
 /// about that number; this is just a fixed-size settings-UI/config cap).
-const MAX_XVTRS: usize = 8;
+const MAX_XVTRS: usize = 10;
 
 /// How long session.cw_ptt_active is allowed to stay continuously true
 /// before the CW break-in logic treats it as a stuck key (e.g. a bad
@@ -286,6 +286,10 @@ pub struct Xvtr {
     pub lo_error_hz: i64,
     pub disable_pa: bool,
     pub default_mode: spectrum::Mode,
+    /// Band-dependent RX gain offset in dB (deskHPSDR's band->gain): the displayed level drops by it while this
+    /// transverter is active.
+    #[serde(default)]
+    pub gain_db: i32,
 }
 
 impl Default for Xvtr {
@@ -298,6 +302,7 @@ impl Default for Xvtr {
             lo_error_hz: 0,
             disable_pa: true,
             default_mode: spectrum::Mode::Usb,
+            gain_db: 0,
         }
     }
 }
@@ -2319,6 +2324,8 @@ struct ConnectedState {
     vfo_encoder_acc: f64,
     /// Encoder ticks needed for one VFO step (Settings -> MIDI), like piHPSDR's vfo_encoder_divisor.
     vfo_encoder_divisor: f32,
+    /// Settings -> TX "PA enable" (piHPSDR): off keeps the HL2's TR relay in the RX position and the RX gain while keyed.
+    pa_enabled: bool,
     /// Frequency calibration (ppm factor), Settings -> RX; applied in radio.rs to the frequencies sent to the radio.
     freq_cal_ppm: f64,
     /// VFO step of each mode, loaded when the mode changes (like deskHPSDR's per-mode step).
@@ -2611,6 +2618,9 @@ struct ConnectedState {
     /// an unused slot, same "empty string = unconfigured" convention as
     /// piHPSDR's own XVTR menu.
     xvtrs: Vec<Xvtr>,
+    /// Text being edited in Settings -> XVTR (title, min, max, LO MHz, LO error, gain per slot); None = rebuild
+    /// from `xvtrs` (deskHPSDR applies them on Update).
+    xvtr_edit: Option<Vec<[String; 6]>>,
     /// Name of the XVTR slot currently being displayed/reported through
     /// (see Xvtr's doc comment), or None for plain hardware-IF operation.
     /// Deliberately EXPLICIT state, set only by an XVTR/band button click
@@ -3858,6 +3868,7 @@ fn connect_to_device(device: Device, cfg: &Config) -> Result<ConnectedState, Str
                 tune_step_hz,
                 vfo_encoder_acc: 0.0,
                 vfo_encoder_divisor: cfg.vfo_encoder_divisor.unwrap_or(10.0).clamp(1.0, 50.0),
+                pa_enabled: cfg.pa_enabled.unwrap_or(!lcd_kiosk_mode()),
                 freq_cal_ppm: cfg.freq_cal_ppm.unwrap_or(0.0).clamp(-100.0, 100.0),
                 step_memory: cfg.step_memory.clone(),
                 step_last_mode: None,
@@ -3919,6 +3930,7 @@ fn connect_to_device(device: Device, cfg: &Config) -> Result<ConnectedState, Str
                 // stable fixed-size row list to render/edit -- a config
                 // saved with fewer (or none, or from before this existed)
                 // just pads out with unconfigured (empty-name) slots.
+                xvtr_edit: None,
                 xvtrs: {
                     let mut xvtrs = cfg.xvtrs.clone();
                     xvtrs.truncate(MAX_XVTRS);
@@ -4799,7 +4811,7 @@ impl eframe::App for HpsdrApp {
                 connected
                     .session
                     .disable_pa
-                    .store(xvtr_disable_pa, std::sync::atomic::Ordering::Relaxed);
+                    .store(xvtr_disable_pa || !connected.pa_enabled, std::sync::atomic::Ordering::Relaxed);
                 // See RadioSession::mute_local_audio_for_tci's doc comment
                 // -- recomputed every frame (not just when the checkbox or
                 // TCI Start/Stop are clicked) so it stays correct even
@@ -5039,7 +5051,14 @@ impl eframe::App for HpsdrApp {
                     } else {
                         connected.rx_gain_calibration_db + stored_rx_atten + alex_atten_db
                     };
-                    f64::from(correction_db)
+                    // deskHPSDR: calib = rx_gain_calibration - band->gain (the XVTR slot's Gain).
+                    let xvtr_gain_db = connected
+                        .active_xvtr
+                        .as_deref()
+                        .and_then(|n| connected.xvtrs.iter().find(|x| x.name == n))
+                        .map(|x| x.gain_db)
+                        .unwrap_or(0);
+                    f64::from(correction_db - xvtr_gain_db)
                 };
                 let meter_db = meter_db + rx_display_correction_db;
                 if rx_display_correction_db != 0.0 {
@@ -5160,13 +5179,17 @@ impl eframe::App for HpsdrApp {
                 if mox_on_now && connected.spectrum.duplex() {
                     let row: Vec<f32> = connected.tx_spectrum.display.lock().unwrap().spectrum.clone();
                     let (lo, hi) = if tx_low < tx_high { (tx_low, tx_high) } else { (tx_high, tx_high + 1.0) };
+                    let tx_mode_now = connected.spectrum.mode();
                     egui::Window::new("TX")
                         .id(egui::Id::new("duplex_tx_window"))
-                        .anchor(egui::Align2::RIGHT_TOP, egui::vec2(-8.0, 150.0))
+                        .anchor(egui::Align2::LEFT_TOP, egui::vec2(8.0, connected.last_spectrum_top + 2.0)) // left: the CW decoder / RADE panels are on the right
                         .collapsible(false)
                         .resizable(false)
+                        // No window title bar (it left a gap on its right): the "TX" caption is drawn inside, full width.
+                        .title_bar(false)
+                        .fixed_size(egui::vec2(150.0, 200.0))
                         .show(ui.ctx(), |ui| {
-                            let (rect, _) = ui.allocate_exact_size(egui::vec2(240.0, 230.0), egui::Sense::hover());
+                            let (rect, _) = ui.allocate_exact_size(egui::vec2(150.0, 200.0), egui::Sense::hover());
                             let painter = ui.painter_at(rect);
                             painter.rect_filled(rect, 0.0, egui::Color32::BLACK);
                             for k in 1..4 {
@@ -5176,9 +5199,19 @@ impl eframe::App for HpsdrApp {
                                     egui::Stroke::new(1.0, egui::Color32::from_gray(50)),
                                 );
                             }
+                            ui.painter_at(rect).text(
+                                rect.left_top() + egui::vec2(6.0, 4.0),
+                                egui::Align2::LEFT_TOP,
+                                "TX",
+                                egui::TextStyle::Body.resolve(ui.style()),
+                                egui::Color32::from_gray(190),
+                            );
                             let n = row.len();
                             if n >= 8 {
-                                let width = (n / 4).max(2);
+                                // Central quarter of the TX spectrum like piHPSDR's TX window (12 kHz at the 48 kHz TX rate);
+                                // FM is wider (about 16 kHz with wide deviation), so it shows the central half.
+                                let fm = matches!(tx_mode_now, spectrum::Mode::Fmn);
+                                let width = (if fm { n / 2 } else { n / 4 }).max(2);
                                 let start = (n - width) / 2;
                                 let pts: Vec<egui::Pos2> = (0..width)
                                     .map(|i| {
@@ -5340,6 +5373,14 @@ impl eframe::App for HpsdrApp {
                                 .show(ui, |ui| {
                                     if lcd_kiosk_mode() {
                                         ui.set_min_height(60.0);
+                                        // Fixed width: always the room of the widest reading (000.000.000), so the box does not
+                                        // grow and shrink with the frequency.
+                                        let widest = ui
+                                            .painter()
+                                            .layout_no_wrap("000.000.000".to_string(), egui::FontId::monospace(38.0), egui::Color32::WHITE)
+                                            .size()
+                                            .x;
+                                        ui.set_min_width(widest);
                                     }
                                     ui.vertical(|ui| {
                                         ui.horizontal(|ui| {
@@ -5399,9 +5440,10 @@ impl eframe::App for HpsdrApp {
                                         let resp = ui
                                             .add(
                                                 egui::Label::new(
-                                                    egui::RichText::new(format_frequency(displayed_freq_hz))
+                                                    egui::RichText::new(kiosk_freq_text(format_frequency(displayed_freq_hz)))
                                                         .monospace()
-                                                        .size(28.0)
+                                                        // Kiosk: VFO A is bigger now that the VFO buttons are gone.
+                                                        .size(if lcd_kiosk_mode() { 38.0 } else { 28.0 })
                                                         .strong()
                                                         .color(freq_a_color),
                                                 )
@@ -5441,7 +5483,7 @@ impl eframe::App for HpsdrApp {
                                             });
                                         // Right-click -> keypad frequency
                                         // entry popup, real request.
-                                        if resp.secondary_clicked() {
+                                        if resp.secondary_clicked() || (lcd_kiosk_mode() && resp.clicked()) {
                                             connected.frequency_entry =
                                                 Some(FrequencyEntry { vfo_b: false, digits: String::new() });
                                         }
@@ -5451,6 +5493,9 @@ impl eframe::App for HpsdrApp {
                                 })
                                 .inner;
 
+                            // Kiosk: A>B, B>A, A<>B, Split, VFO and CTUN are controlled from MIDI (and the VFO window opened by
+                            // tapping VFO A / VFO B); CTUN and Split are shown as indicators in the gain grid.
+                            if !lcd_kiosk_mode() {
                             ui.vertical(|ui| {
                             let _black_chips = IdleChipsBlack::new();
                             let cw1 = chip_width(ui, &["A>B", "A<>B", "CTUN"]);
@@ -5520,7 +5565,25 @@ impl eframe::App for HpsdrApp {
                                         connected.vfo_b_frequency_hz = new_b;
                                         settings_changed = true;
                                     }
-                                    if ui
+                                    if lcd_kiosk_mode() {
+                                        // Kiosk: CTUN, Split, Duplex and Lock VFOs are in the VFO window (deskHPSDR's VFO
+                                        // menu), so the VFO button sits here.
+                                        if toggle_chip(
+                                            ui,
+                                            "VFO",
+                                            connected.frequency_entry.is_some(),
+                                            0.0,
+                                            "Direct frequency entry keypad, steps, CTUN, Split, Duplex and Lock VFOs",
+                                        )
+                                        .clicked()
+                                        {
+                                            connected.frequency_entry = if connected.frequency_entry.is_some() {
+                                                None
+                                            } else {
+                                                Some(FrequencyEntry { vfo_b: false, digits: String::new() })
+                                            };
+                                        }
+                                    } else if ui
                                         .add(chip_button("Split", connected.split).min_size(egui::vec2(cw2, 0.0)))
                                         .on_hover_text(
                                             "Transmit on VFO B while continuing to receive on VFO A",
@@ -5531,6 +5594,7 @@ impl eframe::App for HpsdrApp {
                                         settings_changed = true;
                                     }
                                 });
+                                if !lcd_kiosk_mode() {
                                 ui.horizontal(|ui| {
                                     if ui
                                         .add(chip_button("CTUN", connected.ctun).min_size(egui::vec2(cw1, 0.0)))
@@ -5613,7 +5677,9 @@ impl eframe::App for HpsdrApp {
                                         settings_changed = true;
                                     }
                                 });
+                                }
                             });
+                            }
 
                             // rigctl/TCI/CAT column, centred between the VFO-A buttons and the
                             // VFO-B box (equal gap on both sides). Kiosk: moved to the band row, and VFO-B
@@ -5636,6 +5702,14 @@ impl eframe::App for HpsdrApp {
                                 .show(ui, |ui| {
                                     if lcd_kiosk_mode() {
                                         ui.set_min_height(60.0);
+                                        // Fixed width: always the room of the widest reading (000.000.000), so the box does not
+                                        // grow and shrink with the frequency.
+                                        let widest = ui
+                                            .painter()
+                                            .layout_no_wrap("000.000.000".to_string(), egui::FontId::monospace(28.0), egui::Color32::WHITE)
+                                            .size()
+                                            .x;
+                                        ui.set_min_width(widest);
                                     }
                                     ui.vertical(|ui| {
                                         ui.horizontal(|ui| {
@@ -5669,9 +5743,9 @@ impl eframe::App for HpsdrApp {
                                         let resp = ui
                                             .add(
                                                 egui::Label::new(
-                                                    egui::RichText::new(format_frequency(
+                                                    egui::RichText::new(kiosk_freq_text(format_frequency(
                                                         connected.vfo_b_frequency_hz,
-                                                    ))
+                                                    )))
                                                     .monospace()
                                                     .size(28.0)
                                                     .strong()
@@ -5682,7 +5756,7 @@ impl eframe::App for HpsdrApp {
                                             .on_hover_text(
                                                 "Scroll to tune -- Shift: 100 Hz, none: 1 kHz -- right-click to type a frequency",
                                             );
-                                        if resp.secondary_clicked() {
+                                        if resp.secondary_clicked() || (lcd_kiosk_mode() && resp.clicked()) {
                                             connected.frequency_entry =
                                                 Some(FrequencyEntry { vfo_b: true, digits: String::new() });
                                         }
@@ -6229,7 +6303,7 @@ impl eframe::App for HpsdrApp {
                         let mut close_now = false;
                         // Compact window like piHPSDR's VFO menu (keypad + the two step
                         // pickers). Bigger in kiosk mode (scaled fonts).
-                        let win_size = if lcd_kiosk_mode() { [330.0, 378.0] } else { [310.0, 340.0] };
+                        let win_size = if lcd_kiosk_mode() { [350.0, 384.0] } else { [310.0, 340.0] };
                         let mut freq_entry_viewport = egui::ViewportBuilder::default()
                             .with_title("VFO")
                             .with_inner_size(win_size)
@@ -6422,6 +6496,43 @@ impl eframe::App for HpsdrApp {
                                             ui.add_space(h);
                                             ui.label("VFO step");
                                             if render_step_combo_only(ui, connected) {
+                                                settings_changed = true;
+                                            }
+                                            // deskHPSDR's VFO menu check boxes: Lock VFOs, Duplex, CTUN, Split.
+                                            ui.add_space(h * 0.6);
+                                            let mut locked = VFO_LOCKED.load(Ordering::Relaxed);
+                                            if ui.checkbox(&mut locked, "Lock VFOs").changed() {
+                                                VFO_LOCKED.store(locked, Ordering::Relaxed);
+                                            }
+                                            if connected.tx_enabled {
+                                                let mut dup = connected.spectrum.duplex();
+                                                if ui.checkbox(&mut dup, "Duplex").changed() {
+                                                    connected.spectrum.set_duplex(dup);
+                                                    settings_changed = true;
+                                                }
+                                            }
+                                            let mut ctun = connected.ctun;
+                                            if ui
+                                                .checkbox(&mut ctun, "CTUN")
+                                                .on_hover_text("Click to Tune: browse within the spectrum without retuning the radio")
+                                                .changed()
+                                            {
+                                                if connected.ctun {
+                                                    // Turning off: commit the CTUN'd listen frequency as the new hardware frequency.
+                                                    connected.session.set_frequency(connected.ctun_frequency_hz);
+                                                } else {
+                                                    connected.ctun_frequency_hz = freq_hz;
+                                                }
+                                                connected.ctun = !connected.ctun;
+                                                settings_changed = true;
+                                            }
+                                            let mut split = connected.split;
+                                            if ui
+                                                .checkbox(&mut split, "Split")
+                                                .on_hover_text("Transmit on VFO B while continuing to receive on VFO A")
+                                                .changed()
+                                            {
+                                                connected.split = split;
                                                 settings_changed = true;
                                             }
                                         });
@@ -7244,6 +7355,37 @@ impl eframe::App for HpsdrApp {
                             }
                             framed_label(ui, "Filter width:", col4_w);
                             filter_slider!(ui);
+                            // CTUN and Split indicators (not buttons: they are set from MIDI / the VFO window), right after
+                            // the Filter width value box. One grid cell each, narrower than the cells above them (the
+                            // Mic gain / AGC Gain name and slider columns), so they do not push those columns apart.
+                            {
+                                let _black_chips = IdleChipsBlack::new();
+                                let ctun = ui
+                                    .add(chip_button("CTUN", connected.ctun).sense(egui::Sense::hover()))
+                                    .on_hover_text("CTUN: on while Click-to-Tune is active");
+                                // Split is painted 8 px to the right of CTUN (like the chips of the first row) instead of in
+                                // the next grid cell, whose column is far wider and left a big gap.
+                                let w = chip_width(ui, &["Split"]);
+                                let rect = egui::Rect::from_min_size(
+                                    egui::pos2(ctun.rect.right() + 8.0, ctun.rect.top()),
+                                    egui::vec2(w, ctun.rect.height()),
+                                );
+                                let on = connected.split;
+                                let orange = egui::Color32::from_rgb(232, 150, 46);
+                                let (fill, text, stroke) = if on {
+                                    (orange, egui::Color32::from_gray(15), egui::Stroke::new(1.0, orange))
+                                } else {
+                                    (egui::Color32::BLACK, egui::Color32::from_gray(205), egui::Stroke::new(1.0, egui::Color32::from_gray(95)))
+                                };
+                                ui.painter().rect(rect, 5.0, fill, stroke, egui::StrokeKind::Inside);
+                                ui.painter().text(
+                                    rect.center(),
+                                    egui::Align2::CENTER_CENTER,
+                                    "Split",
+                                    egui::TextStyle::Button.resolve(ui.style()),
+                                    text,
+                                );
+                            }
                             ui.end_row();
                         }
 
@@ -10337,6 +10479,23 @@ Waterfall rebuilds: {prof_wf_n:.0}/s, {prof_wf_ms:.1} ms each."
                             // switching tabs is always visible/reachable
                             // regardless of scroll position.
                             egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
+                            // Pending XVTR edits are applied when the tab is left (deskHPSDR saves on Close).
+                            if connected.settings_tab != SettingsTab::Xvtr {
+                                if let Some(edit) = connected.xvtr_edit.take() {
+                                    let (rmin, rmax) = (connected.device.frequency_min, connected.device.frequency_max);
+                                    for (i, row) in edit.iter().enumerate() {
+                                        if let Some(x) = connected.xvtrs.get_mut(i) {
+                                            let was_active = connected.active_xvtr.as_deref() == Some(x.name.as_str());
+                                            let old_name = x.name.clone();
+                                            apply_xvtr_edit(x, row, rmin, rmax);
+                                            if was_active && x.name != old_name {
+                                                connected.active_xvtr = None;
+                                            }
+                                        }
+                                    }
+                                    settings_changed = true;
+                                }
+                            }
                             match connected.settings_tab {
                                 SettingsTab::Network => {
                                     ui.label("rigctl (for WSJT-X's \"Hamlib NET rigctl\", etc.):");
@@ -12746,6 +12905,16 @@ Waterfall rebuilds: {prof_wf_n:.0}/s, {prof_wf_ms:.1} ms each."
                                             settings_changed = true;
                                         }
                                     }
+                                    // piHPSDR's "PA enable" (radio menu).
+                                    if ui
+                                        .checkbox(&mut connected.pa_enabled, "PA enable")
+                                        .on_hover_text(
+                                            "On (default on the desktop; off in the kiosk): the radio's PA is used for TX. Off: TX comes out of the                                              low-power output, the HermesLite2's TR relay stays in the RX position                                              and the RX gain is not reduced while transmitting, so you keep                                              receiving during TX (duplex) -- e.g. with a transverter or an external                                              amplifier and no band filters.",
+                                        )
+                                        .changed()
+                                    {
+                                        settings_changed = true;
+                                    }
                                     ui.add_space(8.0);
 
                                     // Standard (non-HermesLite) boards only -- see
@@ -13173,73 +13342,95 @@ Waterfall rebuilds: {prof_wf_n:.0}/s, {prof_wf_ms:.1} ms each."
                                     });
                                 }
                                 SettingsTab::Xvtr => {
-                                    // See Xvtr's doc comment (main-receiver
-                                    // only for now). Up to MAX_XVTRS slots,
-                                    // always rendered (an empty Name marks
-                                    // an unused slot) rather than an
-                                    // add/remove list, matching how
-                                    // piHPSDR's own XVTR menu presents a
-                                    // fixed 10-row grid.
+                                    // deskHPSDR's XVTR menu (xvtr_menu.c): a fixed grid of slots with text fields in MHz,
+                                    // applied by "Update" (and when the tab is left), NOT per field: the limits depend on the LO, so entering Min before LO
+                                    // would be clamped; an empty Title marks an unused
+                                    // slot; Reset clears a slot (and leaves it if it is the active transverter).
+                                    // Main receiver only -- extra receiver windows are unaffected.
+                                    let radio_min = connected.device.frequency_min;
+                                    let radio_max = connected.device.frequency_max;
+                                    if connected.xvtr_edit.is_none() {
+                                        connected.xvtr_edit = Some(connected.xvtrs.iter().map(xvtr_edit_row).collect());
+                                    }
+                                    let mut edit = connected.xvtr_edit.take().unwrap_or_default();
+                                    let mut apply_all = false;
+                                    let mut apply_row: Option<usize> = None;
+                                    let mut reset_row: Option<usize> = None;
                                     ui.add_space(4.0);
-                                    ui.label(
-                                        "Transverters convert this radio's real tunable range (its \
-                                         IF) to some other operating frequency (RF) via an external \
-                                         analog box -- e.g. a 10m IF of 28-29.7MHz driving a 2m \
-                                         transverter to cover 144-145.7MHz. RF = IF + LO Offset + LO \
-                                         Error. Only supports up to ~4.3GHz RF (not QO-100-class \
-                                         microwave transverters). Main receiver only -- extra \
-                                         receiver windows are unaffected.",
-                                    );
+                                    if ui
+                                        .add_sized([90.0, 34.0], egui::Button::new("Update"))
+                                        .on_hover_text(
+                                            "Transverters convert this radio's real tunable range (its IF) to some \
+                                             other operating frequency (RF) via an external analog box, e.g. a 10m \
+                                             IF of 28-29.7MHz driving a 2m transverter to cover 144-145.7MHz. \
+                                             RF = IF + LO Frq + LO Err. Up to about 4.3GHz RF. Main receiver only.",
+                                        )
+                                        .clicked()
+                                    {
+                                        apply_all = true;
+                                    }
                                     ui.add_space(6.0);
-                                    egui::Grid::new("xvtr_grid").striped(true).show(ui, |ui| {
-                                        ui.label("Name");
-                                        ui.label("RF Min (Hz)");
-                                        ui.label("RF Max (Hz)");
-                                        ui.label("LO Offset (Hz)");
-                                        ui.label("LO Error (Hz)");
-                                        ui.label("Disable PA");
+                                    egui::Grid::new("xvtr_grid").spacing([8.0, 6.0]).show(ui, |ui| {
+                                        for h in ["Title", "Min Frq(MHz)", "Max Frq(MHz)", "LO Frq(MHz)", "LO Err(Hz)", "Gain (dB)"] {
+                                            ui.label(egui::RichText::new(h).strong());
+                                        }
+                                        if matches!(connected.device.protocol, 1 | 2) {
+                                            ui.label(egui::RichText::new("Disable PA").strong());
+                                        }
+                                        ui.label(egui::RichText::new("Reset").strong());
                                         ui.end_row();
-                                        for xvtr in connected.xvtrs.iter_mut() {
-                                            if ui
-                                                .add(
-                                                    egui::TextEdit::singleline(&mut xvtr.name)
-                                                        .hint_text("(unused)")
-                                                        .desired_width(80.0),
-                                                )
-                                                .changed()
-                                            {
-                                                settings_changed = true;
+                                        for (i, row) in edit.iter_mut().enumerate() {
+                                            // The title column is kept narrow (the text scrolls inside it); the numbers are short.
+                                            let widths = [75.0, 80.0, 80.0, 80.0, 56.0, 48.0];
+                                            for (c, w) in widths.iter().enumerate() {
+                                                let resp = ui.add_sized(
+                                                    [*w, 28.0],
+                                                    egui::TextEdit::singleline(&mut row[c])
+                                                        .font(egui::TextStyle::Monospace)
+                                                        .char_limit(if c == 0 { 15 } else { 12 }),
+                                                );
+                                                let _ = &resp; // applied only by Update (and when leaving the tab), like deskHPSDR
                                             }
-                                            if ui
-                                                .add(egui::DragValue::new(&mut xvtr.frequency_min_hz).range(0..=u32::MAX))
-                                                .changed()
-                                            {
-                                                settings_changed = true;
+                                            if matches!(connected.device.protocol, 1 | 2) {
+                                                if let Some(x) = connected.xvtrs.get_mut(i) {
+                                                    if ui.checkbox(&mut x.disable_pa, "").changed() {
+                                                        settings_changed = true;
+                                                    }
+                                                } else {
+                                                    ui.label("");
+                                                }
                                             }
-                                            if ui
-                                                .add(egui::DragValue::new(&mut xvtr.frequency_max_hz).range(0..=u32::MAX))
-                                                .changed()
-                                            {
-                                                settings_changed = true;
-                                            }
-                                            if ui
-                                                .add(egui::DragValue::new(&mut xvtr.lo_offset_hz))
-                                                .changed()
-                                            {
-                                                settings_changed = true;
-                                            }
-                                            if ui
-                                                .add(egui::DragValue::new(&mut xvtr.lo_error_hz))
-                                                .changed()
-                                            {
-                                                settings_changed = true;
-                                            }
-                                            if ui.checkbox(&mut xvtr.disable_pa, "").changed() {
-                                                settings_changed = true;
+                                            if ui.add_sized([62.0, 28.0], egui::Button::new("Reset")).clicked() {
+                                                reset_row = Some(i);
                                             }
                                             ui.end_row();
                                         }
                                     });
+                                    if let Some(i) = reset_row {
+                                        if let Some(x) = connected.xvtrs.get_mut(i) {
+                                            if connected.active_xvtr.as_deref() == Some(x.name.as_str()) {
+                                                connected.active_xvtr = None;
+                                            }
+                                            *x = Xvtr::default();
+                                            edit[i] = xvtr_edit_row(x);
+                                            settings_changed = true;
+                                        }
+                                    }
+                                    let rows: Vec<usize> =
+                                        if apply_all { (0..edit.len()).collect() } else { apply_row.into_iter().collect() };
+                                    for i in rows {
+                                        if let Some(x) = connected.xvtrs.get_mut(i) {
+                                            let was_active = connected.active_xvtr.as_deref() == Some(x.name.as_str());
+                                            let old_name = x.name.clone();
+                                            apply_xvtr_edit(x, &edit[i], radio_min, radio_max);
+                                            if was_active && x.name != old_name {
+                                                connected.active_xvtr = None;
+                                            }
+                                            edit[i] = xvtr_edit_row(x);
+                                            settings_changed = true;
+                                        }
+                                    }
+                                    connected.xvtr_edit = Some(edit);
                                 }
                                 SettingsTab::OpenCollector => {
                                     // See OcMask's doc comment. Board-
@@ -14997,6 +15188,7 @@ Waterfall rebuilds: {prof_wf_n:.0}/s, {prof_wf_ms:.1} ms each."
                         toolbar_layers: Some(toolbar::layers_to_config(&connected.toolbar_layers)),
                         toolbar_layer: Some(connected.toolbar_layer),
                         vfo_encoder_divisor: Some(connected.vfo_encoder_divisor),
+                        pa_enabled: Some(connected.pa_enabled),
                         freq_cal_ppm: Some(connected.freq_cal_ppm),
                         step_memory: connected.step_memory.clone(),
                         diag_items: connected.diag_items.clone(),
@@ -15739,6 +15931,62 @@ fn spin_buttons(ui: &mut egui::Ui, id: &str, value: &mut f64, min: f64, max: f64
         response.mark_changed();
     }
     response
+}
+
+/// The texts of one XVTR slot for the Settings -> XVTR grid (deskHPSDR's formats: MHz with 3 decimals).
+fn xvtr_edit_row(x: &Xvtr) -> [String; 6] {
+    [
+        x.name.clone(),
+        format!("{:.3}", x.frequency_min_hz as f64 / 1e6),
+        format!("{:.3}", x.frequency_max_hz as f64 / 1e6),
+        format!("{:.3}", x.lo_offset_hz as f64 / 1e6),
+        format!("{}", x.lo_error_hz),
+        format!("{}", x.gain_db),
+    ]
+}
+
+/// deskHPSDR's save_xvtr() for one slot: an empty title clears the slot; otherwise the texts are parsed and the
+/// frequencies patched so that min >= LO + radio minimum, max <= LO + radio maximum and max > min.
+fn apply_xvtr_edit(x: &mut Xvtr, row: &[String; 6], radio_min_hz: u64, radio_max_hz: u64) {
+    let title: String = row[0].chars().take(15).collect();
+    x.name = title;
+    if x.name.is_empty() {
+        x.frequency_min_hz = 0;
+        x.frequency_max_hz = 0;
+        x.lo_offset_hz = 0;
+        x.lo_error_hz = 0;
+        x.gain_db = 0;
+        x.disable_pa = true;
+        return;
+    }
+    let mhz = |s: &str| (s.trim().replace(',', ".").parse::<f64>().unwrap_or(0.0) * 1e6).round() as i64;
+    let lo = mhz(&row[3]);
+    let mut min = mhz(&row[1]);
+    let mut max = mhz(&row[2]);
+    x.lo_error_hz = row[4].trim().parse::<i64>().unwrap_or(0);
+    x.gain_db = row[5].trim().parse::<i32>().unwrap_or(0);
+    if min < lo + radio_min_hz as i64 || min > lo + radio_max_hz as i64 {
+        min = lo + radio_min_hz as i64;
+    }
+    if max < min {
+        max = min + 1_000_000;
+    }
+    if max > lo + radio_max_hz as i64 {
+        max = lo + radio_max_hz as i64;
+    }
+    x.lo_offset_hz = lo;
+    x.frequency_min_hz = min.clamp(0, u32::MAX as i64) as u32;
+    x.frequency_max_hz = max.clamp(0, u32::MAX as i64) as u32;
+}
+
+/// Kiosk: the frequency is padded with spaces on the left to the widest reading (000.000.000), so the digits stay
+/// right-aligned in a box of fixed width and the extra digit of a higher band appears on the left.
+fn kiosk_freq_text(text: String) -> String {
+    if lcd_kiosk_mode() {
+        format!("{text:>11}")
+    } else {
+        text
+    }
 }
 
 /// CW message picker plus the SEND CW / STOP button. On the desktop it sits in the TX row; in the kiosk it is the
@@ -17691,7 +17939,7 @@ fn render_net_status_column(
         // chips (text + button padding; interact_size.y is smaller and made these 2 px shorter).
         let h = ui
             .data(|d| d.get_temp::<f32>(egui::Id::new("kiosk_chip_h")))
-            .unwrap_or(ui.spacing().interact_size.y);
+            .unwrap_or(ui.text_style_height(&egui::TextStyle::Button) + 2.0 * ui.spacing().button_padding.y);
         ui.add_sized(
             [w, h],
             chip_button(name, status.is_some()).sense(egui::Sense::hover()),
@@ -18116,27 +18364,13 @@ fn render_rit_xit(ui: &mut egui::Ui, connected: &mut ConnectedState) -> bool {
             "Transmitter Incremental Tuning -- nudges your actual TX frequency without moving VFO A's (or VFO B's, if Split is on) displayed frequency.",
         );
     }
-    // LOCK (deskHPSDR "Locked") freezes the tuning; DUP (deskHPSDR duplex) keeps the receiver running while transmitting.
-    if !lcd_kiosk_mode() {
-        return changed;
-    }
-    let locked = VFO_LOCKED.load(Ordering::Relaxed);
-    if ui
-        .add(chip_button("LOCK", locked))
-        .on_hover_text("Lock the VFO: tuning by click, wheel, MIDI or remote does nothing while on")
-        .clicked()
-    {
-        VFO_LOCKED.store(!locked, Ordering::Relaxed);
-    }
-    if connected.tx_enabled {
-        let dup = connected.spectrum.duplex();
-        if ui
-            .add(chip_button("DUP", dup))
-            .on_hover_text("Duplex: keep receiving while transmitting")
-            .clicked()
-        {
-            connected.spectrum.set_duplex(!dup);
-            changed = true;
+    // LOCK and DUP are indicators only (orange = on): they are switched in the VFO window (tap VFO A / VFO B) or by MIDI.
+    if lcd_kiosk_mode() {
+        ui.add(chip_button("LOCK", VFO_LOCKED.load(Ordering::Relaxed)).sense(egui::Sense::hover()))
+            .on_hover_text("Lock VFOs: on while tuning is locked (set it in the VFO window)");
+        if connected.tx_enabled {
+            ui.add(chip_button("DUP", connected.spectrum.duplex()).sense(egui::Sense::hover()))
+                .on_hover_text("Duplex: on while the receiver keeps running during TX (set it in the VFO window)");
         }
     }
     changed
@@ -22630,4 +22864,36 @@ fn main() -> eframe::Result<()> {
         options,
         Box::new(|cc| Ok(Box::new(HpsdrApp::new(&cc.egui_ctx)))),
     )
+}
+
+#[cfg(test)]
+mod xvtr_tests {
+    use super::*;
+
+    fn row(t: &str, min: &str, max: &str, lo: &str) -> [String; 6] {
+        [t.into(), min.into(), max.into(), lo.into(), "0".into(), "0".into()]
+    }
+
+    #[test]
+    fn xvtr_430_to_440_with_lo_404_is_clamped_to_the_radios_if_range() {
+        let mut x = Xvtr::default();
+        apply_xvtr_edit(&mut x, &row("QO-1", "430.000", "440.000", "404.000"), 0, 30_720_000);
+        assert_eq!(x.name, "QO-1");
+        assert_eq!(x.frequency_min_hz, 430_000_000);
+        assert_eq!(x.frequency_max_hz, 434_720_000);
+        assert_eq!(x.lo_offset_hz, 404_000_000);
+        // IF the radio must tune: 26.000 .. 30.720 MHz
+        let off = xvtr_rf_offset(&x);
+        assert_eq!(x.frequency_min_hz as i64 - off, 26_000_000);
+        assert_eq!(x.frequency_max_hz as i64 - off, 30_720_000);
+    }
+
+    #[test]
+    fn xvtr_28_mhz_if_to_430_mhz_needs_lo_402() {
+        let mut x = Xvtr::default();
+        apply_xvtr_edit(&mut x, &row("70cm", "430.000", "432.000", "402.000"), 0, 30_720_000);
+        assert_eq!((x.frequency_min_hz, x.frequency_max_hz), (430_000_000, 432_000_000));
+        let off = xvtr_rf_offset(&x);
+        assert_eq!(x.frequency_min_hz as i64 - off, 28_000_000);
+    }
 }

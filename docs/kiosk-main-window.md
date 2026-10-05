@@ -116,3 +116,8 @@ Behaviour on the desktop is meant to be identical, but these are shared, so chec
 * **VFO encoder:** each tick moves the selected step, dynamic tune from the distance to 64 in the MIDI value, Settings -> MIDI "ticks per step" (default 10),
   17 steps (deskHPSDR's list) stored per mode.
 * Discover: the Radioberry Juice setup help is a tooltip on its header.
+
+* **VFO window and main screen:** tapping VFO A / VFO B opens the VFO window (keypad, RIT/VFO step, Lock VFOs, Duplex, CTUN, Split, like deskHPSDR's VFO menu). A>B, B>A, A<>B, Split, VFO and CTUN are no longer on the main screen (MIDI first); LOCK, DUP, CTUN and Split are shown as indicators (first row / after the Filter width box). VFO A is 38 pt, right-aligned in a fixed-width box (000.000.000).
+* **Settings -> XVTR** is deskHPSDR's grid (Title, Min/Max/LO in MHz, LO error, Gain, Disable PA, Reset); the limits are applied by Update or when leaving the tab, never per field (they depend on the LO; the HL2 IF range is 0-30.72 MHz, so e.g. LO 404 MHz caps the maximum at 434.72 MHz).
+* **Settings -> TX "PA enable"** (piHPSDR): off by default in the kiosk. With it off the HL2 keeps its RX gain while transmitting (no 30 dB drop in duplex) and the TR relay bit stays in RX.
+* **Duplex TX window:** left side, below the start of the spectrum, 150x200 px (central quarter of the TX spectrum, half for FM). **Open item:** make it draggable and remember its position.

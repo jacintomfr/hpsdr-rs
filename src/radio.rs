@@ -4008,6 +4008,10 @@ fn p1_build_packet(
                 let mut c2 = 0x00;
                 if !disable_pa {
                     c2 |= 0x08;
+                } else {
+                    // piHPSDR: with the PA disabled the TR relay stays in the RX position ALWAYS (the TX signal is on
+                    // the low-power RF1 output), which is what allows duplex.
+                    c2 |= 0x04;
                 }
                 if tune_active {
                     c2 |= 0x10;
@@ -4094,7 +4098,9 @@ fn p1_build_packet(
             // transmitting, same protective intent as the other boards'
             // TX-time attenuation just mentioned.
             let c4: u8 = if is_hermes_lite {
-                0x40 | (if mox_on { 0 } else { rx_attenuation & 0x3F })
+                // piHPSDR (old_protocol.c, HL2 RX gain): the RX gain is dropped to the minimum while transmitting only
+                // when the PA is in use (`pa_enabled && !txband->disablePA`); without the PA the receiver keeps its gain.
+                0x40 | (if mox_on && !disable_pa { 0 } else { rx_attenuation & 0x3F })
             } else {
                 0x20 | (rx_attenuation & 0x1F)
             };
