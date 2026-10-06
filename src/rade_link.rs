@@ -232,6 +232,7 @@ impl RadeHandle {
             w.push_rx(audio);
             w.pop_rx(speech_out);
             for RadeTextRx { call, snr_db } in w.poll_text() {
+                crate::freedv_reporter::rx_report(&call, "RADEV1", snr_db.round() as i32);
                 let mut log = self.inner.rx_log.lock().unwrap();
                 log.push(RadeTextRx { call, snr_db });
                 if log.len() > MAX_RX_LOG {

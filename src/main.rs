@@ -10,6 +10,7 @@
 #![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
 
 mod audio;
+mod freedv_reporter;
 mod audio_recorder;
 mod bootloader;
 mod bootloader_ui;
@@ -2191,6 +2192,8 @@ struct ConnectedState {
     /// starting point, matching this app's own prior behaviour before
     /// this toggle existed.
     rade_filter_wide: bool,
+    /// FreeDV Reporter (qso.freedv.org) enabled, set in the RADE panel; default off.
+    freedv_reporter_enabled: bool,
     /// Clicks on the RADE side panel (Fit Filter / Quick Tune), applied later in the frame.
     rade_side_fit: bool,
     rade_side_tune: Option<u32>,
@@ -3982,6 +3985,7 @@ fn connect_to_device(device: Device, cfg: &Config) -> Result<ConnectedState, Str
                 agc_auto: cfg.agc_auto.unwrap_or(false),
                 agc_auto_offset_db: cfg.agc_auto_offset_db.unwrap_or(-25.0),
                 rade_filter_wide: cfg.rade_filter_wide.unwrap_or(false),
+                freedv_reporter_enabled: cfg.freedv_reporter_enabled.unwrap_or(false),
                 rade_side_fit: false,
                 rade_side_tune: None,
                 tx_db_low: cfg.tx_db_low.unwrap_or(cfg.db_low.unwrap_or(-140.0)),
@@ -5070,6 +5074,13 @@ impl eframe::App for HpsdrApp {
                         None => (0, false, None),
                     };
                 let displayed_freq_hz = (dial_freq_hz as i64 + xvtr_rf_offset_hz).clamp(0, u32::MAX as i64) as u32;
+                freedv_reporter::sync(
+                    connected.freedv_reporter_enabled,
+                    &connected.own_callsign,
+                    &connected.own_locator,
+                    displayed_freq_hz as u64,
+                    connected.session.mox.load(Ordering::Relaxed) && rade_is_running(connected) && connected.rade.tx_armed(),
+                );
                 connected
                     .session
                     .disable_pa
@@ -14515,6 +14526,7 @@ Waterfall rebuilds: {prof_wf_n:.0}/s, {prof_wf_ms:.1} ms each."
                     let sstv_tx_prepared = &mut connected.sstv_tx_prepared;
                     let sstv_tx_texture = &mut connected.sstv_tx_texture;
                     let rade_callsign = &mut connected.own_callsign;
+                    let mut fdv_flag = connected.freedv_reporter_enabled;
                     let rtty_send_on_return = &mut connected.rtty_send_on_return;
                     let tx_handle_ref = connected.tx_handle.as_ref();
                     let rade_eq_monitor_output_active = connected.rade_eq_monitor_output.is_some();
@@ -14711,6 +14723,7 @@ Waterfall rebuilds: {prof_wf_n:.0}/s, {prof_wf_ms:.1} ms each."
                                                 tx_handle_ref,
                                                 connected.rade_filter_wide,
                                                 rade_eq_monitor_output_active,
+                                                &mut fdv_flag,
                                             );
                                             rade_fit_filter_clicked |= clicked;
                                             rade_filter_rotate_clicked |= clicked;
@@ -14784,6 +14797,10 @@ Waterfall rebuilds: {prof_wf_n:.0}/s, {prof_wf_ms:.1} ms each."
                                 tx.set_rade_eq_monitor_enabled(false);
                             }
                         }
+                    }
+                    if fdv_flag != connected.freedv_reporter_enabled {
+                        connected.freedv_reporter_enabled = fdv_flag;
+                        settings_changed = true;
                     }
                     if rade_hide_clicked {
                         // Deliberately NOT the same cleanup as
@@ -15154,6 +15171,7 @@ Waterfall rebuilds: {prof_wf_n:.0}/s, {prof_wf_ms:.1} ms each."
                         rade_mute_edges: Some(connected.rade.mute_edges()),
                         rade_mute_analog: Some(connected.rade.mute_analog()),
                         rade_filter_wide: Some(connected.rade_filter_wide),
+                        freedv_reporter_enabled: Some(connected.freedv_reporter_enabled),
                         digital_mode: Some(match connected.digital_mode {
                             DigitalMode::Rtty => 0,
                             DigitalMode::Sstv => 1,
@@ -15397,6 +15415,7 @@ Waterfall rebuilds: {prof_wf_n:.0}/s, {prof_wf_ms:.1} ms each."
                     // than abandoning it with a truncated/placeholder
                     // header. No-op if nothing was recording.
                     connected.spectrum.recorder.stop();
+                    freedv_reporter::stop();
                     connected.session.stop();
                     connected.spectrum.stop();
                     // Deliberately NOT stopping connected.juice_console here:
@@ -17320,6 +17339,7 @@ fn render_rade_panel(
     // reachable from in here), this just reads/toggles it. See the
     // "Monitor EQ" checkbox below and this fn's last return value.
     monitoring_eq: bool,
+    fdv_enabled: &mut bool,
 ) -> (bool, Option<u32>, Option<bool>, Option<bool>, bool) {
     let mut fit_filter_clicked = false;
     let mut quick_tune_hz = None;
@@ -17605,12 +17625,31 @@ fn render_rade_panel(
         {
             rade.set_mute_analog(muted);
         }
+        // Was inside the received-callsigns loop (shown only after a decode, once per callsign): in this row it is always visible.
+        let mut mute_edges = rade.mute_edges();
+        if std_checkbox(ui, &mut mute_edges, "Mute start/end")
+            .on_hover_text(
+                "Silence the decoded speech while RADE is still settling after it locks on \
+                 (about half a second) and from the moment the over ends or the signal \
+                 collapses to noise -- the odd garbled voices at both ends of an over. \
+                 Off by default: neither freedv-gui nor SDRoxide does this, and it costs \
+                 the first moments of speech.",
+            )
+            .changed()
+        {
+            rade.set_mute_edges(mute_edges);
+        }
         if ui.button("Reset RX").on_hover_text("Drop sync and start hunting again").clicked() {
             rade.reset_rx();
         }
         if ui.button("Clear Log").clicked() {
             rade.clear_rx_log();
         }
+        ui.add_space(8.0);
+        if std_checkbox(ui, fdv_enabled, "FreeDV Reporter").changed() && !*fdv_enabled {
+            freedv_reporter::stop();
+        }
+        help_button(ui, "rade_fdv_rep", "While enabled, sends your callsign, locator, dial frequency, RADE RX/TX state and the callsigns you decode to the FreeDV Reporter (qso.freedv.org). Requires Your Callsign and Your Locator in SDR Device. Off by default.");
     });
     ui.separator();
     ui.label("Received callsigns:");
@@ -17627,19 +17666,6 @@ fn render_rade_panel(
             }
             for entry in &log {
                 ui.label(format!("{}  (SNR {:.0} dB)", entry.call, entry.snr_db));
-        let mut mute_edges = rade.mute_edges();
-        if std_checkbox(ui, &mut mute_edges, "Mute start/end")
-            .on_hover_text(
-                "Silence the decoded speech while RADE is still settling after it locks on \
-                 (about half a second) and from the moment the over ends or the signal \
-                 collapses to noise -- the odd garbled voices at both ends of an over. \
-                 Off by default: neither freedv-gui nor SDRoxide does this, and it costs \
-                 the first moments of speech.",
-            )
-            .changed()
-        {
-            rade.set_mute_edges(mute_edges);
-        }
             }
         });
 

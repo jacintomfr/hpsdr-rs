@@ -49,7 +49,8 @@ socket2 = { version = "0.5", features = ["all"] }
 serde = { version = "1", features = ["derive"] }
 cpal = "0.17"
 serde_json = "1"
-tungstenite = "0.29"
+tungstenite = { version = "0.29", features = ["rustls-tls-webpki-roots"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
 # Raw Ethernet send/receive for the P1 bootloader-mode firmware-upload
 # protocol (see bootloader.rs's own doc comment) -- NOT the same thing as
 # ordinary UDP discovery/radio traffic elsewhere in this project. Chosen

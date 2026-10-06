@@ -67,6 +67,9 @@ pub struct Config {
     pub rade_mute_analog: Option<bool>,
     #[serde(default)]
     pub rade_filter_wide: Option<bool>,
+    /// FreeDV Reporter (qso.freedv.org) client enabled; default off.
+    #[serde(default)]
+    pub freedv_reporter_enabled: Option<bool>,
     #[serde(default)]
     pub digital_mode: Option<u8>,
     #[serde(default)]
