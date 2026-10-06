@@ -6624,7 +6624,7 @@ impl eframe::App for HpsdrApp {
                         let mut close_now = false;
                         // Compact window like piHPSDR's VFO menu (keypad + the two step
                         // pickers). Bigger in kiosk mode (scaled fonts).
-                        let win_size = if lcd_kiosk_mode() { [350.0, 384.0] } else { [310.0, 340.0] };
+                        let win_size = if lcd_kiosk_mode() { [420.0, 392.0] } else { [310.0, 340.0] };
                         let mut freq_entry_viewport = egui::ViewportBuilder::default()
                             .with_title("VFO")
                             .with_inner_size(win_size)
@@ -6701,34 +6701,45 @@ impl eframe::App for HpsdrApp {
                                     let gap = ui.spacing().item_spacing.x;
 
                                     // Top row: which VFO this edits, and Close.
-                                    ui.horizontal(|ui| {
-                                        // Kiosk: which VFO this edits is fixed by how the window was opened (right-click on
-                                        // VFO A or VFO B), so the A/B chips make way for a tighter window.
-                                        if lcd_kiosk_mode() {
-                                            // Which VFO the keypad and the step apply to.
-                                            ui.label(egui::RichText::new(if vfo_b { "VFO B" } else { "VFO A" }).strong());
+                                    if lcd_kiosk_mode() {
+                                        // Touch: "VFO A" centred on top, CLOSE as big as the number keys with room above and at the right.
+                                        ui.add_space(10.0);
+                                        let (row, _) = ui.allocate_exact_size(egui::vec2(ui.available_width(), key_h), egui::Sense::hover());
+                                        ui.painter().text(
+                                            row.center(),
+                                            egui::Align2::CENTER_CENTER,
+                                            if vfo_b { "VFO B" } else { "VFO A" },
+                                            egui::FontId::proportional(h * 1.3),
+                                            ui.visuals().strong_text_color(),
+                                        );
+                                        let mut c = ui.new_child(
+                                            egui::UiBuilder::new()
+                                                .max_rect(egui::Rect::from_min_max(row.min, egui::pos2(row.max.x - 12.0, row.max.y)))
+                                                .layout(egui::Layout::right_to_left(egui::Align::Center)),
+                                        );
+                                        if touch_close_button(&mut c, key_h).clicked() {
+                                            close_now = true;
                                         }
-                                        if !lcd_kiosk_mode() {
+                                        ui.add_space(8.0);
+                                    } else {
+                                    ui.horizontal(|ui| {
                                         if toggle_chip(ui, "VFO A", !vfo_b, 0.0, "").clicked() {
                                             vfo_b = false;
                                         }
                                         if toggle_chip(ui, "VFO B", vfo_b, 0.0, "").clicked() {
                                             vfo_b = true;
                                         }
-                                        }
                                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                                            // Kiosk: as big as the number keys.
-                                            let close_resp = if lcd_kiosk_mode() {
-                                                ui.add(chip_button("Close", false).min_size(egui::vec2(key_w, key_h)))
-                                            } else {
-                                                toggle_chip(ui, "Close", false, 0.0, "")
-                                            };
-                                            if close_resp.clicked() {
+                                            if toggle_chip(ui, "Close", false, 0.0, "").clicked() {
                                                 close_now = true;
                                             }
                                         });
                                     });
+                                    }
 
+                                    ui.horizontal_top(|ui| {
+                                        // Keypad (1-9, ".", 0, BS) + units + Clear.
+                                        ui.vertical(|ui| {
                                     // Entry display: right-aligned, what has been typed.
                                     let shown = if digits.is_empty() { "0".to_string() } else { digits.clone() };
                                     // Exact-size box (a Frame with a right-to-left layout stretched to
@@ -6754,9 +6765,6 @@ impl eframe::App for HpsdrApp {
                                         ui.painter().galley(pos, galley, egui::Color32::WHITE);
                                     }
 
-                                    ui.horizontal_top(|ui| {
-                                        // Keypad (1-9, ".", 0, BS) + units + Clear.
-                                        ui.vertical(|ui| {
                                             egui::Grid::new("vfo_keypad").spacing([gap, gap]).show(ui, |ui| {
                                                 let keys = [
                                                     ["1", "2", "3"],
@@ -6789,11 +6797,12 @@ impl eframe::App for HpsdrApp {
                                                 }
                                                 ui.end_row();
                                             });
+                                            let clear_size = egui::vec2(key_w * 3.0 + 2.0 * gap, key_h);
                                             if ui
-                                                .add(
-                                                    chip_button("Clear", false)
-                                                        .min_size(egui::vec2(key_w * 3.0 + 2.0 * gap, key_h * 0.8)),
-                                                )
+                                                .allocate_ui_with_layout(clear_size, egui::Layout::centered_and_justified(egui::Direction::LeftToRight), |ui| {
+                                                    ui.add(chip_button("Clear", false).min_size(clear_size))
+                                                })
+                                                .inner
                                                 .clicked()
                                             {
                                                 digits.clear();
@@ -6803,16 +6812,29 @@ impl eframe::App for HpsdrApp {
                                         ui.add_space(gap * 2.0);
                                         // Right column: RIT step and VFO step (as piHPSDR).
                                         ui.vertical(|ui| {
+                                            // Touch: bigger selector boxes (taller, wider) and bigger items in their lists.
+                                            let kiosk = lcd_kiosk_mode();
+                                            {
+                                                let sp = ui.spacing_mut();
+                                                if kiosk {
+                                                    sp.interact_size.y = 46.0;
+                                                    sp.button_padding = egui::vec2(12.0, 9.0);
+                                                }
+                                            }
                                             ui.label("RIT step");
                                             egui::ComboBox::from_id_salt("rit_step_hz")
-                                                .width(60.0)
+                                                .width(if kiosk { 130.0 } else { 60.0 })
                                                 .selected_text(format!("{} Hz", connected.rit_step_hz))
                                                 .show_ui(ui, |ui| {
                                                     for step in [1, 10, 100] {
-                                                        if ui
-                                                            .selectable_label(connected.rit_step_hz == step, format!("{step} Hz"))
-                                                            .clicked()
-                                                        {
+                                                        let sel = connected.rit_step_hz == step;
+                                                        let label = format!("{step} Hz");
+                                                        let clicked = if kiosk {
+                                                            ui.add(egui::Button::selectable(sel, label).min_size(egui::vec2(130.0, 46.0))).clicked()
+                                                        } else {
+                                                            ui.selectable_label(sel, label).clicked()
+                                                        };
+                                                        if clicked {
                                                             connected.rit_step_hz = step;
                                                             settings_changed = true;
                                                         }
@@ -18296,12 +18318,19 @@ fn render_status_row(
 fn render_step_combo_only(ui: &mut egui::Ui, connected: &mut ConnectedState, for_b: bool) -> bool {
     let mut changed = false;
     let current = if for_b { connected.vfo_b_step_hz } else { connected.tune_step_hz };
+    let kiosk = lcd_kiosk_mode();
     egui::ComboBox::from_id_salt(if for_b { "tune_step_hz_b" } else { "tune_step_hz" })
-        .width(70.0)
+        .width(if kiosk { 130.0 } else { 70.0 })
         .selected_text(tune_step_label(current))
         .show_ui(ui, |ui| {
             for hz in ALL_TUNE_STEPS_HZ {
-                if ui.selectable_label(current == hz, tune_step_label(hz)).clicked() {
+                let sel = current == hz;
+                let clicked = if kiosk {
+                    ui.add(egui::Button::selectable(sel, tune_step_label(hz)).min_size(egui::vec2(130.0, 44.0))).clicked()
+                } else {
+                    ui.selectable_label(sel, tune_step_label(hz)).clicked()
+                };
+                if clicked {
                     if for_b {
                         connected.vfo_b_step_hz = hz;
                     } else {
