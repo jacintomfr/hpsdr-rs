@@ -670,6 +670,37 @@ pub struct RadioSession {
     /// Settings -> RX's own "LNA during TX" slider for where a user
     /// sets this.
     pub lna_tx_db: Arc<AtomicI32>,
+    /// UI -> radio: "Enable external TxInhibit Input" (deskHPSDR
+    /// `enable_tx_inhibit`). While set, the radio's TX-inhibit input (P1:
+    /// IO1, or IO2 on Orion2; P2: status byte 59 bit 0, or bit 1 on
+    /// Orion2/Saturn; active low) is evaluated into `hardware_tx_inhibit`.
+    pub tx_inhibit_enabled: Arc<AtomicBool>,
+    /// UI -> radio: "Enable external AutoTune Input" (deskHPSDR
+    /// `enable_auto_tune`). While set, the AutoTune input (P1: IO3; P2:
+    /// status byte 59 bit 2; active low) is evaluated into
+    /// `auto_tune_asserted`.
+    pub auto_tune_enabled: Arc<AtomicBool>,
+    /// Radio -> UI: true while `tx_inhibit_enabled` is set AND the radio's
+    /// external TX-inhibit input is asserted (active low); false otherwise,
+    /// including whenever the feature is disabled. Written by the receiver
+    /// thread from every status frame that carries the input.
+    pub hardware_tx_inhibit: Arc<AtomicBool>,
+    /// Radio -> UI: true while `auto_tune_enabled` is set AND the radio's
+    /// external AutoTune input is asserted (active low); false otherwise.
+    pub auto_tune_asserted: Arc<AtomicBool>,
+    /// UI -> radio: HermesLite2 CL1 jack as 10 MHz reference clock input
+    /// (deskHPSDR `hl2_cl1_input`). On every change (and once at session
+    /// start when set) sender_loop streams deskHPSDR's 48-byte HL2CL1on/
+    /// HL2CL1off I2C register table as 24 write pairs through the HL2
+    /// extended-command slot (see `HL2_CL1_ON`). Real HermesLite2 only,
+    /// Protocol 1 only.
+    pub hl2_cl1_input: Arc<AtomicBool>,
+    /// UI -> radio: HL2 ATU (AH-4 gateware) TUNE support (deskHPSDR
+    /// `enable_hl2_atu_gateware`). NOTE: this project already sends the
+    /// HL2 config-packet TUNE bit (C2 0x10, "ADDR=0x09 bit 20") on every
+    /// `tune_active` unconditionally (see p1_build_packet command 3), so
+    /// this flag currently has no additional wire effect.
+    pub hl2_atu_gateware: Arc<AtomicBool>,
     /// TX-time step attenuator (0-31 dB) applied to ADC0's input while
     /// transmitting, on both protocols. Standard (non-HermesLite) boards
     /// only. Despite the name (kept for now to avoid a config-schema
@@ -1834,6 +1865,16 @@ fn start_protocol1(
     // See RadioSession::disable_pa's doc comment.
     let disable_pa = Arc::new(AtomicBool::new(false));
     let tune_active = Arc::new(AtomicBool::new(false));
+    // See RadioSession::tx_inhibit_enabled/auto_tune_enabled/
+    // hardware_tx_inhibit/auto_tune_asserted/hl2_cl1_input/
+    // hl2_atu_gateware's doc comments. Created here (not passed in) so
+    // start_protocol1's signature stays unchanged.
+    let tx_inhibit_enabled = Arc::new(AtomicBool::new(false));
+    let auto_tune_enabled = Arc::new(AtomicBool::new(false));
+    let hardware_tx_inhibit = Arc::new(AtomicBool::new(false));
+    let auto_tune_asserted = Arc::new(AtomicBool::new(false));
+    let hl2_cl1_input = Arc::new(AtomicBool::new(false));
+    let hl2_atu_gateware = Arc::new(AtomicBool::new(false));
     // See RadioSession::oc_rx/oc_tx's doc comments.
     let oc_rx = Arc::new(AtomicU8::new(0));
     let oc_tx = Arc::new(AtomicU8::new(0));
@@ -2033,6 +2074,10 @@ fn start_protocol1(
     let sender_is_atlas_backplane = matches!(device.board, Boards::Metis | Boards::Ozy);
     let sender_disable_pa = Arc::clone(&disable_pa);
     let sender_tune_active = Arc::clone(&tune_active);
+    // Real HermesLite2 only (not the v1 HermesLite) -- deskHPSDR gates its
+    // CL1 command loop on DEVICE_HERMES_LITE2.
+    let sender_is_hl2 = device.board == Boards::HermesLite2;
+    let sender_hl2_cl1_input = Arc::clone(&hl2_cl1_input);
     let sender_oc_rx = Arc::clone(&oc_rx);
     let sender_oc_tx = Arc::clone(&oc_tx);
     let sender_num_adcs = device.adcs;
@@ -2078,6 +2123,8 @@ fn start_protocol1(
             sender_is_atlas_backplane,
             sender_disable_pa,
             sender_tune_active,
+            sender_is_hl2,
+            sender_hl2_cl1_input,
             sender_oc_rx,
             sender_oc_tx,
             sender_num_adcs,
@@ -2118,6 +2165,13 @@ fn start_protocol1(
     let receiver_diversity_main_raw_iq = Arc::clone(&diversity_main_raw_iq);
     let receiver_rx_packets_total = Arc::clone(&rx_packets_total);
     let receiver_rx_packets_lost = Arc::clone(&rx_packets_lost);
+    let receiver_hw_io = HwIoInputs {
+        tx_inhibit_enabled: Arc::clone(&tx_inhibit_enabled),
+        auto_tune_enabled: Arc::clone(&auto_tune_enabled),
+        hardware_tx_inhibit: Arc::clone(&hardware_tx_inhibit),
+        auto_tune_asserted: Arc::clone(&auto_tune_asserted),
+    };
+    let receiver_is_orion2 = device.board == Boards::Orion2;
     let rx_max_gap_us = Arc::new(AtomicU64::new(0));
     let receiver_rx_max_gap_us = Arc::clone(&rx_max_gap_us);
     let receiver_thread = thread::spawn(move || {
@@ -2144,6 +2198,8 @@ fn start_protocol1(
             receiver_rx_packets_total,
             receiver_rx_packets_lost,
             receiver_rx_max_gap_us,
+            receiver_hw_io,
+            receiver_is_orion2,
             receiver_stop,
         );
     });
@@ -2219,6 +2275,12 @@ fn start_protocol1(
         rx_packets_lost,
         rx_max_gap_us,
         lna_tx_db,
+        tx_inhibit_enabled,
+        auto_tune_enabled,
+        hardware_tx_inhibit,
+        auto_tune_asserted,
+        hl2_cl1_input,
+        hl2_atu_gateware,
         tx_packet_debug_log,
         stop_flag,
         sender_thread: Some(sender_thread),
@@ -2549,6 +2611,13 @@ fn start_protocol1_ozy_usb(
         rx_packets_lost,
         rx_max_gap_us: Arc::new(AtomicU64::new(0)),
         lna_tx_db: Arc::new(AtomicI32::new(-12)),
+        // External TxInhibit/AutoTune/HL2 CL1/ATU -- not wired on this transport.
+        tx_inhibit_enabled: Arc::new(AtomicBool::new(false)),
+        auto_tune_enabled: Arc::new(AtomicBool::new(false)),
+        hardware_tx_inhibit: Arc::new(AtomicBool::new(false)),
+        auto_tune_asserted: Arc::new(AtomicBool::new(false)),
+        hl2_cl1_input: Arc::new(AtomicBool::new(false)),
+        hl2_atu_gateware: Arc::new(AtomicBool::new(false)),
         tx_packet_debug_log,
         stop_flag,
         sender_thread: Some(sender_thread),
@@ -2778,6 +2847,13 @@ fn start_rx888_usb(
         rx_packets_lost,
         rx_max_gap_us: Arc::new(AtomicU64::new(0)),
         lna_tx_db: Arc::new(AtomicI32::new(-12)),
+        // External TxInhibit/AutoTune/HL2 CL1/ATU -- not wired on this transport.
+        tx_inhibit_enabled: Arc::new(AtomicBool::new(false)),
+        auto_tune_enabled: Arc::new(AtomicBool::new(false)),
+        hardware_tx_inhibit: Arc::new(AtomicBool::new(false)),
+        auto_tune_asserted: Arc::new(AtomicBool::new(false)),
+        hl2_cl1_input: Arc::new(AtomicBool::new(false)),
+        hl2_atu_gateware: Arc::new(AtomicBool::new(false)),
         tx_packet_debug_log,
         ps_rx_feedback_iq,
         ps_tx_feedback_iq,
@@ -4503,6 +4579,11 @@ fn sender_loop(
     // See RadioSession::tune_active's doc comment -- read live, same as
     // disable_pa just above.
     tune_active: Arc<std::sync::atomic::AtomicBool>,
+    // Real HermesLite2 (not HermesLite v1) -- gates the CL1 register
+    // sequence below, like deskHPSDR's DEVICE_HERMES_LITE2 check.
+    is_hl2: bool,
+    // See RadioSession::hl2_cl1_input's doc comment.
+    hl2_cl1_input: Arc<AtomicBool>,
     // See RadioSession::oc_rx/oc_tx's doc comments.
     oc_rx: Arc<AtomicU8>,
     oc_tx: Arc<AtomicU8>,
@@ -4576,6 +4657,15 @@ fn sender_loop(
     // call, before this thread even existed).
     let mut last_diversity_enabled = diversity_enabled.load(Ordering::Relaxed);
     let mut last_puresignal_enabled = puresignal_enabled.load(Ordering::Relaxed);
+    // HL2 CL1 10 MHz reference sequence (see HL2_CL1_ON/OFF): `cl1_state`
+    // is the setting last (being) sent -- starts false because the HL2
+    // boots with "CL1 off" (deskHPSDR's hl2_old_cl1_setting = 0), so a
+    // session that starts with the flag set sends the ON table once.
+    // `cl1_idx` is the next table byte to send; >= 48 means idle (initially
+    // idle until the flag differs from the boot state). Like deskHPSDR, a
+    // change is only picked up between two complete runs.
+    let mut cl1_state = false;
+    let mut cl1_idx: usize = 48;
 
     while !stop.load(Ordering::Relaxed) {
         let now_diversity_enabled = diversity_enabled.load(Ordering::Relaxed);
@@ -4749,7 +4839,20 @@ fn sender_loop(
         // time directly instead).
         let tx_iq_slots_per_sample = 1.0;
 
-        let packet = p1_build_packet(
+        // HL2 CL1 sequence: this packet carries the extended-command slot
+        // (command 11, the slot deskHPSDR's `case 11` round robin owns)
+        // iff ozy_command is 11 on entry -- it is advanced inside
+        // p1_build_packet, so decide now. See the overwrite after the build.
+        let cl1_slot = is_hl2 && ozy_command == 11;
+        if is_hl2 && cl1_idx >= 48 {
+            let want = hl2_cl1_input.load(Ordering::Relaxed);
+            if want != cl1_state {
+                cl1_state = want;
+                cl1_idx = 0;
+            }
+        }
+
+        let mut packet = p1_build_packet(
             seq,
             &mut ozy_command,
             &mut current_receiver,
@@ -4794,6 +4897,22 @@ fn sender_loop(
             mic_bias_enabled.load(Ordering::Relaxed),
             mic_ptt_on_tip.load(Ordering::Relaxed),
         );
+
+        // HL2 CL1 jack re-programming (deskHPSDR old_protocol.c `case 20`):
+        // replace the extended-command slot of the second USB frame with
+        // one I2C write pair -- C0 = 0x78 (I2C-1 without ACK, MOX bit kept),
+        // C1 = 0x06 (write), C2 = 0xEA (i2c address), C3/C4 = the pair.
+        if cl1_slot && cl1_idx < 48 {
+            let table = if cl1_state { &HL2_CL1_ON } else { &HL2_CL1_OFF };
+            let f1 = HEADER_SIZE + USB_FRAME_SIZE;
+            let mox_bit = packet[f1 + 3] & 0x01;
+            packet[f1 + 3] = 0x78 | mox_bit;
+            packet[f1 + 4] = 0x06;
+            packet[f1 + 5] = 0xEA;
+            packet[f1 + 6] = table[cl1_idx];
+            packet[f1 + 7] = table[cl1_idx + 1];
+            cl1_idx += 2;
+        }
 
         // See RadioSession::tx_packet_debug_log's own doc comment --
         // is_enabled() is a single relaxed atomic load, cheap enough to
@@ -5005,6 +5124,60 @@ fn p2_rx_audio_loop(
     }
 }
 
+/// The radio's external TxInhibit/AutoTune hardware inputs (deskHPSDR
+/// old_protocol.c status address 0 / new_protocol.c status byte 59) --
+/// bundled so the receiver loops and parse_iq_stream take one parameter
+/// instead of five. The four Arcs are the same ones exposed on
+/// RadioSession (tx_inhibit_enabled, auto_tune_enabled,
+/// hardware_tx_inhibit, auto_tune_asserted).
+#[derive(Clone)]
+struct HwIoInputs {
+    tx_inhibit_enabled: Arc<AtomicBool>,
+    auto_tune_enabled: Arc<AtomicBool>,
+    hardware_tx_inhibit: Arc<AtomicBool>,
+    auto_tune_asserted: Arc<AtomicBool>,
+}
+
+impl HwIoInputs {
+    /// Inputs that never assert (boards/transports without these lines,
+    /// e.g. Ozy USB): fresh Arcs that nothing else holds.
+    fn unused() -> Self {
+        Self {
+            tx_inhibit_enabled: Arc::new(AtomicBool::new(false)),
+            auto_tune_enabled: Arc::new(AtomicBool::new(false)),
+            hardware_tx_inhibit: Arc::new(AtomicBool::new(false)),
+            auto_tune_asserted: Arc::new(AtomicBool::new(false)),
+        }
+    }
+
+    /// `inhibit_in`/`auto_tune_in` are the raw input bits (0 or 1), both
+    /// ACTIVE LOW like deskHPSDR's `data == 0` tests; an output flag is
+    /// only ever true while its own enable flag is set, and is cleared
+    /// again as soon as the feature is disabled.
+    fn update(&self, inhibit_in: u8, auto_tune_in: u8) {
+        let inhibit = self.tx_inhibit_enabled.load(Ordering::Relaxed) && inhibit_in & 1 == 0;
+        self.hardware_tx_inhibit.store(inhibit, Ordering::Relaxed);
+        let auto_tune = self.auto_tune_enabled.load(Ordering::Relaxed) && auto_tune_in & 1 == 0;
+        self.auto_tune_asserted.store(auto_tune, Ordering::Relaxed);
+    }
+}
+
+/// HermesLite2 "CL1 as 10 MHz in, CL2 as 10 MHz out" I2C register/data
+/// pairs (xx, yy, xx, yy, ...), copied verbatim from deskHPSDR
+/// old_protocol.c (HL2CL1on/HL2CL1off). Each pair goes out as one C&C
+/// frame with C0=0x78 (I2C-1 without ACK), C1=0x06 (write), C2=0xEA (i2c
+/// address), C3/C4 = the pair.
+const HL2_CL1_ON: [u8; 48] = [
+    0x10, 0xc0, 0x13, 0x03, 0x10, 0x40, 0x2d, 0x01, 0x2e, 0x20, 0x22, 0x03, 0x23, 0x00, 0x24, 0x00, 0x25, 0x00, 0x19, 0x00,
+    0x1A, 0x00, 0x1B, 0x00, 0x18, 0x00, 0x17, 0x12, 0x62, 0x3b, 0x2c, 0x00, 0x31, 0x81, 0x3d, 0x09, 0x3e, 0x00, 0x32, 0x00,
+    0x33, 0x00, 0x34, 0x00, 0x35, 0x00, 0x63, 0x01,
+];
+const HL2_CL1_OFF: [u8; 48] = [
+    0x10, 0xc0, 0x13, 0x00, 0x10, 0x80, 0x2d, 0x01, 0x2e, 0x10, 0x22, 0x00, 0x23, 0x00, 0x24, 0x00, 0x25, 0x00, 0x19, 0x00,
+    0x1A, 0x00, 0x1B, 0x00, 0x18, 0x40, 0x17, 0x04, 0x62, 0x5b, 0x2c, 0x00, 0x31, 0x00, 0x3d, 0x00, 0x3e, 0x00, 0x32, 0x00,
+    0x33, 0x00, 0x34, 0x00, 0x35, 0x00, 0x63, 0x00,
+];
+
 fn receiver_loop(
     socket: UdpSocket,
     buffers: Vec<Arc<Mutex<VecDeque<IqSample>>>>,
@@ -5037,6 +5210,10 @@ fn receiver_loop(
     rx_packets_total: Arc<AtomicU64>,
     rx_packets_lost: Arc<AtomicU64>,
     rx_max_gap_us: Arc<AtomicU64>,
+    // External TxInhibit/AutoTune inputs -- see HwIoInputs.
+    hw_io: HwIoInputs,
+    // Orion2 (ANAN-7000/8000) reports TxInhibit on IO2 instead of IO1.
+    is_orion2: bool,
     stop: Arc<AtomicBool>,
 ) {
     let mut buf = [0u8; PACKET_SIZE + 64]; // a little slack in case of larger packets
@@ -5158,6 +5335,8 @@ fn receiver_loop(
                         &mut hl2_current_acc,
                         &mut carry,
                         &mut frame_synced,
+                        &hw_io,
+                        is_orion2,
                     );
                 }
                 // EP_WIDEBAND (0x04) and anything else: ignored for now.
@@ -5354,6 +5533,9 @@ fn ozy_receiver_loop(
     let ps_rx_feedback_iq: Arc<Mutex<VecDeque<IqSample>>> = Arc::new(Mutex::new(VecDeque::new()));
     let ps_tx_feedback_iq: Arc<Mutex<VecDeque<IqSample>>> = Arc::new(Mutex::new(VecDeque::new()));
     let diversity_main_raw_iq: Arc<Mutex<VecDeque<IqSample>>> = Arc::new(Mutex::new(VecDeque::new()));
+    // Ozy has no IOx status lines wired to TxInhibit/AutoTune -- detached
+    // flags that never assert.
+    let hw_io = HwIoInputs::unused();
 
     while !stop.load(Ordering::Relaxed) {
         match rx_endpoint.read(&mut buf) {
@@ -5385,6 +5567,8 @@ fn ozy_receiver_loop(
                     &mut hl2_current_acc,
                     &mut carry,
                     &mut frame_synced,
+                    &hw_io,
+                    false,
                 );
             }
             Ok(_) => continue, // 0 bytes -- transient, keep polling
@@ -5553,6 +5737,12 @@ fn parse_iq_stream(
     // diagnostic is no longer needed.
     carry: &mut Vec<u8>,
     frame_synced: &mut bool,
+    // External TxInhibit/AutoTune inputs, evaluated from status address 0
+    // (deskHPSDR old_protocol.c: C1 bit 1 = IO1, bit 2 = IO2, bit 3 = IO3,
+    // active low). TxInhibit uses IO2 on Orion2 (`is_orion2`), IO1 on
+    // everything else; AutoTune always IO3.
+    hw_io: &HwIoInputs,
+    is_orion2: bool,
 ) -> (u32, u32) {
     let mut rx_fb_pushed: u32 = 0;
     let mut tx_fb_pushed: u32 = 0;
@@ -5676,6 +5866,8 @@ fn parse_iq_stream(
             hl2_pa_current_raw.store(*hl2_current_acc / 16, Ordering::Relaxed);
         } else if address == 0 {
             adc0_overload.store(frame[4] & 0x01 != 0, Ordering::Relaxed);
+            let inhibit_in = if is_orion2 { frame[4] >> 2 } else { frame[4] >> 1 };
+            hw_io.update(inhibit_in, frame[4] >> 3);
         } else if address == 4 {
             adc0_overload.store(frame[4] & 0x01 != 0, Ordering::Relaxed);
             adc1_overload.store(frame[5] & 0x01 != 0, Ordering::Relaxed);
@@ -6158,6 +6350,19 @@ fn start_protocol2(
     let receiver_diversity_main_raw_iq = Arc::clone(&diversity_main_raw_iq);
     // Live -- see RadioSession::puresignal_enabled's doc comment.
     let receiver_puresignal_enabled = Arc::clone(&puresignal_enabled);
+    // External TxInhibit/AutoTune inputs -- see RadioSession::
+    // tx_inhibit_enabled and friends.
+    let tx_inhibit_enabled = Arc::new(AtomicBool::new(false));
+    let auto_tune_enabled = Arc::new(AtomicBool::new(false));
+    let hardware_tx_inhibit = Arc::new(AtomicBool::new(false));
+    let auto_tune_asserted = Arc::new(AtomicBool::new(false));
+    let receiver_hw_io = HwIoInputs {
+        tx_inhibit_enabled: Arc::clone(&tx_inhibit_enabled),
+        auto_tune_enabled: Arc::clone(&auto_tune_enabled),
+        hardware_tx_inhibit: Arc::clone(&hardware_tx_inhibit),
+        auto_tune_asserted: Arc::clone(&auto_tune_asserted),
+    };
+    let receiver_inhibit_on_bit1 = matches!(device.board, Boards::Orion2 | Boards::Saturn);
     let receiver_thread = thread::spawn(move || {
         p2_receiver_loop(
             receiver_socket,
@@ -6180,6 +6385,8 @@ fn start_protocol2(
             receiver_radio_mic_audio,
             receiver_diversity_enabled,
             receiver_diversity_main_raw_iq,
+            receiver_hw_io,
+            receiver_inhibit_on_bit1,
             receiver_stop,
         );
     });
@@ -6260,6 +6467,14 @@ fn start_protocol2(
         rx_packets_lost,
         rx_max_gap_us: Arc::new(AtomicU64::new(0)),
         lna_tx_db: Arc::new(AtomicI32::new(-12)),
+        // External TxInhibit/AutoTune inputs, shared with p2_receiver_loop.
+        tx_inhibit_enabled,
+        auto_tune_enabled,
+        hardware_tx_inhibit,
+        auto_tune_asserted,
+        // P1/HL2-only features: detached flags, never read by the P2 threads.
+        hl2_cl1_input: Arc::new(AtomicBool::new(false)),
+        hl2_atu_gateware: Arc::new(AtomicBool::new(false)),
         tx_packet_debug_log,
         stop_flag,
         sender_thread: Some(sender_thread),
@@ -7334,6 +7549,11 @@ fn p2_receiver_loop(
     // fresh each packet, same as p2_sender_loop's own live read.
     diversity_enabled: Arc<AtomicBool>,
     diversity_main_raw_iq: Arc<Mutex<VecDeque<IqSample>>>,
+    // External TxInhibit/AutoTune inputs, status byte 59 -- see HwIoInputs.
+    hw_io: HwIoInputs,
+    // Orion2/Saturn report TxInhibit on bit 1 of byte 59 (IO5), all other
+    // boards on bit 0 (IO4); AutoTune is always bit 2 (IO6).
+    inhibit_on_bit1: bool,
     stop: Arc<AtomicBool>,
 ) {
     let mut buf = [0u8; P2_PACKET_SIZE + 64];
@@ -7525,6 +7745,12 @@ fn p2_receiver_loop(
                         let dot = (buf[4] >> 1) & 0x01;
                         let dash = (buf[4] >> 2) & 0x01;
                         cw_paddle_contacts.store(dot | (dash << 1), Ordering::Relaxed);
+                    }
+                    // External TxInhibit/AutoTune inputs -- byte 59, active
+                    // low, confirmed against deskHPSDR's new_protocol.c.
+                    if n >= 60 {
+                        let inhibit_in = if inhibit_on_bit1 { buf[59] >> 1 } else { buf[59] };
+                        hw_io.update(inhibit_in, buf[59] >> 2);
                     }
                     hp_request.store(true, Ordering::Relaxed);
                 } else if port == P2_TX_SPECIFIC_PORT {

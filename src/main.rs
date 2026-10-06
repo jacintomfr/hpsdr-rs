@@ -102,8 +102,40 @@ const BANDS: [Band; 11] = [
     Band { name: "6m", low_hz: 50_000_000, high_hz: 54_000_000, default_hz: 50_313_000, default_mode: spectrum::Mode::Usb },
 ];
 
+/// IARU region (1, 2 or 3) chosen in Settings -> SDR Device: it moves the edges of 160/80/40 m (deskHPSDR's
+/// `band_apply_iaru_region`). Default 2 = the limits the BANDS table holds.
+static IARU_REGION: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(2);
+
+fn iaru_region() -> u8 {
+    IARU_REGION.load(Ordering::Relaxed)
+}
+
+fn set_iaru_region(r: u8) {
+    IARU_REGION.store(r.clamp(1, 3), Ordering::Relaxed);
+}
+
+impl Band {
+    /// Lower band edge for the selected IARU region.
+    fn low(&self) -> u32 {
+        match (self.name, iaru_region()) {
+            ("160m", 1) => 1_810_000,
+            _ => self.low_hz,
+        }
+    }
+
+    /// Upper band edge for the selected IARU region.
+    fn high(&self) -> u32 {
+        match (self.name, iaru_region()) {
+            ("80m", 1) => 3_800_000,
+            ("80m", 3) => 3_900_000,
+            ("40m", 1) | ("40m", 3) => 7_200_000,
+            _ => self.high_hz,
+        }
+    }
+}
+
 fn band_for_frequency(freq_hz: u32) -> Option<&'static Band> {
-    BANDS.iter().find(|b| freq_hz >= b.low_hz && freq_hz <= b.high_hz)
+    BANDS.iter().find(|b| freq_hz >= b.low() && freq_hz <= b.high())
 }
 
 /// "General coverage" -- not a real ham band, but a real request: a
@@ -1072,37 +1104,7 @@ fn dispatch_midi_binding(
         // Mirrors the TUNE button handler -- see its own comments for why
         // tune_may_start excludes Two-Tone/CW-text-sending and an
         // externally-keyed transmission.
-        MidiAction::Tune => {
-            if connected.tune_active {
-                connected.session.set_mox(false);
-                if let Some(tx) = &connected.tx_handle {
-                    tx.set_tune(false);
-                }
-                if let Some(prev) = connected.pre_tune_power_watts.take() {
-                    connected.session.tx_power_watts.store(prev, Ordering::Relaxed);
-                }
-                connected.tune_active = false;
-            } else {
-                let tune_may_start = !connected.session.mox_active()
-                    && !connected.two_tone_active
-                    && !connected.cw_text_sending
-                    && tx_frequency_allowed(
-                        connected.session.tx_frequency_hz.load(Ordering::Relaxed),
-                        connected.allow_out_of_band_tx.load(Ordering::Relaxed),
-                    );
-                if tune_may_start {
-                    let current_watts = connected.session.tx_power_watts.load(Ordering::Relaxed);
-                    connected.pre_tune_power_watts = Some(current_watts);
-                    let tune_watts = current_watts * connected.tune_power_percent / 100;
-                    connected.session.tx_power_watts.store(tune_watts, Ordering::Relaxed);
-                    if let Some(tx) = &connected.tx_handle {
-                        tx.set_tune(true);
-                    }
-                    connected.session.set_mox(true);
-                    connected.tune_active = true;
-                }
-            }
-        }
+        MidiAction::Tune => tune_set(connected, !connected.tune_active),
         MidiAction::Split => connected.split = !connected.split,
         MidiAction::RitToggle => {
             connected.rit_enabled = !connected.rit_enabled;
@@ -1173,8 +1175,8 @@ fn dispatch_midi_binding(
             let reachable: Vec<&'static Band> = BANDS
                 .iter()
                 .filter(|b| {
-                    (b.low_hz as u64) >= connected.device.frequency_min
-                        && b.high_hz as u64 <= connected.device.frequency_max
+                    (b.low() as u64) >= connected.device.frequency_min
+                        && b.high() as u64 <= connected.device.frequency_max
                 })
                 .collect();
             if reachable.is_empty() {
@@ -1226,25 +1228,18 @@ fn dispatch_midi_binding(
             connected.width_memory.insert(current_mode.label().to_string(), width);
         }
         MidiAction::VfoStepUp | MidiAction::VfoStepDown => {
-            let cw_mode = matches!(current_mode, spectrum::Mode::Cwl | spectrum::Mode::Cwu);
-            let step = scroll_tune_step_hz(connected.tune_step_hz, cw_mode, false, false);
-            let signed_step = if binding.action == MidiAction::VfoStepUp { step } else { -step };
-            let new_freq = (dial_freq_hz as i64 + signed_step).max(0) as u32;
-            let (effective_freq, retune) = resolve_tune_main(connected.ctun, freq_hz, sample_rate, passband, new_freq);
-            if let Some(lo) = retune {
-                connected.session.set_frequency(lo);
+            // deskHPSDR/piHPSDR's VFO STEP UP / DOWN: pick the next larger / smaller tuning step (1 Hz, 10 Hz, 25 Hz ...),
+            // not move the frequency. Kept per mode like the step combo of the VFO window.
+            let pos = ALL_TUNE_STEPS_HZ.iter().position(|&h| h == connected.tune_step_hz).unwrap_or(0);
+            let new_pos = if binding.action == MidiAction::VfoStepUp {
+                (pos + 1).min(ALL_TUNE_STEPS_HZ.len() - 1)
             } else {
-                connected.ctun_frequency_hz = effective_freq;
-            }
-            remember_band_settings(
-                &mut connected.band_memory,
-                effective_freq,
-                connected.db_low,
-                connected.db_high,
-                connected.waterfall_db_low,
-                connected.waterfall_db_high,
-                current_mode,
-            );
+                pos.saturating_sub(1)
+            };
+            let hz = ALL_TUNE_STEPS_HZ[new_pos];
+            connected.tune_step_hz = hz;
+            connected.step_memory.insert(current_mode.label().to_string(), hz);
+            connected.settings_dirty.store(true, Ordering::Relaxed);
         }
         MidiAction::VfoTune => {
             // piHPSDR's VFO action: every encoder tick moves the frequency by the selected VFO step (the yellow
@@ -1356,8 +1351,8 @@ fn dispatch_midi_binding(
             // Same reachability guard as the on-screen band-button row
             // and MidiAction::BandUp/BandDown just above -- e.g. never
             // jump to 6m on a HermesLite/HermesLite2.
-            if (band.low_hz as u64) >= connected.device.frequency_min
-                && band.high_hz as u64 <= connected.device.frequency_max
+            if (band.low() as u64) >= connected.device.frequency_min
+                && band.high() as u64 <= connected.device.frequency_max
             {
                 apply_band(connected, band);
             }
@@ -1686,6 +1681,7 @@ fn dispatch_midi_binding(
 
 #[derive(Copy, Clone, PartialEq, Eq)]
 enum SettingsTab {
+    SdrDevice,
     Network,
     Audio,
     Cw,
@@ -2356,7 +2352,8 @@ struct ConnectedState {
     /// The callsign RADE transmits in its End-of-Over frame -- see
     /// render_rade_panel and rade::text's own doc comment. Persisted in
     /// Config the same way rtty's settings are.
-    rade_callsign: String,
+    own_callsign: String,
+    own_locator: String,
     extra_receivers: Vec<Arc<Mutex<ExtraReceiver>>>,
     settings_dirty: Arc<std::sync::atomic::AtomicBool>,
     /// Last frequency (IF) and mode of each transverter slot (by name), see Config::xvtr_settings.
@@ -2426,6 +2423,11 @@ struct ConnectedState {
     vox_window_open: bool,
     /// The deskHPSDR-style WDSP EQ window (eq_window.rs), its per-mode EQ maps (config) and the active mic-profile slot.
     eq_window_open: bool,
+    /// Kiosk: the SDR Device page as a full-screen window (sdr_device_window).
+    sdr_window_open: bool,
+    /// Edge detection of the external AutoTune input and whether it started the running TUNE (see radio_inputs_tick).
+    auto_tune_prev: bool,
+    auto_tune_started: bool,
     rx_eq_by_mode: std::collections::HashMap<String, spectrum::EqualizerParams>,
     tx_eq_by_mode: std::collections::HashMap<String, spectrum::EqualizerParams>,
     eq_mode_group_seen: String,
@@ -3354,6 +3356,12 @@ fn connect_to_device(device: Device, cfg: &Config) -> Result<ConnectedState, Str
                 cfg.send_rx_audio_to_radio.unwrap_or(false),
                 Ordering::Relaxed,
             );
+            session.tx_inhibit_enabled.store(cfg.tx_inhibit_enabled.unwrap_or(false), Ordering::Relaxed);
+            session.auto_tune_enabled.store(cfg.auto_tune_enabled.unwrap_or(false), Ordering::Relaxed);
+            session.hl2_cl1_input.store(cfg.hl2_cl1_input.unwrap_or(false), Ordering::Relaxed);
+            session.hl2_atu_gateware.store(cfg.hl2_atu_gateware.unwrap_or(false), Ordering::Relaxed);
+            report_recorder::set_max_seconds(cfg.report_capture_secs.unwrap_or(60));
+            set_iaru_region(cfg.iaru_region.unwrap_or(2));
             session
                 .hl2_ak4951_codec
                 .store(cfg.hl2_ak4951_codec.unwrap_or(false), Ordering::Relaxed);
@@ -3697,9 +3705,10 @@ fn connect_to_device(device: Device, cfg: &Config) -> Result<ConnectedState, Str
             if let Some(v) = cfg.sstv_tx_lead_ms {
                 sstv.set_tx_lead_ms(v);
             }
-            let rade_callsign = cfg.rade_callsign.clone().unwrap_or_default();
-            if !rade_callsign.is_empty() {
-                rade.set_callsign(&rade_callsign);
+            let own_callsign = cfg.own_callsign.clone().or_else(|| cfg.rade_callsign.clone()).unwrap_or_default();
+            let own_locator = cfg.own_locator.clone().unwrap_or_default();
+            if !own_callsign.is_empty() {
+                rade.set_callsign(&own_callsign);
             }
             let mic_buffer = Arc::new(Mutex::new(VecDeque::new()));
             let mic_input_device = cfg.mic_input_device.clone();
@@ -3960,7 +3969,8 @@ fn connect_to_device(device: Device, cfg: &Config) -> Result<ConnectedState, Str
                 sstv_tx_texture: None,
                 sstv_tx_sending: false,
                 rade,
-                rade_callsign,
+                own_callsign,
+                own_locator,
                 // Matches deskHPSDR's own rx_gain_calibration default
                 // (radio.c: `case DEVICE_HERMES_LITE: case
                 // DEVICE_HERMES_LITE2: ... rx_gain_calibration = 14;`,
@@ -4009,6 +4019,9 @@ fn connect_to_device(device: Device, cfg: &Config) -> Result<ConnectedState, Str
                 vox_filter_high_hz: cfg.vox_filter_high_hz.unwrap_or(2000.0).clamp(0.0, 4000.0),
                 vox_window_open: false,
                 eq_window_open: false,
+                sdr_window_open: false,
+                auto_tune_prev: false,
+                auto_tune_started: false,
                 rx_eq_by_mode: cfg.rx_eq_by_mode.clone(),
                 tx_eq_by_mode: cfg.tx_eq_by_mode.clone(),
                 eq_mode_group_seen: String::new(),
@@ -4113,8 +4126,8 @@ fn connect_to_device(device: Device, cfg: &Config) -> Result<ConnectedState, Str
                             for name in BANDS
                                 .iter()
                                 .filter(|b| {
-                                    (b.low_hz as u64) >= device.frequency_min
-                                        && (b.high_hz as u64) <= device.frequency_max
+                                    (b.low() as u64) >= device.frequency_min
+                                        && (b.high() as u64) <= device.frequency_max
                                 })
                                 .map(|b| b.name)
                                 .chain(cfg.xvtrs.iter().filter(|x| !x.name.is_empty()).map(|x| x.name.as_str()))
@@ -4908,6 +4921,7 @@ impl eframe::App for HpsdrApp {
                 }
                 vox_tick(ui.ctx(), connected);
                 eq_window::mode_tick(connected);
+                radio_inputs_tick(connected);
                 spectrum::set_smeter_peak(connected.smeter_mode == SMeterMode::Peak);
                 tx::set_alc_mode(match connected.alc_mode {
                     AlcMode::Peak => 0,
@@ -6313,8 +6327,8 @@ impl eframe::App for HpsdrApp {
                             // 30.72MHz, well short of 6m's 50MHz start.
                             // Same check piHPSDR's own band_menu.c makes
                             // against radio->frequency_min/frequency_max.
-                            if (band.low_hz as u64) < connected.device.frequency_min
-                                || band.high_hz as u64 > connected.device.frequency_max
+                            if (band.low() as u64) < connected.device.frequency_min
+                                || band.high() as u64 > connected.device.frequency_max
                             {
                                 continue;
                             }
@@ -6456,8 +6470,8 @@ impl eframe::App for HpsdrApp {
                             None
                         };
                         for (i, band) in BANDS.iter().enumerate() {
-                            if (band.low_hz as u64) < connected.device.frequency_min
-                                || band.high_hz as u64 > connected.device.frequency_max
+                            if (band.low() as u64) < connected.device.frequency_min
+                                || band.high() as u64 > connected.device.frequency_max
                             {
                                 continue;
                             }
@@ -6578,6 +6592,17 @@ impl eframe::App for HpsdrApp {
                         }
                         if close_now {
                             connected.vox_window_open = false;
+                        }
+                    }
+
+                    // SDR Device window (kiosk), see sdr_device_window.
+                    if connected.sdr_window_open {
+                        let (close_now, changed) = sdr_device_window(ui, connected);
+                        if changed {
+                            settings_changed = true;
+                        }
+                        if close_now {
+                            connected.sdr_window_open = false;
                         }
                     }
 
@@ -7257,7 +7282,7 @@ impl eframe::App for HpsdrApp {
                                         action_progress_bar(
                                             ui,
                                             progress,
-                                            format!("{:.0}s", progress * report_recorder::MAX_SECONDS),
+                                            format!("{:.0}s", progress * report_recorder::max_seconds()),
                                         );
                                     }
                                     }
@@ -9663,7 +9688,7 @@ impl eframe::App for HpsdrApp {
                         let (slot, _) = strip.allocate_exact_size(egui::vec2(80.0, h), egui::Sense::hover());
                         let mut bar_ui = strip.new_child(egui::UiBuilder::new().max_rect(slot));
                         if let Some(progress) = rr.record_progress() {
-                            action_progress_bar(&mut bar_ui, progress, format!("{:.0}s", progress * report_recorder::MAX_SECONDS));
+                            action_progress_bar(&mut bar_ui, progress, format!("{:.0}s", progress * report_recorder::max_seconds()));
                         } else if let Some(progress) = rr.play_progress() {
                             action_progress_bar(&mut bar_ui, progress, format!("{:.0}%", progress * 100.0));
                         }
@@ -10451,7 +10476,7 @@ Waterfall rebuilds: {prof_wf_n:.0}/s, {prof_wf_ms:.1} ms each."
                                 // top placement caused on the Settings
                                 // window).
                                 egui::Area::new(egui::Id::new(("kiosk_close_extra_rx", ddc_index)))
-                                    .anchor(egui::Align2::RIGHT_BOTTOM, egui::vec2(-6.0, -6.0))
+                                    .anchor(egui::Align2::RIGHT_BOTTOM, egui::vec2(-24.0, -26.0))
                                     .show(ui, |ui| {
                                         ui.horizontal(|ui| {
                                             if kiosk_accent_button(ui, "CLOSE").clicked() {
@@ -10539,7 +10564,7 @@ Waterfall rebuilds: {prof_wf_n:.0}/s, {prof_wf_ms:.1} ms each."
                                                 "kiosk_close_extra_rx_settings",
                                                 ddc_index,
                                             )))
-                                            .anchor(egui::Align2::RIGHT_BOTTOM, egui::vec2(-6.0, -6.0))
+                                            .anchor(egui::Align2::RIGHT_BOTTOM, egui::vec2(-24.0, -26.0))
                                             .show(ui.ctx(), |ui| {
                                                 ui.horizontal(|ui| {
                                                     if kiosk_accent_button(ui, "CLOSE").clicked() {
@@ -10704,7 +10729,7 @@ Waterfall rebuilds: {prof_wf_n:.0}/s, {prof_wf_ms:.1} ms each."
                                 // found a top-right placement overlapping
                                 // the tab row (About/Antenna/.../XVTR).
                                 egui::Area::new(egui::Id::new("kiosk_close_settings"))
-                                    .anchor(egui::Align2::RIGHT_BOTTOM, egui::vec2(-6.0, -6.0))
+                                    .anchor(egui::Align2::RIGHT_BOTTOM, egui::vec2(-24.0, -26.0))
                                     .show(ui.ctx(), |ui| {
                                         ui.horizontal(|ui| {
                                             if kiosk_accent_button(ui, "CLOSE").clicked() {
@@ -10727,6 +10752,7 @@ Waterfall rebuilds: {prof_wf_n:.0}/s, {prof_wf_ms:.1} ms each."
                             ui.horizontal_wrapped(|ui| {
                                 for (tab, label) in [
                                     (SettingsTab::About, "About"),
+                                    (SettingsTab::SdrDevice, "SDR Device"),
                                     (SettingsTab::Antenna, "Antenna"),
                                     (SettingsTab::Audio, "Audio"),
                                     (SettingsTab::Cw, "CW"),
@@ -11153,18 +11179,6 @@ Waterfall rebuilds: {prof_wf_n:.0}/s, {prof_wf_ms:.1} ms each."
 
                                 SettingsTab::Midi => {
                                     ui.label("MIDI control surface:");
-                                    ui.horizontal(|ui| {
-                                        ui.label("VFO encoder: ticks per step");
-                                        if ui
-                                            .add(egui::Slider::new(&mut connected.vfo_encoder_divisor, 1.0..=50.0).integer())
-                                            .on_hover_text(
-                                                "How many encoder ticks make one VFO step (piHPSDR's VFO encoder                                                  divisor). Higher = slower tuning when turning slowly; turning                                                  faster still speeds it up.",
-                                            )
-                                            .changed()
-                                        {
-                                            settings_changed = true;
-                                        }
-                                    });
                                     ui.horizontal(|ui| {
                                         let mut midi_enabled_ui = connected.midi.enabled.load(Ordering::Relaxed);
                                         if ui.checkbox(&mut midi_enabled_ui, "Enable MIDI control").changed() {
@@ -12181,277 +12195,38 @@ Waterfall rebuilds: {prof_wf_n:.0}/s, {prof_wf_ms:.1} ms each."
                                     }
                                 }
 
-                                SettingsTab::Agc => {
-                                    // deskHPSDR's "Freq. Calibration (ppm factor)": a value with - and + buttons (a spin
-                                    // button, tap or hold), not a drag value.
-                                    ui.horizontal(|ui| {
-                                        ui.vertical(|ui| {
-                                            ui.label("Freq. Calibration");
-                                            ui.label("(ppm factor):");
-                                        });
-                                        let changed = spin_buttons(ui, "freq_cal_ppm", &mut connected.freq_cal_ppm, -100.0, 100.0, 0.1)
-                                            .on_hover_text(
-                                                "Frequency calibration as pure ppm factor
-                                                 with range -100.0..+100.0 in 0.1 steps,
-                                                 because in this case we don't need
-                                                 the exact calibration frequency.
-
-                                                 Use a high-precision RF generator and
-                                                 adjust a possible frequency inaccuracy.",
-                                            )
-                                            .changed();
-                                        if changed {
-                                            radio::set_freq_cal_ppm(connected.freq_cal_ppm);
-                                            settings_changed = true;
-                                        }
-                                    });
-                                    ui.add_space(4.0);
-                                    ui.label("Sample Rate:");
-                                    ui.horizontal_wrapped(|ui| {
-                                        // RX-888: its own NCO+CIC software DDC (rx888.rs) can
-                                        // only land exactly on WDSP-recognized rates it has a
-                                        // real (ADC rate, decimation) pair for -- see
-                                        // rx888::ddc_params_for_output_rate's own doc comment
-                                        // for why that's just 96/192/384 (not the full P1/P2
-                                        // list) -- a real earlier report: offering a rate this
-                                        // DDC can't actually hit crashed WDSP outright (its
-                                        // decimation state has no defense against the input
-                                        // rate it was opened with not matching what's actually
-                                        // arriving).
-                                        //
-                                        // Protocol 2 boards support 768/1536ksps too (encoded as
-                                        // a raw ksps value in p2_ddc_specific_packet, not the
-                                        // fixed 2-bit code P1 uses -- see sample_rate_code, which
-                                        // only has entries up to 384000 and would silently fall
-                                        // through to 48kHz for anything higher, so these extra
-                                        // rates are P2-only).
-                                        let rates: &[u32] = if connected.device.board == Boards::Rx888 {
-                                            &[96_000, 192_000, 384_000]
-                                        } else if connected.device.protocol == 2 {
-                                            &[48_000, 96_000, 192_000, 384_000, 768_000, 1_536_000]
-                                        } else {
-                                            &[48_000, 96_000, 192_000, 384_000]
-                                        };
-                                        for &rate in rates {
-                                            let selected = rate == connected.sample_rate;
-                                            let label = format!("{}", rate / 1000);
-                                            if ui
-                                                .add(egui::Button::selectable(selected, label))
-                                                .clicked()
-                                                && !selected
-                                            {
-                                                change_sample_rate(connected, rate);
-                                                settings_changed = true;
-                                            }
-                                        }
-                                        ui.weak("kHz");
-                                    });
-                                    if connected.device.board == Boards::Rx888 {
-                                        ui.weak(
-                                            "Changing this stops streaming, reprograms the RX-888's own ADC clock, \
-                                             and restarts it -- a bigger interruption than a real P1/P2 radio's \
-                                             live rate change, but still brief.",
-                                        );
+                                SettingsTab::SdrDevice => {
+                                    // Kiosk: the page is a full-screen window (see sdr_device_window), opened straight from the tab.
+                                    if lcd_kiosk_mode() {
+                                        connected.sdr_window_open = true;
+                                        connected.show_settings_window = false;
+                                        connected.settings_tab = SettingsTab::About;
+                                        ui.ctx().request_repaint_of(egui::ViewportId::ROOT);
                                     } else {
-                                        ui.weak(
-                                            "Changing this briefly interrupts audio/spectrum while the demod chain restarts.",
-                                        );
+                                        render_sdr_device(ui, connected, &mut settings_changed);
                                     }
-                                    ui.separator();
+                                }
+                                SettingsTab::Agc => {
+                                    // The ADC of the main receiver (deskHPSDR keeps it in the RX menu: it is a receiver property); only
+                                    // shown when the board has more than one.
+                                    if connected.device.adcs > 1 {
+                    let current_adc = connected.session.adc.load(Ordering::Relaxed);
+                    ui.label("ADC:");
+                    ui.horizontal_wrapped(|ui| {
+                        for adc in 0..connected.device.adcs as u32 {
+                            let selected = adc == current_adc;
+                            if ui
+                                .add(egui::Button::selectable(selected, format!("ADC{adc}")).min_size(egui::vec2(72.0, 40.0)))
+                                .clicked()
+                                && !selected
+                            {
+                                connected.session.adc.store(adc, Ordering::Relaxed);
+                                settings_changed = true;
+                            }
+                        }
+                    });
 
-                                    // BUG FIX: this used to be gated on
-                                    // `connected.device.protocol == 2`,
-                                    // hiding ADC/Antenna selection for
-                                    // any Protocol 1 board -- but Angelia/
-                                    // Orion/Orion2 have 2 ADCs and Alex
-                                    // antenna relays on P1 too (both are
-                                    // already wired into P1's own
-                                    // p1_build_packet -- see radio.rs's
-                                    // wire-0 ADC bits and antenna_val/c4
-                                    // handling), and the extra-receiver
-                                    // settings panel already shows this
-                                    // unconditionally (render_extra_receiver_settings,
-                                    // no protocol check at all) -- a real
-                                    // report confirmed a real Angelia was
-                                    // missing both controls. Same recurring
-                                    // pattern as Add Receiver/extra_frequencies_hz/
-                                    // RX2 filter tracking before it -- check
-                                    // for a bare `protocol == 2` gate first
-                                    // whenever a P1 feature seems mysteriously
-                                    // capped/missing while the P2 equivalent
-                                    // works fine.
-                                    let current_adc = connected.session.adc.load(Ordering::Relaxed);
-                                    ui.label("ADC:");
-                                    ui.horizontal_wrapped(|ui| {
-                                        for adc in 0..connected.device.adcs as u32 {
-                                            let selected = adc == current_adc;
-                                            if ui
-                                                .add(egui::Button::selectable(selected, format!("ADC{adc}")))
-                                                .clicked()
-                                                && !selected
-                                            {
-                                                connected.session.adc.store(adc, Ordering::Relaxed);
-                                                settings_changed = true;
-                                            }
-                                        }
-                                    });
-
-                                    // RX/TX antenna selection is per-band now -- see
-                                    // Settings -> Antenna and AntennaMask's doc comment.
-                                    ui.separator();
-
-                                    // RX Gain / RX Attenuation (the live, wire-level
-                                    // control) moved to the main window's own toolbar,
-                                    // next to Audio gain -- see that block's doc comment
-                                    // for why (matches piHPSDR's own layout: its RF/ATT
-                                    // slider lives on the main sliders row, not in a
-                                    // settings dialog, since it's something adjusted
-                                    // continuously while operating, not a one-off
-                                    // setup step). What piHPSDR actually keeps in ITS
-                                    // Radio settings dialog alongside Frequency
-                                    // Calibration is a separate thing entirely: "RX Gain
-                                    // Calibr. (dB)" (radio_menu.c's rx_gain_calibration),
-                                    // a fixed correction folded into the S-meter/
-                                    // panadapter dBm reading (see receiver.c's
-                                    // rx_update_display: level += calib + attenuation -
-                                    // gain) -- NOT a live gain knob at all. That's what
-                                    // belongs here, so that's what's here.
-                                    {
-                                        let mut cal = connected.rx_gain_calibration_db;
-                                        ui.horizontal(|ui| {
-                                            ui.label("RX Gain Cal:");
-                                            if scroll_slider_i32(
-                                                ui,
-                                                &mut connected.slider_scroll_accum,
-                                                &mut cal,
-                                                -50..=50,
-                                                1,
-                                                " dB",
-                                            ) {
-                                                connected.rx_gain_calibration_db = cal;
-                                                settings_changed = true;
-                                            }
-                                        });
-                                        ui.weak(
-                                            "Corrects the S-meter/panadapter dBm reading against a \
-                                             known reference signal -- doesn't change what the radio \
-                                             actually receives. Leave at 0 unless you've measured a \
-                                             real offset (piHPSDR calls this same value \"RX Gain \
-                                             Calibr.\" in its Radio settings).",
-                                        );
-                                        ui.separator();
                                     }
-
-                                    // HermesLite/HermesLite2-only: hardware-managed
-                                    // LNA gain applied specifically while
-                                    // transmitting -- see RadioSession::lna_tx_db's
-                                    // doc comment. Confirmed against Quisk's own
-                                    // hermes/quisk_hardware.py (ChangeTxLNA) and its
-                                    // UI's own help text: "The LNA gain is -12 to 48
-                                    // dB. Use -12 for Pure Signal."
-                                    if matches!(connected.device.board, Boards::HermesLite | Boards::HermesLite2) {
-                                        let mut db = connected.session.lna_tx_db.load(Ordering::Relaxed);
-                                        ui.horizontal(|ui| {
-                                            ui.label("LNA during TX:");
-                                            if scroll_slider_i32(
-                                                ui,
-                                                &mut connected.slider_scroll_accum,
-                                                &mut db,
-                                                -12..=48,
-                                                1,
-                                                " dB",
-                                            ) {
-                                                connected.session.lna_tx_db.store(db.clamp(-12, 48), Ordering::Relaxed);
-                                                settings_changed = true;
-                                            }
-                                        });
-                                        ui.weak(
-                                            "The RX LNA's gain while transmitting -- separate from the \
-                                             RX Gain slider above, which only applies while receiving. \
-                                             Matters most for PureSignal's TX feedback (which reuses the \
-                                             RX ADC to sample a strong local TX signal that would \
-                                             otherwise clip at a normal RX-time gain). Use -12 for \
-                                             PureSignal, same as Quisk's own recommendation.",
-                                        );
-                                        ui.separator();
-                                    }
-
-                                    // Streams the main receiver's demodulated audio back to the
-                                    // radio's own local audio output (a headphone/speaker jack
-                                    // driven by the radio's own DAC, independent of this PC's
-                                    // sound card) -- see radio::RadioSession::
-                                    // send_rx_audio_to_radio's doc comment. Off by default:
-                                    // most setups have no local audio output in use, and this
-                                    // adds continuous extra network/USB traffic for no benefit
-                                    // otherwise.
-                                    {
-                                        let mut send_rx_audio = connected
-                                            .session
-                                            .send_rx_audio_to_radio
-                                            .load(Ordering::Relaxed);
-                                        if ui.checkbox(&mut send_rx_audio, "Send RX audio to radio").changed() {
-                                            connected
-                                                .session
-                                                .send_rx_audio_to_radio
-                                                .store(send_rx_audio, Ordering::Relaxed);
-                                            settings_changed = true;
-                                        }
-                                        // See radio::RadioSession::hl2_ak4951_codec's doc
-                                        // comment. HermesLite2 + Protocol 1 only -- the
-                                        // add-on board it declares doesn't exist for the
-                                        // original HermesLite, and Protocol 2 has no wire-
-                                        // byte conflict to protect against in the first
-                                        // place (send_rx_audio_to_radio already just works
-                                        // there, nothing to opt into). Real HermesLite2
-                                        // hardware only -- a Radioberry (see Device::
-                                        // is_radioberry's doc comment for why it otherwise
-                                        // reports as `Boards::HermesLite2` here) never has
-                                        // this add-on board.
-                                        let hl2_p1 = connected.device.protocol == 1
-                                            && matches!(connected.device.board, Boards::HermesLite2)
-                                            && !connected.device.is_radioberry;
-                                        let mut hl2_ak4951_codec = false;
-                                        if hl2_p1 {
-                                            hl2_ak4951_codec =
-                                                connected.session.hl2_ak4951_codec.load(Ordering::Relaxed);
-                                            if ui
-                                                .checkbox(
-                                                    &mut hl2_ak4951_codec,
-                                                    "HL2+ Audio Codec (AK4951 add-on board)",
-                                                )
-                                                .on_hover_text(
-                                                    "Enable only if this HermesLite2 has the AK4951 \
-                                                     companion board (PHONES/MIC/KEY jacks) installed \
-                                                     and is running its dedicated firmware build -- \
-                                                     required for \"Send RX audio to radio\" above to \
-                                                     actually reach it.",
-                                                )
-                                                .changed()
-                                            {
-                                                connected
-                                                    .session
-                                                    .hl2_ak4951_codec
-                                                    .store(hl2_ak4951_codec, Ordering::Relaxed);
-                                                settings_changed = true;
-                                            }
-                                        }
-                                        if send_rx_audio
-                                            && connected.device.protocol == 1
-                                            && matches!(
-                                                connected.device.board,
-                                                Boards::HermesLite | Boards::HermesLite2
-                                            )
-                                            && !(hl2_p1 && hl2_ak4951_codec)
-                                        {
-                                            ui.weak(
-                                                "No effect on this board over Protocol 1 unless the \
-                                                 HL2+ Audio Codec option above is enabled (requires \
-                                                 the AK4951 add-on board's own firmware).",
-                                            );
-                                        }
-                                        ui.separator();
-                                    }
-
                                     // Ported from deskHPSDR's own rx->agc_auto/
                                     // agc_auto_offset (agc_menu.c/rx_panadapter.c):
                                     // continuously re-targets AGC Top from the
@@ -13228,64 +13003,6 @@ Waterfall rebuilds: {prof_wf_n:.0}/s, {prof_wf_ms:.1} ms each."
                                             settings_changed = true;
                                         }
                                     }
-                                    // piHPSDR's "PA enable" (radio menu).
-                                    if ui
-                                        .checkbox(&mut connected.pa_enabled, "PA enable")
-                                        .on_hover_text(
-                                            "On (default on the desktop; off in the kiosk): the radio's PA is used for TX. Off: TX comes out of the                                              low-power output, the HermesLite2's TR relay stays in the RX position                                              and the RX gain is not reduced while transmitting, so you keep                                              receiving during TX (duplex) -- e.g. with a transverter or an external                                              amplifier and no band filters.",
-                                        )
-                                        .changed()
-                                    {
-                                        settings_changed = true;
-                                    }
-                                    ui.add_space(8.0);
-
-                                    // Standard (non-HermesLite) boards only -- see
-                                    // radio::RadioSession::ps_tx_attenuation's doc comment. Despite
-                                    // the internal name, this protects ADC0's front end from the
-                                    // radio's OWN TX leakage during transmit generally -- it isn't
-                                    // a PureSignal-only concept, and matters just as much with
-                                    // PureSignal off (confirmed by a real "ADC0 Overload while
-                                    // transmitting" report with PureSignal/Diversity both
-                                    // disabled: this defaulted to 0dB, i.e. no protection at all,
-                                    // since the only place it was previously exposed was
-                                    // PureSignal's own settings tab). Same underlying value as
-                                    // that tab's "Feedback Attenuation" slider -- adjusting either
-                                    // one changes both.
-                                    if !matches!(connected.device.board, Boards::HermesLite | Boards::HermesLite2) {
-                                        let mut tx_atten = connected
-                                            .session
-                                            .ps_tx_attenuation
-                                            .load(Ordering::Relaxed)
-                                            as i32;
-                                        ui.horizontal(|ui| {
-                                            ui.label("TX ADC0 Attenuation:");
-                                            if scroll_slider_i32(
-                                                ui,
-                                                &mut connected.slider_scroll_accum,
-                                                &mut tx_atten,
-                                                0..=31,
-                                                1,
-                                                " dB",
-                                            ) {
-                                                connected
-                                                    .session
-                                                    .ps_tx_attenuation
-                                                    .store(tx_atten as u32, Ordering::Relaxed);
-                                                settings_changed = true;
-                                            }
-                                        })
-                                        .response
-                                        .on_hover_text(
-                                            "Protects ADC0's front end from this radio's own TX \
-                                             leakage while transmitting -- raise this if you see \
-                                             \"ADC0 Overload\" while transmitting. Also used (and \
-                                             adjustable from) Settings -> PureSignal as \"Feedback \
-                                             Attenuation\" -- same value either way.",
-                                        );
-                                        ui.add_space(8.0);
-                                    }
-
                                     // RX-888: receive-only hardware, no TX capability at
                                     // all -- don't let this checkbox re-enable the MOX/
                                     // TUNE/etc. row the connect-time override above hides.
@@ -13483,67 +13200,6 @@ Waterfall rebuilds: {prof_wf_n:.0}/s, {prof_wf_ms:.1} ms each."
                                         );
                                     }
 
-                                    // Radio mic connector config (PTT enable, tip/ring wiring,
-                                    // bias) -- standard Angelia/Orion/Orion2 boards only, matching
-                                    // piHPSDR's own UI gating (radio_menu.c) for the same controls.
-                                    // See radio::RadioSession::mic_ptt_enabled/mic_bias_enabled/
-                                    // mic_ptt_on_tip's doc comments for the exact wire encoding.
-                                    if matches!(
-                                        connected.device.board,
-                                        Boards::Angelia | Boards::Orion | Boards::Orion2
-                                    ) {
-                                        ui.add_space(8.0);
-                                        ui.separator();
-                                        ui.label("Radio Mic Connector:");
-
-                                        let mut ptt_on_tip =
-                                            connected.session.mic_ptt_on_tip.load(Ordering::Relaxed);
-                                        ui.horizontal(|ui| {
-                                            if ui
-                                                .add(egui::Button::selectable(
-                                                    !ptt_on_tip,
-                                                    "PTT on Ring, Mic/Bias on Tip",
-                                                ))
-                                                .clicked()
-                                                && ptt_on_tip
-                                            {
-                                                ptt_on_tip = false;
-                                                connected.session.mic_ptt_on_tip.store(false, Ordering::Relaxed);
-                                                settings_changed = true;
-                                            }
-                                            if ui
-                                                .add(egui::Button::selectable(
-                                                    ptt_on_tip,
-                                                    "PTT on Tip, Mic/Bias on Ring",
-                                                ))
-                                                .clicked()
-                                                && !ptt_on_tip
-                                            {
-                                                connected.session.mic_ptt_on_tip.store(true, Ordering::Relaxed);
-                                                settings_changed = true;
-                                            }
-                                        });
-
-                                        let mut mic_ptt_enabled =
-                                            connected.session.mic_ptt_enabled.load(Ordering::Relaxed);
-                                        if ui.checkbox(&mut mic_ptt_enabled, "Mic PTT Enabled").changed() {
-                                            connected
-                                                .session
-                                                .mic_ptt_enabled
-                                                .store(mic_ptt_enabled, Ordering::Relaxed);
-                                            settings_changed = true;
-                                        }
-
-                                        let mut mic_bias_enabled =
-                                            connected.session.mic_bias_enabled.load(Ordering::Relaxed);
-                                        if ui.checkbox(&mut mic_bias_enabled, "Mic Bias Enabled").changed() {
-                                            connected
-                                                .session
-                                                .mic_bias_enabled
-                                                .store(mic_bias_enabled, Ordering::Relaxed);
-                                            settings_changed = true;
-                                        }
-                                    }
                                 }
                                 SettingsTab::PaCalibration => {
                                     // Used by both protocols -- see
@@ -13560,8 +13216,8 @@ Waterfall rebuilds: {prof_wf_n:.0}/s, {prof_wf_ms:.1} ms each."
                                         // the main band-button row -- no
                                         // point calibrating PA power for
                                         // a band this radio can't reach.
-                                        if (band.low_hz as u64) < connected.device.frequency_min
-                                            || band.high_hz as u64 > connected.device.frequency_max
+                                        if (band.low() as u64) < connected.device.frequency_min
+                                            || band.high() as u64 > connected.device.frequency_max
                                         {
                                             continue;
                                         }
@@ -13632,8 +13288,8 @@ Waterfall rebuilds: {prof_wf_n:.0}/s, {prof_wf_ms:.1} ms each."
                                         ui.label("");
                                         ui.end_row();
                                         for band in &BANDS {
-                                            if (band.low_hz as u64) < connected.device.frequency_min
-                                                || band.high_hz as u64 > connected.device.frequency_max
+                                            if (band.low() as u64) < connected.device.frequency_min
+                                                || band.high() as u64 > connected.device.frequency_max
                                             {
                                                 continue;
                                             }
@@ -13774,106 +13430,6 @@ Waterfall rebuilds: {prof_wf_n:.0}/s, {prof_wf_ms:.1} ms each."
                                          button is engaged.",
                                     );
                                     ui.add_space(6.0);
-                                    // "Filter Board" presets -- ported from
-                                    // deskHPSDR's own filter_board combo
-                                    // (radio_menu.c: n2adr_oc_settings/
-                                    // n2adr_oc_settings_tx) for the N2ADR
-                                    // filter board add-on some HermesLite2
-                                    // units use. A real request: without
-                                    // this, getting an N2ADR board working
-                                    // meant computing and hand-entering
-                                    // every band's OC bits into the grid
-                                    // below one at a time. Unlike
-                                    // deskHPSDR's persistent mode (re-
-                                    // applied at several points whenever
-                                    // the band changes), these just fill
-                                    // in oc_settings once per click -- the
-                                    // grid below is the single source of
-                                    // truth either way, so a preset is
-                                    // just a fast way to populate it, and
-                                    // the operator can still hand-edit
-                                    // afterward exactly like any other
-                                    // value there.
-                                    ui.horizontal(|ui| {
-                                        ui.label("Filter Board:");
-                                        // Read back which preset (if any)
-                                        // the REAL oc_settings currently
-                                        // match -- see
-                                        // detect_filter_board's own doc
-                                        // comment. A real request: this
-                                        // is what actually lets an
-                                        // operator who wouldn't know how
-                                        // to read raw OC1-OC7 bits still
-                                        // see, at a glance, which preset
-                                        // (orange) or none of them (all 3
-                                        // grey -- e.g. after hand-editing
-                                        // the grid below) is active right
-                                        // now, and it's automatically
-                                        // "remembered" across a restart
-                                        // for free since oc_settings
-                                        // itself is already persisted.
-                                        // Dropdown (a real request) instead
-                                        // of 3 side-by-side buttons -- matches
-                                        // deskHPSDR's own filter_combo
-                                        // (radio_menu.c) layout, and leaves
-                                        // room to append a future preset
-                                        // without the row growing wider
-                                        // every time (see FilterBoard::ALL's
-                                        // own doc comment).
-                                        let detected = detect_filter_board(&connected.oc_settings);
-                                        let current = detected.map(|(b, _)| b).unwrap_or_default();
-                                        let mut apply_now = None;
-                                        egui::ComboBox::from_id_salt("filter_board")
-                                            .width(200.0)
-                                            .selected_text(match detected {
-                                                Some((b, _)) => b.label(),
-                                                // No known preset matches --
-                                                // same "grey"/non-committal
-                                                // idea as the button version's
-                                                // all-grey state, just spelled
-                                                // out since a ComboBox always
-                                                // shows exactly one label.
-                                                None => "(custom OC1-OC7)",
-                                            })
-                                            .show_ui(ui, |ui| {
-                                                for board in FilterBoard::ALL {
-                                                    if ui.selectable_label(current == board && detected.is_some(), board.label()).clicked() {
-                                                        apply_now = Some(board);
-                                                    }
-                                                }
-                                            });
-                                        // Only meaningful (and only
-                                        // interactive) while "N2ADR (LPF TX
-                                        // only)" is the active selection --
-                                        // matches deskHPSDR's own
-                                        // n2adr_hpf_btn sensitivity exactly
-                                        // (radio_menu.c: gtk_widget_set_
-                                        // sensitive(n2adr_hpf_btn, TRUE) only
-                                        // in the N2ADR_TX case, FALSE
-                                        // everywhere else) -- a real report:
-                                        // this used to stay clickable no
-                                        // matter which (if any) preset was
-                                        // last applied.
-                                        ui.add_enabled_ui(detected.is_some_and(|(b, _)| b == FilterBoard::N2adrTxOnly), |ui| {
-                                            if ui
-                                                .checkbox(&mut connected.n2adr_hpf_enabled, "+Rx: N2ADR HPF 3MHz")
-                                                .on_hover_text(
-                                                    "Only used by \"N2ADR (LPF TX only)\" -- takes \
-                                                     effect immediately.",
-                                                )
-                                                .changed()
-                                            {
-                                                apply_now = Some(FilterBoard::N2adrTxOnly);
-                                            }
-                                        });
-                                        if let Some(board) = apply_now {
-                                            for (name, mask) in filter_board_oc_settings(board, connected.n2adr_hpf_enabled) {
-                                                connected.oc_settings.insert(name, mask);
-                                            }
-                                            settings_changed = true;
-                                        }
-                                    });
-                                    ui.add_space(6.0);
                                     // Every row emits exactly the same 15
                                     // cells (Band + 7 Rx + 7 Tx) so the
                                     // header's per-OC-number columns line
@@ -13909,8 +13465,8 @@ Waterfall rebuilds: {prof_wf_n:.0}/s, {prof_wf_ms:.1} ms each."
                                         let names: Vec<&str> = BANDS
                                             .iter()
                                             .filter(|band| {
-                                                (band.low_hz as u64) >= connected.device.frequency_min
-                                                    && (band.high_hz as u64) <= connected.device.frequency_max
+                                                (band.low() as u64) >= connected.device.frequency_min
+                                                    && (band.high() as u64) <= connected.device.frequency_max
                                             })
                                             .map(|band| band.name)
                                             .chain(std::iter::once("Gen"))
@@ -14033,8 +13589,8 @@ Waterfall rebuilds: {prof_wf_n:.0}/s, {prof_wf_ms:.1} ms each."
                                         let names: Vec<&str> = BANDS
                                             .iter()
                                             .filter(|band| {
-                                                (band.low_hz as u64) >= connected.device.frequency_min
-                                                    && (band.high_hz as u64) <= connected.device.frequency_max
+                                                (band.low() as u64) >= connected.device.frequency_min
+                                                    && (band.high() as u64) <= connected.device.frequency_max
                                             })
                                             .map(|band| band.name)
                                             .chain(std::iter::once("Gen"))
@@ -14789,7 +14345,7 @@ Waterfall rebuilds: {prof_wf_n:.0}/s, {prof_wf_ms:.1} ms each."
                     let sstv_tx_banner = &mut connected.sstv_tx_banner;
                     let sstv_tx_prepared = &mut connected.sstv_tx_prepared;
                     let sstv_tx_texture = &mut connected.sstv_tx_texture;
-                    let rade_callsign = &mut connected.rade_callsign;
+                    let rade_callsign = &mut connected.own_callsign;
                     let rtty_send_on_return = &mut connected.rtty_send_on_return;
                     let tx_handle_ref = connected.tx_handle.as_ref();
                     let rade_eq_monitor_output_active = connected.rade_eq_monitor_output.is_some();
@@ -14875,7 +14431,7 @@ Waterfall rebuilds: {prof_wf_n:.0}/s, {prof_wf_ms:.1} ms each."
                             }
                             if digital_kiosk {
                                 egui::Area::new(egui::Id::new("kiosk_close_digital"))
-                                    .anchor(egui::Align2::RIGHT_BOTTOM, egui::vec2(-6.0, -6.0))
+                                    .anchor(egui::Align2::RIGHT_BOTTOM, egui::vec2(-24.0, -26.0))
                                     .show(ui.ctx(), |ui| {
                                         if kiosk_accent_button(ui, "CLOSE").clicked() {
                                             close_requested = true;
@@ -15349,7 +14905,9 @@ Waterfall rebuilds: {prof_wf_n:.0}/s, {prof_wf_ms:.1} ms each."
                         mode: Some(connected.spectrum.mode()),
                         width_hz: Some(connected.spectrum.width_hz()),
                         rtty: Some(connected.rtty.settings()),
-                        rade_callsign: Some(connected.rade_callsign.clone()),
+                        own_callsign: Some(connected.own_callsign.clone()),
+                        own_locator: Some(connected.own_locator.clone()),
+                        rade_callsign: None,
                         gain: Some(connected.spectrum.gain()),
                         squelch_memory: connected.squelch_memory.clone(),
                         duplex: Some(connected.spectrum.duplex()),
@@ -15512,6 +15070,12 @@ Waterfall rebuilds: {prof_wf_n:.0}/s, {prof_wf_ms:.1} ms each."
                         ps_mox_delay: Some(connected.ps_mox_delay),
                         ps_loop_delay: Some(connected.ps_loop_delay),
                         ps_tx_delay_ns: Some(connected.ps_tx_delay_ns),
+                        tx_inhibit_enabled: Some(connected.session.tx_inhibit_enabled.load(std::sync::atomic::Ordering::Relaxed)),
+                        auto_tune_enabled: Some(connected.session.auto_tune_enabled.load(std::sync::atomic::Ordering::Relaxed)),
+                        hl2_cl1_input: Some(connected.session.hl2_cl1_input.load(std::sync::atomic::Ordering::Relaxed)),
+                        report_capture_secs: Some(report_recorder::max_seconds() as u32),
+                        iaru_region: Some(iaru_region()),
+                        hl2_atu_gateware: Some(connected.session.hl2_atu_gateware.load(std::sync::atomic::Ordering::Relaxed)),
                         send_rx_audio_to_radio: Some(
                             connected
                                 .session
@@ -16247,6 +15811,75 @@ fn spin_buttons_dec(ui: &mut egui::Ui, id: &str, value: &mut f64, min: f64, max:
     spin_buttons_full(ui, id, value, min, max, step, decimals, None, 88.0)
 }
 
+/// Help for a setting: a round "!" button (touch sized) at the end of the control; tapping it opens a small window
+/// with the explanation and an OK button. Replaces the explanatory text that used to sit on the screen.
+fn help_button(ui: &mut egui::Ui, id: &str, text: &str) {
+    let open_id = egui::Id::new(("help_open", id));
+    let mut open: bool = ui.ctx().data(|d| d.get_temp(open_id)).unwrap_or(false);
+    let size = egui::vec2(30.0, 30.0);
+    let (rect, resp) = ui.allocate_exact_size(size, egui::Sense::click());
+    let col = if resp.is_pointer_button_down_on() { egui::Color32::from_gray(255) } else { egui::Color32::from_rgb(90, 160, 255) };
+    ui.painter().circle_stroke(rect.center(), 12.0, egui::Stroke::new(1.5, col));
+    ui.painter().text(rect.center(), egui::Align2::CENTER_CENTER, "!", egui::FontId::proportional(18.0), col);
+    if resp.clicked() {
+        open = true;
+    }
+    if open {
+        egui::Window::new(format!("help_window_{id}"))
+            .id(egui::Id::new(("help_window", id)))
+            .title_bar(false)
+            .collapsible(false)
+            .resizable(false)
+            .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
+            .order(egui::Order::Foreground)
+            .show(ui.ctx(), |ui| {
+                ui.set_max_width(440.0);
+                ui.add(egui::Label::new(text).wrap());
+                ui.add_space(8.0);
+                let ok_size = egui::vec2(110.0, 40.0);
+                let ok = ui
+                    .allocate_ui_with_layout(ok_size, egui::Layout::centered_and_justified(egui::Direction::LeftToRight), |ui| {
+                        ui.add(chip_button("OK", false).min_size(ok_size))
+                    })
+                    .inner;
+                if ok.clicked() {
+                    open = false;
+                }
+            });
+    }
+    ui.ctx().data_mut(|d| d.insert_temp(open_id, open));
+}
+
+/// Touch checkbox: a big square (34 px) with a thick X filling it when on, label to the right. Same contract as
+/// `ui.checkbox` (the response reports `changed()` when toggled); dimmed and inert inside `add_enabled_ui(false, ..)`.
+fn touch_checkbox(ui: &mut egui::Ui, value: &mut bool, label: &str) -> egui::Response {
+    let enabled = ui.is_enabled();
+    let box_size = 34.0f32;
+    let font = egui::TextStyle::Button.resolve(ui.style());
+    let galley = ui.painter().layout_no_wrap(label.to_string(), font, ui.visuals().text_color());
+    let total = egui::vec2(box_size + 10.0 + galley.size().x, box_size.max(galley.size().y));
+    let (rect, mut resp) = ui.allocate_exact_size(total, if enabled { egui::Sense::click() } else { egui::Sense::hover() });
+    if resp.clicked() {
+        *value = !*value;
+        resp.mark_changed();
+    }
+    let sq = egui::Rect::from_min_size(egui::pos2(rect.left(), rect.center().y - box_size / 2.0), egui::vec2(box_size, box_size));
+    let dim = if enabled { 1.0 } else { 0.4 };
+    let line = egui::Color32::from_gray((95.0 + 130.0 * dim) as u8);
+    let fill = if resp.is_pointer_button_down_on() { egui::Color32::from_gray(70) } else { egui::Color32::from_gray(40) };
+    ui.painter().rect(sq, 5.0, fill, egui::Stroke::new(1.5, line), egui::StrokeKind::Inside);
+    if *value {
+        let c = if enabled { egui::Color32::from_rgb(232, 150, 46) } else { egui::Color32::from_gray(110) };
+        let r = sq.shrink(6.0);
+        let st = egui::Stroke::new(4.0, c);
+        ui.painter().line_segment([r.left_top(), r.right_bottom()], st);
+        ui.painter().line_segment([r.right_top(), r.left_bottom()], st);
+    }
+    let text_col = if enabled { ui.visuals().text_color() } else { egui::Color32::from_gray(110) };
+    ui.painter().galley(egui::pos2(sq.right() + 10.0, rect.center().y - galley.size().y / 2.0), galley, text_col);
+    resp
+}
+
 /// `spin_buttons_dec` with an optional middle button that sets the value to `reset` ("-  0  +": three touch zones), and a
 /// choice of the width of the value box.
 fn spin_buttons_full(
@@ -16261,7 +15894,9 @@ fn spin_buttons_full(
     box_w: f32,
 ) -> egui::Response {
     let mut changed = false;
-    let size = egui::vec2(40.0, 34.0);
+    // Pages that want bigger touch targets (SDR Device) set this scale in the egui data for the duration of the page.
+    let scale: f32 = ui.data(|d| d.get_temp(egui::Id::new("spin_touch_scale"))).unwrap_or(1.0);
+    let size = egui::vec2(40.0, 34.0) * scale;
     let mut response = ui
         .horizontal(|ui| {
             let font = egui::TextStyle::Monospace.resolve(ui.style());
@@ -16700,13 +16335,6 @@ fn render_digital_panel(
     }
     ui.add_enabled_ui(tx_available, |ui| {
         ui.horizontal(|ui| {
-            ui.label("My Call:");
-            ui.add(
-                egui::TextEdit::singleline(callsign)
-                    .desired_width(90.0)
-                    .char_limit(12)
-                    .hint_text("(none)"),
-            );
             ui.add_space(8.0);
             let (sent, total) = rtty.tx_progress();
             ui.label(format!("Sent {sent}/{total}"));
@@ -17157,20 +16785,6 @@ fn render_sstv_panel(
                 ui.colored_label(red, "ON AIR");
             }
             ui.add_space(8.0);
-            ui.label("My Call:");
-            let callsign_changed = ui
-                .add(
-                    egui::TextEdit::singleline(callsign)
-                        .desired_width(if lcd_kiosk_mode() { 100.0 } else { 90.0 })
-                        .char_limit(12)
-                        .hint_text("(none)"),
-                )
-                .changed();
-            // Re-burn the banner with the edited text -- same invalidation
-            // as picking a new picture or changing mode/banner below.
-            if callsign_changed && *tx_banner && tx_source.is_some() {
-                *tx_prepared = None;
-            }
             if lcd_kiosk_mode() {
                 ui.add_space(8.0);
                 sstv_fsk_lead_controls!(ui);
@@ -17553,16 +17167,6 @@ fn render_rade_panel(
     }
 
     ui.horizontal(|ui| {
-        ui.label("My Call:");
-        let resp = ui.add(
-            egui::TextEdit::singleline(callsign)
-                .desired_width(100.0)
-                .char_limit(rade::text::MAX_CHARS)
-                .hint_text("(none)"),
-        );
-        if resp.lost_focus() || resp.changed() {
-            rade.set_callsign(callsign);
-        }
         ui.add_space(8.0);
         // See hide_clicked's own doc comment above -- "once this is
         // parametrized there's nothing left to touch" request: tucks
@@ -18497,8 +18101,8 @@ fn draw_band_edge_markers(painter: &egui::Painter, rect: egui::Rect, center_hz: 
         );
     };
     for band in &BANDS {
-        draw_edge(band.low_hz as f64);
-        draw_edge(band.high_hz as f64);
+        draw_edge(band.low() as f64);
+        draw_edge(band.high() as f64);
     }
     // XVTR edges are defined in RF space -- center_hz/half_span_hz here
     // are real hardware IF, so shift each edge back by the transverter's
@@ -21093,7 +20697,7 @@ fn render_extra_receiver_ui(ui: &mut egui::Ui, rx: &Arc<Mutex<ExtraReceiver>>) {
         for band in &BANDS {
             // Same reachable-band filter as the main receiver's own
             // band-button row -- see its doc comment for why.
-            if (band.low_hz as u64) < rx.frequency_min || band.high_hz as u64 > rx.frequency_max {
+            if (band.low() as u64) < rx.frequency_min || band.high() as u64 > rx.frequency_max {
                 continue;
             }
             let selected = Some(band.name) == current_band;
@@ -21734,6 +21338,7 @@ fn render_extra_receiver_settings(ui: &mut egui::Ui, rx: &Arc<Mutex<ExtraReceive
         // such tabs shown for extra receivers, so redirect same as
         // Network if any of these are ever somehow selected.
         SettingsTab::Tx => rx.settings_tab = SettingsTab::Agc,
+        SettingsTab::SdrDevice => rx.settings_tab = SettingsTab::Agc,
         SettingsTab::PaCalibration => rx.settings_tab = SettingsTab::Agc,
         SettingsTab::PureSignal => rx.settings_tab = SettingsTab::Agc,
         SettingsTab::Diversity => rx.settings_tab = SettingsTab::Agc,
@@ -22247,6 +21852,465 @@ fn set_rade_aware_mox(connected: &mut ConnectedState, want_on: bool) {
     } else {
         connected.session.set_mox(want_on);
     }
+}
+
+/// Settings -> SDR Device (deskHPSDR's "SDR Device Settings"): everything about the radio itself, in three columns by
+/// topic (receive / transmit / audio and hardware) with touch-sized controls. Used by the full-screen window (kiosk)
+/// and by the Settings tab (desktop).
+fn render_sdr_device(ui: &mut egui::Ui, connected: &mut ConnectedState, settings_changed: &mut bool) {
+        // deskHPSDR's "SDR Device Settings": everything about the radio itself in one place, laid out
+        // in three columns with larger touch fonts; explanations are behind the round "!" buttons.
+        ui.scope(|ui| {
+            for (_, f) in ui.style_mut().text_styles.iter_mut() {
+                f.size += 3.0;
+            }
+            let blue = egui::Color32::from_rgb(90, 160, 255);
+            let btn_h = 46.0f32;
+            {
+                let sp = ui.spacing_mut();
+                sp.interact_size.y = 44.0;
+                sp.icon_width = 32.0;
+                sp.icon_spacing = 10.0;
+                sp.button_padding = egui::vec2(12.0, 8.0);
+                sp.item_spacing = egui::vec2(6.0, 4.0);
+            }
+            ui.ctx().data_mut(|d| d.insert_temp(egui::Id::new("spin_touch_scale"), 1.2f32));
+            ui.columns(3, |cols| {
+                // ---- column 1: filter board, sample rate, ADC
+                {
+                    let ui = &mut cols[0];
+                    ui.colored_label(egui::Color32::from_rgb(90, 160, 255), egui::RichText::new("RECEIVE").strong());
+                    ui.horizontal(|ui| {
+                        ui.label("Filter Board:");
+                        help_button(ui, "sdr_filter_board", "Selects a ready-made Open Collector pattern for the N2ADR filter board (LPF/HPF) used by some HermesLite2 units, so you do not have to enter every band by hand. The +Rx: N2ADR HPF 3MHz box is only used by the N2ADR (LPF TX only) preset and takes effect immediately.");
+                    });
+                    let detected = detect_filter_board(&connected.oc_settings);
+                    let current = detected.map(|(b, _)| b).unwrap_or_default();
+                    let mut apply_now = None;
+                    let combo_param_w = ui.available_width() - 40.0;
+                    let combo = egui::ComboBox::from_id_salt("filter_board")
+                        .width(combo_param_w)
+                        .selected_text(match detected {
+                            Some((b, _)) => b.label(),
+                            None => "(custom OC1-OC7)",
+                        })
+                        .show_ui(ui, |ui| {
+                            for board in FilterBoard::ALL {
+                                if ui.selectable_label(current == board && detected.is_some(), board.label()).clicked() {
+                                    apply_now = Some(board);
+                                }
+                            }
+                        });
+                    // The +Rx box is right-aligned to the end of the filter board selector (not hard against the column edge).
+                    // The drawn selector is its width parameter plus its padding (about 12 px).
+                    let _ = &combo;
+                    let combo_w = combo_param_w + 12.0;
+                    ui.add_enabled_ui(detected.is_some_and(|(b, _)| b == FilterBoard::N2adrTxOnly), |ui| {
+                        let (row, _) = ui.allocate_exact_size(egui::vec2(combo_w, 40.0), egui::Sense::hover());
+                        let mut row_ui = ui.new_child(egui::UiBuilder::new().max_rect(row).layout(egui::Layout::right_to_left(egui::Align::Center)));
+                        if touch_checkbox(&mut row_ui, &mut connected.n2adr_hpf_enabled, "+Rx: N2ADR HPF 3MHz").changed() {
+                            apply_now = Some(FilterBoard::N2adrTxOnly);
+                        }
+                    });
+                    if let Some(board) = apply_now {
+                        for (name, mask) in filter_board_oc_settings(board, connected.n2adr_hpf_enabled) {
+                            connected.oc_settings.insert(name, mask);
+                        }
+                        *settings_changed = true;
+                    }
+                    ui.add_space(2.0);
+
+                    ui.horizontal(|ui| {
+                        ui.label("Sample Rate (kHz):");
+                        help_button(
+                            ui,
+                            "sdr_sample_rate",
+                            if connected.device.board == Boards::Rx888 {
+                                "Changing this stops streaming, reprograms the RX-888's own ADC clock and restarts it: a bigger interruption than a real P1/P2 radio's live rate change, but still brief."
+                            } else {
+                                "Changing this briefly interrupts audio and spectrum while the demodulator chain restarts."
+                            },
+                        );
+                    });
+                    let rates: &[u32] = if connected.device.board == Boards::Rx888 {
+                        &[96_000, 192_000, 384_000]
+                    } else if connected.device.protocol == 2 {
+                        &[48_000, 96_000, 192_000, 384_000, 768_000, 1_536_000]
+                    } else {
+                        &[48_000, 96_000, 192_000, 384_000]
+                    };
+                    ui.horizontal_wrapped(|ui| {
+                        for &rate in rates {
+                            let selected = rate == connected.sample_rate;
+                            if ui
+                                .add(egui::Button::selectable(selected, format!("{}", rate / 1000)).min_size(egui::vec2(64.0, btn_h)))
+                                .clicked()
+                                && !selected
+                            {
+                                change_sample_rate(connected, rate);
+                                *settings_changed = true;
+                            }
+                        }
+                    });
+                    ui.add_space(2.0);
+                    ui.add_space(2.0);
+                    ui.horizontal(|ui| {
+                        ui.label("Freq. Calibration (ppm):");
+                        help_button(ui, "sdr_freq_cal", "Frequency calibration as a pure ppm factor, range -100.0 to +100.0 in 0.1 steps (the exact calibration frequency is not needed). Use a high-precision RF generator and adjust any frequency inaccuracy of the radio.");
+                    });
+                    if spin_buttons_full(ui, "freq_cal_ppm", &mut connected.freq_cal_ppm, -100.0, 100.0, 0.1, 1, None, 80.0).changed() {
+                        radio::set_freq_cal_ppm(connected.freq_cal_ppm);
+                        *settings_changed = true;
+                    }
+                    ui.add_space(2.0);
+
+                    ui.horizontal(|ui| {
+                        ui.label("RX Gain Cal (dB):");
+                        help_button(ui, "sdr_rx_gain_cal", "Corrects the S-meter and panadapter dBm reading against a known reference signal; it does not change what the radio actually receives. Leave at 0 unless you have measured a real offset (piHPSDR and deskHPSDR call this RX Gain Calibration).");
+                    });
+                    let mut cal = connected.rx_gain_calibration_db as f64;
+                    if spin_buttons_full(ui, "rx_gain_cal", &mut cal, -50.0, 50.0, 1.0, 0, None, 80.0).changed() {
+                        connected.rx_gain_calibration_db = cal.round() as i32;
+                        *settings_changed = true;
+                    }
+                    ui.add_space(2.0);
+
+                }
+
+                // ---- column 2: calibrations and gains as spin buttons
+                {
+                    let ui = &mut cols[1];
+                    ui.colored_label(egui::Color32::from_rgb(90, 160, 255), egui::RichText::new("TRANSMIT").strong());
+                    if matches!(connected.device.board, Boards::HermesLite | Boards::HermesLite2) {
+                        ui.horizontal(|ui| {
+                            ui.label("LNA during TX (dB):");
+                            help_button(ui, "sdr_lna_tx", "The RX LNA's gain while transmitting, separate from the RX Gain slider which only applies while receiving. It matters most for PureSignal's TX feedback, which reuses the RX ADC to sample a strong local TX signal that would otherwise clip at a normal RX-time gain. Use -12 for PureSignal.");
+                        });
+                        let mut db = connected.session.lna_tx_db.load(Ordering::Relaxed) as f64;
+                        if spin_buttons_full(ui, "lna_tx", &mut db, -12.0, 48.0, 1.0, 0, None, 80.0).changed() {
+                            connected.session.lna_tx_db.store((db.round() as i32).clamp(-12, 48), Ordering::Relaxed);
+                            *settings_changed = true;
+                        }
+                    } else {
+                        ui.horizontal(|ui| {
+                            ui.label("TX ADC0 Attenuation (dB):");
+                            help_button(ui, "sdr_tx_adc0_atten", "Protects ADC0's front end from this radio's own TX leakage while transmitting. Raise it if you see ADC0 Overload while transmitting. It is the same value as Feedback Attenuation in Settings -> PureSignal.");
+                        });
+                        let mut tx_atten = connected.session.ps_tx_attenuation.load(Ordering::Relaxed) as f64;
+                        if spin_buttons_full(ui, "tx_adc0_atten", &mut tx_atten, 0.0, 31.0, 1.0, 0, None, 80.0).changed() {
+                            connected.session.ps_tx_attenuation.store(tx_atten.round() as u32, Ordering::Relaxed);
+                            *settings_changed = true;
+                        }
+                    }
+                    ui.add_space(2.0);
+                    if ui
+                        .horizontal(|ui| {
+                            let r = touch_checkbox(ui, &mut connected.pa_enabled, "PA enable");
+                            help_button(ui, "sdr_pa_enable", "On (default on the desktop, off in the kiosk): the radio's PA is used for TX. Off: TX comes out of the low-power output, the HermesLite2's TR relay stays in the RX position and the RX gain is not reduced while transmitting, so you keep receiving during TX (duplex), e.g. with a transverter or an external amplifier and no band filters.");
+                            r
+                        })
+                        .inner
+                        .changed()
+                    {
+                        *settings_changed = true;
+                    }
+                    {
+                        let mut v = connected.session.tx_inhibit_enabled.load(Ordering::Relaxed);
+                        if ui
+                            .horizontal(|ui| {
+                                let r = touch_checkbox(ui, &mut v, "Ext. TxInhibit Input");
+                                help_button(ui, "sdr_tx_inhibit", "Default OFF. When on, an external active-low signal on the radio's IO input (IO1, or IO2 on ANAN-7000/8000 over Protocol 1; IO4/IO5 over Protocol 2) blocks transmitting while it is asserted. Look into the SDR device manual before using.");
+                                r
+                            })
+                            .inner
+                            .changed()
+                        {
+                            connected.session.tx_inhibit_enabled.store(v, Ordering::Relaxed);
+                            *settings_changed = true;
+                        }
+                    }
+                    {
+                        let mut v = connected.session.auto_tune_enabled.load(Ordering::Relaxed);
+                        if ui
+                            .horizontal(|ui| {
+                                let r = touch_checkbox(ui, &mut v, "Ext. AutoTune Input");
+                                help_button(ui, "sdr_auto_tune", "Default OFF. Starts TUNE while the external active-low AutoTune input is asserted (Protocol 1 uses IO3, Protocol 2 uses IO6) and stops it when released. Look into the SDR device manual before using.");
+                                r
+                            })
+                            .inner
+                            .changed()
+                        {
+                            connected.session.auto_tune_enabled.store(v, Ordering::Relaxed);
+                            *settings_changed = true;
+                        }
+                    }
+                    if matches!(connected.device.board, Boards::HermesLite2) && !connected.device.is_radioberry {
+                        {
+                            let mut v = connected.session.hl2_atu_gateware.load(Ordering::Relaxed);
+                            if ui
+                                .horizontal(|ui| {
+                                    let r = touch_checkbox(ui, &mut v, "HL2 ATU TUNE support");
+                                    help_button(ui, "sdr_hl2_atu", "Enable ATU TUNE support in the HL2 gateware. If enabled, the ATU detection process results in a short delay before the RF carrier is generated. If you use an ATU controlled by the IO board, leave this option OFF.");
+                                    r
+                                })
+                                .inner
+                                .changed()
+                            {
+                                connected.session.hl2_atu_gateware.store(v, Ordering::Relaxed);
+                                *settings_changed = true;
+                            }
+                        }
+                    }
+                    if matches!(connected.device.board, Boards::Angelia | Boards::Orion | Boards::Orion2) {
+                        ui.add_space(2.0);
+                        ui.label("Radio Mic Connector:");
+                        let mut ptt_on_tip = connected.session.mic_ptt_on_tip.load(Ordering::Relaxed);
+                        if ui
+                            .add(egui::Button::selectable(!ptt_on_tip, "PTT on Ring, Mic/Bias on Tip").min_size(egui::vec2(0.0, btn_h)))
+                            .clicked()
+                            && ptt_on_tip
+                        {
+                            ptt_on_tip = false;
+                            connected.session.mic_ptt_on_tip.store(false, Ordering::Relaxed);
+                            *settings_changed = true;
+                        }
+                        if ui
+                            .add(egui::Button::selectable(ptt_on_tip, "PTT on Tip, Mic/Bias on Ring").min_size(egui::vec2(0.0, btn_h)))
+                            .clicked()
+                            && !ptt_on_tip
+                        {
+                            connected.session.mic_ptt_on_tip.store(true, Ordering::Relaxed);
+                            *settings_changed = true;
+                        }
+                        let mut mic_ptt_enabled = connected.session.mic_ptt_enabled.load(Ordering::Relaxed);
+                        if touch_checkbox(ui, &mut mic_ptt_enabled, "Mic PTT Enabled").changed() {
+                            connected.session.mic_ptt_enabled.store(mic_ptt_enabled, Ordering::Relaxed);
+                            *settings_changed = true;
+                        }
+                        let mut mic_bias_enabled = connected.session.mic_bias_enabled.load(Ordering::Relaxed);
+                        if touch_checkbox(ui, &mut mic_bias_enabled, "Mic Bias Enabled").changed() {
+                            connected.session.mic_bias_enabled.store(mic_bias_enabled, Ordering::Relaxed);
+                            *settings_changed = true;
+                        }
+                    }
+                    ui.add_space(2.0);
+                    ui.horizontal(|ui| {
+                        ui.label("VFO Encoder Divisor:");
+                        help_button(ui, "sdr_vfo_divisor", "How many encoder ticks make one VFO step (piHPSDR/deskHPSDR VFO encoder divisor). Higher = slower tuning when turning slowly; turning faster still speeds it up.");
+                    });
+                    let mut div = connected.vfo_encoder_divisor as f64;
+                    if spin_buttons_full(ui, "vfo_divisor", &mut div, 1.0, 50.0, 1.0, 0, None, 80.0).changed() {
+                        connected.vfo_encoder_divisor = div.round() as f32;
+                        *settings_changed = true;
+                    }
+                    if connected.tx_handle.is_some() {
+                        ui.add_space(2.0);
+                        ui.horizontal(|ui| {
+                            ui.label("Audio Capture Time (s):");
+                            help_button(ui, "sdr_capture_time", "Maximum length of the REC recording used for reports (the REC / PLAY buttons), 10 to 120 seconds.");
+                        });
+                        let mut secs = report_recorder::max_seconds() as f64;
+                        if spin_buttons_full(ui, "capture_secs", &mut secs, 10.0, 120.0, 10.0, 0, None, 80.0).changed() {
+                            report_recorder::set_max_seconds(secs.round() as u32);
+                            *settings_changed = true;
+                        }
+                    }
+                }
+
+                // ---- column 3: switches
+                {
+                    let ui = &mut cols[2];
+                    ui.colored_label(egui::Color32::from_rgb(90, 160, 255), egui::RichText::new("AUDIO / HARDWARE").strong());
+                    let mut send_rx_audio = connected.session.send_rx_audio_to_radio.load(Ordering::Relaxed);
+                    if ui
+                        .horizontal(|ui| {
+                            let r = touch_checkbox(ui, &mut send_rx_audio, "Send RX audio to radio");
+                            help_button(ui, "sdr_send_rx_audio", "Streams the main receiver's demodulated audio back to the radio's own audio output (a headphone or speaker jack driven by the radio, independent of this computer's sound card). Off by default: it adds continuous extra network traffic. On HermesLite and HermesLite2 over Protocol 1 it has no effect unless the HL2+ Audio Codec option is enabled (it needs the AK4951 add-on board's own firmware).");
+                            r
+                        })
+                        .inner
+                        .changed()
+                    {
+                        connected.session.send_rx_audio_to_radio.store(send_rx_audio, Ordering::Relaxed);
+                        *settings_changed = true;
+                    }
+                    ui.add_space(8.0);
+                    let hl2_p1 = connected.device.protocol == 1
+                        && matches!(connected.device.board, Boards::HermesLite2)
+                        && !connected.device.is_radioberry;
+                    if hl2_p1 {
+                        let mut hl2_ak4951_codec = connected.session.hl2_ak4951_codec.load(Ordering::Relaxed);
+                        if ui
+                            .horizontal(|ui| {
+                                let r = touch_checkbox(ui, &mut hl2_ak4951_codec, "HL2+ Audio Codec");
+                                help_button(ui, "sdr_hl2_codec", "Enable only if this HermesLite2 has the AK4951 companion board (PHONES/MIC/KEY jacks) installed and is running its dedicated firmware build. It is required for Send RX audio to radio to actually reach it.");
+                                r
+                            })
+                            .inner
+                            .changed()
+                        {
+                            connected.session.hl2_ak4951_codec.store(hl2_ak4951_codec, Ordering::Relaxed);
+                            *settings_changed = true;
+                        }
+                        ui.add_space(8.0);
+                    }
+                    if matches!(connected.device.board, Boards::HermesLite2) && !connected.device.is_radioberry {
+                        {
+                            let mut v = connected.session.hl2_cl1_input.load(Ordering::Relaxed);
+                            if ui
+                                .horizontal(|ui| {
+                                    let r = touch_checkbox(ui, &mut v, "HL2 CL1 10MHz Ref Clock");
+                                    help_button(ui, "sdr_hl2_cl1", "Switch ON if using a Hermes Lite 2 with a 10 MHz GPS disciplined oscillator connected at the CL1 input.");
+                                    r
+                                })
+                                .inner
+                                .changed()
+                            {
+                                connected.session.hl2_cl1_input.store(v, Ordering::Relaxed);
+                                *settings_changed = true;
+                            }
+                        }
+                    }
+                    ui.add_space(2.0);
+                    ui.colored_label(blue, "Your Callsign:");
+                    if ui
+                        .add(
+                            egui::TextEdit::singleline(&mut connected.own_callsign)
+                                .desired_width(ui.available_width() - 10.0)
+                                .char_limit(15)
+                                .hint_text("YOUR_CALLSIGN")
+                                .text_color(egui::Color32::from_rgb(232, 150, 46)),
+                        )
+                        .changed()
+                    {
+                        connected.rade.set_callsign(&connected.own_callsign);
+                        *settings_changed = true;
+                    }
+                    ui.colored_label(blue, "Your Locator:");
+                    if ui
+                        .add(
+                            egui::TextEdit::singleline(&mut connected.own_locator)
+                                .desired_width(ui.available_width() - 10.0)
+                                .char_limit(8)
+                                .hint_text("JO01AA")
+                                .text_color(egui::Color32::from_rgb(232, 150, 46)),
+                        )
+                        .changed()
+                    {
+                        *settings_changed = true;
+                    }
+                    ui.add_space(2.0);
+                    ui.horizontal(|ui| {
+                        ui.label("IARU Region:");
+                        help_button(ui, "sdr_iaru", "Selects the IARU region for the general band limits: 1 = Europe, Africa, Middle East; 2 = Americas; 3 = Asia-Pacific. It changes the 160 m, 80 m and 40 m edges used to name the band, to allow transmitting and to draw the band edges.");
+                    });
+                    ui.horizontal(|ui| {
+                        let cur = iaru_region();
+                        for r in 1..=3u8 {
+                            if ui.add(egui::Button::selectable(cur == r, r.to_string()).min_size(egui::vec2(64.0, btn_h))).clicked() && cur != r {
+                                set_iaru_region(r);
+                                *settings_changed = true;
+                            }
+                        }
+                    });
+                }
+            });
+        });
+        ui.ctx().data_mut(|d| d.remove::<f32>(egui::Id::new("spin_touch_scale")));
+}
+
+/// Kiosk: the SDR Device page as a full-screen in-app window (like the EQ window). Returns (close, changed).
+fn sdr_device_window(ui: &mut egui::Ui, connected: &mut ConnectedState) -> (bool, bool) {
+    let screen = ui.ctx().content_rect();
+    let mut close_now = false;
+    let mut changed = false;
+    let frame = egui::Frame::window(ui.style()).inner_margin(4.0).corner_radius(0.0);
+    egui::Window::new("SDR Device Settings")
+        .id(egui::Id::new("sdr_device_window"))
+        .title_bar(false)
+        .collapsible(false)
+        .resizable(false)
+        .frame(frame)
+        .fixed_pos(screen.min)
+        .constrain_to(screen)
+        .fixed_size(screen.size() - egui::vec2(10.0, 10.0))
+        .show(ui.ctx(), |ui| {
+            if ui.input(|i| i.key_pressed(egui::Key::Escape)) {
+                close_now = true;
+            }
+            ui.set_min_height(screen.height() - 10.0);
+            ui.spacing_mut().item_spacing = egui::vec2(6.0, 0.0);
+            let title = format!("hpsdr-rs - SDR Device Settings [{}]", connected.device.board_label());
+            let (tr, _) = ui.allocate_exact_size(egui::vec2(ui.available_width(), 24.0), egui::Sense::hover());
+            ui.painter().text(tr.center(), egui::Align2::CENTER_CENTER, title, egui::FontId::proportional(16.0), egui::Color32::from_gray(225));
+            render_sdr_device(ui, connected, &mut changed);
+            egui::Area::new(egui::Id::new("sdr_window_close"))
+                .order(egui::Order::Foreground)
+                .anchor(egui::Align2::RIGHT_BOTTOM, egui::vec2(-24.0, -26.0))
+                .show(ui.ctx(), |ui| {
+                    if kiosk_accent_button(ui, "CLOSE").clicked() {
+                        close_now = true;
+                    }
+                });
+        });
+    (close_now, changed)
+}
+
+/// Starts or stops TUNE like the TUNE button (also used by the external AutoTune input): see `tune_may_start` for why
+/// Two-Tone/CW-text-sending and an externally keyed transmission block it.
+fn tune_set(connected: &mut ConnectedState, want: bool) {
+    if !want {
+        if connected.tune_active {
+            connected.session.set_mox(false);
+            if let Some(tx) = &connected.tx_handle {
+                tx.set_tune(false);
+            }
+            if let Some(prev) = connected.pre_tune_power_watts.take() {
+                connected.session.tx_power_watts.store(prev, Ordering::Relaxed);
+            }
+            connected.tune_active = false;
+        }
+    } else if !connected.tune_active {
+        let tune_may_start = !connected.session.mox_active()
+            && !connected.two_tone_active
+            && !connected.cw_text_sending
+            && tx_frequency_allowed(
+                connected.session.tx_frequency_hz.load(Ordering::Relaxed),
+                connected.allow_out_of_band_tx.load(Ordering::Relaxed),
+            );
+        if tune_may_start {
+            let current_watts = connected.session.tx_power_watts.load(Ordering::Relaxed);
+            connected.pre_tune_power_watts = Some(current_watts);
+            let tune_watts = current_watts * connected.tune_power_percent / 100;
+            connected.session.tx_power_watts.store(tune_watts, Ordering::Relaxed);
+            if let Some(tx) = &connected.tx_handle {
+                tx.set_tune(true);
+            }
+            connected.session.set_mox(true);
+            connected.tune_active = true;
+        }
+    }
+}
+
+/// The external hardware inputs of the radio (deskHPSDR's TxInhibit / AutoTune): while the TxInhibit input is asserted any
+/// transmission (MOX or TUNE) is cut; the AutoTune input starts TUNE when it is asserted and stops it when released.
+fn radio_inputs_tick(connected: &mut ConnectedState) {
+    if connected.session.hardware_tx_inhibit.load(Ordering::Relaxed) {
+        if connected.tune_active {
+            tune_set(connected, false);
+        } else if connected.session.mox_active() {
+            connected.session.set_mox(false);
+        }
+    }
+    let asserted = connected.session.auto_tune_asserted.load(Ordering::Relaxed);
+    if asserted && !connected.auto_tune_prev && !connected.tune_active {
+        tune_set(connected, true);
+        connected.auto_tune_started = connected.tune_active;
+    } else if !asserted && connected.auto_tune_prev && connected.auto_tune_started {
+        tune_set(connected, false);
+        connected.auto_tune_started = false;
+    }
+    connected.auto_tune_prev = asserted;
 }
 
 /// VOX: the decision (threshold, hang, keying) runs in the TX thread (tx.rs / vox.rs), so nothing is redrawn for it.
@@ -23187,7 +23251,13 @@ pub enum AlcMode {
 fn touch_close_button(ui: &mut egui::Ui, height: f32) -> egui::Response {
     let size = egui::vec2(110.0, height);
     ui.allocate_ui_with_layout(size, egui::Layout::centered_and_justified(egui::Direction::LeftToRight), |ui| {
-        ui.add(chip_button("Close", false).min_size(size))
+        ui.add(
+            egui::Button::new(egui::RichText::new("CLOSE").strong().color(egui::Color32::BLACK))
+                .fill(egui::Color32::from_rgb(235, 195, 40))
+                .stroke(egui::Stroke::new(1.0, egui::Color32::from_rgb(250, 225, 120)))
+                .corner_radius(5.0)
+                .min_size(size),
+        )
     })
     .inner
 }

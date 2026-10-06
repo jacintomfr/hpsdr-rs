@@ -18,6 +18,8 @@ const KEY_H: f32 = 42.0;
 const GAP: f32 = 6.0;
 const PAD: f32 = 6.0;
 const ROWS: usize = 5;
+/// Gap kept between the keyboard and the top / bottom edge of the window: keys against the very edge are hard to hit.
+const EDGE_GAP: f32 = 28.0;
 
 #[derive(Clone, Default)]
 struct KbState {
@@ -86,8 +88,8 @@ pub fn begin(ctx: &egui::Context) {
 
     let screen = ctx.content_rect();
     let kb_h = ROWS as f32 * KEY_H + (ROWS as f32 - 1.0) * GAP + 2.0 * PAD;
-    let at_top = st.field_rect.is_some_and(|f| f.bottom() > screen.bottom() - kb_h - 8.0);
-    let top = if at_top { screen.top() } else { screen.bottom() - kb_h };
+    let at_top = st.field_rect.is_some_and(|f| f.bottom() > screen.bottom() - kb_h - EDGE_GAP - 8.0);
+    let top = if at_top { screen.top() + EDGE_GAP } else { screen.bottom() - kb_h - EDGE_GAP };
     let kb = egui::Rect::from_min_size(egui::pos2(screen.left(), top), egui::vec2(screen.width(), kb_h));
 
     let mut presses: Vec<Press> = Vec::new();

@@ -34,6 +34,12 @@ pub struct Config {
     /// callsign is sent (a well-formed but identity-less over).
     #[serde(default)]
     pub rade_callsign: Option<String>,
+    /// Your Callsign / Your Locator (Settings -> SDR Device): one value for RADE, SSTV, RTTY... Old configs carry the
+    /// callsign in `rade_callsign` (read as a fallback).
+    #[serde(default)]
+    pub own_callsign: Option<String>,
+    #[serde(default)]
+    pub own_locator: Option<String>,
     /// RADE's own mic conditioning (Noise Reduction/Leveler/Compressor,
     /// render_rade_panel) -- see tx::TxParams::rade_denoiser_enabled's
     /// doc comment for why these are separate from tx_denoiser_enabled/
@@ -536,6 +542,20 @@ pub struct Config {
     /// the live default.
     #[serde(default)]
     pub send_rx_audio_to_radio: Option<bool>,
+    /// Settings -> SDR Device (deskHPSDR's radio menu): external TxInhibit / AutoTune inputs, HL2 CL1 10 MHz reference clock, HL2 ATU TUNE support.
+    #[serde(default)]
+    pub tx_inhibit_enabled: Option<bool>,
+    #[serde(default)]
+    pub auto_tune_enabled: Option<bool>,
+    #[serde(default)]
+    pub hl2_cl1_input: Option<bool>,
+    #[serde(default)]
+    pub hl2_atu_gateware: Option<bool>,
+    /// Settings -> SDR Device: REC (report recorder) maximum length in seconds and the IARU region (1..3).
+    #[serde(default)]
+    pub report_capture_secs: Option<u32>,
+    #[serde(default)]
+    pub iaru_region: Option<u8>,
     /// See radio::RadioSession::hl2_ak4951_codec's doc comment
     /// (Settings -> RX, HermesLite2 + Protocol 1 only). Missing/never
     /// set falls back to off, same as the live default.

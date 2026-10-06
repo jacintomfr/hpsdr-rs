@@ -8,7 +8,7 @@
 use crate::eq_curve as ec;
 use crate::eq_profiles as ep;
 use crate::spectrum::EqualizerParams;
-use crate::{chip_button, spin_buttons_full, toggle_chip, touch_close_button, ConnectedState};
+use crate::{chip_button, spin_buttons_full, toggle_chip, ConnectedState};
 
 /// DSP sample rate of the EQ channels (RX and TX run at 48 kHz in this program).
 const DSP_RATE_HZ: f64 = 48000.0;
@@ -124,6 +124,7 @@ pub fn eq_window(ui: &mut egui::Ui, connected: &mut ConnectedState) -> (bool, bo
             }
             let avail_w = screen.width() - 10.0;
             ui.set_width(avail_w);
+            ui.set_min_height(screen.height() - 10.0);
             ui.spacing_mut().item_spacing = egui::vec2(6.0, 2.0);
             ui.scope(|ui| {
                     // Title strip.
@@ -133,10 +134,6 @@ pub fn eq_window(ui: &mut egui::Ui, connected: &mut ConnectedState) -> (bool, bo
                     // Row 1: Close, the RX/TX radios, the mic profiles.
                     ui.horizontal(|ui| {
                         ui.set_height(36.0);
-                        if touch_close_button(ui, 34.0).clicked() {
-                            close_now = true;
-                        }
-                        ui.add_space(30.0);
                         for (s, label) in &side_list {
                             ui.radio_value(&mut side, *s, label);
                             ui.add_space(24.0);
@@ -203,7 +200,7 @@ pub fn eq_window(ui: &mut egui::Ui, connected: &mut ConnectedState) -> (bool, bo
                     });
 
                     // The framed plot with the curve row under it; its height takes what the table leaves.
-                    let plot_h = (screen.height() - 398.0).max(110.0);
+                    let plot_h = (screen.height() - 470.0).max(100.0);
                     egui::Frame::NONE
                         .stroke(egui::Stroke::new(1.0, egui::Color32::from_gray(150)))
                         .inner_margin(3.0)
@@ -367,6 +364,15 @@ pub fn eq_window(ui: &mut egui::Ui, connected: &mut ConnectedState) -> (bool, bo
                             }
                         }
                     }
+
+                    egui::Area::new(egui::Id::new("eq_window_close"))
+                        .order(egui::Order::Foreground)
+                        .anchor(egui::Align2::RIGHT_BOTTOM, egui::vec2(-24.0, -26.0))
+                        .show(ui.ctx(), |ui| {
+                            if crate::kiosk_accent_button(ui, "CLOSE").clicked() {
+                                close_now = true;
+                            }
+                        });
 
                     if dirty {
                         put_eq(connected, side, eq);

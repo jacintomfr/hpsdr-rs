@@ -24,8 +24,21 @@ use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 pub const SAMPLE_RATE_HZ: usize = 48_000;
-pub const MAX_SECONDS: f32 = 60.0;
-const MAX_SAMPLES: usize = (SAMPLE_RATE_HZ as f32 * MAX_SECONDS) as usize;
+/// Maximum length of a REC recording in seconds (Settings -> SDR Device "Audio Capture Time", 10..120; deskHPSDR's
+/// `capture_max`). Default 60.
+static MAX_SECONDS_SETTING: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(60);
+
+pub fn max_seconds() -> f32 {
+    MAX_SECONDS_SETTING.load(std::sync::atomic::Ordering::Relaxed) as f32
+}
+
+pub fn set_max_seconds(s: u32) {
+    MAX_SECONDS_SETTING.store(s.clamp(10, 120), std::sync::atomic::Ordering::Relaxed);
+}
+
+fn max_samples() -> usize {
+    (SAMPLE_RATE_HZ as f32 * max_seconds()) as usize
+}
 
 #[derive(Clone)]
 pub struct ReportRecorder {
@@ -85,7 +98,7 @@ impl ReportRecorder {
         }
         let mut buf = self.buffer.lock().unwrap();
         buf.push((l + r) * 0.5);
-        if buf.len() >= MAX_SAMPLES {
+        if buf.len() >= max_samples() {
             self.recording.store(false, Ordering::Relaxed);
         }
     }
@@ -123,7 +136,7 @@ impl ReportRecorder {
         Some(buf[pos])
     }
 
-    /// 0.0..=1.0 while recording (elapsed / MAX_SECONDS) -- `None` when
+    /// 0.0..=1.0 while recording (elapsed / max_seconds()) -- `None` when
     /// idle, so the caller only shows the progress bar "only while in
     /// use" per the original request.
     pub fn record_progress(&self) -> Option<f32> {
@@ -131,7 +144,7 @@ impl ReportRecorder {
             return None;
         }
         let started = (*self.started_at.lock().unwrap())?;
-        Some((started.elapsed().as_secs_f32() / MAX_SECONDS).min(1.0))
+        Some((started.elapsed().as_secs_f32() / max_seconds()).min(1.0))
     }
 
     /// 0.0..=1.0 while playing (play_pos / recording length) -- same
