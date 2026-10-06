@@ -6545,7 +6545,7 @@ impl eframe::App for HpsdrApp {
                                         3.0,
                                         if hot { egui::Color32::from_rgb(230, 30, 30) } else { egui::Color32::from_rgb(0, 220, 0) },
                                     );
-                                    if ui.checkbox(&mut connected.vox_enabled, "VOX Enable").changed() {
+                                    if std_checkbox(ui, &mut connected.vox_enabled, "VOX Enable").changed() {
                                         vox_changed = true;
                                     }
                                 });
@@ -6571,7 +6571,7 @@ impl eframe::App for HpsdrApp {
                                         vox_changed = true;
                                     }
                                 });
-                                if ui.checkbox(&mut connected.vox_filter, "Use Side Channel Filter").changed() {
+                                if std_checkbox(ui, &mut connected.vox_filter, "Use Side Channel Filter").changed() {
                                     vox_changed = true;
                                 }
                                 ui.horizontal(|ui| {
@@ -6826,19 +6826,18 @@ impl eframe::App for HpsdrApp {
                                             // deskHPSDR's VFO menu check boxes: Lock VFOs, Duplex, CTUN, Split.
                                             ui.add_space(h * 0.6);
                                             let mut locked = VFO_LOCKED.load(Ordering::Relaxed);
-                                            if ui.checkbox(&mut locked, "Lock VFOs").changed() {
+                                            if std_checkbox(ui, &mut locked, "Lock VFOs").changed() {
                                                 VFO_LOCKED.store(locked, Ordering::Relaxed);
                                             }
                                             if connected.tx_enabled {
                                                 let mut dup = connected.spectrum.duplex();
-                                                if ui.checkbox(&mut dup, "Duplex").changed() {
+                                                if std_checkbox(ui, &mut dup, "Duplex").changed() {
                                                     connected.spectrum.set_duplex(dup);
                                                     settings_changed = true;
                                                 }
                                             }
                                             let mut ctun = connected.ctun;
-                                            if ui
-                                                .checkbox(&mut ctun, "CTUN")
+                                            if std_checkbox(ui, &mut ctun, "CTUN")
                                                 .on_hover_text("Click to Tune: browse within the spectrum without retuning the radio")
                                                 .changed()
                                             {
@@ -6852,8 +6851,7 @@ impl eframe::App for HpsdrApp {
                                                 settings_changed = true;
                                             }
                                             let mut split = connected.split;
-                                            if ui
-                                                .checkbox(&mut split, "Split")
+                                            if std_checkbox(ui, &mut split, "Split")
                                                 .on_hover_text("Transmit on VFO B while continuing to receive on VFO A")
                                                 .changed()
                                             {
@@ -7465,7 +7463,7 @@ impl eframe::App for HpsdrApp {
                                 if has_preamp {
                                     let mut preamp =
                                         connected.session.preamp_enabled.load(Ordering::Relaxed);
-                                    if ui.checkbox(&mut preamp, "Preamp").changed() {
+                                    if std_checkbox(ui, &mut preamp, "Preamp").changed() {
                                         connected.session.preamp_enabled.store(preamp, Ordering::Relaxed);
                                         settings_changed = true;
                                     }
@@ -10080,7 +10078,12 @@ Waterfall rebuilds: {prof_wf_n:.0}/s, {prof_wf_ms:.1} ms each."
                                 egui::pos2(meter_rect.right() - 180.0 * KIOSK_METER_SCALE, meter_rect.top()),
                                 egui::pos2(meter_rect.right(), meter_rect.top() + 85.0 * KIOSK_METER_SCALE),
                             );
-                            let tapped = ui.input(|i| i.pointer.primary_clicked() && i.pointer.interact_pos().is_some_and(|p| drawn.contains(p)));
+                            // A tap only counts when nothing lies over the meter: the full-screen windows (EQ, SDR Device, ...)
+                            // draw above this panel and their clicks must not reach it.
+                            let top_is_panel = ui.input(|i| i.pointer.interact_pos()).is_none_or(|p| {
+                                ui.ctx().layer_id_at(p).is_none_or(|l| l.order == egui::Order::Background || l == ui.layer_id())
+                            });
+                            let tapped = top_is_panel && ui.input(|i| i.pointer.primary_clicked() && i.pointer.interact_pos().is_some_and(|p| drawn.contains(p)));
                             if tapped {
                                 connected.meter_window_open = !connected.meter_window_open;
                             }
@@ -10899,8 +10902,7 @@ Waterfall rebuilds: {prof_wf_n:.0}/s, {prof_wf_ms:.1} ms each."
                                     }
                                     {
                                         let mut logging = connected.rigctl_debug_log.is_enabled();
-                                        if ui
-                                            .checkbox(&mut logging, "Log to file (rigctl_log.txt)")
+                                        if std_checkbox(ui, &mut logging, "Log to file (rigctl_log.txt)")
                                             .on_hover_text(
                                                 "Logs every command received and reply sent, for debugging a \
                                                  client's behavior -- saved alongside this radio's settings.",
@@ -10973,8 +10975,7 @@ Waterfall rebuilds: {prof_wf_n:.0}/s, {prof_wf_ms:.1} ms each."
                                     }
                                     {
                                         let mut logging = connected.tci_debug_log.is_enabled();
-                                        if ui
-                                            .checkbox(&mut logging, "Log to file (tci_log.txt)")
+                                        if std_checkbox(ui, &mut logging, "Log to file (tci_log.txt)")
                                             .on_hover_text(
                                                 "Logs every command received and reply sent, for debugging a \
                                                  client's behavior -- saved alongside this radio's settings.",
@@ -10987,8 +10988,7 @@ Waterfall rebuilds: {prof_wf_n:.0}/s, {prof_wf_ms:.1} ms each."
                                     }
                                     {
                                         let mut mute = connected.mute_local_audio_during_tci;
-                                        if ui
-                                            .checkbox(&mut mute, "Mute local audio output while TCI is running")
+                                        if std_checkbox(ui, &mut mute, "Mute local audio output while TCI is running")
                                             .on_hover_text(
                                                 "Prevents a client (e.g. WSJT-X) that's ALSO picking up \
                                                  hpsdr-rs's local audio output device (e.g. a virtual \
@@ -11064,8 +11064,7 @@ Waterfall rebuilds: {prof_wf_n:.0}/s, {prof_wf_ms:.1} ms each."
                                     }
                                     {
                                         let mut logging = connected.cat_debug_log.is_enabled();
-                                        if ui
-                                            .checkbox(&mut logging, "Log to file (cat_log.txt)")
+                                        if std_checkbox(ui, &mut logging, "Log to file (cat_log.txt)")
                                             .on_hover_text(
                                                 "Logs every command received and reply sent, for debugging a \
                                                  client's behavior -- saved alongside this radio's settings.",
@@ -11181,7 +11180,7 @@ Waterfall rebuilds: {prof_wf_n:.0}/s, {prof_wf_ms:.1} ms each."
                                     ui.label("MIDI control surface:");
                                     ui.horizontal(|ui| {
                                         let mut midi_enabled_ui = connected.midi.enabled.load(Ordering::Relaxed);
-                                        if ui.checkbox(&mut midi_enabled_ui, "Enable MIDI control").changed() {
+                                        if std_checkbox(ui, &mut midi_enabled_ui, "Enable MIDI control").changed() {
                                             connected.midi.enabled.store(midi_enabled_ui, Ordering::Relaxed);
                                             settings_changed = true;
                                         }
@@ -11279,7 +11278,7 @@ Waterfall rebuilds: {prof_wf_n:.0}/s, {prof_wf_ms:.1} ms each."
                                     let port_keys: Vec<String> = ports.iter().map(|p| midi::port_key(p)).collect();
                                     for (name, key) in ports.iter().zip(port_keys.iter()) {
                                         let mut on = wanted.contains(key);
-                                        if ui.checkbox(&mut on, name).changed() {
+                                        if std_checkbox(ui, &mut on, name).changed() {
                                             if on {
                                                 if !wanted.contains(key) {
                                                     wanted.push(key.clone());
@@ -11297,7 +11296,7 @@ Waterfall rebuilds: {prof_wf_n:.0}/s, {prof_wf_ms:.1} ms each."
                                     // from the config the moment it's unplugged.
                                     for name in wanted.iter().filter(|n| !port_keys.contains(n)).cloned().collect::<Vec<_>>() {
                                         let mut on = true;
-                                        if ui.checkbox(&mut on, format!("{name} (not currently detected)")).changed()
+                                        if std_checkbox(ui, &mut on, format!("{name} (not currently detected)")).changed()
                                             && !on
                                         {
                                             connected.midi.device_names.lock().unwrap().retain(|n| n != &name);
@@ -11370,7 +11369,7 @@ Waterfall rebuilds: {prof_wf_n:.0}/s, {prof_wf_ms:.1} ms each."
                                             });
                                         }
 
-                                        ui.checkbox(&mut connected.midi_learn.channel_any, "Any channel");
+                                        std_checkbox(ui, &mut connected.midi_learn.channel_any, "Any channel");
 
                                         let binding_kind = if ev.kind == MidiEventKind::NoteKey {
                                             MidiBindingKind::Key
@@ -11417,7 +11416,7 @@ Waterfall rebuilds: {prof_wf_n:.0}/s, {prof_wf_ms:.1} ms each."
                                                 Some(MidiAction::Mox) | Some(MidiAction::Tune)
                                             )
                                         {
-                                            ui.checkbox(
+                                            std_checkbox(ui, 
                                                 &mut connected.midi_learn.momentary,
                                                 "Momentary (act on press AND release)",
                                             );
@@ -11724,7 +11723,7 @@ Waterfall rebuilds: {prof_wf_n:.0}/s, {prof_wf_ms:.1} ms each."
                                     ui.add_space(6.0);
                                     for (id, label, hint) in DIAG_ITEMS {
                                         let mut on = connected.diag_items.iter().any(|s| s == id);
-                                        if ui.checkbox(&mut on, format!("{label}  --  {hint}")).changed() {
+                                        if std_checkbox(ui, &mut on, format!("{label}  --  {hint}")).changed() {
                                             connected.diag_items.retain(|s| s != id);
                                             if on {
                                                 connected.diag_items.push(id.to_string());
@@ -12161,8 +12160,7 @@ Waterfall rebuilds: {prof_wf_n:.0}/s, {prof_wf_ms:.1} ms each."
 
                                     ui.separator();
                                     let mut pc_sidetone = connected.cw_sidetone.enabled.load(Ordering::Relaxed);
-                                    if ui
-                                        .checkbox(&mut pc_sidetone, "PC Sidetone")
+                                    if std_checkbox(ui, &mut pc_sidetone, "PC Sidetone")
                                         .on_hover_text(
                                             "Also play the sidetone through this PC's own audio \
                                              output (using the Sidetone Level/Frequency above), \
@@ -12265,8 +12263,7 @@ Waterfall rebuilds: {prof_wf_n:.0}/s, {prof_wf_ms:.1} ms each."
                                     // algorithm this affects.
                                     if connected.device.board == Boards::HermesLite2 {
                                         ui.add_enabled_ui(connected.autogain_enabled, |ui| {
-                                            if ui
-                                                .checkbox(
+                                            if std_checkbox(ui, 
                                                     &mut connected.autogain_time_enabled,
                                                     "HL2 Auto Gain time-regulated",
                                                 )
@@ -12541,8 +12538,7 @@ Waterfall rebuilds: {prof_wf_n:.0}/s, {prof_wf_ms:.1} ms each."
                                     // two independent toggles, combinable.
                                     ui.horizontal(|ui| {
                                         ui.label("Spectrum trace:");
-                                        if ui
-                                            .checkbox(&mut connected.spectrum_filled, "Filled")
+                                        if std_checkbox(ui, &mut connected.spectrum_filled, "Filled")
                                             .on_hover_text(
                                                 "Fill the area under the spectrum trace \
                                                  instead of drawing a bare line.",
@@ -12551,8 +12547,7 @@ Waterfall rebuilds: {prof_wf_n:.0}/s, {prof_wf_ms:.1} ms each."
                                         {
                                             settings_changed = true;
                                         }
-                                        if ui
-                                            .checkbox(&mut connected.spectrum_gradient, "Gradient")
+                                        if std_checkbox(ui, &mut connected.spectrum_gradient, "Gradient")
                                             .on_hover_text(
                                                 "Colour the trace/fill with a vertical \
                                                  gradient (weak signals dim, strong signals \
@@ -12565,8 +12560,7 @@ Waterfall rebuilds: {prof_wf_n:.0}/s, {prof_wf_ms:.1} ms each."
                                     });
 
                                     ui.separator();
-                                    if ui
-                                        .checkbox(&mut connected.waterfall_enabled, "Enable Waterfall")
+                                    if std_checkbox(ui, &mut connected.waterfall_enabled, "Enable Waterfall")
                                         .on_hover_text(
                                             "When off, the spectrum trace uses the full \
                                              spectrum+waterfall height instead of sharing it.",
@@ -12776,8 +12770,7 @@ Waterfall rebuilds: {prof_wf_n:.0}/s, {prof_wf_ms:.1} ms each."
                                     );
                                     {
                                         let mut logging = connected.session.tx_packet_debug_log.is_enabled();
-                                        if ui
-                                            .checkbox(&mut logging, "Log TX packets (tx_packet_log.txt)")
+                                        if std_checkbox(ui, &mut logging, "Log TX packets (tx_packet_log.txt)")
                                             .on_hover_text(
                                                 "Protocol 1 only. Logs the raw hex of every outgoing TX \
                                                  packet (~380/sec while enabled, including the MOX bit and \
@@ -12808,8 +12801,7 @@ Waterfall rebuilds: {prof_wf_n:.0}/s, {prof_wf_ms:.1} ms each."
                                         // for RADE. See TxParams::
                                         // tx_denoiser_enabled's doc comment.
                                         let mut denoise = tx.tx_denoiser_enabled();
-                                        if ui
-                                            .checkbox(&mut denoise, "Noise Reduction")
+                                        if std_checkbox(ui, &mut denoise, "Noise Reduction")
                                             .on_hover_text(
                                                 "RNNoise -- a neural denoiser on the microphone, \
                                                  before Leveler/Compressor/CFC below",
@@ -12820,8 +12812,7 @@ Waterfall rebuilds: {prof_wf_n:.0}/s, {prof_wf_ms:.1} ms each."
                                             settings_changed = true;
                                         }
                                         let mut leveler = tx.leveler_enabled();
-                                        if ui
-                                            .checkbox(&mut leveler, "Leveler")
+                                        if std_checkbox(ui, &mut leveler, "Leveler")
                                             .on_hover_text(
                                                 "Slower average-level normalizer, separate from the \
                                                  ALC's fast peak limiting -- evens out a speaker who \
@@ -12866,8 +12857,7 @@ Waterfall rebuilds: {prof_wf_n:.0}/s, {prof_wf_ms:.1} ms each."
                                         }
 
                                         let mut compressor = tx.compressor_enabled();
-                                        if ui
-                                            .checkbox(&mut compressor, "Compressor (PROC)")
+                                        if std_checkbox(ui, &mut compressor, "Compressor (PROC)")
                                             .on_hover_text(
                                                 "Simple single-band speech compressor -- raises average \
                                                  TX power for a more 'in your face' SSB sound. Cruder \
@@ -12898,8 +12888,7 @@ Waterfall rebuilds: {prof_wf_n:.0}/s, {prof_wf_ms:.1} ms each."
                                         }
 
                                         let mut cfc = tx.cfc_enabled();
-                                        if ui
-                                            .checkbox(&mut cfc, "CFC (multiband punch)")
+                                        if std_checkbox(ui, &mut cfc, "CFC (multiband punch)")
                                             .on_hover_text(
                                                 "Continuous Frequency Compressor -- the real \"punch\" \
                                                  processor, matching deskHPSDR: compresses each \
@@ -12988,8 +12977,7 @@ Waterfall rebuilds: {prof_wf_n:.0}/s, {prof_wf_ms:.1} ms each."
                                     {
                                         let mut allow_oob =
                                             connected.allow_out_of_band_tx.load(Ordering::Relaxed);
-                                        if ui
-                                            .checkbox(&mut allow_oob, "Allow TX outside ham bands")
+                                        if std_checkbox(ui, &mut allow_oob, "Allow TX outside ham bands")
                                             .on_hover_text(
                                                 "Off (default): TX is blocked outside the defined ham \
                                                  band allocations, e.g. on \"Gen\". Enable only for \
@@ -13010,7 +12998,7 @@ Waterfall rebuilds: {prof_wf_n:.0}/s, {prof_wf_ms:.1} ms each."
                                         ui.weak("Enable Transmit (receive-only hardware)");
                                     } else {
                                     let mut tx_enabled = connected.tx_enabled;
-                                    if ui.checkbox(&mut tx_enabled, "Enable Transmit").changed() {
+                                    if std_checkbox(ui, &mut tx_enabled, "Enable Transmit").changed() {
                                         if tx_enabled {
                                             // ROOT CAUSE FIX for a real report (bad TX spectrum +
                                             // excess power bouncing specifically at a non-48k P1
@@ -13177,7 +13165,7 @@ Waterfall rebuilds: {prof_wf_n:.0}/s, {prof_wf_ms:.1} ms each."
                                     if let Some(tx) = &connected.tx_handle {
                                         ui.add_space(8.0);
                                         let mut monitoring = connected.tx_audio_monitor_output.is_some();
-                                        if ui.checkbox(&mut monitoring, "Monitor TX Audio").changed() {
+                                        if std_checkbox(ui, &mut monitoring, "Monitor TX Audio").changed() {
                                             if monitoring {
                                                 // Always the system default (None) -- see
                                                 // ConnectedState::audio_output_device's doc comment on
@@ -13372,7 +13360,7 @@ Waterfall rebuilds: {prof_wf_n:.0}/s, {prof_wf_ms:.1} ms each."
                                             }
                                             if matches!(connected.device.protocol, 1 | 2) {
                                                 if let Some(x) = connected.xvtrs.get_mut(i) {
-                                                    if ui.checkbox(&mut x.disable_pa, "").changed() {
+                                                    if std_checkbox(ui, &mut x.disable_pa, "").changed() {
                                                         settings_changed = true;
                                                     }
                                                 } else {
@@ -13485,7 +13473,7 @@ Waterfall rebuilds: {prof_wf_n:.0}/s, {prof_wf_ms:.1} ms each."
                                             for i in 0..7u8 {
                                                 let mask = 0x01 << i;
                                                 let mut on = oc.rx & mask != 0;
-                                                if ui.checkbox(&mut on, "").changed() {
+                                                if std_checkbox(ui, &mut on, "").changed() {
                                                     if on { oc.rx |= mask } else { oc.rx &= !mask }
                                                     changed = true;
                                                 }
@@ -13493,7 +13481,7 @@ Waterfall rebuilds: {prof_wf_n:.0}/s, {prof_wf_ms:.1} ms each."
                                             for i in 0..7u8 {
                                                 let mask = 0x01 << i;
                                                 let mut on = oc.tx & mask != 0;
-                                                if ui.checkbox(&mut on, "").changed() {
+                                                if std_checkbox(ui, &mut on, "").changed() {
                                                     if on { oc.tx |= mask } else { oc.tx &= !mask }
                                                     changed = true;
                                                 }
@@ -13519,7 +13507,7 @@ Waterfall rebuilds: {prof_wf_n:.0}/s, {prof_wf_ms:.1} ms each."
                                         for i in 0..7u8 {
                                             let mask = 0x01 << i;
                                             let mut on = connected.oc_tune & mask != 0;
-                                            if ui.checkbox(&mut on, "").changed() {
+                                            if std_checkbox(ui, &mut on, "").changed() {
                                                 if on { connected.oc_tune |= mask } else { connected.oc_tune &= !mask }
                                                 settings_changed = true;
                                             }
@@ -13559,8 +13547,7 @@ Waterfall rebuilds: {prof_wf_n:.0}/s, {prof_wf_ms:.1} ms each."
                                         ui.add_space(4.0);
                                         let mut new_pa_board =
                                             connected.session.new_pa_board.load(Ordering::Relaxed);
-                                        if ui
-                                            .checkbox(&mut new_pa_board, "ANAN 100/200 new PA board")
+                                        if std_checkbox(ui, &mut new_pa_board, "ANAN 100/200 new PA board")
                                             .on_hover_text(
                                                 "Only matters if you use EXT1/EXT2/XVTR as an RX \
                                                  antenna below -- selects which of two incompatible \
@@ -13675,8 +13662,7 @@ Waterfall rebuilds: {prof_wf_n:.0}/s, {prof_wf_ms:.1} ms each."
                                     // (see radio::RadioSession::diversity_enabled's doc
                                     // comment). Disabled, not hidden, so it's clear why.
                                     ui.add_enabled_ui(!connected.diversity_enabled, |ui| {
-                                        if ui
-                                            .checkbox(&mut puresignal_enabled, "Enable PureSignal")
+                                        if std_checkbox(ui, &mut puresignal_enabled, "Enable PureSignal")
                                             .changed()
                                         {
                                             connected.puresignal_enabled = puresignal_enabled;
@@ -13709,8 +13695,7 @@ Waterfall rebuilds: {prof_wf_n:.0}/s, {prof_wf_ms:.1} ms each."
                                             ui.add_space(6.0);
 
                                             let mut ps_enabled = connected.ps_enabled;
-                                            if ui
-                                                .checkbox(&mut ps_enabled, "Running (continuous auto-calibrate)")
+                                            if std_checkbox(ui, &mut ps_enabled, "Running (continuous auto-calibrate)")
                                                 .changed()
                                             {
                                                 connected.ps_enabled = ps_enabled;
@@ -13719,7 +13704,7 @@ Waterfall rebuilds: {prof_wf_n:.0}/s, {prof_wf_ms:.1} ms each."
                                             }
 
                                             let mut ps_oneshot = connected.ps_oneshot;
-                                            if ui.checkbox(&mut ps_oneshot, "OneShot").changed() {
+                                            if std_checkbox(ui, &mut ps_oneshot, "OneShot").changed() {
                                                 connected.ps_oneshot = ps_oneshot;
                                                 tx.set_ps_oneshot(ps_oneshot);
                                                 settings_changed = true;
@@ -13869,8 +13854,7 @@ Waterfall rebuilds: {prof_wf_n:.0}/s, {prof_wf_ms:.1} ms each."
                                                 );
 
                                                 let mut ps_auto_attenuate = connected.ps_auto_attenuate;
-                                                if ui
-                                                    .checkbox(&mut ps_auto_attenuate, "Auto Attenuate (Two Tone)")
+                                                if std_checkbox(ui, &mut ps_auto_attenuate, "Auto Attenuate (Two Tone)")
                                                     .changed()
                                                 {
                                                     connected.ps_auto_attenuate = ps_auto_attenuate;
@@ -14114,8 +14098,7 @@ Waterfall rebuilds: {prof_wf_n:.0}/s, {prof_wf_ms:.1} ms each."
                                     // Mutually exclusive with PureSignal -- see that
                                     // tab's own checkbox handler for why.
                                     ui.add_enabled_ui(!connected.puresignal_enabled, |ui| {
-                                        if ui
-                                            .checkbox(&mut diversity_enabled, "Enable Diversity")
+                                        if std_checkbox(ui, &mut diversity_enabled, "Enable Diversity")
                                             .changed()
                                         {
                                             connected.diversity_enabled = diversity_enabled;
@@ -15850,11 +15833,21 @@ fn help_button(ui: &mut egui::Ui, id: &str, text: &str) {
     ui.ctx().data_mut(|d| d.insert_temp(open_id, open));
 }
 
+/// The standard checkbox of the kiosk (rule: a filled box shows a big X, not a tick): `touch_checkbox_sized` at 30 px. Every
+/// `ui.checkbox(...)` of the settings pages goes through this.
+fn std_checkbox(ui: &mut egui::Ui, value: &mut bool, label: impl AsRef<str>) -> egui::Response {
+    touch_checkbox_sized(ui, value, label.as_ref(), 30.0)
+}
+
 /// Touch checkbox: a big square (34 px) with a thick X filling it when on, label to the right. Same contract as
 /// `ui.checkbox` (the response reports `changed()` when toggled); dimmed and inert inside `add_enabled_ui(false, ..)`.
 fn touch_checkbox(ui: &mut egui::Ui, value: &mut bool, label: &str) -> egui::Response {
+    touch_checkbox_sized(ui, value, label, 34.0)
+}
+
+/// `touch_checkbox` with a chosen square size (the EQ window uses a slightly smaller one).
+fn touch_checkbox_sized(ui: &mut egui::Ui, value: &mut bool, label: &str, box_size: f32) -> egui::Response {
     let enabled = ui.is_enabled();
-    let box_size = 34.0f32;
     let font = egui::TextStyle::Button.resolve(ui.style());
     let galley = ui.painter().layout_no_wrap(label.to_string(), font, ui.visuals().text_color());
     let total = egui::vec2(box_size + 10.0 + galley.size().x, box_size.max(galley.size().y));
@@ -15870,8 +15863,8 @@ fn touch_checkbox(ui: &mut egui::Ui, value: &mut bool, label: &str) -> egui::Res
     ui.painter().rect(sq, 5.0, fill, egui::Stroke::new(1.5, line), egui::StrokeKind::Inside);
     if *value {
         let c = if enabled { egui::Color32::from_rgb(232, 150, 46) } else { egui::Color32::from_gray(110) };
-        let r = sq.shrink(6.0);
-        let st = egui::Stroke::new(4.0, c);
+        let r = sq.shrink(box_size * 0.18);
+        let st = egui::Stroke::new(box_size / 8.5, c);
         ui.painter().line_segment([r.left_top(), r.right_bottom()], st);
         ui.painter().line_segment([r.right_top(), r.left_bottom()], st);
     }
@@ -16239,9 +16232,9 @@ fn render_digital_panel(
             }
         }
         ui.add_space(8.0);
-        ui.checkbox(&mut s.reverse, "Reverse");
-        ui.checkbox(&mut s.afc, "AFC");
-        ui.checkbox(&mut s.squelch, "Squelch")
+        std_checkbox(ui, &mut s.reverse, "Reverse");
+        std_checkbox(ui, &mut s.afc, "AFC");
+        std_checkbox(ui, &mut s.squelch, "Squelch")
             .on_hover_text("Discard decoded text while the signal is too noise-dominated to trust");
         ui.add_space(8.0);
         // A real report: the RX filter defaults/sliders were left
@@ -16391,7 +16384,7 @@ fn render_digital_panel(
                 tx_input.clear();
             }
             ui.add_space(8.0);
-            ui.checkbox(send_on_return, "Send on Return").on_hover_text(
+            std_checkbox(ui, send_on_return, "Send on Return").on_hover_text(
                 "Return in the text box below sends the line and keys PTT if not already \
                  on -- turn off to require the Send button instead, e.g. to proofread a \
                  line first",
@@ -16595,8 +16588,7 @@ fn render_sstv_panel(
         // matching QSSTV) and config::sstv_image_path for the save
         // location.
         let mut auto_save = sstv.rx_auto_save();
-        if ui
-            .checkbox(&mut auto_save, "Auto-save")
+        if std_checkbox(ui, &mut auto_save, "Auto-save")
             .on_hover_text(format!(
                 "Save every completed picture as a PNG, like QSSTV does -- {}",
                 config::sstv_image_dir().map(|p| p.display().to_string()).unwrap_or_default()
@@ -16663,8 +16655,7 @@ fn render_sstv_panel(
         ($ui:ident) => {{
             let ui = &mut *$ui;
             let mut fsk_id = sstv.tx_fsk_id_enabled();
-            if ui
-                .checkbox(&mut fsk_id, "FSK ID")
+            if std_checkbox(ui, &mut fsk_id, "FSK ID")
                 .on_hover_text(
                     "Send \"My Call\" in tones after each picture -- the identification \
                      SSTV repeaters and other programs read. Adds ~2.5 seconds, and \
@@ -16832,7 +16823,7 @@ fn render_sstv_panel(
                     }
                 });
             let banner_changed =
-                ui.checkbox(tx_banner, "Callsign banner").on_hover_text(
+                std_checkbox(ui, tx_banner, "Callsign banner").on_hover_text(
                     "Burns \"My Call\" into the top-left corner of the picture before sending"
                 ).changed();
             if (mode_changed || banner_changed) && tx_source.is_some() {
@@ -17248,8 +17239,7 @@ fn render_rade_panel(
         ui.horizontal(|ui| {
             ui.label("Mic conditioning:");
             let mut denoise = tx.rade_denoiser_enabled();
-            if ui
-                .checkbox(&mut denoise, "Noise Reduction")
+            if std_checkbox(ui, &mut denoise, "Noise Reduction")
                 .on_hover_text(
                     "RNNoise -- the same neural denoiser FreeDV's own mic pipeline uses, \
                      applied before the Leveler/Compressor",
@@ -17259,8 +17249,7 @@ fn render_rade_panel(
                 tx.set_rade_denoiser_enabled(denoise);
             }
             let mut lev = tx.rade_leveler_enabled();
-            if ui
-                .checkbox(&mut lev, "Leveler")
+            if std_checkbox(ui, &mut lev, "Leveler")
                 .on_hover_text(
                     "Rides the mic gain toward a consistent level before the vocoder -- \
                      FreeDV's own AgcStep, ported here",
@@ -17270,8 +17259,7 @@ fn render_rade_panel(
                 tx.set_rade_leveler_enabled(lev);
             }
             let mut comp = tx.rade_compressor_enabled();
-            if ui
-                .checkbox(&mut comp, "Compressor")
+            if std_checkbox(ui, &mut comp, "Compressor")
                 .on_hover_text(
                     "Soft-knee compressor/limiter on the mic, same idea as FreeDV GUI's own",
                 )
@@ -17280,8 +17268,7 @@ fn render_rade_panel(
                 tx.set_rade_compressor_enabled(comp);
             }
             let mut eq_on = tx.rade_eq_enabled();
-            if ui
-                .checkbox(&mut eq_on, "Equalizer")
+            if std_checkbox(ui, &mut eq_on, "Equalizer")
                 .on_hover_text(
                     "Bass/Mid/Treble/Vol EQ, same shapes and defaults as FreeDV GUI's own \
                      Mic In Equaliser, applied last before the modem",
@@ -17291,8 +17278,7 @@ fn render_rade_panel(
                 tx.set_rade_eq_enabled(eq_on);
             }
             let mut monitor_eq = monitoring_eq;
-            if ui
-                .checkbox(&mut monitor_eq, "Monitor EQ")
+            if std_checkbox(ui, &mut monitor_eq, "Monitor EQ")
                 .on_hover_text(
                     "Plays your mic audio back through the local speaker/headphones right after \
                      Denoise/Leveler/Compressor/Equalizer, before RADE's own codec -- so you can \
@@ -17410,8 +17396,7 @@ fn render_rade_panel(
         }
         ui.add_space(8.0);
         let mut muted = rade.mute_analog();
-        if ui
-            .checkbox(&mut muted, "Mute Analog")
+        if std_checkbox(ui, &mut muted, "Mute Analog")
             .on_hover_text(
                 "Mute the demodulated audio so only decoded speech is heard. Otherwise \
                  the raw signal passes through while not yet synced -- that hiss is how \
@@ -17444,8 +17429,7 @@ fn render_rade_panel(
             for entry in &log {
                 ui.label(format!("{}  (SNR {:.0} dB)", entry.call, entry.snr_db));
         let mut mute_edges = rade.mute_edges();
-        if ui
-            .checkbox(&mut mute_edges, "Mute start/end")
+        if std_checkbox(ui, &mut mute_edges, "Mute start/end")
             .on_hover_text(
                 "Silence the decoded speech while RADE is still settling after it locks on \
                  (about half a second) and from the moment the over ends or the signal \
@@ -19505,7 +19489,7 @@ fn render_equalizer_panel(ui: &mut egui::Ui, scroll_accum: &mut f32, side_label:
         eq.band_count = spectrum::EqBandCount::Twelve;
         changed = true;
     }
-    if ui.checkbox(&mut eq.enabled, format!("Enable {side_label} Equalizer")).changed() {
+    if std_checkbox(ui, &mut eq.enabled, format!("Enable {side_label} Equalizer")).changed() {
         changed = true;
     }
     ui.horizontal(|ui| {
@@ -21601,8 +21585,7 @@ fn render_extra_receiver_settings(ui: &mut egui::Ui, rx: &Arc<Mutex<ExtraReceive
             });
 
             ui.separator();
-            if ui
-                .checkbox(&mut rx.waterfall_enabled, "Enable Waterfall")
+            if std_checkbox(ui, &mut rx.waterfall_enabled, "Enable Waterfall")
                 .on_hover_text(
                     "When off, the spectrum trace uses the full \
                      spectrum+waterfall height instead of sharing it.",

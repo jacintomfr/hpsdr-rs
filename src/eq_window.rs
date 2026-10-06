@@ -8,7 +8,10 @@
 use crate::eq_curve as ec;
 use crate::eq_profiles as ep;
 use crate::spectrum::EqualizerParams;
-use crate::{chip_button, spin_buttons_full, toggle_chip, ConnectedState};
+use crate::{chip_button, spin_buttons_full, ConnectedState};
+
+/// Width kept free at the right of the first two rows for the CLOSE button (button 96 + right gap 24 + a small gap 20).
+const CLOSE_RESERVE: f32 = 140.0;
 
 /// DSP sample rate of the EQ channels (RX and TX run at 48 kHz in this program).
 const DSP_RATE_HZ: f64 = 48000.0;
@@ -132,14 +135,24 @@ pub fn eq_window(ui: &mut egui::Ui, connected: &mut ConnectedState) -> (bool, bo
                     ui.painter().text(tr.center(), egui::Align2::CENTER_CENTER, &title, egui::FontId::proportional(16.0), egui::Color32::from_gray(225));
 
                     // Row 1: Close, the RX/TX radios, the mic profiles.
-                    ui.horizontal(|ui| {
-                        ui.set_height(36.0);
+                    {
+                        let (row, _) = ui.allocate_exact_size(egui::vec2(avail_w, 46.0), egui::Sense::hover());
+                        let mut left = ui.new_child(egui::UiBuilder::new().max_rect(row).layout(egui::Layout::left_to_right(egui::Align::Center)));
+                        left.add_space(14.0);
                         for (s, label) in &side_list {
-                            ui.radio_value(&mut side, *s, label);
-                            ui.add_space(24.0);
+                            let mut on = side == *s;
+                            if crate::touch_checkbox_sized(&mut left, &mut on, label, 30.0).changed() && on {
+                                side = *s;
+                            }
+                            left.add_space(20.0);
                         }
                         if connected.tx_handle.is_some() {
-                            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            // The mic profile group ends just before the CLOSE button (a small gap), right-aligned.
+                            let mut cluster = row;
+                            cluster.max.x -= CLOSE_RESERVE;
+                            let mut right = ui.new_child(egui::UiBuilder::new().max_rect(cluster).layout(egui::Layout::right_to_left(egui::Align::Center)));
+                            {
+                                let ui = &mut right;
                                 if let Some(n) = connected.mic_profile_nr {
                                     let mut desc: String = ui.ctx().data(|d| d.get_temp(desc_id)).unwrap_or_else(|| {
                                         ep::load_slot(n).map(|p| p.desc).unwrap_or_default()
@@ -156,7 +169,15 @@ pub fn eq_window(ui: &mut egui::Ui, connected: &mut ConnectedState) -> (bool, bo
                                 }
                                 for n in (1..=3usize).rev() {
                                     let active = connected.mic_profile_nr == Some(n);
-                                    if toggle_chip(ui, &n.to_string(), active, 30.0, &format!("Load mic profile {n}: {}", profile_names[n - 1])).clicked() {
+                                    // Same look as the IARU region buttons: the selected slot is orange.
+                                    let resp = ui
+                                        .add(egui::Button::selectable(active, n.to_string()).min_size(egui::vec2(46.0, 36.0)))
+                                        .on_hover_text(format!("Mic profile {n}: {}", profile_names[n - 1]));
+                                    if resp.clicked() {
+                                        // The slot becomes the active one even when it is still empty (then Save fills it);
+                                        // an existing profile is loaded.
+                                        connected.mic_profile_nr = Some(n);
+                                        ui.ctx().data_mut(|d| d.remove::<String>(desc_id));
                                         if let (Some(p), Some(tx)) = (ep::load_slot(n), connected.tx_handle.as_ref()) {
                                             let rx = p.apply(tx);
                                             let tx_eq = tx.eq();
@@ -164,16 +185,15 @@ pub fn eq_window(ui: &mut egui::Ui, connected: &mut ConnectedState) -> (bool, bo
                                             let group = ep::eq_mode_group(connected.spectrum.mode()).to_string();
                                             connected.rx_eq_by_mode.insert(group.clone(), rx);
                                             connected.tx_eq_by_mode.insert(group, tx_eq);
-                                            connected.mic_profile_nr = Some(n);
                                             ui.ctx().data_mut(|d| d.insert_temp(desc_id, p.desc.clone()));
-                                            changed = true;
                                         }
+                                        changed = true;
                                     }
                                 }
                                 ui.label("Mic profile:");
-                            });
+                            }
                         }
-                    });
+                    }
                     let Some(mut eq) = get_eq(connected, side) else {
                         return;
                     };
@@ -181,26 +201,31 @@ pub fn eq_window(ui: &mut egui::Ui, connected: &mut ConnectedState) -> (bool, bo
                     let mut dirty = false;
 
                     // Row 2: Enable ... "Added Frequency-Independent Gain:" [spin].
-                    ui.horizontal(|ui| {
-                        ui.set_height(36.0);
-                        if ui.checkbox(&mut eq.enabled, "Enable").changed() {
+                    {
+                        let (row, _) = ui.allocate_exact_size(egui::vec2(avail_w, 36.0), egui::Sense::hover());
+                        let mut left = ui.new_child(egui::UiBuilder::new().max_rect(row).layout(egui::Layout::left_to_right(egui::Align::Center)));
+                        left.add_space(14.0);
+                        if crate::touch_checkbox_sized(&mut left, &mut eq.enabled, "Enable", 30.0).changed() {
                             dirty = true;
                         }
-                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                            let mut v = eq.preamp12_db as f64;
-                            // The spin keeps its own left-to-right order (-, +) inside this right-to-left row.
-                            ui.allocate_ui_with_layout(egui::vec2(262.0, 34.0), egui::Layout::left_to_right(egui::Align::Center), |ui| {
-                                if spin_buttons_full(ui, "eqw_preamp", &mut v, -20.0, 20.0, 1.0, 0, None, 160.0).changed() {
-                                    eq.preamp12_db = v.round() as i32;
-                                    dirty = true;
-                                }
-                            });
-                            ui.label("Added Frequency-Independent Gain:");
+                        // The gain group is right-aligned to the same edge as the mic profile buttons (so "+" sits under "3").
+                        let mut cluster = row;
+                        cluster.max.x -= CLOSE_RESERVE;
+                        let mut right = ui.new_child(egui::UiBuilder::new().max_rect(cluster).layout(egui::Layout::right_to_left(egui::Align::Center)));
+                        let mut v = eq.preamp12_db as f64;
+                        // The spin keeps its own left-to-right order (-, +) inside this right-to-left row.
+                        right.allocate_ui_with_layout(egui::vec2(212.0, 34.0), egui::Layout::left_to_right(egui::Align::Center), |ui| {
+                            if spin_buttons_full(ui, "eqw_preamp", &mut v, -20.0, 20.0, 1.0, 0, None, 120.0).changed() {
+                                eq.preamp12_db = v.round() as i32;
+                                dirty = true;
+                            }
                         });
-                    });
+                        right.label("Added Frequency-Independent Gain:");
+                    }
 
+                    ui.add_space(8.0);
                     // The framed plot with the curve row under it; its height takes what the table leaves.
-                    let plot_h = (screen.height() - 470.0).max(100.0);
+                    let plot_h = (screen.height() - 440.0).max(100.0);
                     egui::Frame::NONE
                         .stroke(egui::Stroke::new(1.0, egui::Color32::from_gray(150)))
                         .inner_margin(3.0)
@@ -308,9 +333,14 @@ pub fn eq_window(ui: &mut egui::Ui, connected: &mut ConnectedState) -> (bool, bo
 
                     // ---- curve type
                     ui.horizontal(|ui| {
+                        ui.set_height(40.0);
+                        ui.spacing_mut().interact_size.y = 36.0;
+                        ui.spacing_mut().button_padding = egui::vec2(10.0, 7.0);
+                        ui.add_space(8.0);
                         ui.label("Curve:");
                         let cur = ec::index_for_curve_degree(eq.curve_deg);
                         egui::ComboBox::from_id_salt("eqw_curve")
+                            .width(150.0)
                             .selected_text(ec::CURVE_LABELS[cur])
                             .show_ui(ui, |ui| {
                                 for (i, l) in ec::CURVE_LABELS.iter().enumerate() {
@@ -320,10 +350,11 @@ pub fn eq_window(ui: &mut egui::Ui, connected: &mut ConnectedState) -> (bool, bo
                                     }
                                 }
                             });
-                        if ui.checkbox(&mut eq.nurbs_r, "NURBS weights").changed() {
+                        ui.add_space(10.0);
+                        if crate::touch_checkbox_sized(ui, &mut eq.nurbs_r, "NURBS weights", 30.0).changed() {
                             dirty = true;
                         }
-                        ui.weak("Drag points; DSP updates on release. Curve excludes the frequency-independent gain.");
+                        ui.weak(egui::RichText::new("Drag points; DSP updates on release. Curve excludes the frequency-independent gain.").small());
                     });
                         });
 
@@ -367,7 +398,7 @@ pub fn eq_window(ui: &mut egui::Ui, connected: &mut ConnectedState) -> (bool, bo
 
                     egui::Area::new(egui::Id::new("eq_window_close"))
                         .order(egui::Order::Foreground)
-                        .anchor(egui::Align2::RIGHT_BOTTOM, egui::vec2(-24.0, -26.0))
+                        .anchor(egui::Align2::RIGHT_TOP, egui::vec2(-24.0, 30.0))
                         .show(ui.ctx(), |ui| {
                             if crate::kiosk_accent_button(ui, "CLOSE").clicked() {
                                 close_now = true;
