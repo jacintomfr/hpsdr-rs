@@ -113,6 +113,8 @@ pub struct Config {
     pub agc_attack_ms: Option<i32>,
     pub agc_decay_ms: Option<i32>,
     pub agc_hang_ms: Option<i32>,
+    #[serde(default)]
+    pub agc_hang_threshold: Option<i32>,
     pub agc_top_db: Option<f64>,
     pub agc_slope_db: Option<i32>,
     /// See spectrum::DemodParams::meter_calibration_db's own doc
@@ -250,14 +252,32 @@ pub struct Config {
     /// TX graphic EQ -- see spectrum::EqualizerParams's doc comment.
     pub tx_eq: Option<EqualizerParams>,
     /// Per-mode-group RX EQ (key = eq_profiles::eq_mode_group); `rx_eq` stays the live copy.
+    /// Settings -> Noise (deskHPSDR noise menu): NR2/NB/NR4/notch parameters.
+    #[serde(default)]
+    pub noise_extra: Option<crate::spectrum::NoiseExtra>,
     #[serde(default)]
     pub rx_eq_by_mode: std::collections::HashMap<String, EqualizerParams>,
     /// Per-mode-group TX EQ (key = eq_profiles::eq_mode_group); `tx_eq` stays the live copy.
     #[serde(default)]
     pub tx_eq_by_mode: std::collections::HashMap<String, EqualizerParams>,
-    /// Active mic-profile slot (1..=3, see eq_profiles::MicProfile), if one was loaded/saved.
+    /// Active mic-profile slot, 0..=2 (deskHPSDR `mic_prof.nr`; file `audio_profile_<n>.prop`, see
+    /// eq_profiles). Values > 2 (old 1..=3 numbering is NOT converted) are ignored, see `active_mic_profile()`.
     #[serde(default)]
     pub mic_profile_nr: Option<usize>,
+    /// Descriptions of the 3 mic-profile slots (deskHPSDR: the mic input device description at Save time).
+    #[serde(default)]
+    pub mic_profile_descs: Vec<String>,
+    /// UI-only / persisted-live TX options of the Settings -> TX window.
+    #[serde(default)]
+    pub tx_ui: TxUiExtra,
+    /// Filter menu: edited Var1/Var2 edges ([low1, high1, low2, high2]) and the chosen filter (0..14 fixed, 15 Var1, 16 Var2) per mode.
+    #[serde(default)]
+    pub filter_vars: std::collections::HashMap<String, [i32; 4]>,
+    #[serde(default)]
+    pub filter_sel: std::collections::HashMap<String, usize>,
+    /// Settings -> RX Menu options (see RxUiExtra).
+    #[serde(default)]
+    pub rx_ui: RxUiExtra,
     /// WDSP Leveler/Compressor ("PROC") on-off and gain -- see
     /// tx::TxParams::leveler_enabled/compressor_enabled's doc comments.
     #[serde(default)]
@@ -1081,6 +1101,103 @@ struct SharedControls {
     toolbar_layers: Option<Vec<Vec<String>>>,
     #[serde(default)]
     toolbar_layer: Option<usize>,
+}
+
+/// UI-only (non-DSP) TX options of deskHPSDR's TX menu, plus the persisted live DSP options (`tx_extra`).
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct TxUiExtra {
+    pub tune_use_drive: bool,
+    pub drive_per_band: bool,
+    /// Tune drive step in %: 1, 5, 10, 20 or 25.
+    pub tune_drive_step: u8,
+    pub swr_protection: bool,
+    pub swr_alarm: f64,
+    pub max_digi_drive: i32,
+    pub tx_display_filled: bool,
+    pub peaks_on: bool,
+    pub peaks_in_passband: bool,
+    pub peaks_hide_noise: bool,
+    pub peaks_num: i32,
+    pub peaks_ignore_divider: i32,
+    pub peaks_noise_percentile: i32,
+    pub tx_extra: Option<crate::tx::TxExtra>,
+}
+
+impl Default for TxUiExtra {
+    fn default() -> Self {
+        Self {
+            tune_use_drive: false,
+            drive_per_band: true,
+            tune_drive_step: 1,
+            swr_protection: false,
+            swr_alarm: 3.0,
+            max_digi_drive: 100,
+            tx_display_filled: false,
+            peaks_on: false,
+            peaks_in_passband: false,
+            peaks_hide_noise: true,
+            peaks_num: 4,
+            peaks_ignore_divider: 24,
+            peaks_noise_percentile: 50,
+            tx_extra: None,
+        }
+    }
+}
+
+/// Settings -> RX Menu (deskHPSDR rx_menu.c): the options that live in the radio / audio layers, plus the persisted
+/// live DSP options (`rx_extra`).
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct RxUiExtra {
+    pub adc_dither: bool,
+    pub adc_random: bool,
+    pub adc0_filter_bypass: bool,
+    pub adc1_filter_bypass: bool,
+    pub rx_reserve_enabled: bool,
+    pub rx_reserve_ms: i32,
+    pub p2_jitter_enabled: bool,
+    pub p2_jitter_depth_ms: i32,
+    pub latency_correction: bool,
+    pub rx_extra: Option<crate::spectrum::RxExtra>,
+}
+
+impl Default for RxUiExtra {
+    fn default() -> Self {
+        Self {
+            adc_dither: false,
+            adc_random: false,
+            adc0_filter_bypass: false,
+            adc1_filter_bypass: false,
+            rx_reserve_enabled: false,
+            rx_reserve_ms: 100,
+            p2_jitter_enabled: false,
+            p2_jitter_depth_ms: 20,
+            latency_correction: true,
+            rx_extra: None,
+        }
+    }
+}
+
+/// Number of mic-profile slots (deskHPSDR `audio_profile_0..2.prop`).
+pub const MIC_PROFILE_SLOTS: usize = 3;
+
+impl Config {
+    /// Active mic-profile slot, ignoring out-of-range values (0..=2 only).
+    pub fn active_mic_profile(&self) -> Option<usize> {
+        self.mic_profile_nr.filter(|&n| n < MIC_PROFILE_SLOTS)
+    }
+
+    /// The 3 slot descriptions, missing entries default to "NOMIC".
+    pub fn mic_profile_descriptions(&self) -> [String; MIC_PROFILE_SLOTS] {
+        std::array::from_fn(|i| {
+            self.mic_profile_descs
+                .get(i)
+                .filter(|s| !s.trim().is_empty())
+                .cloned()
+                .unwrap_or_else(|| "NOMIC".to_string())
+        })
+    }
 }
 
 fn shared_controls_path() -> Option<PathBuf> {

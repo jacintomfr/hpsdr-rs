@@ -22,6 +22,13 @@ mod discovery;
 mod discovery_ui;
 mod eq_curve;
 mod eq_window;
+mod noise_window;
+mod peaks;
+mod agc_window;
+mod filter_window;
+mod filters;
+mod rx_window;
+mod tx_window;
 mod eq_profiles;
 mod hpsdrsim;
 mod midi;
@@ -1152,18 +1159,21 @@ fn dispatch_midi_binding(
         }
         // One menu at a time, like deskHPSDR (opening one closes the other two).
         MidiAction::BandMenu => {
+            connected.agc_window_open = false;
             let open = !connected.band_window_open;
             connected.mode_window_open = false;
             connected.filter_window_open = false;
             connected.band_window_open = open;
         }
         MidiAction::ModeMenu => {
+            connected.agc_window_open = false;
             let open = !connected.mode_window_open;
             connected.band_window_open = false;
             connected.filter_window_open = false;
             connected.mode_window_open = open;
         }
         MidiAction::FilterMenu => {
+            connected.agc_window_open = false;
             let open = !connected.filter_window_open;
             connected.band_window_open = false;
             connected.mode_window_open = false;
@@ -1423,6 +1433,21 @@ fn dispatch_midi_binding(
         }
         MidiAction::VoxMenu => connected.vox_window_open = !connected.vox_window_open,
         MidiAction::EqMenu => connected.eq_window_open = !connected.eq_window_open,
+        MidiAction::AgcMenu => {
+            let open = !connected.agc_window_open;
+            connected.band_window_open = false;
+            connected.mode_window_open = false;
+            connected.filter_window_open = false;
+            connected.agc_window_open = open;
+        }
+        MidiAction::NoiseMenu => connected.noise_window_open = !connected.noise_window_open,
+        MidiAction::TxMenu => {
+            if connected.tx_handle.is_some() {
+                connected.tx_window_open = !connected.tx_window_open;
+            }
+        }
+        MidiAction::RxMenu => connected.rx_window_open = !connected.rx_window_open,
+        MidiAction::SdrMenu => connected.sdr_window_open = !connected.sdr_window_open,
         // deskHPSDR: KnobOrWheel(vox_threshold, 0.0, 1.0, 0.01).
         MidiAction::VoxLevel => {
             connected.vox_threshold = if binding.kind == MidiBindingKind::Wheel {
@@ -1682,6 +1707,9 @@ fn dispatch_midi_binding(
 #[derive(Copy, Clone, PartialEq, Eq)]
 enum SettingsTab {
     SdrDevice,
+    Noise,
+    TxMenu,
+    RxMenu,
     Network,
     Audio,
     Cw,
@@ -2373,6 +2401,15 @@ struct ConnectedState {
     /// Top (y) of the spectrum in the last frame: the band / mode / filter menus open right below it.
     last_spectrum_top: f32,
     filter_window_open: bool,
+    /// The AGC menu (agc_window.rs).
+    agc_window_open: bool,
+    /// Filter menu state (filter_window.rs): edited Var1/Var2 edges per mode, chosen filter per mode, whether the menu's
+    /// passband is the active one and the width it left on the width slider.
+    filter_vars: std::collections::HashMap<String, [i32; 4]>,
+    filter_sel: std::collections::HashMap<String, usize>,
+    filter_menu_applied: bool,
+    filter_last_width: f64,
+    filter_last_mode: Option<spectrum::Mode>,
     wav_visible: bool,
     wav_hide_at: Option<Instant>,
     width_memory: std::collections::HashMap<String, f64>,
@@ -2423,6 +2460,15 @@ struct ConnectedState {
     vox_window_open: bool,
     /// The deskHPSDR-style WDSP EQ window (eq_window.rs), its per-mode EQ maps (config) and the active mic-profile slot.
     eq_window_open: bool,
+    /// The Noise window (noise_window.rs).
+    noise_window_open: bool,
+    /// The TX Menu window (tx_window.rs), the UI-only TX options and the mic profile slot names.
+    tx_window_open: bool,
+    /// The RX Menu window (rx_window.rs) and its radio/audio-layer options.
+    rx_window_open: bool,
+    rx_ui: config::RxUiExtra,
+    tx_ui: config::TxUiExtra,
+    mic_profile_descs: Vec<String>,
     /// Kiosk: the SDR Device page as a full-screen window (sdr_device_window).
     sdr_window_open: bool,
     /// Edge detection of the external AutoTune input and whether it started the running TUNE (see radio_inputs_tick).
@@ -3360,6 +3406,10 @@ fn connect_to_device(device: Device, cfg: &Config) -> Result<ConnectedState, Str
             session.auto_tune_enabled.store(cfg.auto_tune_enabled.unwrap_or(false), Ordering::Relaxed);
             session.hl2_cl1_input.store(cfg.hl2_cl1_input.unwrap_or(false), Ordering::Relaxed);
             session.hl2_atu_gateware.store(cfg.hl2_atu_gateware.unwrap_or(false), Ordering::Relaxed);
+            session.adc_dither.store(cfg.rx_ui.adc_dither, Ordering::Relaxed);
+            session.adc_random.store(cfg.rx_ui.adc_random, Ordering::Relaxed);
+            session.adc0_filter_bypass.store(cfg.rx_ui.adc0_filter_bypass, Ordering::Relaxed);
+            session.adc1_filter_bypass.store(cfg.rx_ui.adc1_filter_bypass, Ordering::Relaxed);
             report_recorder::set_max_seconds(cfg.report_capture_secs.unwrap_or(60));
             set_iaru_region(cfg.iaru_region.unwrap_or(2));
             session
@@ -3573,6 +3623,9 @@ fn connect_to_device(device: Device, cfg: &Config) -> Result<ConnectedState, Str
             if let Some(v) = cfg.agc_decay_ms {
                 spectrum.set_agc_decay_ms(v);
             }
+            if let Some(v) = cfg.agc_hang_threshold {
+                spectrum.set_agc_hang_threshold(v);
+            }
             if let Some(v) = cfg.agc_hang_ms {
                 spectrum.set_agc_hang_ms(v);
             }
@@ -3609,6 +3662,14 @@ fn connect_to_device(device: Device, cfg: &Config) -> Result<ConnectedState, Str
             if let Some(v) = cfg.binaural {
                 spectrum.set_binaural(v);
             }
+            if let Some(v) = cfg.noise_extra {
+                spectrum.set_noise_extra(v);
+            }
+            if let Some(v) = cfg.rx_ui.rx_extra {
+                spectrum.set_rx_extra(v);
+            }
+            audio::set_rx_reserve(cfg.rx_ui.rx_reserve_enabled, cfg.rx_ui.rx_reserve_ms.clamp(5, 500) as u32);
+            audio::set_latency_correction(cfg.rx_ui.latency_correction);
             if let Some(v) = cfg.rx_eq {
                 spectrum.set_eq(v);
             }
@@ -3748,6 +3809,9 @@ fn connect_to_device(device: Device, cfg: &Config) -> Result<ConnectedState, Str
                     tx_handle.set_ps_tx_delay_ns(ps_tx_delay_ns);
                     if let Some(v) = cfg.tx_eq {
                         tx_handle.set_eq(v);
+                    }
+                    if let Some(v) = cfg.tx_ui.tx_extra {
+                        tx_handle.set_tx_extra(v);
                     }
                     if let Some(v) = cfg.tx_leveler_enabled {
                         tx_handle.set_leveler_enabled(v);
@@ -3998,6 +4062,12 @@ fn connect_to_device(device: Device, cfg: &Config) -> Result<ConnectedState, Str
                 mode_window_open: false,
                 last_spectrum_top: 240.0,
                 filter_window_open: false,
+                agc_window_open: false,
+                filter_vars: cfg.filter_vars.clone(),
+                filter_sel: cfg.filter_sel.clone(),
+                filter_menu_applied: !cfg.filter_sel.is_empty(),
+                filter_last_width: 0.0,
+                filter_last_mode: None,
                 wav_visible: false,
                 wav_hide_at: None,
                 ctun,
@@ -4019,13 +4089,26 @@ fn connect_to_device(device: Device, cfg: &Config) -> Result<ConnectedState, Str
                 vox_filter_high_hz: cfg.vox_filter_high_hz.unwrap_or(2000.0).clamp(0.0, 4000.0),
                 vox_window_open: false,
                 eq_window_open: false,
+                noise_window_open: false,
+                tx_window_open: false,
+                rx_window_open: false,
+                rx_ui: cfg.rx_ui,
+                tx_ui: {
+                    // First run with the new TX menu: keep the SWR protection that was always on before.
+                    let mut u = cfg.tx_ui;
+                    if u == config::TxUiExtra::default() {
+                        u.swr_protection = true;
+                    }
+                    u
+                },
+                mic_profile_descs: cfg.mic_profile_descriptions().to_vec(),
                 sdr_window_open: false,
                 auto_tune_prev: false,
                 auto_tune_started: false,
                 rx_eq_by_mode: cfg.rx_eq_by_mode.clone(),
                 tx_eq_by_mode: cfg.tx_eq_by_mode.clone(),
                 eq_mode_group_seen: String::new(),
-                mic_profile_nr: cfg.mic_profile_nr,
+                mic_profile_nr: cfg.active_mic_profile(),
                 vox_level_shown: 0.0,
                 step_memory: cfg.step_memory.clone(),
                 step_last_mode: None,
@@ -4922,6 +5005,7 @@ impl eframe::App for HpsdrApp {
                 vox_tick(ui.ctx(), connected);
                 eq_window::mode_tick(connected);
                 radio_inputs_tick(connected);
+                filter_window::tick(connected);
                 spectrum::set_smeter_peak(connected.smeter_mode == SMeterMode::Peak);
                 tx::set_alc_mode(match connected.alc_mode {
                     AlcMode::Peak => 0,
@@ -6426,22 +6510,20 @@ impl eframe::App for HpsdrApp {
                             connected.mode_window_open = false;
                         }
                     }
-                    // Set RX Filter (deskHPSDR filter_menu.c): the fixed filter presets of the current mode.
+                    // AGC menu (deskHPSDR agc_menu.c), see agc_window.rs.
+                    if connected.agc_window_open {
+                        let (close_now, changed) = agc_window::agc_window(ui, connected);
+                        if changed {
+                            settings_changed = true;
+                        }
+                        if close_now {
+                            connected.agc_window_open = false;
+                        }
+                    }
+                    // Set RX Filter (deskHPSDR filter_menu.c), see filter_window.rs.
                     if connected.filter_window_open {
-                        let mode = connected.spectrum.mode();
-                        let width = connected.spectrum.width_hz();
-                        let presets = rx_filter_presets(mode);
-                        let items: Vec<(String, bool)> =
-                            presets.iter().map(|(name, w)| (name.to_string(), (width - *w).abs() < 1.0)).collect();
-                        let heading = format!("Set RX Filter {}", mode.label());
-                        let (close_now, picked) = choice_window(ui, "filter_menu_window", &heading, &items, connected.last_spectrum_top);
-                        if let Some(i) = picked {
-                            let w = presets[i].1;
-                            connected.spectrum.set_width_hz(w);
-                            if let Some(tx) = &connected.tx_handle {
-                                tx.set_width_hz(w);
-                            }
-                            connected.width_memory.insert(mode.label().to_string(), w);
+                        let (close_now, changed) = filter_window::filter_window(ui, connected);
+                        if changed {
                             settings_changed = true;
                         }
                         if close_now {
@@ -6592,6 +6674,39 @@ impl eframe::App for HpsdrApp {
                         }
                         if close_now {
                             connected.vox_window_open = false;
+                        }
+                    }
+
+                    // RX Menu window (deskHPSDR rx_menu.c), see rx_window.rs.
+                    if connected.rx_window_open {
+                        let (close_now, changed) = rx_window::rx_window(ui, connected);
+                        if changed {
+                            settings_changed = true;
+                        }
+                        if close_now {
+                            connected.rx_window_open = false;
+                        }
+                    }
+
+                    // TX Menu window (deskHPSDR tx_menu.c), see tx_window.rs.
+                    if connected.tx_window_open {
+                        let (close_now, changed) = tx_window::tx_window(ui, connected);
+                        if changed {
+                            settings_changed = true;
+                        }
+                        if close_now {
+                            connected.tx_window_open = false;
+                        }
+                    }
+
+                    // Noise window (deskHPSDR noise_menu.c), see noise_window.rs.
+                    if connected.noise_window_open {
+                        let (close_now, changed) = noise_window::noise_window(ui, connected);
+                        if changed {
+                            settings_changed = true;
+                        }
+                        if close_now {
+                            connected.noise_window_open = false;
                         }
                     }
 
@@ -7588,13 +7703,19 @@ impl eframe::App for HpsdrApp {
                             }
                             // AGC mode sits right after the AGC Gain value box (kiosk).
                             let agc_w = chip_width(ui, &["AGC Medium"]);
-                            if ui
+                            let agc_resp = ui
                                 .add(chip_button(current_agc.label(), current_agc != spectrum::Agc::Off).min_size(egui::vec2(agc_w, 0.0)))
-                                .on_hover_text("Click to cycle: Off -> Long -> Slow -> Medium -> Fast -> Off")
-                                .clicked()
-                            {
+                                .on_hover_text("Click to cycle: Off -> Long -> Slow -> Medium -> Fast -> Off; long press opens the AGC menu");
+                            if agc_resp.clicked() {
                                 connected.spectrum.set_agc(current_agc.next());
                                 settings_changed = true;
+                            }
+                            // Like deskHPSDR: a long press (right click) on the AGC button opens the AGC menu.
+                            if agc_resp.secondary_clicked() {
+                                connected.band_window_open = false;
+                                connected.mode_window_open = false;
+                                connected.filter_window_open = false;
+                                connected.agc_window_open = true;
                             }
                         } else {
                         framed_label(ui, "Filter width:", col6_w);
@@ -10222,7 +10343,7 @@ Waterfall rebuilds: {prof_wf_n:.0}/s, {prof_wf_ms:.1} ms each."
                             // two, so the condition clears itself --
                             // and re-trips immediately if the operator
                             // raises power back up while still mismatched.
-                            if swr >= connected.max_swr && watts > 35.0 {
+                            if connected.tx_ui.swr_protection && swr >= connected.max_swr && watts > 35.0 {
                                 connected.session.tx_power_watts.store(10, std::sync::atomic::Ordering::Relaxed);
                             }
                             match connected.meter_style {
@@ -10763,8 +10884,14 @@ Waterfall rebuilds: {prof_wf_n:.0}/s, {prof_wf_ms:.1} ms each."
                                         });
                                     });
                             }
+                            // Kiosk: keep a free strip at the bottom so the content never runs under the CLOSE button.
+                            let settings_frame = if lcd_kiosk_mode() {
+                                egui::Frame::central_panel(&light_style).inner_margin(egui::Margin { left: 8, right: 8, top: 8, bottom: 74 })
+                            } else {
+                                egui::Frame::central_panel(&light_style)
+                            };
                             egui::CentralPanel::default()
-                                .frame(egui::Frame::central_panel(&light_style))
+                                .frame(settings_frame)
                                 .show(ui, |ui| {
                             ui.visuals_mut().clone_from(&light_visuals);
                             // Wrapped (not a plain ui.horizontal) so a
@@ -10778,6 +10905,9 @@ Waterfall rebuilds: {prof_wf_n:.0}/s, {prof_wf_ms:.1} ms each."
                                 for (tab, label) in [
                                     (SettingsTab::About, "About"),
                                     (SettingsTab::SdrDevice, "SDR Device"),
+                                    (SettingsTab::Noise, "Noise"),
+                                    (SettingsTab::TxMenu, "TX Menu"),
+                                    (SettingsTab::RxMenu, "RX Menu"),
                                     (SettingsTab::Antenna, "Antenna"),
                                     (SettingsTab::Audio, "Audio"),
                                     (SettingsTab::Cw, "CW"),
@@ -12215,6 +12345,31 @@ Waterfall rebuilds: {prof_wf_n:.0}/s, {prof_wf_ms:.1} ms each."
                                     }
                                 }
 
+                                SettingsTab::RxMenu => {
+                                    // The RX Menu is a full-screen window (rx_window.rs), opened straight from the tab.
+                                    connected.rx_window_open = true;
+                                    connected.show_settings_window = false;
+                                    connected.settings_tab = SettingsTab::About;
+                                    ui.ctx().request_repaint_of(egui::ViewportId::ROOT);
+                                }
+                                SettingsTab::TxMenu => {
+                                    // The TX Menu is a full-screen window (tx_window.rs), opened straight from the tab.
+                                    if connected.tx_handle.is_some() {
+                                        connected.tx_window_open = true;
+                                        connected.show_settings_window = false;
+                                        connected.settings_tab = SettingsTab::About;
+                                        ui.ctx().request_repaint_of(egui::ViewportId::ROOT);
+                                    } else {
+                                        ui.label("TX is not available on this connection.");
+                                    }
+                                }
+                                SettingsTab::Noise => {
+                                    // The Noise page is a full-screen window (noise_window.rs), opened straight from the tab.
+                                    connected.noise_window_open = true;
+                                    connected.show_settings_window = false;
+                                    connected.settings_tab = SettingsTab::About;
+                                    ui.ctx().request_repaint_of(egui::ViewportId::ROOT);
+                                }
                                 SettingsTab::SdrDevice => {
                                     // Kiosk: the page is a full-screen window (see sdr_device_window), opened straight from the tab.
                                     if lcd_kiosk_mode() {
@@ -12228,8 +12383,8 @@ Waterfall rebuilds: {prof_wf_n:.0}/s, {prof_wf_ms:.1} ms each."
                                 }
                                 SettingsTab::Agc => {
                                     // The ADC of the main receiver (deskHPSDR keeps it in the RX menu: it is a receiver property); only
-                                    // shown when the board has more than one.
-                                    if connected.device.adcs > 1 {
+                                    // shown when the board has more than one. In the kiosk it is in the RX Menu window.
+                                    if connected.device.adcs > 1 && !lcd_kiosk_mode() {
                     let current_adc = connected.session.adc.load(Ordering::Relaxed);
                     ui.label("ADC:");
                     ui.horizontal_wrapped(|ui| {
@@ -12282,8 +12437,8 @@ Waterfall rebuilds: {prof_wf_n:.0}/s, {prof_wf_ms:.1} ms each."
                                     // RxPGA toggle for the main "HL2 ADC
                                     // Auto Gain RxPGA" switch and
                                     // step_autogain's doc comment for the
-                                    // algorithm this affects.
-                                    if connected.device.board == Boards::HermesLite2 {
+                                    // algorithm this affects. In the kiosk it is in the RX Menu window (Options).
+                                    if connected.device.board == Boards::HermesLite2 && !lcd_kiosk_mode() {
                                         ui.add_enabled_ui(connected.autogain_enabled, |ui| {
                                             if std_checkbox(ui, 
                                                     &mut connected.autogain_time_enabled,
@@ -12408,6 +12563,8 @@ Waterfall rebuilds: {prof_wf_n:.0}/s, {prof_wf_ms:.1} ms each."
                                         }
                                     });
 
+                                    // The NB threshold and the NNR settings live in the Noise window in the kiosk.
+                                    if !lcd_kiosk_mode() {
                                     ui.separator();
                                     ui.horizontal(|ui| {
                                         let mut nb_threshold = connected.spectrum.nb_threshold();
@@ -12460,6 +12617,7 @@ Waterfall rebuilds: {prof_wf_n:.0}/s, {prof_wf_ms:.1} ms each."
                                         "NNR (Neural NR) only -- lower Mask Floor removes more noise, \
                                          higher lets more genuine band noise through.",
                                     );
+                                    }
                                 }
 
                                 SettingsTab::Spectrum => {
@@ -12833,6 +12991,8 @@ Waterfall rebuilds: {prof_wf_n:.0}/s, {prof_wf_ms:.1} ms each."
                                             tx.set_tx_denoiser_enabled(denoise);
                                             settings_changed = true;
                                         }
+                                        // Leveler / Compressor / CFC live in the TX Menu window in the kiosk.
+                                        if !lcd_kiosk_mode() {
                                         let mut leveler = tx.leveler_enabled();
                                         if std_checkbox(ui, &mut leveler, "Leveler")
                                             .on_hover_text(
@@ -12926,6 +13086,7 @@ Waterfall rebuilds: {prof_wf_n:.0}/s, {prof_wf_ms:.1} ms each."
                                             tx.set_cfc_enabled(cfc);
                                             settings_changed = true;
                                         }
+                                        }
                                     }
                                     ui.add_space(8.0);
 
@@ -12952,6 +13113,8 @@ Waterfall rebuilds: {prof_wf_n:.0}/s, {prof_wf_ms:.1} ms each."
                                     });
                                     ui.add_space(8.0);
 
+                                    // Tune Power and Max SWR are in the TX Menu window in the kiosk.
+                                    if !lcd_kiosk_mode() {
                                     ui.horizontal(|ui| {
                                         ui.label("Tune Power:");
                                         let mut percent = connected.tune_power_percent as i32;
@@ -12987,6 +13150,7 @@ Waterfall rebuilds: {prof_wf_n:.0}/s, {prof_wf_ms:.1} ms each."
                                         ui.label(":1");
                                     });
                                     ui.add_space(8.0);
+                                    }
 
                                     // Real request: a safety default
                                     // against accidentally transmitting
@@ -14923,6 +15087,7 @@ Waterfall rebuilds: {prof_wf_n:.0}/s, {prof_wf_ms:.1} ms each."
                         agc_attack_ms: Some(agc_params_now.agc_attack_ms),
                         agc_decay_ms: Some(agc_params_now.agc_decay_ms),
                         agc_hang_ms: Some(agc_params_now.agc_hang_ms),
+                        agc_hang_threshold: Some(agc_params_now.agc_hang_threshold),
                         agc_top_db: Some(agc_params_now.agc_top_db),
                         agc_slope_db: Some(agc_params_now.agc_slope_db),
                         meter_calibration_db: Some(agc_params_now.meter_calibration_db),
@@ -14935,9 +15100,21 @@ Waterfall rebuilds: {prof_wf_n:.0}/s, {prof_wf_ms:.1} ms each."
                         anf: Some(agc_params_now.anf),
                         binaural: Some(agc_params_now.binaural),
                         rx_eq: Some(agc_params_now.eq),
+                        noise_extra: Some(agc_params_now.noise_extra),
                         rx_eq_by_mode: connected.rx_eq_by_mode.clone(),
                         tx_eq_by_mode: connected.tx_eq_by_mode.clone(),
                         mic_profile_nr: connected.mic_profile_nr,
+                        filter_vars: connected.filter_vars.clone(),
+                        filter_sel: connected.filter_sel.clone(),
+                        mic_profile_descs: connected.mic_profile_descs.clone(),
+                        rx_ui: config::RxUiExtra {
+                            rx_extra: Some(connected.spectrum.rx_extra()),
+                            ..connected.rx_ui
+                        },
+                        tx_ui: config::TxUiExtra {
+                            tx_extra: connected.tx_handle.as_ref().map(|t| t.tx_extra()),
+                            ..connected.tx_ui
+                        },
                         mic_gain: Some(connected.mic_gain),
                         tx_eq: connected.tx_handle.as_ref().map(|t| t.eq()),
                         tx_leveler_enabled: connected.tx_handle.as_ref().map(|t| t.leveler_enabled()),
@@ -17760,6 +17937,11 @@ fn toolbar_fn_active(connected: &ConnectedState, f: toolbar::ToolbarFn) -> bool 
         ToolbarFn::Midi(MidiAction::DigitalMenu) => connected.show_digital_window,
         ToolbarFn::Midi(MidiAction::VoxMenu) => connected.vox_window_open,
         ToolbarFn::Midi(MidiAction::EqMenu) => connected.eq_window_open,
+        ToolbarFn::Midi(MidiAction::AgcMenu) => connected.agc_window_open,
+        ToolbarFn::Midi(MidiAction::NoiseMenu) => connected.noise_window_open,
+        ToolbarFn::Midi(MidiAction::TxMenu) => connected.tx_window_open,
+        ToolbarFn::Midi(MidiAction::RxMenu) => connected.rx_window_open,
+        ToolbarFn::Midi(MidiAction::SdrMenu) => connected.sdr_window_open,
         ToolbarFn::Midi(MidiAction::RxEqToggle) => connected.spectrum.eq().enabled,
         _ => false,
     }
@@ -21352,6 +21534,9 @@ fn render_extra_receiver_settings(ui: &mut egui::Ui, rx: &Arc<Mutex<ExtraReceive
         // Network if any of these are ever somehow selected.
         SettingsTab::Tx => rx.settings_tab = SettingsTab::Agc,
         SettingsTab::SdrDevice => rx.settings_tab = SettingsTab::Agc,
+        SettingsTab::Noise => rx.settings_tab = SettingsTab::Agc,
+        SettingsTab::TxMenu => rx.settings_tab = SettingsTab::Agc,
+        SettingsTab::RxMenu => rx.settings_tab = SettingsTab::Agc,
         SettingsTab::PaCalibration => rx.settings_tab = SettingsTab::Agc,
         SettingsTab::PureSignal => rx.settings_tab = SettingsTab::Agc,
         SettingsTab::Diversity => rx.settings_tab = SettingsTab::Agc,
@@ -21932,38 +22117,7 @@ fn render_sdr_device(ui: &mut egui::Ui, connected: &mut ConnectedState, settings
                     }
                     ui.add_space(2.0);
 
-                    ui.horizontal(|ui| {
-                        ui.label("Sample Rate (kHz):");
-                        help_button(
-                            ui,
-                            "sdr_sample_rate",
-                            if connected.device.board == Boards::Rx888 {
-                                "Changing this stops streaming, reprograms the RX-888's own ADC clock and restarts it: a bigger interruption than a real P1/P2 radio's live rate change, but still brief."
-                            } else {
-                                "Changing this briefly interrupts audio and spectrum while the demodulator chain restarts."
-                            },
-                        );
-                    });
-                    let rates: &[u32] = if connected.device.board == Boards::Rx888 {
-                        &[96_000, 192_000, 384_000]
-                    } else if connected.device.protocol == 2 {
-                        &[48_000, 96_000, 192_000, 384_000, 768_000, 1_536_000]
-                    } else {
-                        &[48_000, 96_000, 192_000, 384_000]
-                    };
-                    ui.horizontal_wrapped(|ui| {
-                        for &rate in rates {
-                            let selected = rate == connected.sample_rate;
-                            if ui
-                                .add(egui::Button::selectable(selected, format!("{}", rate / 1000)).min_size(egui::vec2(64.0, btn_h)))
-                                .clicked()
-                                && !selected
-                            {
-                                change_sample_rate(connected, rate);
-                                *settings_changed = true;
-                            }
-                        }
-                    });
+                    // Sample Rate lives in the RX Menu window (like deskHPSDR).
                     ui.add_space(2.0);
                     ui.add_space(2.0);
                     ui.horizontal(|ui| {
@@ -22236,7 +22390,7 @@ fn sdr_device_window(ui: &mut egui::Ui, connected: &mut ConnectedState) -> (bool
     let screen = ui.ctx().content_rect();
     let mut close_now = false;
     let mut changed = false;
-    let frame = egui::Frame::window(ui.style()).inner_margin(4.0).corner_radius(0.0);
+    let frame = egui::Frame::window(ui.style()).inner_margin(egui::Margin::symmetric(24, 4)).corner_radius(0.0);
     egui::Window::new("SDR Device Settings")
         .id(egui::Id::new("sdr_device_window"))
         .title_bar(false)
@@ -22245,11 +22399,12 @@ fn sdr_device_window(ui: &mut egui::Ui, connected: &mut ConnectedState) -> (bool
         .frame(frame)
         .fixed_pos(screen.min)
         .constrain_to(screen)
-        .fixed_size(screen.size() - egui::vec2(10.0, 10.0))
+        .fixed_size(screen.size() - egui::vec2(58.0, 10.0))
         .show(ui.ctx(), |ui| {
             if ui.input(|i| i.key_pressed(egui::Key::Escape)) {
                 close_now = true;
             }
+            ui.set_width(screen.width() - 58.0);
             ui.set_min_height(screen.height() - 10.0);
             ui.spacing_mut().item_spacing = egui::vec2(6.0, 0.0);
             let title = format!("hpsdr-rs - SDR Device Settings [{}]", connected.device.board_label());
@@ -22307,6 +22462,13 @@ fn tune_set(connected: &mut ConnectedState, want: bool) {
 /// The external hardware inputs of the radio (deskHPSDR's TxInhibit / AutoTune): while the TxInhibit input is asserted any
 /// transmission (MOX or TUNE) is cut; the AutoTune input starts TUNE when it is asserted and stops it when released.
 fn radio_inputs_tick(connected: &mut ConnectedState) {
+    // TX menu "Max Digi Drv": in DIGL/DIGU the drive is limited to that percentage of the maximum TX power.
+    if matches!(connected.spectrum.mode(), spectrum::Mode::Digl | spectrum::Mode::Digu) && connected.tx_ui.max_digi_drive < 100 {
+        let limit = (connected.max_tx_power_watts as f32 * connected.tx_ui.max_digi_drive as f32 / 100.0).round() as u32;
+        if connected.session.tx_power_watts.load(Ordering::Relaxed) > limit.max(1) {
+            connected.session.tx_power_watts.store(limit.max(1), Ordering::Relaxed);
+        }
+    }
     if connected.session.hardware_tx_inhibit.load(Ordering::Relaxed) {
         if connected.tune_active {
             tune_set(connected, false);

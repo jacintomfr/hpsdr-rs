@@ -1,6 +1,6 @@
 //! Bottom toolbar of the 1024x600 kiosk panel: eight boxes under the spectrum, F1..F7 plus
-//! `FNC(n)`, modelled on piHPSDR's toolbar -- 6 layers of 7 function buttons, `FNC` steps
-//! through the layers, and every button can be assigned any function from the list below.
+//! `FNC(n)`, modelled on piHPSDR's toolbar -- 9 layers of 7 function buttons, `FNC` steps
+//! through the layers (and `FuncRev` / a long press on `FNC` steps back), and every button can be assigned any function from the list below.
 //!
 //! The list is what hpsdr-rs can do today: every MIDI key action (so the toolbar and a MIDI
 //! controller share one dispatcher in `main.rs`), plus Two Tone and the zoom/pan controls that
@@ -11,7 +11,7 @@ use crate::midi::{MidiAction, KEY_ACTIONS};
 /// Function buttons per layer; the eighth box is `FNC`.
 pub const BUTTONS: usize = 7;
 /// Number of layers `FNC` steps through.
-pub const LAYERS: usize = 6;
+pub const LAYERS: usize = 9;
 
 pub type Layers = [[ToolbarFn; BUTTONS]; LAYERS];
 
@@ -34,7 +34,7 @@ impl ToolbarFn {
     pub fn all() -> Vec<ToolbarFn> {
         let mut v = vec![ToolbarFn::TwoTone, ToolbarFn::Rade];
         // The Toolbar (F1-F8) MIDI actions press toolbar boxes, so they make no sense inside one.
-        v.extend(KEY_ACTIONS.iter().copied().filter(|a| !is_toolbar_action(*a) && *a != MidiAction::Rade).map(ToolbarFn::Midi));
+        v.extend(KEY_ACTIONS.iter().copied().filter(|a| (!is_toolbar_action(*a) || *a == MidiAction::ToolbarFuncRev) && *a != MidiAction::Rade).map(ToolbarFn::Midi));
         v.extend([
             ToolbarFn::ZoomIn,
             ToolbarFn::ZoomOut,
@@ -84,6 +84,12 @@ impl ToolbarFn {
                 MidiAction::Vox => "VOX",
                 MidiAction::VoxMenu => "VOX SET",
                 MidiAction::EqMenu => "EQ",
+                MidiAction::ToolbarFuncRev => "FNC-",
+                MidiAction::AgcMenu => "AGC SET",
+                MidiAction::NoiseMenu => "NOISE",
+                MidiAction::TxMenu => "TX SET",
+                MidiAction::RxMenu => "RX SET",
+                MidiAction::SdrMenu => "SDR SET",
                 MidiAction::ReportRec => "REC",
                 MidiAction::ReportPlay => "PLAY",
                 MidiAction::RecordWav => "RECORD",
@@ -264,6 +270,10 @@ pub fn default_layers() -> Layers {
             Midi(M::Band15m),
             Midi(M::Band10m),
         ],
+        // The layers added after the first six (FNC(6)..FNC(8)) start empty (None): the user assigns them.
+        [ToolbarFn::None; BUTTONS],
+        [ToolbarFn::None; BUTTONS],
+        [ToolbarFn::None; BUTTONS],
     ]
 }
 

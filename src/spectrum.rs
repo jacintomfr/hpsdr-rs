@@ -598,6 +598,102 @@ impl EqualizerParams {
     }
 }
 
+/// deskHPSDR's noise-menu parameters (receiver.c rx_set_noise / rx_set_notch).
+/// NR4 fields are stored and persisted only: there is no NR4 engine yet.
+#[derive(Debug, Clone, Copy, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
+pub struct NoiseExtra {
+    /// Shared position of NR, NR2 and ANF: false = Pre AGC, true = Post AGC.
+    pub nr_pos_post: bool,
+    /// 0 Linear, 1 Log, 2 Gamma, 3 Trained.
+    pub nr2_gain_method: u8,
+    /// 0 OSMS, 1 MMSE, 2 NSTAT.
+    pub nr2_npe_method: u8,
+    pub nr2_ae: bool,
+    pub nr2_post: bool,
+    pub nr2_post_taper: i32,
+    pub nr2_post_nlevel: i32,
+    pub nr2_post_factor: i32,
+    pub nr2_post_rate: i32,
+    pub nr2_trained_threshold: f64,
+    pub nr2_trained_t2: f64,
+    /// 0 Zero, 1 Sample&Hold, 2 Mean Hold, 3 Hold Sample, 4 Interpolate.
+    pub nb2_mode: u8,
+    /// NB/NB2 shared timing, UI milliseconds (WDSP gets seconds).
+    pub nb_tau_ms: f64,
+    pub nb_advtime_ms: f64,
+    pub nb_hang_ms: f64,
+    pub nr4_reduction: f64,
+    pub nr4_smoothing: f64,
+    pub nr4_whitening: f64,
+    pub nr4_rescale: f64,
+    pub nr4_post_threshold: f64,
+    pub mnf_enabled: bool,
+    pub mnf_fbw_hz: f64,
+    /// Absolute RF centre frequency (Hz) of the single manual notch; 0 = none.
+    pub mnf_cfreq_hz: f64,
+}
+
+impl Default for NoiseExtra {
+    fn default() -> Self {
+        Self {
+            nr_pos_post: false,
+            nr2_gain_method: 2,
+            nr2_npe_method: 0,
+            nr2_ae: true,
+            nr2_post: false,
+            nr2_post_taper: 12,
+            nr2_post_nlevel: 15,
+            nr2_post_factor: 15,
+            nr2_post_rate: 5,
+            nr2_trained_threshold: -0.5,
+            nr2_trained_t2: 0.2,
+            nb2_mode: 0,
+            nb_tau_ms: 0.01,
+            nb_advtime_ms: 0.01,
+            nb_hang_ms: 0.01,
+            nr4_reduction: 10.0,
+            nr4_smoothing: 0.0,
+            nr4_whitening: 0.0,
+            nr4_rescale: 2.0,
+            nr4_post_threshold: -10.0,
+            mnf_enabled: false,
+            mnf_fbw_hz: 80.0,
+            mnf_cfreq_hz: 0.0,
+        }
+    }
+}
+
+/// deskHPSDR RX menu extras. Digital offsets follow rx_get_digi_monitor_offset: DIGU shifts the
+/// receiver by -digi_offset_u, DIGL by +digi_offset_l (added to the CTUN offset, SetRXAShiftFreq).
+#[derive(Debug, Clone, Copy, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
+pub struct RxExtra {
+    /// DIGU monitor offset, 0..=4000 Hz.
+    pub digi_offset_u_hz: i32,
+    /// DIGL monitor offset, 0..=4000 Hz.
+    pub digi_offset_l_hz: i32,
+    /// 0 = Stereo / Mono downmix (audio unchanged), 1 = Left only, 2 = Right only.
+    /// Local audio output only; the radio audio path is untouched.
+    pub audio_channel: u8,
+    /// Stored only (this program has no "active receiver" concept for the main receiver).
+    pub mute_when_not_active: bool,
+    /// false = nothing goes to the computer's local audio output (audio to the radio keeps working).
+    pub local_audio: bool,
+}
+
+impl Default for RxExtra {
+    fn default() -> Self {
+        RxExtra {
+            digi_offset_u_hz: 0,
+            digi_offset_l_hz: 0,
+            audio_channel: 0,
+            mute_when_not_active: false,
+            local_audio: true,
+        }
+    }
+}
+
 #[derive(Copy, Clone)]
 pub struct DemodParams {
     pub mode: Mode,
@@ -627,6 +723,8 @@ pub struct DemodParams {
     pub agc_attack_ms: i32,
     pub agc_decay_ms: i32,
     pub agc_hang_ms: i32,
+    /// deskHPSDR's AGC hang threshold (0..100), used by the Long and Slow AGC modes (AGC menu).
+    pub agc_hang_threshold: i32,
     pub agc_top_db: f64,
     pub agc_slope_db: i32,
     /// NB (ANB) vs. NB2 (NOB) vs. off -- mutually exclusive, see
@@ -681,6 +779,8 @@ pub struct DemodParams {
     /// actually applied. radio-audio-to-radio downmixes to mono
     /// regardless of this setting -- see run()'s own doc comment.
     pub binaural: bool,
+    /// RX menu extras (digital monitor offsets, channel mapping, local audio) -- see RxExtra.
+    pub rx_extra: RxExtra,
     /// CTUN ("Click to Tune"): when true, the hardware/LO frequency
     /// (lo_frequency_hz below) stays fixed and ctun_offset_hz shifts the
     /// RXA demod chain instead, so the user can pick a different listen
@@ -740,6 +840,8 @@ pub struct DemodParams {
     /// against their own known reference exactly once, same real-world
     /// methodology as any other S-meter calibration.
     pub meter_calibration_db: f64,
+    /// deskHPSDR noise-menu parameters (see NoiseExtra).
+    pub noise_extra: NoiseExtra,
 }
 
 impl Default for DemodParams {
@@ -761,6 +863,7 @@ impl Default for DemodParams {
             agc_attack_ms: 2,
             agc_decay_ms: 250,
             agc_hang_ms: 500,
+            agc_hang_threshold: 0,
             // ROOT CAUSE FIX for a real report: AGC ON produced heavily
             // clipped audio (WAV analysis: 40-92% of samples pinned at
             // full scale) -- confirmed via controlled recordings to be
@@ -787,6 +890,7 @@ impl Default for DemodParams {
             snb: false,
             anf: false,
             binaural: false,
+            rx_extra: RxExtra::default(),
             ctun: false,
             ctun_offset_hz: 0.0,
             lo_frequency_hz: 0.0,
@@ -794,6 +898,7 @@ impl Default for DemodParams {
             zoom: 1,
             pan: 0.0,
             meter_calibration_db: 0.0,
+            noise_extra: NoiseExtra::default(),
             explicit_passband: None,
         }
     }
@@ -921,13 +1026,16 @@ struct SpectrumAnalyzer {
     last_agc: Option<Agc>,
     last_squelch: Option<(Mode, i32, bool)>,
     last_agc_params: Option<(i32, i32, i32, f64, i32)>,
+    last_agc_hang_thr: Option<i32>,
     last_nb_enabled: Option<NoiseBlanker>,
     last_nb_threshold: Option<f64>,
     last_nr_enabled: Option<NoiseReduction>,
     last_nnr_params: Option<(f64, bool)>,
     last_snb_enabled: Option<bool>,
     last_anf_enabled: Option<bool>,
+    last_noise_extra: Option<NoiseExtra>,
     last_binaural: Option<bool>,
+    last_rx_extra: Option<RxExtra>,
     last_ctun: Option<bool>,
     last_ctun_offset: Option<f64>,
     last_lo_frequency: Option<f64>,
@@ -1320,13 +1428,16 @@ impl SpectrumAnalyzer {
                 last_agc: None,
                 last_squelch: None,
                 last_agc_params: None,
+                last_agc_hang_thr: None,
                 last_nb_enabled: None,
                 last_nb_threshold: None,
                 last_nr_enabled: None,
                 last_nnr_params: None,
                 last_snb_enabled: None,
                 last_anf_enabled: None,
+                last_noise_extra: None,
                 last_binaural: None,
+                last_rx_extra: None,
                 last_ctun: None,
                 last_ctun_offset: None,
                 last_lo_frequency: None,
@@ -1572,6 +1683,12 @@ impl SpectrumAnalyzer {
             }
             self.last_agc = Some(params.agc);
         }
+        if self.last_agc_hang_thr != Some(params.agc_hang_threshold) {
+            unsafe {
+                wdsp::SetRXAAGCHangThreshold(self.channel, params.agc_hang_threshold.clamp(0, 100) as c_int);
+            }
+            self.last_agc_hang_thr = Some(params.agc_hang_threshold);
+        }
         let agc_params = (
             params.agc_attack_ms,
             params.agc_decay_ms,
@@ -1683,6 +1800,72 @@ impl SpectrumAnalyzer {
             self.last_anf_enabled = Some(params.anf);
         }
 
+        // deskHPSDR noise-menu parameters (rx_set_noise / rx_set_notch). NR4 values are
+        // stored only: that engine does not exist here.
+        if self.last_noise_extra != Some(params.noise_extra) {
+            let ne = params.noise_extra;
+            let ch = self.channel;
+            let pos = ne.nr_pos_post as c_int;
+            unsafe {
+                // NB / NB2 shared timing (UI ms -> seconds)
+                wdsp::SetEXTANBTau(ch, ne.nb_tau_ms * 0.001);
+                wdsp::SetEXTANBHangtime(ch, ne.nb_hang_ms * 0.001);
+                wdsp::SetEXTANBAdvtime(ch, ne.nb_advtime_ms * 0.001);
+                wdsp::SetEXTNOBMode(ch, ne.nb2_mode as c_int);
+                wdsp::SetEXTNOBTau(ch, ne.nb_tau_ms * 0.001);
+                wdsp::SetEXTNOBHangtime(ch, ne.nb_hang_ms * 0.001);
+                wdsp::SetEXTNOBAdvtime(ch, ne.nb_advtime_ms * 0.001);
+                // NR
+                wdsp::SetRXAANRPosition(ch, pos);
+                // NR2
+                wdsp::SetRXAEMNRPosition(ch, pos);
+                wdsp::SetRXAEMNRgainMethod(ch, ne.nr2_gain_method as c_int);
+                wdsp::SetRXAEMNRnpeMethod(ch, ne.nr2_npe_method as c_int);
+                wdsp::SetRXAEMNRtrainZetaThresh(ch, ne.nr2_trained_threshold);
+                wdsp::SetRXAEMNRtrainT2(ch, ne.nr2_trained_t2);
+                wdsp::SetRXAEMNRpost2Taper(ch, ne.nr2_post_taper as c_int);
+                wdsp::SetRXAEMNRpost2Nlevel(ch, ne.nr2_post_nlevel as f64);
+                wdsp::SetRXAEMNRpost2Factor(ch, ne.nr2_post_factor as f64);
+                wdsp::SetRXAEMNRpost2Rate(ch, ne.nr2_post_rate as f64);
+                wdsp::SetRXAEMNRpost2Run(ch, ne.nr2_post as c_int);
+                wdsp::SetRXAEMNRaeRun(ch, ne.nr2_ae as c_int);
+                // ANF position
+                wdsp::SetRXAANFPosition(ch, pos);
+
+                // Manual notch. The centre frequency is ABSOLUTE RF Hz (nbp.c converts it
+                // with tunefreq + shift internally), so it needs no re-apply on retune.
+                wdsp::RXANBPSetAutoIncrease(ch, 1);
+                let mut minwidth: f64 = 0.0;
+                wdsp::RXANBPGetMinNotchWidth(ch, &mut minwidth as *mut f64);
+                if !minwidth.is_finite() || minwidth <= 0.0 {
+                    minwidth = 10.0;
+                }
+                let mut width = ne.mnf_fbw_hz;
+                if !width.is_finite() || width <= 0.0 {
+                    width = minwidth;
+                }
+                let width = width.clamp(minwidth, 15000.0);
+                let mut nnotches: c_int = 0;
+                wdsp::RXANBPGetNumNotches(ch, &mut nnotches as *mut c_int);
+                let mut ok = true;
+                while nnotches > 0 {
+                    if wdsp::RXANBPDeleteNotch(ch, nnotches - 1) != 0 {
+                        ok = false;
+                        break;
+                    }
+                    nnotches -= 1;
+                }
+                let mut valid = false;
+                if ok && ne.mnf_cfreq_hz.is_finite() && ne.mnf_cfreq_hz > 0.0 {
+                    if wdsp::RXANBPAddNotch(ch, 0, ne.mnf_cfreq_hz, width, 1) == 0 {
+                        valid = true;
+                    }
+                }
+                wdsp::RXANBPSetNotchesRun(ch, (ok && ne.mnf_enabled && valid) as c_int);
+            }
+            self.last_noise_extra = Some(ne);
+        }
+
         { let n = Instant::now(); DSP_SET_GROUP[7].fetch_max(n.duration_since(set_last).as_micros() as u64, Ordering::Relaxed); set_last = n; }
         // Binaural ("phasing") RX audio -- see DemodParams::binaural's
         // doc comment. Same edge-detected Set*-call pattern as every
@@ -1752,7 +1935,19 @@ impl SpectrumAnalyzer {
         // an absolute tuned frequency or a shift, never both at once,
         // matching the reference's own if/else (never both branches in
         // the same call).
-        if params.ctun {
+        // RX menu digital monitor offset (deskHPSDR rx_get_digi_monitor_offset): DIGU -offset_u,
+        // DIGL +offset_l, other modes 0. Added to the CTUN offset (rx_set_offset(vfo.offset + it)),
+        // so the shift runs whenever CTUN is on OR the digital offset is non-zero. With both zero
+        // this is exactly the previous behaviour.
+        let digi_monitor_hz: f64 = match params.mode {
+            Mode::Digu => -(params.rx_extra.digi_offset_u_hz.clamp(0, 4000) as f64),
+            Mode::Digl => params.rx_extra.digi_offset_l_hz.clamp(0, 4000) as f64,
+            _ => 0.0,
+        };
+        self.last_rx_extra = Some(params.rx_extra);
+        let shift_active = params.ctun || digi_monitor_hz != 0.0;
+        let shift_offset_hz = if params.ctun { params.ctun_offset_hz } else { 0.0 } + digi_monitor_hz;
+        if shift_active {
             if self.last_ctun != Some(true) {
                 unsafe {
                     wdsp::SetRXAShiftRun(self.channel, 1);
@@ -1762,20 +1957,20 @@ impl SpectrumAnalyzer {
             // SetRXAShiftFreq blocks until WDSP has finished the block it is processing (measured
             // up to 40 ms at 192 kHz on the Pi), which stalled this thread and starved the audio
             // while dragging. It is done on its own thread instead (see shift_worker).
-            if self.last_ctun_offset != Some(params.ctun_offset_hz) {
-                shift_worker_send(ShiftMsg::Set(self.channel, params.ctun_offset_hz));
-                self.last_ctun_offset = Some(params.ctun_offset_hz);
+            if self.last_ctun_offset != Some(shift_offset_hz) {
+                shift_worker_send(ShiftMsg::Set(self.channel, shift_offset_hz));
+                self.last_ctun_offset = Some(shift_offset_hz);
             }
             // The NBP filter rebuild is expensive (20-30 ms at 192 kHz on the Pi): while the
             // offset keeps changing (dragging) it is applied at most every NBP_MIN_INTERVAL,
             // and the last value always lands once the dragging stops.
-            if self.last_nbp_shift != Some(params.ctun_offset_hz) && self.last_nbp_at.elapsed() >= NBP_MIN_INTERVAL {
+            if self.last_nbp_shift != Some(shift_offset_hz) && self.last_nbp_at.elapsed() >= NBP_MIN_INTERVAL {
                 let t_c = Instant::now();
                 unsafe {
-                    wdsp::RXANBPSetShiftFrequency(self.channel, params.ctun_offset_hz);
+                    wdsp::RXANBPSetShiftFrequency(self.channel, shift_offset_hz);
                 }
                 DSP_SET_GROUP[12].fetch_max(t_c.elapsed().as_micros() as u64, Ordering::Relaxed);
-                self.last_nbp_shift = Some(params.ctun_offset_hz);
+                self.last_nbp_shift = Some(shift_offset_hz);
                 self.last_nbp_at = Instant::now();
             }
         } else {
@@ -2496,13 +2691,21 @@ fn run(
                 // that variable's own doc comment (RadeHandle::
                 // mute_analog).
                 if rade_pass_raw {
-                    if !mute_local {
+                    if !mute_local && params.rx_extra.local_audio {
+                        // RX menu (RxExtra::audio_channel): applies to the local output (and the
+                        // recorders, which follow what is audible locally) only; TCI and the
+                        // radio path below keep the unmapped audio.
+                        let (lo, ro) = match params.rx_extra.audio_channel {
+                            1 => (l, 0.0),
+                            2 => (0.0, r),
+                            _ => (l, r),
+                        };
                         if out.len() >= AUDIO_BUFFER_CAPACITY {
                             out.pop_front();
                         }
-                        out.push_back((l, r));
-                        recorder.write_frame(l, r);
-                        report_recorder.write_frame(l, r);
+                        out.push_back((lo, ro));
+                        recorder.write_frame(lo, ro);
+                        report_recorder.write_frame(lo, ro);
                     } else {
                         // ROOT CAUSE FIX for a real report: same
                         // "Audio glitches" false-positive as
@@ -2629,10 +2832,22 @@ fn run(
             for _ in 0..rade_scratch.len() {
                 let s = (rade_jitter.pop_front().unwrap_or(0.0) * params.gain).clamp(-1.0, 1.0);
                 if !mute_local {
+                    // RX menu (RxExtra): local output only. RADE speech is mono (l == r == s), so
+                    // the channel selection just silences the unselected side; local_audio off
+                    // pushes silence to keep the queue fed.
+                    let (sl, sr) = if !params.rx_extra.local_audio {
+                        (0.0, 0.0)
+                    } else {
+                        match params.rx_extra.audio_channel {
+                            1 => (s, 0.0),
+                            2 => (0.0, s),
+                            _ => (s, s),
+                        }
+                    };
                     if out.len() >= AUDIO_BUFFER_CAPACITY {
                         out.pop_front();
                     }
-                    out.push_back((s, s));
+                    out.push_back((sl, sr));
                     // ROOT CAUSE FIX for a real report: Record/REC
                     // captured nothing at all (an empty .wav, 0 data
                     // bytes) while RADE was the active decoder -- this
@@ -3016,6 +3231,10 @@ impl SpectrumHandle {
     pub fn set_agc_decay_ms(&self, v: i32) {
         self.demod_params.lock().unwrap().agc_decay_ms = v.max(0);
     }
+    pub fn set_agc_hang_threshold(&self, v: i32) {
+        self.demod_params.lock().unwrap().agc_hang_threshold = v.clamp(0, 100);
+    }
+
     pub fn set_agc_hang_ms(&self, v: i32) {
         self.demod_params.lock().unwrap().agc_hang_ms = v.max(0);
     }
@@ -3068,6 +3287,20 @@ impl SpectrumHandle {
     }
     pub fn set_anf(&self, v: bool) {
         self.demod_params.lock().unwrap().anf = v;
+    }
+
+    pub fn rx_extra(&self) -> RxExtra {
+        self.demod_params.lock().unwrap().rx_extra
+    }
+    pub fn set_rx_extra(&self, v: RxExtra) {
+        self.demod_params.lock().unwrap().rx_extra = v;
+    }
+
+    pub fn noise_extra(&self) -> NoiseExtra {
+        self.demod_params.lock().unwrap().noise_extra
+    }
+    pub fn set_noise_extra(&self, v: NoiseExtra) {
+        self.demod_params.lock().unwrap().noise_extra = v;
     }
 
     pub fn binaural(&self) -> bool {

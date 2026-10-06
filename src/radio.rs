@@ -701,6 +701,24 @@ pub struct RadioSession {
     /// `tune_active` unconditionally (see p1_build_packet command 3), so
     /// this flag currently has no additional wire effect.
     pub hl2_atu_gateware: Arc<AtomicBool>,
+    /// UI -> radio: deskHPSDR "Dither Bit". P1: ORed into register 0x14's C3
+    /// bit 3 (LT2208_DITHER_ON 0x08, in addition to the HL2 AK4951 forcing);
+    /// P2: DDC-specific packet byte 5 (one bit per ADC, ADC0 and, on 2-ADC
+    /// boards, ADC1; cleared while PureSignal is transmitting). Default false.
+    pub adc_dither: Arc<AtomicBool>,
+    /// UI -> radio: deskHPSDR "Random Bit". P1: register 0x14's C3 bit 4
+    /// (LT2208_RANDOM_ON 0x10); P2: DDC-specific packet byte 6. Default false.
+    pub adc_random: Arc<AtomicBool>,
+    /// UI -> radio: deskHPSDR "Bypass ADC0 RX filters". P1: while not
+    /// transmitting, register 0x12 C2 |= 0x40 (manual filter selection) and
+    /// C3 |= 0x20 (bypass all RX filters), non-HL2 boards; P2: alex0 HPF
+    /// ladder forced to bypass (and the LPF to 6m/bypass on pre-Orion2 boards
+    /// while receiving on ANT1/2/3). Default false.
+    pub adc0_filter_bypass: Arc<AtomicBool>,
+    /// UI -> radio: deskHPSDR "Bypass ADC1 RX filters" (only meaningful on
+    /// 2-ADC boards: Orion2/Saturn). P1: register 0x24 C1 = 0x20 (BPF2
+    /// bypass); P2: alex1 RX BPF forced to RX_BYPASS_BPF (0x1000). Default false.
+    pub adc1_filter_bypass: Arc<AtomicBool>,
     /// TX-time step attenuator (0-31 dB) applied to ADC0's input while
     /// transmitting, on both protocols. Standard (non-HermesLite) boards
     /// only. Despite the name (kept for now to avoid a config-schema
@@ -1875,6 +1893,18 @@ fn start_protocol1(
     let auto_tune_asserted = Arc::new(AtomicBool::new(false));
     let hl2_cl1_input = Arc::new(AtomicBool::new(false));
     let hl2_atu_gateware = Arc::new(AtomicBool::new(false));
+    // See RadioSession::adc_dither/adc_random/adc0_filter_bypass/
+    // adc1_filter_bypass's doc comments.
+    let adc_dither = Arc::new(AtomicBool::new(false));
+    let adc_random = Arc::new(AtomicBool::new(false));
+    let adc0_filter_bypass = Arc::new(AtomicBool::new(false));
+    let adc1_filter_bypass = Arc::new(AtomicBool::new(false));
+    let sender_adc_opts = AdcUserOpts {
+        dither: Arc::clone(&adc_dither),
+        random: Arc::clone(&adc_random),
+        adc0_filter_bypass: Arc::clone(&adc0_filter_bypass),
+        adc1_filter_bypass: Arc::clone(&adc1_filter_bypass),
+    };
     // See RadioSession::oc_rx/oc_tx's doc comments.
     let oc_rx = Arc::new(AtomicU8::new(0));
     let oc_tx = Arc::new(AtomicU8::new(0));
@@ -2140,6 +2170,7 @@ fn start_protocol1(
             sender_mic_bias_enabled,
             sender_mic_ptt_on_tip,
             sender_tx_packet_debug_log,
+            sender_adc_opts,
             sender_stop,
         );
     });
@@ -2281,6 +2312,10 @@ fn start_protocol1(
         auto_tune_asserted,
         hl2_cl1_input,
         hl2_atu_gateware,
+        adc_dither,
+        adc_random,
+        adc0_filter_bypass,
+        adc1_filter_bypass,
         tx_packet_debug_log,
         stop_flag,
         sender_thread: Some(sender_thread),
@@ -2618,6 +2653,10 @@ fn start_protocol1_ozy_usb(
         auto_tune_asserted: Arc::new(AtomicBool::new(false)),
         hl2_cl1_input: Arc::new(AtomicBool::new(false)),
         hl2_atu_gateware: Arc::new(AtomicBool::new(false)),
+        adc_dither: Arc::new(AtomicBool::new(false)),
+        adc_random: Arc::new(AtomicBool::new(false)),
+        adc0_filter_bypass: Arc::new(AtomicBool::new(false)),
+        adc1_filter_bypass: Arc::new(AtomicBool::new(false)),
         tx_packet_debug_log,
         stop_flag,
         sender_thread: Some(sender_thread),
@@ -2854,6 +2893,10 @@ fn start_rx888_usb(
         auto_tune_asserted: Arc::new(AtomicBool::new(false)),
         hl2_cl1_input: Arc::new(AtomicBool::new(false)),
         hl2_atu_gateware: Arc::new(AtomicBool::new(false)),
+        adc_dither: Arc::new(AtomicBool::new(false)),
+        adc_random: Arc::new(AtomicBool::new(false)),
+        adc0_filter_bypass: Arc::new(AtomicBool::new(false)),
+        adc1_filter_bypass: Arc::new(AtomicBool::new(false)),
         tx_packet_debug_log,
         ps_rx_feedback_iq,
         ps_tx_feedback_iq,
@@ -3613,6 +3656,7 @@ fn p1_send_preconfig_and_start(
             mic_ptt_enabled,
             mic_bias_enabled,
             mic_ptt_on_tip,
+            AdcUserOptsNow::default(), // adc user options: startup config uses the defaults, sender_loop applies the live values immediately after
         );
         socket.send(&packet)?;
         pre_seq = pre_seq.wrapping_add(1);
@@ -3800,6 +3844,10 @@ fn p1_build_packet(
     mic_ptt_enabled: bool,
     mic_bias_enabled: bool,
     mic_ptt_on_tip: bool,
+    // See RadioSession::adc_dither/adc_random/adc0_filter_bypass/
+    // adc1_filter_bypass. AdcUserOptsNow::default() reproduces the
+    // pre-existing wire bytes.
+    adc_opts: AdcUserOptsNow,
 ) -> [u8; PACKET_SIZE] {
     // MOX/PTT bit: inferred to be C0's bit 0 on both frames, based
     // on every register value used elsewhere in this file (0x00,
@@ -4094,7 +4142,15 @@ fn p1_build_packet(
                 }
                 (c2, 0x00, 0x00)
             } else {
-                (0x00, 0x00, 0x00)
+                let (mut c2, mut c3) = (0x00u8, 0x00u8);
+                // deskHPSDR "Bypass ADC0 RX filters" (old_protocol.c case 3):
+                // only while receiving, manual filter selection + bypass all
+                // RX filters.
+                if !mox_on && adc_opts.adc0_filter_bypass {
+                    c2 |= 0x40;
+                    c3 |= 0x20;
+                }
+                (c2, c3, 0x00)
             };
             (0x12, c1, c2, c3, c4)
         }
@@ -4211,7 +4267,15 @@ fn p1_build_packet(
             // 0x08 -- otherwise a real ADC dither-generator control this
             // project doesn't implement) as its own "codec present"
             // flag, ported directly from deskhpsdr's old_protocol.c.
-            let c3: u8 = if is_hermes_lite && hl2_ak4951_codec { 0x08 } else { 0x00 };
+            let mut c3: u8 = if is_hermes_lite && hl2_ak4951_codec { 0x08 } else { 0x00 };
+            // deskHPSDR "Dither Bit"/"Random Bit": LT2208_DITHER_ON 0x08 /
+            // LT2208_RANDOM_ON 0x10, global in P1.
+            if adc_opts.dither {
+                c3 |= 0x08;
+            }
+            if adc_opts.random {
+                c3 |= 0x10;
+            }
             (0x14, c1, 0x00, c3, c4)
         }
         5 => {
@@ -4465,6 +4529,9 @@ fn p1_build_packet(
             } else {
                 0x00
             };
+            // deskHPSDR "Bypass ADC1 RX filters": C1 = 0x20 (bypass); only
+            // effective with manual filter selection (ADC0 bypass) active.
+            let bpf2 = if num_adcs == 2 && adc_opts.adc1_filter_bypass { BPF2_BYPASS } else { bpf2 };
             let c1 = bpf2 | if mox_on { 0x80 } else { 0x00 };
             // Alex2 XVTR enable -- confirmed against piHPSDR's
             // old_protocol.c (command 10/0x24 case): gated on the RX
@@ -4623,6 +4690,9 @@ fn sender_loop(
     mic_ptt_on_tip: Arc<AtomicBool>,
     // See RadioSession::tx_packet_debug_log's own doc comment.
     tx_packet_debug_log: DebugLog,
+    // See RadioSession::adc_dither/adc_random/adc0_filter_bypass/
+    // adc1_filter_bypass.
+    adc_opts: AdcUserOpts,
     stop: Arc<AtomicBool>,
 ) {
     let mut seq: u32 = 0;
@@ -4896,6 +4966,7 @@ fn sender_loop(
             mic_ptt_enabled.load(Ordering::Relaxed),
             mic_bias_enabled.load(Ordering::Relaxed),
             mic_ptt_on_tip.load(Ordering::Relaxed),
+            adc_opts.load(),
         );
 
         // HL2 CL1 jack re-programming (deskHPSDR old_protocol.c `case 20`):
@@ -5120,6 +5191,37 @@ fn p2_rx_audio_loop(
             thread::sleep(next_send - now);
         } else {
             next_send = now;
+        }
+    }
+}
+
+/// The four user ADC options (RadioSession::adc_dither/adc_random/
+/// adc0_filter_bypass/adc1_filter_bypass) as handed to the sender threads.
+#[derive(Clone)]
+struct AdcUserOpts {
+    dither: Arc<AtomicBool>,
+    random: Arc<AtomicBool>,
+    adc0_filter_bypass: Arc<AtomicBool>,
+    adc1_filter_bypass: Arc<AtomicBool>,
+}
+
+/// Snapshot of `AdcUserOpts` for one packet build (Default = all off, the
+/// pre-existing wire behaviour).
+#[derive(Clone, Copy, Default)]
+struct AdcUserOptsNow {
+    dither: bool,
+    random: bool,
+    adc0_filter_bypass: bool,
+    adc1_filter_bypass: bool,
+}
+
+impl AdcUserOpts {
+    fn load(&self) -> AdcUserOptsNow {
+        AdcUserOptsNow {
+            dither: self.dither.load(Ordering::Relaxed),
+            random: self.random.load(Ordering::Relaxed),
+            adc0_filter_bypass: self.adc0_filter_bypass.load(Ordering::Relaxed),
+            adc1_filter_bypass: self.adc1_filter_bypass.load(Ordering::Relaxed),
         }
     }
 }
@@ -5465,6 +5567,7 @@ fn ozy_sender_loop(
             mic_ptt_enabled.load(Ordering::Relaxed),
             mic_bias_enabled.load(Ordering::Relaxed),
             mic_ptt_on_tip.load(Ordering::Relaxed),
+            AdcUserOptsNow::default(), // adc user options: not exposed on the Ozy USB path
         );
 
         // `packet` is [8-byte Metis header][512-byte frame][512-byte
@@ -6260,6 +6363,18 @@ fn start_protocol2(
     let sender_mic_ptt_on_tip = Arc::clone(&mic_ptt_on_tip);
     let num_adcs = device.adcs;
     let is_orion2 = device.board == Boards::Orion2;
+    // See RadioSession::adc_dither/adc_random/adc0_filter_bypass/
+    // adc1_filter_bypass's doc comments.
+    let adc_dither = Arc::new(AtomicBool::new(false));
+    let adc_random = Arc::new(AtomicBool::new(false));
+    let adc0_filter_bypass = Arc::new(AtomicBool::new(false));
+    let adc1_filter_bypass = Arc::new(AtomicBool::new(false));
+    let sender_adc_opts = AdcUserOpts {
+        dither: Arc::clone(&adc_dither),
+        random: Arc::clone(&adc_random),
+        adc0_filter_bypass: Arc::clone(&adc0_filter_bypass),
+        adc1_filter_bypass: Arc::clone(&adc1_filter_bypass),
+    };
     // Live -- see RadioSession::diversity_enabled's doc comment.
     let sender_diversity_enabled = Arc::clone(&diversity_enabled);
     // Live -- see RadioSession::puresignal_enabled's doc comment.
@@ -6297,6 +6412,7 @@ fn start_protocol2(
             sender_mic_bias_enabled,
             sender_mic_ptt_on_tip,
             sender_diversity_enabled,
+            sender_adc_opts,
             sender_stop,
         );
     });
@@ -6475,6 +6591,10 @@ fn start_protocol2(
         // P1/HL2-only features: detached flags, never read by the P2 threads.
         hl2_cl1_input: Arc::new(AtomicBool::new(false)),
         hl2_atu_gateware: Arc::new(AtomicBool::new(false)),
+        adc_dither,
+        adc_random,
+        adc0_filter_bypass,
+        adc1_filter_bypass,
         tx_packet_debug_log,
         stop_flag,
         sender_thread: Some(sender_thread),
@@ -6552,6 +6672,9 @@ fn p2_ddc_specific_packet(
     adcs: &[u32],
     num_adcs: u8,
     ps_mox_gate: Option<bool>,
+    // See RadioSession::adc_dither/adc_random.
+    dither: bool,
+    random: bool,
 ) -> [u8; P2_PACKET_SIZE] {
     let mut p = [0u8; P2_PACKET_SIZE];
     p[0..4].copy_from_slice(&seq.to_be_bytes());
@@ -6559,10 +6682,16 @@ fn p2_ddc_specific_packet(
 
     // Dither/random: confirmed 0 (both off) against a working reference
     // capture -- corrects an earlier unconfirmed assumption here that
-    // these should be all-1s ("off produces worse ADC noise"). Left at
-    // 0 to match what's actually been observed working.
-    p[5] = 0;
-    p[6] = 0;
+    // these should be all-1s ("off produces worse ADC noise"). Default
+    // (user options off) stays 0 to match what's actually been observed
+    // working. deskHPSDR (new_protocol.c) sets one bit per ADC
+    // (`dither << adc`); this project has one global flag, so ADC0 and,
+    // on 2-ADC boards, ADC1. Always off while PureSignal is transmitting
+    // ("dither and random are always off" in deskHPSDR's PS case).
+    let ps_transmitting = ps_mox_gate == Some(true);
+    let adc_bits: u8 = if num_adcs >= 2 { 0x03 } else { 0x01 };
+    p[5] = if dither && !ps_transmitting { adc_bits } else { 0 };
+    p[6] = if random && !ps_transmitting { adc_bits } else { 0 };
 
     // Enable bits for DDC0..DDCn-1 (byte 7 covers DDC0-7; we don't
     // support boards with more than 8 DDCs in this pass).
@@ -6812,6 +6941,9 @@ fn p2_high_priority_packet(
     // (2026-09-08, see memory/wdsp_210_port.md): this bit was completely
     // missing from this project until now, on any board, in any state.
     puresignal_enabled: bool,
+    // See RadioSession::adc0_filter_bypass/adc1_filter_bypass.
+    adc0_filter_bypass: bool,
+    adc1_filter_bypass: bool,
 ) -> [u8; P2_PACKET_SIZE] {
     let mut p = [0u8; P2_PACKET_SIZE];
     p[0..4].copy_from_slice(&seq.to_be_bytes());
@@ -6899,6 +7031,7 @@ fn p2_high_priority_packet(
                 puresignal_enabled,
                 is_orion2,
                 new_pa_board,
+                adc0_filter_bypass,
             )
             .to_be_bytes(),
         );
@@ -6909,6 +7042,8 @@ fn p2_high_priority_packet(
     // in -- plausibly no signal path selected, matching a real report of
     // "correct wiring, correct ADC assignment, still nothing on RX2".
     if let Some(rx2_freq) = alex1_rx2_freq_hz {
+        // deskHPSDR: adc1_filter_bypass -> BPFfreq = 0 -> RX_BYPASS_BPF.
+        let rx2_freq = if adc1_filter_bypass { 0 } else { rx2_freq };
         p[1430..1432].copy_from_slice(&alex1_word(rx2_freq, mox_on).to_be_bytes());
     }
 
@@ -6980,6 +7115,8 @@ fn alex0_word(
     // is_orion2 is true.
     is_orion2: bool,
     new_pa_board: bool,
+    // See RadioSession::adc0_filter_bypass.
+    adc0_filter_bypass: bool,
 ) -> u32 {
     const HPF_13MHZ: u32 = 0x00000002;
     const HPF_20MHZ: u32 = 0x00000004;
@@ -7009,9 +7146,13 @@ fn alex0_word(
     const LPF_17_15: u32 = 0x80000000;
 
     let f = freq_hz as f64;
+    // deskHPSDR adc0_filter_bypass: the HPF/BPF frequency is forced to 0
+    // (-> bypass bit); on pre-Orion2 boards, while receiving on ANT1/2/3,
+    // the LPF is forced to its 6m/bypass position too (LPFfreq = 40 MHz).
+    let hpf_f = if adc0_filter_bypass { 0.0 } else { f };
 
     // HPF/preamp ladder ("set BPF" in the reference).
-    let hpf = if f < 1_500_000.0 {
+    let hpf = if hpf_f < 1_500_000.0 {
         HPF_BYPASS
     } else if f < 2_100_000.0 {
         HPF_1_5MHZ
@@ -7032,7 +7173,9 @@ fn alex0_word(
     // no RF output even after TR_RELAY started being set correctly:
     // with no LPF bits set, the TX output path had no filter selected
     // at all.
-    let lpf = if f > 32_000_000.0 {
+    let lpf = if adc0_filter_bypass && !mox_on && !is_orion2 && rx_antenna < 3 {
+        LPF_BYPASS
+    } else if f > 32_000_000.0 {
         LPF_BYPASS
     } else if f > 22_000_000.0 {
         LPF_12_10
@@ -7240,6 +7383,9 @@ fn p2_sender_loop(
     // RadioSession::set_diversity_enabled (bump active_receiver_count,
     // spawn/stop the combiner) already covers the rest.
     diversity_enabled: Arc<AtomicBool>,
+    // See RadioSession::adc_dither/adc_random/adc0_filter_bypass/
+    // adc1_filter_bypass.
+    adc_opts: AdcUserOpts,
     stop: Arc<AtomicBool>,
 ) {
     let mut general_seq: u32 = 0;
@@ -7425,10 +7571,19 @@ fn p2_sender_loop(
         let ps_mox_gate = Some(puresignal_enabled.load(Ordering::Relaxed) && mox_on);
         let ps_tx_atten = ps_tx_attenuation.load(Ordering::Relaxed) as u8;
         let rx_atten = (rx_attenuation.load(Ordering::Relaxed) as u8) & 0x1F;
+        let adc_now = adc_opts.load();
 
         if due_for_keepalive {
             let general = p2_general_packet(general_seq, num_adcs, disable_pa.load(Ordering::Relaxed));
-            let ddc = p2_ddc_specific_packet(ddc_seq, &rates, &adcs, num_adcs, ps_mox_gate);
+            let ddc = p2_ddc_specific_packet(
+                ddc_seq,
+                &rates,
+                &adcs,
+                num_adcs,
+                ps_mox_gate,
+                adc_now.dither,
+                adc_now.random,
+            );
             let tx = p2_tx_specific_packet(
                 tx_seq,
                 mic_ptt_enabled.load(Ordering::Relaxed),
@@ -7457,6 +7612,8 @@ fn p2_sender_loop(
                     rx_atten,
                     is_orion2.then_some(rx2_freq_hz),
                     puresignal_enabled.load(Ordering::Relaxed),
+                    adc_now.adc0_filter_bypass,
+                    adc_now.adc1_filter_bypass,
                 );
 
             let sends: [(&[u8], u16); 5] = [
@@ -7506,6 +7663,8 @@ fn p2_sender_loop(
                     rx_atten,
                     is_orion2.then_some(rx2_freq_hz),
                     puresignal_enabled.load(Ordering::Relaxed),
+                    adc_now.adc0_filter_bypass,
+                    adc_now.adc1_filter_bypass,
                 );
             if socket.send_to(&hp, (radio_ip, P2_HIGH_PRIORITY_PORT)).is_err() {
                 return;

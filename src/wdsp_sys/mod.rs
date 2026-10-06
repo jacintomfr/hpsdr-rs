@@ -363,6 +363,40 @@ unsafe extern "C" {
     pub fn SetRXAANFPosition(channel: ::std::os::raw::c_int, position: ::std::os::raw::c_int);
 }
 unsafe extern "C" {
+    pub fn SetRXAEMNRtrainZetaThresh(channel: ::std::os::raw::c_int, thresh: f64);
+}
+unsafe extern "C" {
+    pub fn SetRXAEMNRtrainT2(channel: ::std::os::raw::c_int, t2: f64);
+}
+unsafe extern "C" {
+    pub fn SetRXAEMNRpost2Run(channel: ::std::os::raw::c_int, run: ::std::os::raw::c_int);
+}
+unsafe extern "C" {
+    pub fn SetRXAEMNRpost2Taper(channel: ::std::os::raw::c_int, taper: ::std::os::raw::c_int);
+}
+unsafe extern "C" {
+    pub fn SetRXAEMNRpost2Nlevel(channel: ::std::os::raw::c_int, nlevel: f64);
+}
+unsafe extern "C" {
+    pub fn SetRXAEMNRpost2Factor(channel: ::std::os::raw::c_int, factor: f64);
+}
+unsafe extern "C" {
+    pub fn SetRXAEMNRpost2Rate(channel: ::std::os::raw::c_int, tc: f64);
+}
+unsafe extern "C" {
+    /// Returns the minimum notch width through the out-pointer (C returns void).
+    pub fn RXANBPGetMinNotchWidth(channel: ::std::os::raw::c_int, minwidth: *mut f64);
+}
+unsafe extern "C" {
+    pub fn RXANBPGetNumNotches(channel: ::std::os::raw::c_int, nnotches: *mut ::std::os::raw::c_int);
+}
+unsafe extern "C" {
+    pub fn RXANBPDeleteNotch(channel: ::std::os::raw::c_int, notch: ::std::os::raw::c_int) -> ::std::os::raw::c_int;
+}
+unsafe extern "C" {
+    pub fn RXANBPSetAutoIncrease(channel: ::std::os::raw::c_int, autoincr: ::std::os::raw::c_int);
+}
+unsafe extern "C" {
     pub fn SetRXAANFRun(channel: ::std::os::raw::c_int, run: ::std::os::raw::c_int);
 }
 unsafe extern "C" {
@@ -870,6 +904,64 @@ unsafe extern "C" {
 }
 unsafe extern "C" {
     pub fn SetTXAAMCarrierLevel(channel: ::std::os::raw::c_int, c_level: f64);
+}
+// EQ cutoff-frequency mode (eq.c).
+unsafe extern "C" {
+    pub fn SetTXAEQCtfmode(channel: ::std::os::raw::c_int, mode: ::std::os::raw::c_int);
+}
+// TX phase rotator (phrot.c), TXA channel based.
+unsafe extern "C" {
+    pub fn SetTXAPHROTRun(channel: ::std::os::raw::c_int, run: ::std::os::raw::c_int);
+    pub fn SetTXAPHROTCorner(channel: ::std::os::raw::c_int, frequency: f64);
+    pub fn SetTXAPHROTNstages(channel: ::std::os::raw::c_int, nstages: ::std::os::raw::c_int);
+}
+// DEXP (dexp.c): standalone object, first arg is the DEXP id (0..3), NOT a TXA channel.
+// Processes interleaved complex (I,Q) f64 buffers of `size` complex samples; `in`/`out`
+// may be the same buffer. `pushvox` may be NULL while run_vox == 0.
+unsafe extern "C" {
+    pub fn create_dexp(
+        id: ::std::os::raw::c_int,
+        run_dexp: ::std::os::raw::c_int,
+        size: ::std::os::raw::c_int,
+        in_: *mut f64,
+        out: *mut f64,
+        rate: ::std::os::raw::c_int,
+        dettau: f64,
+        tattack: f64,
+        tdecay: f64,
+        thold: f64,
+        exp_ratio: f64,
+        hyst_ratio: f64,
+        attack_thresh: f64,
+        nc: ::std::os::raw::c_int,
+        wtype: ::std::os::raw::c_int,
+        lowcut: f64,
+        highcut: f64,
+        run_filt: ::std::os::raw::c_int,
+        run_vox: ::std::os::raw::c_int,
+        run_audelay: ::std::os::raw::c_int,
+        audelay: f64,
+        pushvox: Option<unsafe extern "C" fn(id: ::std::os::raw::c_int, active: ::std::os::raw::c_int)>,
+        antivox_run: ::std::os::raw::c_int,
+        antivox_size: ::std::os::raw::c_int,
+        antivox_rate: ::std::os::raw::c_int,
+        antivox_gain: f64,
+        antivox_tau: f64,
+    );
+    pub fn destroy_dexp(id: ::std::os::raw::c_int);
+    pub fn xdexp(id: ::std::os::raw::c_int);
+    pub fn GetDEXPPeakSignal(id: ::std::os::raw::c_int, peak: *mut f64);
+    pub fn SetDEXPRun(id: ::std::os::raw::c_int, run: ::std::os::raw::c_int);
+    pub fn SetDEXPRunSideChannelFilter(id: ::std::os::raw::c_int, run: ::std::os::raw::c_int);
+    pub fn SetDEXPDetectorTau(id: ::std::os::raw::c_int, tau: f64);
+    pub fn SetDEXPAttackTime(id: ::std::os::raw::c_int, time: f64);
+    pub fn SetDEXPReleaseTime(id: ::std::os::raw::c_int, time: f64);
+    pub fn SetDEXPHoldTime(id: ::std::os::raw::c_int, time: f64);
+    pub fn SetDEXPExpansionRatio(id: ::std::os::raw::c_int, ratio: f64);
+    pub fn SetDEXPHysteresisRatio(id: ::std::os::raw::c_int, ratio: f64);
+    pub fn SetDEXPAttackThreshold(id: ::std::os::raw::c_int, thresh: f64);
+    pub fn SetDEXPLowCut(id: ::std::os::raw::c_int, lowcut: f64);
+    pub fn SetDEXPHighCut(id: ::std::os::raw::c_int, highcut: f64);
 }
 unsafe extern "C" {
     pub fn SetPSRunCal(channel: ::std::os::raw::c_int, run: ::std::os::raw::c_int);

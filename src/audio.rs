@@ -171,6 +171,110 @@ pub fn list_input_devices() -> Vec<String> {
     enumerate_devices(false).into_iter().map(|(label, _)| label).collect()
 }
 
+static RX_RESERVE_ENABLED: AtomicBool = AtomicBool::new(false);
+static RX_RESERVE_MS: AtomicU64 = AtomicU64::new(40);
+static LATENCY_CORRECTION: AtomicBool = AtomicBool::new(true);
+static TEST_TONES_RUNNING: AtomicBool = AtomicBool::new(false);
+
+/// RX audio network reserve (deskHPSDR "RX Audio Network Reserve"): when enabled the RX output
+/// jitter buffer primes with `ms` milliseconds (clamped 5..500) instead of the default 40 ms.
+pub fn set_rx_reserve(enabled: bool, ms: u32) {
+    RX_RESERVE_MS.store(ms.clamp(5, 500) as u64, Ordering::Relaxed);
+    RX_RESERVE_ENABLED.store(enabled, Ordering::Relaxed);
+}
+
+/// Frames (at 48 kHz) the RX output queue must hold before playback starts / resumes after an underrun.
+pub fn prime_frames() -> usize {
+    if RX_RESERVE_ENABLED.load(Ordering::Relaxed) {
+        (RX_RESERVE_MS.load(Ordering::Relaxed) as usize) * 48
+    } else {
+        1920 // 40 ms
+    }
+}
+
+/// Latency correction flag (deskHPSDR). NOTE: audio.rs has no drop/insert logic to keep the ring near a
+/// target (only the drop-oldest overflow backstop in spectrum.rs), so this only stores the flag.
+pub fn set_latency_correction(enabled: bool) {
+    LATENCY_CORRECTION.store(enabled, Ordering::Relaxed);
+}
+
+pub fn latency_correction() -> bool {
+    LATENCY_CORRECTION.load(Ordering::Relaxed)
+}
+
+/// deskHPSDR "Test Audio": 600, 800 and 1000 Hz tones, 2 s each, straight to the given output
+/// device (None = default). Non-blocking; silently ignores failures; no-op if already running.
+pub fn play_test_tones(device_name: Option<&str>) {
+    if TEST_TONES_RUNNING.swap(true, Ordering::SeqCst) {
+        return;
+    }
+    let name = device_name.map(|s| s.to_string());
+    thread::spawn(move || {
+        let _ = run_test_tones(name.as_deref());
+        TEST_TONES_RUNNING.store(false, Ordering::SeqCst);
+    });
+}
+
+fn run_test_tones(device_name: Option<&str>) -> Option<()> {
+    let host = cpal::default_host();
+    let device = match device_name {
+        Some(n) => find_device(n, true).or_else(|| host.default_output_device()),
+        None => host.default_output_device(),
+    }?;
+    let config = cpal::StreamConfig {
+        channels: OUTPUT_CHANNELS,
+        sample_rate: OUTPUT_SAMPLE_RATE,
+        buffer_size: cpal::BufferSize::Default,
+    };
+    let sr = OUTPUT_SAMPLE_RATE as f32;
+    let tone_len = (2.0 * sr) as usize;
+    let total = tone_len * 3;
+    let fade = (0.01 * sr) as usize;
+    let freqs = [600.0f32, 800.0, 1000.0];
+    let mut pos: usize = 0;
+    let mut phase: f32 = 0.0;
+    let ch = OUTPUT_CHANNELS as usize;
+    let stream = device
+        .build_output_stream(
+            &config,
+            move |data: &mut [f32], _: &cpal::OutputCallbackInfo| {
+                for frame in data.chunks_mut(ch) {
+                    let v = if pos < total {
+                        let idx = pos / tone_len;
+                        let within = pos % tone_len;
+                        let f = freqs[idx];
+                        phase += 2.0 * std::f32::consts::PI * f / sr;
+                        if phase > 2.0 * std::f32::consts::PI {
+                            phase -= 2.0 * std::f32::consts::PI;
+                        }
+                        let env = if within < fade {
+                            within as f32 / fade as f32
+                        } else if within >= tone_len - fade {
+                            (tone_len - within) as f32 / fade as f32
+                        } else {
+                            1.0
+                        };
+                        pos += 1;
+                        0.2 * env * phase.sin()
+                    } else {
+                        0.0
+                    };
+                    for s in frame.iter_mut() {
+                        *s = v;
+                    }
+                }
+            },
+            |_| {},
+            None,
+        )
+        .ok()?;
+    stream.play().ok()?;
+    // 6 s of tones plus a little slack for device buffering.
+    thread::sleep(Duration::from_millis(6300));
+    drop(stream);
+    Some(())
+}
+
 pub struct AudioOutput {
     // Kept alive for as long as playback should continue; dropping this
     // stops the stream.
@@ -274,7 +378,6 @@ impl AudioOutput {
         // Jitter buffer: at start and after an underrun, output stays silent until
         // this much audio has queued up, so one late block from the DSP thread does
         // not turn into a stream of clicks (seen at 192 kHz on the Pi).
-        const PRIME_FRAMES: usize = 1920; // 40 ms
         let mut primed = false;
         let mut win_min: usize = usize::MAX;
         let mut win_frames: u32 = 0;
@@ -309,7 +412,7 @@ impl AudioOutput {
                         win_min = usize::MAX;
                         win_frames = 0;
                     }
-                    if !primed && depth >= PRIME_FRAMES {
+                    if !primed && depth >= prime_frames() {
                         primed = true;
                     }
                     for frame in data.chunks_mut(OUTPUT_CHANNELS as usize) {

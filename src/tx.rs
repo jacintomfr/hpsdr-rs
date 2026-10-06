@@ -532,6 +532,8 @@ pub struct TxParams {
     /// -> TX alongside leveler_enabled/compressor_enabled/cfc_enabled
     /// above (same menu, per that request), NOT in the RADE panel.
     pub tx_denoiser_enabled: bool,
+    /// deskHPSDR TX-menu DSP options (see TxExtra).
+    pub extra: TxExtra,
 }
 
 /// deskHPSDR transmitter.c's own default CFC band table (tx->cfc_freq[1..12]) --
@@ -546,9 +548,209 @@ pub const CFC_DEFAULT_PRECOMP_DB: f64 = 3.0;
 /// deskHPSDR's tx->cfc_post[0] ("Post Gain", frequency-independent part), dB.
 pub const CFC_DEFAULT_PREPEQ_DB: f64 = -9.0;
 
+/// The 38 standard CTCSS tones, Hz (deskHPSDR transmitter.c ctcss_frequencies).
+pub const CTCSS_HZ: [f64; 38] = [
+    67.0, 71.9, 74.4, 77.0, 79.7, 82.5, 85.4, 88.5, 91.5, 94.8, 97.4, 100.0, 103.5, 107.2, 110.9, 114.8, 118.8, 123.0, 127.3,
+    131.8, 136.5, 141.3, 146.2, 151.4, 156.7, 162.2, 167.9, 173.8, 179.9, 186.2, 192.8, 203.5, 210.7, 218.1, 225.7, 233.6,
+    241.8, 250.3,
+];
+
+/// DSP-related TX options of deskHPSDR's TX menu that hpsdr-rs did not have (Settings -> TX window). All values are in the
+/// units of the deskHPSDR spin buttons. Index 0 of the three CFC arrays is the frequency-independent value
+/// (cfc_lvl_db[0] = "Pre Comp", cfc_post_db[0] = "Post Gain"; cfc_freq_hz[0] is unused), indices 1..=12 are the 12 bands.
+#[derive(Debug, Clone, Copy, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
+pub struct TxExtra {
+    pub use_rx_filter: bool,          // default true (keeps today's behaviour: the TX filter follows the RX filter)
+    pub tx_filter_low_hz: i32,        // 100   (0..8000 step 50)
+    pub tx_filter_high_hz: i32,       // 2900  (0..8000 step 50)
+    pub phrot_enable: bool,           // false
+    pub phrot_stage: u8,              // 8   (1..15)
+    pub phrot_freq_hz: i32,           // 338 (1..500)
+    pub eq_ctfmode: bool,             // false
+    pub cessb_enable: bool,           // true  (Auto CESSB: osctrl runs when compressor on && cessb_enable && compressor gain > 0)
+    pub dexp: bool,                   // false (TX noise gate)
+    pub dexp_filter: bool,            // false (side channel filter)
+    pub dexp_exp_db: i32,             // 20   (0..30)
+    pub dexp_hyst: f64,               // 0.75 (0.05..0.95)
+    pub dexp_trigger_db: i32,         // -25  (-40..-10)
+    pub dexp_tau_ms: f64,             // 10.0 (1..250)
+    pub dexp_attack_ms: f64,          // 25.0 (1..250)
+    pub dexp_release_ms: f64,         // 100.0 (1..500)
+    pub dexp_hold_ms: f64,            // 800.0 (10..1500)
+    pub dexp_filter_low_hz: i32,      // 1000 (0..1200)
+    pub dexp_filter_high_hz: i32,     // 2000 (500..10000)
+    pub addgain_enable: bool,         // false (Local Mic PreAmp Gain check)
+    pub addgain_gain_db: f64,         // 10.0 (1..20)
+    pub ctcss_enabled: bool,          // false
+    pub ctcss_index: u8,              // 0 (0..37 into the 38 standard CTCSS tones)
+    pub fm_pre_emphasis: bool,        // false = deskHPSDR's pre_emphasize (the menu check "FM PreEmp/ALC" shows !fm_pre_emphasis)
+    pub am_carrier_level: f64,        // 0.5 (0.0..1.0)
+    pub cfc_post_enabled: bool,       // false ("Use Post-CFC" = SetTXACFCOMPPeqRun); the existing TxParams::cfc_enabled stays "Use Pre-CFC"
+    pub cfc_freq_hz: [i32; 13],       // [0, 50,150,300,500,750,1250,1750,2300,2800,3100,6000,8000]
+    pub cfc_lvl_db: [i32; 13],        // [3, 0,0,3,3,3,6,6,6,9,9,0,0]   (0..20)
+    pub cfc_post_db: [i32; 13],       // [-9, 0 x12]                    (-20..20)
+    pub cfc_comp_deg: u8,             // 0 (0 linear, else 1,3,5,7)
+    pub cfc_comp_r: bool,             // false
+    pub cfc_comp_w_x10: [u16; 12],    // [10; 12] (weights in tenths)
+    pub cfc_post_deg: u8,
+    pub cfc_post_r: bool,
+    pub cfc_post_w_x10: [u16; 12],
+}
+
+impl Default for TxExtra {
+    fn default() -> Self {
+        let mut post = [0i32; 13];
+        post[0] = -9;
+        Self {
+            use_rx_filter: true,
+            tx_filter_low_hz: 100,
+            tx_filter_high_hz: 2900,
+            phrot_enable: false,
+            phrot_stage: 8,
+            phrot_freq_hz: 338,
+            eq_ctfmode: false,
+            cessb_enable: true,
+            dexp: false,
+            dexp_filter: false,
+            dexp_exp_db: 20,
+            dexp_hyst: 0.75,
+            dexp_trigger_db: -25,
+            dexp_tau_ms: 10.0,
+            dexp_attack_ms: 25.0,
+            dexp_release_ms: 100.0,
+            dexp_hold_ms: 800.0,
+            dexp_filter_low_hz: 1000,
+            dexp_filter_high_hz: 2000,
+            addgain_enable: false,
+            addgain_gain_db: 10.0,
+            ctcss_enabled: false,
+            ctcss_index: 0,
+            fm_pre_emphasis: false,
+            am_carrier_level: 0.5,
+            cfc_post_enabled: false,
+            cfc_freq_hz: [0, 50, 150, 300, 500, 750, 1250, 1750, 2300, 2800, 3100, 6000, 8000],
+            cfc_lvl_db: [3, 0, 0, 3, 3, 3, 6, 6, 6, 9, 9, 0, 0],
+            cfc_post_db: post,
+            cfc_comp_deg: 0,
+            cfc_comp_r: false,
+            cfc_comp_w_x10: [10; 12],
+            cfc_post_deg: 0,
+            cfc_post_r: false,
+            cfc_post_w_x10: [10; 12],
+        }
+    }
+}
+
+/// Everything the CFC WDSP calls depend on (cache key so a change of any other TxExtra field never rebuilds it).
+type CfcKey = (bool, bool, [i32; 13], [i32; 13], [i32; 13], u8, bool, [u16; 12], u8, bool, [u16; 12]);
+
+fn cfc_key(cfc_enabled: bool, e: &TxExtra) -> CfcKey {
+    (
+        cfc_enabled,
+        e.cfc_post_enabled,
+        e.cfc_freq_hz,
+        e.cfc_lvl_db,
+        e.cfc_post_db,
+        e.cfc_comp_deg,
+        e.cfc_comp_r,
+        e.cfc_comp_w_x10,
+        e.cfc_post_deg,
+        e.cfc_post_r,
+        e.cfc_post_w_x10,
+    )
+}
+
+/// The DEXP-related fields of two TxExtra compare equal.
+fn dexp_fields_eq(a: &TxExtra, b: &TxExtra) -> bool {
+    a.dexp == b.dexp
+        && a.dexp_filter == b.dexp_filter
+        && a.dexp_exp_db == b.dexp_exp_db
+        && a.dexp_hyst == b.dexp_hyst
+        && a.dexp_trigger_db == b.dexp_trigger_db
+        && a.dexp_tau_ms == b.dexp_tau_ms
+        && a.dexp_attack_ms == b.dexp_attack_ms
+        && a.dexp_release_ms == b.dexp_release_ms
+        && a.dexp_hold_ms == b.dexp_hold_ms
+        && a.dexp_filter_low_hz == b.dexp_filter_low_hz
+        && a.dexp_filter_high_hz == b.dexp_filter_high_hz
+}
+
+/// deskHPSDR tx_set_filter: the explicit TX filter (audio low/high, positive Hz) mapped to IQ-space edges per mode.
+/// Modes deskHPSDR pins itself (CW, FM) or does not define keep the existing passband_for result.
+fn explicit_tx_passband(mode: Mode, low: f64, high: f64, fallback: (f64, f64)) -> (f64, f64) {
+    match mode {
+        Mode::Usb | Mode::Digu => (low, high),
+        Mode::Lsb | Mode::Digl => (-high, -low),
+        Mode::Dsb | Mode::Am | Mode::Sam | Mode::Spec => (-high, high),
+        _ => fallback,
+    }
+}
+
+/// deskHPSDR tx_set_compressor's CFC block, with the guards the EQ already has against WDSP's silent rejection:
+/// the 12 points are sorted by frequency (with their levels/post gains/weights), made strictly increasing, weights > 0,
+/// curve degree in {0,1,3,5,7}, NURBS "r" only when every weight is > 0.
+unsafe fn apply_cfc(channel: i32, cfc_enabled: bool, e: &TxExtra) {
+    let mut idx: Vec<usize> = (1..=12).collect();
+    idx.sort_by_key(|&i| e.cfc_freq_hz[i]);
+    let mut freq = [0.0f64; 12];
+    let mut lvl = [0.0f64; 12];
+    let mut post = [0.0f64; 12];
+    let mut wc = [0.0f64; 12];
+    let mut wp = [0.0f64; 12];
+    for (k, &i) in idx.iter().enumerate() {
+        let mut f = e.cfc_freq_hz[i] as f64;
+        if k > 0 && f <= freq[k - 1] {
+            f = freq[k - 1] + 1.0;
+        }
+        freq[k] = f;
+        lvl[k] = e.cfc_lvl_db[i] as f64;
+        post[k] = e.cfc_post_db[i] as f64;
+        wc[k] = e.cfc_comp_w_x10[i - 1] as f64 / 10.0;
+        wp[k] = e.cfc_post_w_x10[i - 1] as f64 / 10.0;
+    }
+    let comp_r = e.cfc_comp_r && wc.iter().all(|&x| x > 0.0);
+    let post_r = e.cfc_post_r && wp.iter().all(|&x| x > 0.0);
+    for w in wc.iter_mut().chain(wp.iter_mut()) {
+        if *w <= 0.0 {
+            *w = 0.01;
+        }
+    }
+    let deg = |d: u8| match d {
+        1 | 3 | 5 | 7 => d as c_int,
+        _ => 0,
+    };
+    wdsp::SetTXACFCOMPprofile(channel, 12, freq.as_mut_ptr(), lvl.as_mut_ptr(), post.as_mut_ptr());
+    wdsp::SetTXACFCOMPCompCurve(channel, deg(e.cfc_comp_deg), comp_r as c_int, 0);
+    wdsp::SetTXACFCOMPCompWeights(channel, 12, wc.as_mut_ptr());
+    wdsp::SetTXACFCOMPPeqCurve(channel, deg(e.cfc_post_deg), post_r as c_int, 0);
+    wdsp::SetTXACFCOMPPeqWeights(channel, 12, wp.as_mut_ptr());
+    wdsp::SetTXACFCOMPPrecomp(channel, e.cfc_lvl_db[0] as f64);
+    wdsp::SetTXACFCOMPRun(channel, cfc_enabled as c_int);
+    wdsp::SetTXACFCOMPPrePeq(channel, e.cfc_post_db[0] as f64);
+    wdsp::SetTXACFCOMPPeqRun(channel, e.cfc_post_enabled as c_int);
+}
+
+/// deskHPSDR tx_set_dexp (DEXP id 0, forced off in DIGL/DIGU without touching the stored values).
+unsafe fn apply_dexp(e: &TxExtra, mode: Mode) {
+    let digi = matches!(mode, Mode::Digl | Mode::Digu);
+    wdsp::SetDEXPDetectorTau(0, e.dexp_tau_ms * 0.001);
+    wdsp::SetDEXPAttackTime(0, e.dexp_attack_ms * 0.001);
+    wdsp::SetDEXPReleaseTime(0, e.dexp_release_ms * 0.001);
+    wdsp::SetDEXPHoldTime(0, e.dexp_hold_ms * 0.001);
+    wdsp::SetDEXPExpansionRatio(0, 10f64.powf(0.05 * e.dexp_exp_db as f64));
+    wdsp::SetDEXPHysteresisRatio(0, e.dexp_hyst);
+    wdsp::SetDEXPAttackThreshold(0, 10f64.powf(0.05 * e.dexp_trigger_db as f64));
+    wdsp::SetDEXPLowCut(0, e.dexp_filter_low_hz as f64);
+    wdsp::SetDEXPHighCut(0, e.dexp_filter_high_hz as f64);
+    wdsp::SetDEXPRunSideChannelFilter(0, (!digi && e.dexp_filter) as c_int);
+    wdsp::SetDEXPRun(0, (!digi && e.dexp) as c_int);
+}
+
 impl Default for TxParams {
     fn default() -> Self {
         Self {
+            extra: TxExtra::default(),
             mode: Mode::Usb,
             // CHANGED (2026-09-08): was 0.5 (-6dB), a deliberately
             // conservative starting point -- real-hardware testing found
@@ -616,9 +818,15 @@ struct TxProcessor {
     /// See TxParams::leveler_enabled's doc comment.
     last_leveler: Option<(bool, f32, i32)>,
     /// See TxParams::compressor_enabled/compressor_gain_db's doc comment.
-    last_compressor: Option<(bool, f32)>,
-    /// See TxParams::cfc_enabled's doc comment.
-    last_cfc: Option<bool>,
+    last_compressor: Option<(bool, f32, bool)>,
+    /// See TxParams::cfc_enabled's doc comment (key = every field the CFC calls depend on).
+    last_cfc: Option<CfcKey>,
+    /// TxExtra as last applied (phase rotator / EQ ctfmode / CTCSS / FM emphasis / AM carrier groups diff against it).
+    last_extra: Option<TxExtra>,
+    /// DEXP parameters + whether the mode forced it off, as last applied.
+    last_dexp: Option<(TxExtra, bool)>,
+    /// True while DEXP is effectively running (xdexp is only called then).
+    dexp_active: bool,
     /// (tune, two_tone) as last applied to WDSP's PostGen -- see
     /// process()'s PostGen update for why these are tracked together.
     last_post_gen: Option<(bool, bool)>,
@@ -691,6 +899,9 @@ impl TxProcessor {
         let dsp_rate = if protocol == 2 { 96_000 } else { 48_000 };
         let default_passband =
             crate::spectrum::passband_for(Mode::Usb, crate::spectrum::default_width_hz(Mode::Usb));
+
+        // Allocated here (not in the struct literal) because DEXP is created with a pointer into it.
+        let mut mic_scratch = vec![0.0f64; TX_BUFFER_SIZE * 2];
 
         // Serializes this one-time TXA setup sequence against every RXA
         // channel's own setup (spectrum.rs's SpectrumAnalyzer::open) --
@@ -771,7 +982,7 @@ impl TxProcessor {
             // neither attack time nor filter phase changed anything.
             // Filter back on -- it must stay on for real operation.
             wdsp::SetTXABandpassRun(channel, 1);
-            wdsp::SetTXAFMEmphPosition(channel, 0);
+            wdsp::SetTXAFMEmphPosition(channel, TxExtra::default().fm_pre_emphasis as c_int);
             if protocol == 1 {
                 wdsp::SetTXACFIRRun(channel, 0); // not needed for P1 -- done in FPGA instead
             } else {
@@ -931,7 +1142,7 @@ impl TxProcessor {
             // reference rather than because this project currently
             // supports those modes.
             wdsp::SetTXAFMDeviation(channel, 2500.0);
-            wdsp::SetTXAAMCarrierLevel(channel, 0.5);
+            wdsp::SetTXAAMCarrierLevel(channel, TxExtra::default().am_carrier_level);
 
             wdsp::SetTXACompressorGain(channel, 0.0);
             wdsp::SetTXACompressorRun(channel, 0);
@@ -942,19 +1153,8 @@ impl TxProcessor {
             // (curve degree/r/umethod = 0 = linear/off, weights = 1.0 --
             // confirmed via its transmitter.c init block).
             {
-                let mut freq = CFC_FREQ_HZ;
-                let mut lvl = CFC_DEFAULT_LVL_DB;
-                let mut post = CFC_DEFAULT_POST_DB;
-                let mut weights = [1.0f64; 12];
-                wdsp::SetTXACFCOMPprofile(channel, 12, freq.as_mut_ptr(), lvl.as_mut_ptr(), post.as_mut_ptr());
-                wdsp::SetTXACFCOMPCompCurve(channel, 0, 0, 0);
-                wdsp::SetTXACFCOMPCompWeights(channel, 12, weights.as_mut_ptr());
-                wdsp::SetTXACFCOMPPeqCurve(channel, 0, 0, 0);
-                wdsp::SetTXACFCOMPPeqWeights(channel, 12, weights.as_mut_ptr());
-                wdsp::SetTXACFCOMPPrecomp(channel, CFC_DEFAULT_PRECOMP_DB);
-                wdsp::SetTXACFCOMPPrePeq(channel, CFC_DEFAULT_PREPEQ_DB);
-                wdsp::SetTXACFCOMPRun(channel, 0);
-                wdsp::SetTXACFCOMPPeqRun(channel, 0);
+                // TxExtra defaults (the live values are applied by process() on its first call).
+                apply_cfc(channel, false, &TxExtra::default());
             }
 
             // TX bandpass passband -- ROOT CAUSE FIX: this was
@@ -981,6 +1181,40 @@ impl TxProcessor {
             // matches TxParams::default(); process() updates it live
             // on mode/width change, same pattern as mic_gain/mode.
             wdsp::SetTXABandpassFreqs(channel, default_passband.0, default_passband.1);
+
+            // DEXP (downward expander, TX noise gate): lives OUTSIDE the TXA channel, id 0, processed in place on
+            // the interleaved mic block before fexchange0 (deskHPSDR create_dexp/xdexp). mic_scratch is never
+            // reallocated, so its heap pointer stays valid for the lifetime of this processor.
+            let mic_ptr = mic_scratch.as_mut_ptr();
+            wdsp::create_dexp(
+                0,
+                0,
+                TX_BUFFER_SIZE as c_int,
+                mic_ptr,
+                mic_ptr,
+                mic_rate,
+                0.01,
+                0.025,
+                0.100,
+                0.800,
+                10.0,
+                0.75,
+                0.05,
+                TX_BUFFER_SIZE as c_int,
+                0,
+                1000.0,
+                2000.0,
+                0,
+                0,
+                0,
+                0.050,
+                None,
+                0,
+                1,
+                1,
+                1.0,
+                1.0,
+            );
         }
 
         // PureSignal: no separate OpenChannel/channel-id needed -- the
@@ -1018,7 +1252,7 @@ impl TxProcessor {
 
         TxProcessor {
             channel,
-            mic_scratch: vec![0.0; TX_BUFFER_SIZE * 2],
+            mic_scratch,
             iq_scratch: vec![0.0; out_iq_pairs * 2],
             last_mode: None,
             last_gain: None,
@@ -1032,6 +1266,9 @@ impl TxProcessor {
             last_leveler: None,
             last_compressor: None,
             last_cfc: None,
+            last_extra: None,
+            last_dexp: None,
+            dexp_active: false,
             last_post_gen: None,
             last_ps_mox: None,
             ps_ratio_baseline: None,
@@ -1085,8 +1322,11 @@ impl TxProcessor {
         compressor_gain_db: f32,
         cfc_enabled: bool,
         alc_enabled: bool,
+        extra: TxExtra,
     ) -> (Vec<f32>, c_int) {
         debug_assert_eq!(mic_samples.len(), TX_BUFFER_SIZE);
+        let prev_extra = self.last_extra;
+        let digi = matches!(mode, Mode::Digl | Mode::Digu);
 
         // Live bandpass-freqs update -- see open()'s SetTXABandpassFreqs
         // comment for the full root-cause story. Same
@@ -1094,7 +1334,13 @@ impl TxProcessor {
         // keyed on the computed (f_low, f_high) pair instead of the
         // raw mode/width so a width change alone (same mode) still
         // triggers it.
-        let passband = explicit_passband.unwrap_or_else(|| crate::spectrum::passband_for(mode, width_hz));
+        let rx_passband = explicit_passband.unwrap_or_else(|| crate::spectrum::passband_for(mode, width_hz));
+        // deskHPSDR tx_set_filter: with "Use RX filter" off the TX bandpass uses its own low/high edges.
+        let passband = if extra.use_rx_filter {
+            rx_passband
+        } else {
+            explicit_tx_passband(mode, extra.tx_filter_low_hz as f64, extra.tx_filter_high_hz as f64, rx_passband)
+        };
         if self.last_passband != Some(passband) {
             unsafe {
                 wdsp::SetTXABandpassFreqs(self.channel, passband.0, passband.1);
@@ -1221,12 +1467,63 @@ impl TxProcessor {
             self.last_mode = Some(mode);
         }
 
+        // Local mic preamp (deskHPSDR "Local Mic PreAmp Gain"): extra linear factor, never in DIGL/DIGU.
+        let mic_gain = if extra.addgain_enable && !digi {
+            mic_gain * 10f64.powf(extra.addgain_gain_db * 0.05) as f32
+        } else {
+            mic_gain
+        };
         if self.last_gain != Some(mic_gain) {
             unsafe {
                 wdsp::SetTXAPanelGain1(self.channel, mic_gain as f64);
             }
             self.last_gain = Some(mic_gain);
         }
+
+        // Phase rotator / EQ cutoff mode / CTCSS / FM emphasis position / AM carrier level: each group only
+        // when its own fields changed (first call: everything).
+        {
+            let ch = self.channel;
+            let changed = |f: &dyn Fn(&TxExtra) -> bool| match &prev_extra {
+                Some(p) => f(p) != f(&extra),
+                None => true,
+            };
+            unsafe {
+                if prev_extra.map_or(true, |p| {
+                    p.phrot_freq_hz != extra.phrot_freq_hz
+                        || p.phrot_stage != extra.phrot_stage
+                        || p.phrot_enable != extra.phrot_enable
+                }) {
+                    wdsp::SetTXAPHROTCorner(ch, extra.phrot_freq_hz as f64);
+                    wdsp::SetTXAPHROTNstages(ch, extra.phrot_stage as c_int);
+                    wdsp::SetTXAPHROTRun(ch, extra.phrot_enable as c_int);
+                }
+                if changed(&|e| e.eq_ctfmode) {
+                    wdsp::SetTXAEQCtfmode(ch, extra.eq_ctfmode as c_int);
+                }
+                if prev_extra.map_or(true, |p| p.ctcss_index != extra.ctcss_index || p.ctcss_enabled != extra.ctcss_enabled) {
+                    let idx = (extra.ctcss_index as usize).min(CTCSS_HZ.len() - 1);
+                    wdsp::SetTXACTCSSFreq(ch, CTCSS_HZ[idx]);
+                    wdsp::SetTXACTCSSRun(ch, extra.ctcss_enabled as c_int);
+                }
+                if changed(&|e| e.fm_pre_emphasis) {
+                    wdsp::SetTXAFMEmphPosition(ch, extra.fm_pre_emphasis as c_int);
+                }
+                if prev_extra.map_or(true, |p| p.am_carrier_level != extra.am_carrier_level) {
+                    wdsp::SetTXAAMCarrierLevel(ch, extra.am_carrier_level);
+                }
+            }
+        }
+
+        // DEXP (TX noise gate), forced off in DIGL/DIGU. See open() for the object, process() end for xdexp.
+        if self.last_dexp.map_or(true, |(e, d)| !dexp_fields_eq(&e, &extra) || d != digi) {
+            unsafe {
+                apply_dexp(&extra, mode);
+            }
+            self.dexp_active = extra.dexp && !digi;
+            self.last_dexp = Some((extra, digi));
+        }
+        self.last_extra = Some(extra);
 
         // ALC bypass for RADE: same reasoning as leveler_enabled/
         // compressor_enabled/cfc_enabled above -- ALC is a dynamics
@@ -1300,7 +1597,7 @@ impl TxProcessor {
         // Simple Compressor ("PROC") -- see TxParams::compressor_enabled's
         // doc comment. Gain set before Run, same order as deskHPSDR's own
         // tx_menu.c/transmitter.c.
-        if self.last_compressor != Some((compressor_enabled, compressor_gain_db)) {
+        if self.last_compressor != Some((compressor_enabled, compressor_gain_db, extra.cessb_enable)) {
             unsafe {
                 wdsp::SetTXACompressorGain(self.channel, compressor_gain_db as f64);
                 wdsp::SetTXACompressorRun(self.channel, compressor_enabled as c_int);
@@ -1317,10 +1614,10 @@ impl TxProcessor {
                 // pushed harder without the overshoot that would
                 // otherwise cause, more average TX power for the same
                 // peak envelope.
-                let cessb_on = compressor_enabled && compressor_gain_db > 0.0;
+                let cessb_on = compressor_enabled && extra.cessb_enable && compressor_gain_db > 0.0;
                 wdsp::SetTXAosctrlRun(self.channel, cessb_on as c_int);
             }
-            self.last_compressor = Some((compressor_enabled, compressor_gain_db));
+            self.last_compressor = Some((compressor_enabled, compressor_gain_db, extra.cessb_enable));
         }
 
         // CFC (multiband Continuous Frequency Compressor + post-EQ) --
@@ -1329,12 +1626,12 @@ impl TxProcessor {
         // default -- only Run toggles live here; the coefficient calls
         // only need to happen once, at open() (see there), not per
         // chunk.
-        if self.last_cfc != Some(cfc_enabled) {
+        let cfc_k = cfc_key(cfc_enabled, &extra);
+        if self.last_cfc != Some(cfc_k) {
             unsafe {
-                wdsp::SetTXACFCOMPRun(self.channel, cfc_enabled as c_int);
-                wdsp::SetTXACFCOMPPeqRun(self.channel, cfc_enabled as c_int);
+                apply_cfc(self.channel, cfc_enabled, &extra);
             }
-            self.last_cfc = Some(cfc_enabled);
+            self.last_cfc = Some(cfc_k);
         }
 
         // Confirmed against the reference: real mono mic sample in the
@@ -1347,6 +1644,12 @@ impl TxProcessor {
         for (i, &s) in mic_samples.iter().enumerate() {
             self.mic_scratch[i * 2] = s as f64;
             self.mic_scratch[i * 2 + 1] = 0.0;
+        }
+        // DEXP works in place on mic_scratch (deskHPSDR: xdexp(0) right before fexchange0).
+        if self.dexp_active {
+            unsafe {
+                wdsp::xdexp(0);
+            }
         }
 
         let mut error: c_int = 0;
@@ -1829,6 +2132,7 @@ impl Drop for TxProcessor {
         // being covered by this lock, only setup was).
         let _guard = wdsp::SETUP_LOCK.lock().unwrap();
         unsafe {
+            wdsp::destroy_dexp(0);
             wdsp::CloseChannel(self.channel);
         }
     }
@@ -2956,6 +3260,9 @@ fn run(
             p.leveler_enabled = false;
             p.compressor_enabled = false;
             p.cfc_enabled = false;
+            p.extra.dexp = false;
+            p.extra.cfc_post_enabled = false;
+            p.extra.phrot_enable = false;
             // ROOT CAUSE FIX for a real report: the TX Equalizer (the
             // same SSB one, boosting/cutting fixed bands) was left
             // running over these tones -- same problem as Leveler/
@@ -3000,6 +3307,7 @@ fn run(
             p.compressor_gain_db,
             p.cfc_enabled,
             alc_enabled,
+            p.extra,
         );
 
         if exch_error != 0 {
@@ -3411,6 +3719,14 @@ impl TxHandle {
     }
     pub fn set_cfc_enabled(&self, enabled: bool) {
         self.params.lock().unwrap().cfc_enabled = enabled;
+    }
+
+    /// See TxExtra.
+    pub fn tx_extra(&self) -> TxExtra {
+        self.params.lock().unwrap().extra
+    }
+    pub fn set_tx_extra(&self, extra: TxExtra) {
+        self.params.lock().unwrap().extra = extra;
     }
 
     /// See TxParams::rade_leveler_enabled's doc comment.

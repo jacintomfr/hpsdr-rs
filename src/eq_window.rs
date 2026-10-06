@@ -98,20 +98,21 @@ pub fn eq_window(ui: &mut egui::Ui, connected: &mut ConnectedState) -> (bool, bo
 
     let side_id = egui::Id::new("eq_window_side");
     let drag_id = egui::Id::new("eq_window_drag");
-    let desc_id = egui::Id::new("eq_window_desc");
     let mut side: Side = ui.ctx().data(|d| d.get_temp(side_id)).unwrap_or(Side::Rx1);
     let side_list = sides(connected);
     if !side_list.iter().any(|(s, _)| *s == side) {
         side = Side::Rx1;
     }
 
-    let profile_names = ep::slot_descriptions();
+    let profile_names: Vec<String> = (0..3)
+        .map(|i| connected.mic_profile_descs.get(i).filter(|s| !s.trim().is_empty()).cloned().unwrap_or_else(|| "NOMIC".to_string()))
+        .collect();
     let title = match connected.mic_profile_nr {
-        Some(n) if (1..=3).contains(&n) => format!("hpsdr-rs - WDSP EQ Menu (Mic Profile: {})", profile_names[n - 1]),
+        Some(n) if n <= 2 => format!("hpsdr-rs - WDSP EQ Menu (Mic Profile: {})", profile_names[n]),
         _ => "hpsdr-rs - WDSP EQ Menu".to_string(),
     };
 
-    let frame = egui::Frame::window(ui.style()).inner_margin(4.0).corner_radius(0.0);
+    let frame = egui::Frame::window(ui.style()).inner_margin(egui::Margin::symmetric(24, 4)).corner_radius(0.0);
     egui::Window::new("WDSP EQ Menu")
         .id(egui::Id::new("eq_window"))
         .title_bar(false)
@@ -120,12 +121,12 @@ pub fn eq_window(ui: &mut egui::Ui, connected: &mut ConnectedState) -> (bool, bo
         .frame(frame)
         .fixed_pos(screen.min)
         .constrain_to(screen)
-        .fixed_size(screen.size() - egui::vec2(10.0, 10.0))
+        .fixed_size(screen.size() - egui::vec2(58.0, 10.0))
         .show(ui.ctx(), |ui| {
             if ui.input(|i| i.key_pressed(egui::Key::Escape)) {
                 close_now = true;
             }
-            let avail_w = screen.width() - 10.0;
+            let avail_w = screen.width() - 58.0;
             ui.set_width(avail_w);
             ui.set_min_height(screen.height() - 10.0);
             ui.spacing_mut().item_spacing = egui::vec2(6.0, 2.0);
@@ -153,31 +154,28 @@ pub fn eq_window(ui: &mut egui::Ui, connected: &mut ConnectedState) -> (bool, bo
                             let mut right = ui.new_child(egui::UiBuilder::new().max_rect(cluster).layout(egui::Layout::right_to_left(egui::Align::Center)));
                             {
                                 let ui = &mut right;
-                                if let Some(n) = connected.mic_profile_nr {
-                                    let mut desc: String = ui.ctx().data(|d| d.get_temp(desc_id)).unwrap_or_else(|| {
-                                        ep::load_slot(n).map(|p| p.desc).unwrap_or_default()
-                                    });
+                                if let Some(n) = connected.mic_profile_nr.filter(|n| *n <= 2) {
                                     if ui.add(chip_button("Save", false).min_size(egui::vec2(60.0, 30.0))).clicked() {
                                         if let Some(tx) = connected.tx_handle.as_ref() {
-                                            let mut p = ep::MicProfile::capture(tx, connected.spectrum.eq());
-                                            p.desc = desc.clone();
+                                            let p = ep::MicProfile::capture(tx, connected.spectrum.eq());
                                             let _ = ep::save_slot(n, &p);
+                                            while connected.mic_profile_descs.len() < 3 {
+                                                connected.mic_profile_descs.push("NOMIC".to_string());
+                                            }
+                                            connected.mic_profile_descs[n] = connected.mic_input_device.clone().unwrap_or_else(|| "SDR Device Mic".to_string());
                                         }
                                     }
-                                    ui.add(egui::TextEdit::singleline(&mut desc).desired_width(110.0));
-                                    ui.ctx().data_mut(|d| d.insert_temp(desc_id, desc));
                                 }
-                                for n in (1..=3usize).rev() {
+                                for n in (0..3usize).rev() {
                                     let active = connected.mic_profile_nr == Some(n);
                                     // Same look as the IARU region buttons: the selected slot is orange.
                                     let resp = ui
                                         .add(egui::Button::selectable(active, n.to_string()).min_size(egui::vec2(46.0, 36.0)))
-                                        .on_hover_text(format!("Mic profile {n}: {}", profile_names[n - 1]));
+                                        .on_hover_text(format!("Mic profile {n}: {}", profile_names[n]));
                                     if resp.clicked() {
                                         // The slot becomes the active one even when it is still empty (then Save fills it);
                                         // an existing profile is loaded.
                                         connected.mic_profile_nr = Some(n);
-                                        ui.ctx().data_mut(|d| d.remove::<String>(desc_id));
                                         if let (Some(p), Some(tx)) = (ep::load_slot(n), connected.tx_handle.as_ref()) {
                                             let rx = p.apply(tx);
                                             let tx_eq = tx.eq();
@@ -185,7 +183,6 @@ pub fn eq_window(ui: &mut egui::Ui, connected: &mut ConnectedState) -> (bool, bo
                                             let group = ep::eq_mode_group(connected.spectrum.mode()).to_string();
                                             connected.rx_eq_by_mode.insert(group.clone(), rx);
                                             connected.tx_eq_by_mode.insert(group, tx_eq);
-                                            ui.ctx().data_mut(|d| d.insert_temp(desc_id, p.desc.clone()));
                                         }
                                         changed = true;
                                     }
