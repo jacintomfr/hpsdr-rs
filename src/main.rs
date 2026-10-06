@@ -20,6 +20,9 @@ mod cw_encoder;
 mod debug_log;
 mod discovery;
 mod discovery_ui;
+mod eq_curve;
+mod eq_window;
+mod eq_profiles;
 mod hpsdrsim;
 mod midi;
 mod midi_import;
@@ -1424,6 +1427,7 @@ fn dispatch_midi_binding(
             connected.vox_enabled = !connected.vox_enabled;
         }
         MidiAction::VoxMenu => connected.vox_window_open = !connected.vox_window_open,
+        MidiAction::EqMenu => connected.eq_window_open = !connected.eq_window_open,
         // deskHPSDR: KnobOrWheel(vox_threshold, 0.0, 1.0, 0.01).
         MidiAction::VoxLevel => {
             connected.vox_threshold = if binding.kind == MidiBindingKind::Wheel {
@@ -2420,6 +2424,12 @@ struct ConnectedState {
     vox_filter_low_hz: f64,
     vox_filter_high_hz: f64,
     vox_window_open: bool,
+    /// The deskHPSDR-style WDSP EQ window (eq_window.rs), its per-mode EQ maps (config) and the active mic-profile slot.
+    eq_window_open: bool,
+    rx_eq_by_mode: std::collections::HashMap<String, spectrum::EqualizerParams>,
+    tx_eq_by_mode: std::collections::HashMap<String, spectrum::EqualizerParams>,
+    eq_mode_group_seen: String,
+    mic_profile_nr: Option<usize>,
     /// Detector level for the meter in the VOX window (peak with slow decay).
     vox_level_shown: f32,
     /// VFO step of each mode, loaded when the mode changes (like deskHPSDR's per-mode step).
@@ -3998,6 +4008,11 @@ fn connect_to_device(device: Device, cfg: &Config) -> Result<ConnectedState, Str
                 vox_filter_low_hz: cfg.vox_filter_low_hz.unwrap_or(1000.0).clamp(0.0, 4000.0),
                 vox_filter_high_hz: cfg.vox_filter_high_hz.unwrap_or(2000.0).clamp(0.0, 4000.0),
                 vox_window_open: false,
+                eq_window_open: false,
+                rx_eq_by_mode: cfg.rx_eq_by_mode.clone(),
+                tx_eq_by_mode: cfg.tx_eq_by_mode.clone(),
+                eq_mode_group_seen: String::new(),
+                mic_profile_nr: cfg.mic_profile_nr,
                 vox_level_shown: 0.0,
                 step_memory: cfg.step_memory.clone(),
                 step_last_mode: None,
@@ -4892,6 +4907,7 @@ impl eframe::App for HpsdrApp {
                     }
                 }
                 vox_tick(ui.ctx(), connected);
+                eq_window::mode_tick(connected);
                 spectrum::set_smeter_peak(connected.smeter_mode == SMeterMode::Peak);
                 tx::set_alc_mode(match connected.alc_mode {
                     AlcMode::Peak => 0,
@@ -6562,6 +6578,17 @@ impl eframe::App for HpsdrApp {
                         }
                         if close_now {
                             connected.vox_window_open = false;
+                        }
+                    }
+
+                    // WDSP EQ window (deskHPSDR equalizer_menu.c), see eq_window.rs.
+                    if connected.eq_window_open {
+                        let (close_now, changed) = eq_window::eq_window(ui, connected);
+                        if changed {
+                            settings_changed = true;
+                        }
+                        if close_now {
+                            connected.eq_window_open = false;
                         }
                     }
 
@@ -14608,6 +14635,20 @@ Waterfall rebuilds: {prof_wf_n:.0}/s, {prof_wf_ms:.1} ms each."
                                     // 10-band), ported from piHPSDR's equalizer_menu.c
                                     // (which the user originally wrote, 3-band only --
                                     // 10-band added here per explicit request).
+                                    // Kiosk: picking the tab opens the EQ window straight away (and leaves the tab on About so
+                                    // that reopening Settings does not pop it up again).
+                                    let open_now = lcd_kiosk_mode();
+                                    if open_now {
+                                        connected.settings_tab = SettingsTab::About;
+                                    }
+                                    if open_now || (!lcd_kiosk_mode() && ui.button("Open the WDSP EQ window (12-point curve)").clicked()) {
+                                        // The EQ window is drawn by the main window: close Settings and wake the main window.
+                                        connected.eq_window_open = true;
+                                        connected.show_settings_window = false;
+                                        ui.ctx().request_repaint_of(egui::ViewportId::ROOT);
+                                    }
+                                    // Kiosk: the EQ window is the equalizer (as in deskHPSDR); the old simple panels stay on the desktop.
+                                    if !lcd_kiosk_mode() {
                                     if connected.tx_handle.is_some() {
                                         ui.horizontal(|ui| {
                                             for (is_tx, label) in [(false, "RX"), (true, "TX")] {
@@ -14643,6 +14684,7 @@ Waterfall rebuilds: {prof_wf_n:.0}/s, {prof_wf_ms:.1} ms each."
                                             connected.spectrum.set_eq(eq);
                                             settings_changed = true;
                                         }
+                                    }
                                     }
                                 }
                             }
@@ -15330,6 +15372,9 @@ Waterfall rebuilds: {prof_wf_n:.0}/s, {prof_wf_ms:.1} ms each."
                         anf: Some(agc_params_now.anf),
                         binaural: Some(agc_params_now.binaural),
                         rx_eq: Some(agc_params_now.eq),
+                        rx_eq_by_mode: connected.rx_eq_by_mode.clone(),
+                        tx_eq_by_mode: connected.tx_eq_by_mode.clone(),
+                        mic_profile_nr: connected.mic_profile_nr,
                         mic_gain: Some(connected.mic_gain),
                         tx_eq: connected.tx_handle.as_ref().map(|t| t.eq()),
                         tx_leveler_enabled: connected.tx_handle.as_ref().map(|t| t.leveler_enabled()),
@@ -18104,6 +18149,7 @@ fn toolbar_fn_active(connected: &ConnectedState, f: toolbar::ToolbarFn) -> bool 
         ToolbarFn::Midi(MidiAction::Vox) => connected.vox_enabled,
         ToolbarFn::Midi(MidiAction::DigitalMenu) => connected.show_digital_window,
         ToolbarFn::Midi(MidiAction::VoxMenu) => connected.vox_window_open,
+        ToolbarFn::Midi(MidiAction::EqMenu) => connected.eq_window_open,
         ToolbarFn::Midi(MidiAction::RxEqToggle) => connected.spectrum.eq().enabled,
         _ => false,
     }

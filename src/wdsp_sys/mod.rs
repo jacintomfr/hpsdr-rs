@@ -505,6 +505,10 @@ unsafe extern "C" {
     // index 0 = the frequency-independent gain (F[0] unused), then the bands.
     pub fn SetRXAEQProfile(channel: ::std::os::raw::c_int, nfreqs: ::std::os::raw::c_int, F: *mut f64, G: *mut f64);
     pub fn SetTXAEQProfile(channel: ::std::os::raw::c_int, nfreqs: ::std::os::raw::c_int, F: *mut f64, G: *mut f64);
+    pub fn SetRXAEQCurve(channel: ::std::os::raw::c_int, deg: ::std::os::raw::c_int, r: ::std::os::raw::c_int, umethod: ::std::os::raw::c_int);
+    pub fn SetTXAEQCurve(channel: ::std::os::raw::c_int, deg: ::std::os::raw::c_int, r: ::std::os::raw::c_int, umethod: ::std::os::raw::c_int);
+    pub fn SetRXAEQWeights(channel: ::std::os::raw::c_int, nfreq: ::std::os::raw::c_int, weights: *mut f64);
+    pub fn SetTXAEQWeights(channel: ::std::os::raw::c_int, nfreq: ::std::os::raw::c_int, weights: *mut f64);
 }
 unsafe extern "C" {
     pub fn create_divEXT(

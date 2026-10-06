@@ -83,6 +83,7 @@ impl ToolbarFn {
                 MidiAction::SquelchToggle => "SQL",
                 MidiAction::Vox => "VOX",
                 MidiAction::VoxMenu => "VOX SET",
+                MidiAction::EqMenu => "EQ",
                 MidiAction::ReportRec => "REC",
                 MidiAction::ReportPlay => "PLAY",
                 MidiAction::RecordWav => "RECORD",

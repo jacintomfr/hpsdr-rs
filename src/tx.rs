@@ -1257,10 +1257,12 @@ impl TxProcessor {
             unsafe {
                 match eq.band_count {
                     EqBandCount::Three => {
+                        wdsp::SetTXAEQCurve(self.channel, 0, 0, 0);
                         let mut coeffs = [eq.preamp_db, eq.bands_3_db[0], eq.bands_3_db[1], eq.bands_3_db[2]];
                         wdsp::SetTXAGrphEQ(self.channel, coeffs.as_mut_ptr());
                     }
                     EqBandCount::Ten => {
+                        wdsp::SetTXAEQCurve(self.channel, 0, 0, 0);
                         let mut coeffs = [0i32; 11];
                         coeffs[0] = eq.preamp_db;
                         coeffs[1..11].copy_from_slice(&eq.bands_10_db);
@@ -1269,6 +1271,11 @@ impl TxProcessor {
                     EqBandCount::Twelve => {
                         let (mut fr, mut gn) = eq.profile12();
                         wdsp::SetTXAEQProfile(self.channel, 12, fr.as_mut_ptr(), gn.as_mut_ptr());
+                        let mut w = eq.weights12();
+                        let deg = match eq.curve_deg { 1 | 3 | 5 | 7 => eq.curve_deg as c_int, _ => 0 };
+                        let r = (eq.nurbs_r && w.iter().all(|&x| x > 0.0)) as c_int;
+                        wdsp::SetTXAEQCurve(self.channel, deg, r, 0);
+                        wdsp::SetTXAEQWeights(self.channel, 12, w.as_mut_ptr());
                     }
                 }
                 wdsp::SetTXAEQRun(self.channel, eq.enabled as c_int);

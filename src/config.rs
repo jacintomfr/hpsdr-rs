@@ -243,6 +243,15 @@ pub struct Config {
     pub mic_gain: Option<f32>,
     /// TX graphic EQ -- see spectrum::EqualizerParams's doc comment.
     pub tx_eq: Option<EqualizerParams>,
+    /// Per-mode-group RX EQ (key = eq_profiles::eq_mode_group); `rx_eq` stays the live copy.
+    #[serde(default)]
+    pub rx_eq_by_mode: std::collections::HashMap<String, EqualizerParams>,
+    /// Per-mode-group TX EQ (key = eq_profiles::eq_mode_group); `tx_eq` stays the live copy.
+    #[serde(default)]
+    pub tx_eq_by_mode: std::collections::HashMap<String, EqualizerParams>,
+    /// Active mic-profile slot (1..=3, see eq_profiles::MicProfile), if one was loaded/saved.
+    #[serde(default)]
+    pub mic_profile_nr: Option<usize>,
     /// WDSP Leveler/Compressor ("PROC") on-off and gain -- see
     /// tx::TxParams::leveler_enabled/compressor_enabled's doc comments.
     #[serde(default)]

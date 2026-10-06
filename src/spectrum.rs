@@ -506,6 +506,14 @@ fn default_eq12_freqs() -> [i32; 12] {
     EQ12_DEFAULT_RX_HZ
 }
 
+/// deskHPSDR's default TX equalizer gains (transmitter.c), dB, matching `EQ12_DEFAULT_TX_HZ`.
+pub const EQ12_DEFAULT_TX_DB: [i32; 12] = [-9, -6, -6, -9, 0, 0, 3, 3, 3, 3, 0, 0];
+
+/// NURBS point weights are stored in tenths (10 = 1.0, range 1..=999 = 0.1..=99.9) so `EqualizerParams` stays `Eq`.
+fn default_eq12_weights() -> [u16; 12] {
+    [10; 12]
+}
+
 /// Equalizer settings for one WDSP channel (RXA or TXA -- see EqBandCount's
 /// doc comment). Disabled and flat by default. The 3-/10-band gains are whole
 /// dB in -12..15 (SetXXAGrphEQ[10] take `int*`); the 12-band mode takes
@@ -531,6 +539,16 @@ pub struct EqualizerParams {
     /// Gain" in deskHPSDR), dB; the 3-/10-band modes use `preamp_db`.
     #[serde(default)]
     pub preamp12_db: i32,
+    /// deskHPSDR's "Curve" choice as the WDSP curve degree: 0 = Legacy linear, otherwise 1, 3, 5 or 7 (B-spline /
+    /// NURBS through the 12 points, `SetXXAEQCurve`).
+    #[serde(default)]
+    pub curve_deg: u8,
+    /// deskHPSDR's "NURBS weights" checkbox (`eq_curve_r`): rational curve using `weights_x10`.
+    #[serde(default)]
+    pub nurbs_r: bool,
+    /// Weight of each of the 12 points, in tenths (see `default_eq12_weights`).
+    #[serde(default = "default_eq12_weights")]
+    pub weights_x10: [u16; 12],
 }
 
 impl Default for EqualizerParams {
@@ -544,6 +562,9 @@ impl Default for EqualizerParams {
             bands_12_db: [0; 12],
             freqs_12_hz: EQ12_DEFAULT_RX_HZ,
             preamp12_db: 0,
+            curve_deg: 0,
+            nurbs_r: false,
+            weights_x10: default_eq12_weights(),
         }
     }
 }
@@ -551,7 +572,16 @@ impl Default for EqualizerParams {
 impl EqualizerParams {
     /// Defaults for the transmit side (deskHPSDR's TX frequencies).
     pub fn default_tx() -> Self {
-        Self { freqs_12_hz: EQ12_DEFAULT_TX_HZ, ..Self::default() }
+        Self { freqs_12_hz: EQ12_DEFAULT_TX_HZ, bands_12_db: EQ12_DEFAULT_TX_DB, ..Self::default() }
+    }
+
+    /// `W` array for `SetRXAEQWeights`/`SetTXAEQWeights` (the 12 point weights, 0.1..=99.9).
+    pub fn weights12(&self) -> [f64; 12] {
+        let mut w = [1.0f64; 12];
+        for i in 0..12 {
+            w[i] = (self.weights_x10[i].clamp(1, 999) as f64) / 10.0;
+        }
+        w
     }
 
     /// `F`/`G` arrays for `SetRXAEQProfile`/`SetTXAEQProfile` (index 0 = the
@@ -1676,6 +1706,9 @@ impl SpectrumAnalyzer {
             unsafe {
                 match params.eq.band_count {
                     EqBandCount::Three => {
+                        // GrphEQ reuses the stored NURBS degree; a stuck degree >= 4 makes
+                        // checkSplineInputs reject the 4-point profile silently. Reset to linear.
+                        wdsp::SetRXAEQCurve(self.channel, 0, 0, 0);
                         let mut coeffs = [
                             params.eq.preamp_db,
                             params.eq.bands_3_db[0],
@@ -1685,6 +1718,7 @@ impl SpectrumAnalyzer {
                         wdsp::SetRXAGrphEQ(self.channel, coeffs.as_mut_ptr());
                     }
                     EqBandCount::Ten => {
+                        wdsp::SetRXAEQCurve(self.channel, 0, 0, 0);
                         let mut coeffs = [0i32; 11];
                         coeffs[0] = params.eq.preamp_db;
                         coeffs[1..11].copy_from_slice(&params.eq.bands_10_db);
@@ -1693,6 +1727,13 @@ impl SpectrumAnalyzer {
                     EqBandCount::Twelve => {
                         let (mut fr, mut gn) = params.eq.profile12();
                         wdsp::SetRXAEQProfile(self.channel, 12, fr.as_mut_ptr(), gn.as_mut_ptr());
+                        // deskHPSDR order: Profile, Curve, Weights (the last call leaves the
+                        // final impulse). Degree must be < 12 and r=1 needs all weights > 0.
+                        let mut w = params.eq.weights12();
+                        let deg = match params.eq.curve_deg { 1 | 3 | 5 | 7 => params.eq.curve_deg as c_int, _ => 0 };
+                        let r = (params.eq.nurbs_r && w.iter().all(|&x| x > 0.0)) as c_int;
+                        wdsp::SetRXAEQCurve(self.channel, deg, r, 0);
+                        wdsp::SetRXAEQWeights(self.channel, 12, w.as_mut_ptr());
                     }
                 }
                 wdsp::SetRXAEQRun(self.channel, params.eq.enabled as c_int);
