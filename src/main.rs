@@ -25,6 +25,7 @@ mod eq_curve;
 mod eq_window;
 mod noise_window;
 mod pa_window;
+mod menu_window;
 mod display_window;
 mod peaks;
 mod agc_window;
@@ -1451,6 +1452,7 @@ fn dispatch_midi_binding(
         }
         MidiAction::RxMenu => connected.rx_window_open = !connected.rx_window_open,
         MidiAction::SdrMenu => connected.sdr_window_open = !connected.sdr_window_open,
+        MidiAction::NewMenu => menu_window::toggle(connected),
         // deskHPSDR: KnobOrWheel(vox_threshold, 0.0, 1.0, 0.01).
         MidiAction::VoxLevel => {
             connected.vox_threshold = if binding.kind == MidiBindingKind::Wheel {
@@ -2231,6 +2233,8 @@ struct ConnectedState {
     /// by default, preserving this app's prior plain-line look.
     spectrum_filled: bool,
     spectrum_gradient: bool,
+    /// Smooth the panadapter trace (5-tap smoothing + spline); off = deskHPSDR's raw per-pixel polyline.
+    spectrum_smooth_trace: bool,
     waterfall_palette: Palette,
     /// S-meter style (Settings -> Meter) -- see MeterStyle's own doc
     /// comment.
@@ -2475,6 +2479,10 @@ struct ConnectedState {
     pa_window_open: bool,
     /// The Display window (display_window.rs).
     display_window_open: bool,
+    /// The full-screen Menu window (menu_window.rs), opened by the NEW MENU action.
+    menu_window_open: bool,
+    /// A window was opened from the Menu window: when nothing is open any more, the Menu comes back (menu_window.rs `return_tick`).
+    menu_return: bool,
     /// Settings -> Display: noise-floor margin of Panadapter Automatic (dB), WDSP detector (0 Peak, 1 Rosenfell,
     /// 2 Average, 3 Sample), averaging mode (0 None, 1 Recursive, 2 Time Window, 3 Log Recursive), averaging time (ms)
     /// and "Display Panadapter".
@@ -2485,6 +2493,8 @@ struct ConnectedState {
     display_panadapter: bool,
     /// Runtime state of the deskHPSDR-style Panadapter/Waterfall Automatic (display_window.rs).
     display_auto: display_window::AutoState,
+    /// Peak labels noise cache and Peaks & Hold buffers of the main panadapter (peaks.rs).
+    peak_state: peaks::PeakState,
     /// The PA window's drive-linearization measurement assistant (pa_window.rs); None when idle.
     pa_measure: Option<pa_window::Measure>,
     /// The RX Menu window (rx_window.rs) and its radio/audio-layer options.
@@ -4022,7 +4032,8 @@ fn connect_to_device(device: Device, cfg: &Config) -> Result<ConnectedState, Str
                 tx_spectrum_fps: cfg.tx_spectrum_fps.unwrap_or(30),
                 spectrum_filled: cfg.spectrum_filled.unwrap_or(false),
                 spectrum_gradient: cfg.spectrum_gradient.unwrap_or(false),
-                waterfall_palette: cfg.waterfall_palette.unwrap_or(Palette::Ocean),
+                spectrum_smooth_trace: cfg.spectrum_smooth_trace.unwrap_or(false),
+                waterfall_palette: cfg.waterfall_palette.unwrap_or(Palette::DeskHpsdr),
                 meter_style: cfg.meter_style.unwrap_or(MeterStyle::Analog),
                 smeter_mode: cfg.smeter_mode.unwrap_or(SMeterMode::Average),
                 alc_mode: cfg.alc_mode.unwrap_or(AlcMode::Average),
@@ -4117,12 +4128,15 @@ fn connect_to_device(device: Device, cfg: &Config) -> Result<ConnectedState, Str
                 tx_window_open: false,
                 pa_window_open: false,
                 display_window_open: false,
+                menu_window_open: false,
+                menu_return: false,
                 panadapter_noise_margin: cfg.panadapter_noise_margin.unwrap_or(-5).clamp(-20, 10),
                 display_detector: cfg.display_detector.unwrap_or(2).min(3),
                 display_average_mode: cfg.display_average_mode.unwrap_or(3).min(3),
                 display_average_time_ms: cfg.display_average_time_ms.unwrap_or(250).clamp(1, 9999),
                 display_panadapter: cfg.display_panadapter.unwrap_or(true),
                 display_auto: display_window::AutoState::default(),
+                peak_state: peaks::PeakState::default(),
                 pa_measure: None,
                 rx_window_open: false,
                 rx_ui: cfg.rx_ui,
@@ -5455,6 +5469,7 @@ impl eframe::App for HpsdrApp {
                 if mox_on_now && connected.spectrum.duplex() {
                     let row: Vec<f32> = connected.tx_spectrum.display.lock().unwrap().spectrum.clone();
                     let (lo, hi) = if tx_low < tx_high { (tx_low, tx_high) } else { (tx_high, tx_high + 1.0) };
+                    let dup_tx_col = { let c = connected.tx_ui.tx_pan_col.map(|v| (v.clamp(0.0, 1.0) * 255.0).round() as u8); egui::Color32::from_rgb(c[0], c[1], c[2]) };
                     let tx_mode_now = connected.spectrum.mode();
                     let just_shown = connected.tx_window_frames_shown == 0;
                     // egui measures a new window first (its size is unknown for a frame or two) and `constrain` then pushes it
@@ -5515,7 +5530,7 @@ impl eframe::App for HpsdrApp {
                                         )
                                     })
                                     .collect();
-                                painter.add(egui::Shape::line(pts, egui::Stroke::new(1.0, egui::Color32::from_rgb(120, 220, 90))));
+                                painter.add(egui::Shape::line(pts, egui::Stroke::new(1.0, dup_tx_col)));
                             }
                         });
                     if let Some(w) = tx_win {
@@ -6703,6 +6718,20 @@ impl eframe::App for HpsdrApp {
                         }
                         if close_now {
                             connected.tx_window_open = false;
+                        }
+                    }
+
+                    // Back to the Menu when a window opened from it has been closed.
+                    menu_window::return_tick(connected);
+
+                    // Menu window (all menus in one grid), see menu_window.rs.
+                    if connected.menu_window_open {
+                        let (close_now, changed) = menu_window::menu_window(ui, connected);
+                        if changed {
+                            settings_changed = true;
+                        }
+                        if close_now {
+                            connected.menu_window_open = false;
                         }
                     }
 
@@ -9210,18 +9239,32 @@ impl eframe::App for HpsdrApp {
                         // happens upstream, in WDSP's own FFT size, not
                         // here.
                         let n = spectrum_row.len().saturating_sub(1).max(1);
-                        let smoothed_row = smooth_spectrum_values(&spectrum_row, connected.spectrum_zoom);
+                        // "Smooth trace" (Settings -> Display) off (default) = deskHPSDR: the raw row, one point per bin,
+                        // plain polyline, y floored to whole pixels. The peak hold/labels below always use the raw row.
+                        let smooth_trace_on = connected.spectrum_smooth_trace;
+                        let smoothed_row = if smooth_trace_on {
+                            smooth_spectrum_values(&spectrum_row, connected.spectrum_zoom)
+                        } else {
+                            spectrum_row.to_vec()
+                        };
+                        let ppp_px = ui.ctx().pixels_per_point().max(0.5);
                         let points: Vec<egui::Pos2> = smoothed_row
                             .iter()
                             .enumerate()
                             .map(|(i, &v)| {
                                 let x = rect.left() + (i as f32 / n as f32) * rect.width();
-                                let t = ((v - db_low) / range).clamp(0.0, 1.0);
-                                let y = plot_bottom - t * plot_height;
+                                let y = if smooth_trace_on {
+                                    let t = ((v - db_low) / range).clamp(0.0, 1.0);
+                                    plot_bottom - t * plot_height
+                                } else {
+                                    // deskHPSDR: floor((high - s) * height / (high - low)) from the top.
+                                    let off = ((db_high - v) * plot_height / range * ppp_px).floor() / ppp_px;
+                                    (rect.top() + off).clamp(rect.top(), plot_bottom)
+                                };
                                 egui::pos2(x, y)
                             })
                             .collect();
-                        let trace_points = smooth_trace(&points);
+                        let trace_points = if smooth_trace_on { smooth_trace(&points) } else { points };
 
                         // Trace style -- Settings -> Spectrum -- ported
                         // from deskHPSDR's rx_panadapter.c
@@ -9301,6 +9344,43 @@ impl eframe::App for HpsdrApp {
                         } else {
                             (db_low, 0.55 * range)
                         };
+                        // TX line/fill colour (Settings -> Display -> Peak Blobs & Hold, deskHPSDR tx_pan_fill_col); RX keeps its colours.
+                        let (trace_line_col, trace_fill_col) = if transmitting {
+                            let c = connected.tx_ui.tx_pan_col.map(|v| (v.clamp(0.0, 1.0) * 255.0).round() as u8);
+                            (egui::Color32::from_rgb(c[0], c[1], c[2]), egui::Color32::from_rgba_unmultiplied(c[0], c[1], c[2], 110))
+                        } else {
+                            // RX flat fill: deskHPSDR COLOUR_PAN_FILL2 (white, alpha 0.50, active + filled).
+                            (egui::Color32::LIGHT_GREEN, egui::Color32::from_rgba_unmultiplied(255, 255, 255, 128))
+                        };
+                        // RX gradient: deskHPSDR's exact stops (rx_panadapter.c), opaque, positions along the whole
+                        // panadapter height (0 = Low at the bottom, 1 = High at the top); S9 = -73 dBm (-93 above 30 MHz)
+                        // + 10 dB, normalised to the Low..High span and clamped. TX keeps the previous gradient.
+                        let desk_s9n = {
+                            let s9: f32 = (if freq_hz > 30_000_000 { -93.0 } else { -73.0 }) + 10.0;
+                            ((s9 - db_low) / range).clamp(0.0, 1.0)
+                        };
+                        let grad_db_low = db_low;
+                        let grad_range = range;
+                        let grad_plot_bottom = plot_bottom;
+                        let grad_plot_height = plot_height.max(1.0);
+                        let grad_tx = transmitting;
+                        let grad_floor = gradient_floor_db;
+                        let grad_span = gradient_red_span_db;
+                        let gradient_at_y = move |y: f32, alpha: u8| -> egui::Color32 {
+                            let db = grad_db_low + ((grad_plot_bottom - y) / grad_plot_height) * grad_range;
+                            if grad_tx {
+                                spectrum_gradient_color(((db - grad_floor) / grad_span).clamp(0.0, 1.0), alpha)
+                            } else {
+                                desk_gradient_color((db - grad_db_low) / grad_range, desk_s9n, 255)
+                            }
+                        };
+                        let trace_stroke = |w: f32| -> egui::epaint::PathStroke {
+                            if connected.spectrum_gradient && !grad_tx {
+                                egui::epaint::PathStroke::new_uv(w, move |_r, p| gradient_at_y(p.y, 255))
+                            } else {
+                                egui::Stroke::new(w, trace_line_col).into()
+                            }
+                        };
                         if connected.spectrum_filled {
                             // Gouraud-shaded quad strip from the trace
                             // down to the plot baseline, matching
@@ -9318,13 +9398,11 @@ impl eframe::App for HpsdrApp {
                             // used to build `points` above) so the
                             // gradient can key off real dB distance from
                             // the noise floor instead of screen fraction.
-                            let db_at = |y: f32| db_low + ((plot_bottom - y) / plot_height.max(1.0)) * range;
                             let color_at = |y: f32| -> egui::Color32 {
                                 if connected.spectrum_gradient {
-                                    let t = ((db_at(y) - gradient_floor_db) / gradient_red_span_db).clamp(0.0, 1.0);
-                                    spectrum_gradient_color(t, 190)
+                                    gradient_at_y(y, 190)
                                 } else {
-                                    egui::Color32::from_rgba_unmultiplied(0, 200, 0, 110)
+                                    trace_fill_col
                                 }
                             };
                             // BUG FIX for a real report ("tudo laranja",
@@ -9420,24 +9498,87 @@ impl eframe::App for HpsdrApp {
                             // non-gradient outline exactly instead of
                             // trying to rainbow the stroke too (the fill
                             // underneath already carries the gradient).
-                            ui.painter().add(egui::Shape::line(
-                                trace_points,
-                                egui::Stroke::new(1.0, egui::Color32::LIGHT_GREEN),
-                            ));
-                        } else if connected.spectrum_gradient {
-                            // Gradient without fill -- same seam issue
-                            // and same fix as the filled case just above:
-                            // one continuous Shape::line instead of many
-                            // separately-antialiased line_segment calls.
-                            ui.painter().add(egui::Shape::line(
-                                trace_points,
-                                egui::Stroke::new(1.5, egui::Color32::LIGHT_GREEN),
-                            ));
+                            //
+                            // Update: RX with Gradient now strokes with the same gradient as the fill (deskHPSDR uses
+                            // one pattern for both) through a single PathStroke::new_uv path, so there is still no seam.
+                            // Width: deskHPSDR PAN_LINE_THIN 0.5 (raw trace) / the previous 1.0 (smooth trace).
+                            ui.painter().add(egui::Shape::line(trace_points, trace_stroke(if smooth_trace_on { 1.0 } else { 0.5 })));
                         } else {
-                            ui.painter().add(egui::Shape::line(
-                                trace_points,
-                                egui::Stroke::new(1.5, egui::Color32::LIGHT_GREEN),
-                            ));
+                            // Not filled: deskHPSDR PAN_LINE_THICK 1.0 (raw trace) / the previous 1.5 (smooth trace).
+                            ui.painter().add(egui::Shape::line(trace_points, trace_stroke(if smooth_trace_on { 1.5 } else { 1.0 })));
+                        }
+
+                        // Peaks & Hold trace and Peak Labels (Settings -> Display), ported from deskHPSDR's rx_panadapter.c /
+                        // tx_panadapter.c -- see peaks.rs and docs/display-menu.md. They use the RAW row (like deskHPSDR), never the smoothed one: the
+                        // dB-domain smoothing flattens narrow signals by ~30 dB (S9 read as S4).
+                        {
+                            let tu = connected.tx_ui;
+                            let raw_row: &[f32] = &spectrum_row;
+                            let nbins = raw_row.len();
+                            let (hold_rx_on, hold_tx_on) = (tu.peak_hold_on, tu.peak_hold_on && tu.peak_hold_tx);
+                            if !hold_rx_on {
+                                connected.peak_state.hold_rx.reset();
+                            }
+                            if !hold_tx_on {
+                                connected.peak_state.hold_tx.reset();
+                            }
+                            if (transmitting && hold_tx_on) || (!transmitting && hold_rx_on) {
+                                let hp = peaks::HoldParams { mode: tu.peak_hold_mode, hold_sec: tu.peak_hold_sec, drop_db_per_sec: tu.peak_hold_drop_db };
+                                let hz_per_bin = 2.0 * visible_half_span_hz / n as f64;
+                                let min_display = view_center_hz - visible_half_span_hz;
+                                let ps = &mut connected.peak_state;
+                                let hold = if transmitting { &mut ps.hold_tx } else { &mut ps.hold_rx };
+                                hold.update(raw_row, waterfall_data_revision, &hp, min_display, hz_per_bin, transmitting);
+                                let vals = hold.values();
+                                if vals.len() == nbins {
+                                    let pts: Vec<egui::Pos2> = vals
+                                        .iter()
+                                        .enumerate()
+                                        .map(|(i, &v)| {
+                                            let t = ((v - db_low) / range).clamp(0.0, 1.0);
+                                            egui::pos2(rect.left() + (i as f32 / n as f32) * rect.width(), plot_bottom - t * plot_height)
+                                        })
+                                        .collect();
+                                    let c = tu.peak_line_col.map(|v| (v.clamp(0.0, 1.0) * 255.0).round() as u8);
+                                    ui.painter().add(egui::Shape::line(pts, egui::Stroke::new(1.5, egui::Color32::from_rgba_unmultiplied(c[0], c[1], c[2], c[3]))));
+                                }
+                            }
+                            if tu.peaks_on && nbins > 2 {
+                                let pp = peaks::PeakParams {
+                                    on: true,
+                                    in_passband: tu.peaks_in_passband,
+                                    hide_noise: tu.peaks_hide_noise,
+                                    num_peaks: tu.peaks_num,
+                                    ignore_range_divider: tu.peaks_ignore_divider,
+                                    noise_percentile: tu.peaks_noise_percentile,
+                                };
+                                let nl = if pp.hide_noise { Some(connected.peak_state.noise_level(raw_row, pp.noise_percentile, transmitting)) } else { None };
+                                let to_bin = |x: f32| (((x - rect.left()) / rect.width()).clamp(0.0, 1.0) * n as f32).round() as usize;
+                                let pb = if pp.in_passband { Some((to_bin(x_low.min(x_high)), to_bin(x_low.max(x_high)))) } else { None };
+                                let found = peaks::find_peaks_nl(raw_row, nbins, pb, &pp, nl);
+                                if !found.is_empty() {
+                                    // Peaks in pixels of the plot, like deskHPSDR's pixel samples.
+                                    let found_px: Vec<(usize, f32)> =
+                                        found.iter().map(|&(i, v)| (((i as f32 / n as f32) * rect.width()).round() as usize, v)).collect();
+                                    let font = egui::FontId::proportional(16.0);
+                                    let painter = ui.painter();
+                                    let width_of = |s: &str| painter.layout_no_wrap(s.to_string(), font.clone(), egui::Color32::WHITE).size().x;
+                                    let freq_now = freq_hz as u64;
+                                    let as_smeter = tu.peaks_as_smeter;
+                                    let text_fn = |db: f32| if as_smeter { peaks::smeter_text(freq_now, db).to_string() } else { peaks::dbm_text(db) };
+                                    // cairo text extents.height of 16 px digits is about 12 px.
+                                    let labels = peaks::layout_labels_w(&found_px, db_high, db_low, plot_height, rect.width(), 12.0, &width_of, &text_fn);
+                                    for l in &labels {
+                                        painter.text(
+                                            egui::pos2(rect.left() + l.x_px, rect.top() + l.y_px + 3.0),
+                                            egui::Align2::CENTER_BOTTOM,
+                                            &l.text,
+                                            font.clone(),
+                                            egui::Color32::WHITE,
+                                        );
+                                    }
+                                }
+                            }
                         }
                     }
 
@@ -10988,6 +11129,22 @@ Waterfall rebuilds: {prof_wf_n:.0}/s, {prof_wf_ms:.1} ms each."
                                     // freely, so this tab would be a no-op
                                     // (and confusing) there.
                                     if tab == SettingsTab::Diagnostic && !lcd_kiosk_mode() {
+                                        continue;
+                                    }
+                                    // Kiosk: these pages are full-screen windows now reached from the Menu window / MIDI
+                                    // actions (menu_window.rs); the arms below stay for the desktop.
+                                    if lcd_kiosk_mode()
+                                        && matches!(
+                                            tab,
+                                            SettingsTab::SdrDevice
+                                                | SettingsTab::Noise
+                                                | SettingsTab::TxMenu
+                                                | SettingsTab::Pa
+                                                | SettingsTab::Display
+                                                | SettingsTab::RxMenu
+                                                | SettingsTab::Equalizer
+                                        )
+                                    {
                                         continue;
                                     }
                                     if tab == SettingsTab::Screen && !lcd_kiosk_mode() {
@@ -15238,6 +15395,7 @@ Waterfall rebuilds: {prof_wf_n:.0}/s, {prof_wf_ms:.1} ms each."
                         tx_spectrum_fps: Some(connected.tx_spectrum_fps),
                         spectrum_filled: Some(connected.spectrum_filled),
                         spectrum_gradient: Some(connected.spectrum_gradient),
+                        spectrum_smooth_trace: Some(connected.spectrum_smooth_trace),
                         panadapter_noise_margin: Some(connected.panadapter_noise_margin),
                         display_detector: Some(connected.display_detector),
                         display_average_mode: Some(connected.display_average_mode),
@@ -18002,6 +18160,7 @@ fn toolbar_fn_active(connected: &ConnectedState, f: toolbar::ToolbarFn) -> bool 
         ToolbarFn::Midi(MidiAction::TxMenu) => connected.tx_window_open,
         ToolbarFn::Midi(MidiAction::RxMenu) => connected.rx_window_open,
         ToolbarFn::Midi(MidiAction::SdrMenu) => connected.sdr_window_open,
+        ToolbarFn::Midi(MidiAction::NewMenu) => connected.menu_window_open,
         ToolbarFn::Midi(MidiAction::RxEqToggle) => connected.spectrum.eq().enabled,
         _ => false,
     }
@@ -22944,7 +23103,7 @@ fn spawn_extra_receiver(
         db_high: saved.map(|s| s.db_high).unwrap_or(-40.0),
         waterfall_db_low: saved.map(|s| s.waterfall_db_low).unwrap_or(-140.0),
         waterfall_db_high: saved.map(|s| s.waterfall_db_high).unwrap_or(-60.0),
-        waterfall_palette: saved.map(|s| s.waterfall_palette).unwrap_or(Palette::Ocean),
+        waterfall_palette: saved.map(|s| s.waterfall_palette).unwrap_or(Palette::DeskHpsdr),
         spectrum_waterfall_ratio: saved.map(|s| s.spectrum_waterfall_ratio).unwrap_or(150.0 / 350.0),
         waterfall_enabled: saved.map(|s| s.waterfall_enabled).unwrap_or(true),
         spectrum_zoom: saved.map(|s| s.spectrum_zoom).unwrap_or(1),
@@ -23400,6 +23559,37 @@ fn smooth_trace(points: &[egui::Pos2]) -> Vec<egui::Pos2> {
     out
 }
 
+/// deskHPSDR's panadapter gradient (rx_panadapter.c, active RX): a linear gradient from the bottom (`pos` 0) to the top
+/// (`pos` 1) of the panadapter with the stops green 0, yellow 0.20*S9, orange 0.55*S9, red 0.80*S9, purple S9 (`s9n` =
+/// the normalised S9 position, 0..1); above the last stop cairo repeats the last colour.
+fn desk_gradient_color(pos: f32, s9n: f32, alpha: u8) -> egui::Color32 {
+    let stops: [(f32, [f32; 3]); 5] = [
+        (0.0, [0.0, 1.0, 0.0]),
+        (s9n * 0.20, [1.0, 1.0, 0.0]),
+        (s9n * 0.55, [1.0, 0.66, 0.0]),
+        (s9n * 0.80, [1.0, 0.0, 0.0]),
+        (s9n, [0.75, 0.25, 1.0]),
+    ];
+    let mut c = stops[4].1;
+    if pos <= stops[0].0 {
+        c = stops[0].1;
+    } else {
+        for w in stops.windows(2) {
+            if pos <= w[1].0 {
+                let span = w[1].0 - w[0].0;
+                let f = if span > 1e-9 { ((pos - w[0].0) / span).clamp(0.0, 1.0) } else { 1.0 };
+                c = [
+                    w[0].1[0] + (w[1].1[0] - w[0].1[0]) * f,
+                    w[0].1[1] + (w[1].1[1] - w[0].1[1]) * f,
+                    w[0].1[2] + (w[1].1[2] - w[0].1[2]) * f,
+                ];
+                break;
+            }
+        }
+    }
+    egui::Color32::from_rgba_unmultiplied((c[0] * 255.0).round() as u8, (c[1] * 255.0).round() as u8, (c[2] * 255.0).round() as u8, alpha)
+}
+
 /// `display_rows`: the waterfall pane's own real on-screen pixel height
 /// (from last frame -- see the call site's doc comment on why it's one
 /// frame behind, and why that's fine), clamped by the caller to
@@ -23440,7 +23630,9 @@ fn build_waterfall_image(
             if col_idx >= width {
                 break;
             }
-            let t = ((v - db_low) / range).clamp(0.0, 1.0);
+            // deskHPSDR palette sees the unclamped fraction (black below low, yellow above high).
+            let raw = (v - db_low) / range;
+            let t = if palette == Palette::DeskHpsdr { raw } else { raw.clamp(0.0, 1.0) };
             image.pixels[row_idx * width + col_idx] = palette.color(t);
         }
     }
@@ -23577,9 +23769,44 @@ pub enum Palette {
     Fire,
     Ocean,
     Grayscale,
+    /// deskHPSDR's waterfall mapping (waterfall.c): see `desk_hpsdr_color`.
+    DeskHpsdr,
 }
 
-const ALL_PALETTES: [Palette; 4] = [Palette::Fire, Palette::Ocean, Palette::Classic, Palette::Grayscale];
+const ALL_PALETTES: [Palette; 5] = [Palette::Fire, Palette::Ocean, Palette::Classic, Palette::Grayscale, Palette::DeskHpsdr];
+
+/// deskHPSDR's waterfall colour mapping (waterfall.c, default colorLow black / colorHigh yellow), on the UNCLAMPED
+/// fraction p = (level - low) / (high - low): below the range black, above it yellow, in between seven linear
+/// segments with the same constants and truncating casts as the C code.
+fn desk_hpsdr_color(p: f32) -> egui::Color32 {
+    let (r, g, b) = if p < 0.0 {
+        (0, 0, 0)
+    } else if p > 1.0 {
+        (255, 255, 0)
+    } else if p < 0.222222 {
+        let q = p * 4.5;
+        (0, 0, (q * 255.0) as u8)
+    } else if p < 0.333333 {
+        let q = (p - 0.222222) * 9.0;
+        (0, (q * 255.0) as u8, 255)
+    } else if p < 0.444444 {
+        let q = (p as f64 - 0.333333) as f32 * 9.0;
+        (0, 255, ((1.0 - q) * 255.0) as u8)
+    } else if p < 0.555555 {
+        let q = (p - 0.444444) * 9.0;
+        ((q * 255.0) as u8, 255, 0)
+    } else if p < 0.777777 {
+        let q = (p - 0.555555) * 4.5;
+        (255, ((1.0 - q) * 255.0) as u8, 0)
+    } else if p < 0.888888 {
+        let q = (p - 0.777777) * 9.0;
+        (255, 0, (q * 255.0) as u8)
+    } else {
+        let q = (p - 0.888888) * 9.0;
+        (((0.75 + 0.25 * (1.0 - q)) * 255.0) as u8, (q * 255.0 * 0.5) as u8, 255)
+    };
+    egui::Color32::from_rgb(r, g, b)
+}
 
 impl Palette {
     fn label(self) -> &'static str {
@@ -23588,10 +23815,14 @@ impl Palette {
             Palette::Fire => "Fire",
             Palette::Ocean => "Ocean",
             Palette::Grayscale => "Grayscale",
+            Palette::DeskHpsdr => "deskHPSDR",
         }
     }
 
     fn color(self, t: f32) -> egui::Color32 {
+        if self == Palette::DeskHpsdr {
+            return desk_hpsdr_color(t);
+        }
         let t = t.clamp(0.0, 1.0);
         let (r, g, b) = match self {
             // black -> blue -> green -> yellow -> red. Most typical
@@ -23642,6 +23873,7 @@ impl Palette {
                 }
             }
             Palette::Grayscale => (t, t, t),
+            Palette::DeskHpsdr => unreachable!("handled above"),
         };
         egui::Color32::from_rgb((r * 255.0) as u8, (g * 255.0) as u8, (b * 255.0) as u8)
     }

@@ -228,6 +228,8 @@ pub enum MidiAction {
     Toolbar8,
     /// Previous toolbar layer (piHPSDR's FuncRev).
     ToolbarFuncRev,
+    /// The full-screen Menu window with every menu in one grid (menu_window.rs).
+    NewMenu,
 }
 
 impl MidiAction {
@@ -333,6 +335,7 @@ impl MidiAction {
             MidiAction::Toolbar7 => "ToolBar7",
             MidiAction::Toolbar8 => "Function",
             MidiAction::ToolbarFuncRev => "FuncRev",
+            MidiAction::NewMenu => "NEW MENU",
         }
     }
 }
@@ -414,6 +417,7 @@ pub const KEY_ACTIONS: &[MidiAction] = &[
     MidiAction::Toolbar7,
     MidiAction::Toolbar8,
     MidiAction::ToolbarFuncRev,
+    MidiAction::NewMenu,
 ];
 
 /// Actions valid for a Knob (absolute value) binding.

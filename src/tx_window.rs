@@ -107,7 +107,7 @@ pub fn tx_window(ui: &mut egui::Ui, connected: &mut ConnectedState) -> (bool, bo
 
             // Section selector (round radios) and CLOSE at the top right.
             let row = new_row(ui, w, 54.0);
-            for (i, (x0, label)) in [(10.0, "TX Basic Settings"), (240.0, "WDSP TX Audio Tools"), (500.0, "WDSP CFC"), (660.0, "Peak Labels")].iter().enumerate() {
+            for (i, (x0, label)) in [(10.0, "TX Basic Settings"), (300.0, "WDSP TX Audio Tools"), (610.0, "WDSP CFC")].iter().enumerate() {
                 let mut c = child(ui, row, *x0, *x0 + 250.0, false, 0.0);
                 if touch_radio(&mut c, section == i as u8, label).clicked() {
                     section = i as u8;
@@ -126,8 +126,7 @@ pub fn tx_window(ui: &mut egui::Ui, connected: &mut ConnectedState) -> (bool, bo
             match section {
                 0 => basic(ui, w, connected, &mut ex, &mut tui, digital, local_mic, popup_id, &mut changed),
                 1 => audio_tools(ui, w, connected, &mut ex, &mut changed),
-                2 => cfc_section(ui, w, connected, &mut ex),
-                _ => peaks_section(ui, w, &mut tui),
+                _ => cfc_section(ui, w, connected, &mut ex),
             }
         });
     ui.ctx().data_mut(|d| d.insert_temp(section_id, section));
@@ -720,34 +719,5 @@ fn cfc_section(ui: &mut egui::Ui, w: f32, connected: &mut ConnectedState, ex: &m
                 ex.cfc_post_db[b] = v.round() as i32;
             }
         }
-    }
-}
-
-// ======================================================================= Peak Labels
-
-fn peaks_section(ui: &mut egui::Ui, w: f32, tui: &mut TxUiExtra) {
-    let row = new_row(ui, w, ROW_H + 4.0);
-    check(ui, row, 0.0, 600.0, &mut tui.peaks_on, "Show Peak Numbers on Panadapter");
-    let row = new_row(ui, w, ROW_H + 4.0);
-    check(ui, row, 0.0, 600.0, &mut tui.peaks_in_passband, "Show Peaks in Passband Only");
-    let row = new_row(ui, w, ROW_H + 4.0);
-    check(ui, row, 0.0, 600.0, &mut tui.peaks_hide_noise, "Hide Peaks Below Noise Floor");
-    let row = new_row(ui, w, ROW_H + 4.0);
-    lbl(ui, row, 0.0, 480.0, "Number of Peaks to label:");
-    let mut v = tui.peaks_num as f64;
-    if spin(ui, row, 490.0, 700.0, "pk_num", &mut v, 1.0, 10.0, 1.0, 0) {
-        tui.peaks_num = v.round() as i32;
-    }
-    let row = new_row(ui, w, ROW_H + 4.0);
-    lbl(ui, row, 0.0, 480.0, "Panadapter Ignore Adjacent Peaks:");
-    let mut v = tui.peaks_ignore_divider as f64;
-    if spin(ui, row, 490.0, 700.0, "pk_ign", &mut v, 1.0, 150.0, 1.0, 0) {
-        tui.peaks_ignore_divider = v.round() as i32;
-    }
-    let row = new_row(ui, w, ROW_H + 4.0);
-    lbl(ui, row, 0.0, 480.0, "Panadapter Noise Floor Percentile:");
-    let mut v = tui.peaks_noise_percentile as f64;
-    if spin(ui, row, 490.0, 700.0, "pk_pct", &mut v, 1.0, 100.0, 1.0, 0) {
-        tui.peaks_noise_percentile = v.round() as i32;
     }
 }

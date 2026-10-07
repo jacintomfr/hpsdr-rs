@@ -9,7 +9,7 @@ Pages (round radios in the header, last page remembered): General Settings, Peak
 
 Content height 590 - 8 (frame margins) = 582 px: title 22 + header 54 + gap 4 = 80, leaving 502 px. General page: 11 rows x 44 px
 (34 px controls + 10 px gap) = 484 px (18 px spare). Left column x 0..470, right column x 490..966 (24 px side margins, 20 px between
-columns). Not yet checked on the Pi screen (capture pending).
+columns). Peak Blobs & Hold page: 7 rows x 44 = 308 px; Peak Labels page: 7 rows x 44 = 308 px (194 px spare each); the colour rows end at x = 906 of 966. Not yet checked on the Pi screen (capture pending).
 
 ## General Settings: control -> field -> effect
 
@@ -62,21 +62,51 @@ UI "Frames Per Second", which does not pace the analyzer here); so the UI fps ch
 Show Worldmap, 3D Waterfall History, Display Info Bar, Show Solardata in Info Bar, Show clock & UDP broadcast. "Show ADC OVF Alarm"
 and "Show AH4 state" of deskHPSDR are not shown.
 
-## Peak Blobs & Hold page
+## Phase 2: Peak Labels, Peak Blobs & Hold (src/peaks.rs, drawn in main.rs after the trace)
 
-All deskHPSDR controls shown greyed (Enable PEAKS & HOLD, Type, Decay hold time, Drop, Enable for TX, line colour); not implemented.
+Fields: all in `TxUiExtra` (config.rs, `#[serde(default)]` on the struct, so no migration; shared with the old TX Menu fields): `peaks_on`,
+`peaks_in_passband`, `peaks_hide_noise`, `peaks_num` (1..10, default 4), `peaks_ignore_divider` (1..150, 24), `peaks_noise_percentile`
+(1..100, default now 80 like deskHPSDR, was 50; stored values are kept), NEW `peaks_as_smeter` (false), `peak_hold_on` (false), `peak_hold_mode`
+(1 hold / 2 decay, default 2), `peak_hold_sec` (0.1..5.0 step 0.1, 2.0), `peak_hold_drop_db` (1..10 step 0.5, 6.0), `peak_hold_tx` (false),
+`peak_line_col` (RGBA 0.70,0.70,0.70,1.0), `tx_pan_col` (0,1,0,1). The kiosk has no colour dialog: swatch + R, G, B spin buttons (0..255,
+step 5); alpha is fixed. The Peak Labels section left the TX Menu (the three remaining sections are re-spaced); the fields stay.
 
-## Peak Labels page
+Where it is drawn (main.rs, RX1 panadapter block, only when the panadapter is shown; the same code path serves RX and TX, `transmitting`
+selects the spectrum): trace, then Peaks & Hold line (1.5 px, line colour), then the peak labels (white, 16 px, over everything). The
+extra receivers' windows (`render_extra_receiver_ui`) have their own simpler drawing and get neither. All work is done on the displayed
+(smoothed) row of 1024 bins: ignore range = ceil(bins / divider) bins, labels are laid out in plot pixels.
 
-Bound to `TxUiExtra` (shared with the TX Menu's Peak Labels page): `peaks_on`, `peaks_in_passband`, `peaks_hide_noise`, `peaks_num`
-(1..10), `peaks_ignore_divider` (1..150), `peaks_noise_percentile` (1..100). "Peak Labels as S-Meter values" is skipped (no such
-field). The "!" says the labels are not drawn yet. The TX Menu page is unchanged.
+### Peak labels (rx_panadapter.c 2092-2287)
+
+Local maxima `s > both neighbours` (first/last sample forced to -200 like the C code), `num_peaks` slots, a new maximum within the ignore range
+replaces the slot only if stronger, otherwise the lowest slot is replaced when stronger; exchange sort descending. "In passband only" =
+only between the filter edges (x of the passband overlay converted to bins). "Hide below noise floor": `noise_level` = percentile of the
+visible row + 3 dB, recomputed at most once per second (own cache, also when the percentile or RX/TX changes). Label y =
+`floor((high-peak)*h/(high-low)) - 5`, clamped to the text height at the top; overlap with an earlier label (dy < height and dx < width)
+moves it down by height+5, else up, else right/left by width+5. Text `"%d dBm"` (integer truncation), or with "as S-Meter values"
+deskHPSDR's `dbm2smeter[get_SWert(f, dBm)]` table (meter.c: "S1".."S9", "S9+5db".."S9+60db", "no signal", "out of range"; S9 = -73 dBm up to
+30 MHz, -93 dBm above). Not the app's own `s_meter_label` (that one appends dBm and uses another rounding).
+
+Differences between the old peaks.rs and deskHPSDR, now fixed: default noise percentile 50 vs 80; label text `{:.1}` instead of `%d dBm`;
+first/last sample not forced to -200; noise level recomputed on every call instead of the 1 s cache. Intentional deviation: deskHPSDR compares
+`s` (with the display offset) against neighbours without the offset; here the row already carries the correction, so both sides match.
+
+### Peaks & Hold (rx_panadapter.c 1674-1768, 1881-1906; tx_panadapter.c 425-475, 526-556)
+
+One buffer + age array per panadapter (RX and TX separate, `PeakHold`). The buffer is cleared when the mode changes, the feature is toggled
+(reset while off), the bin count or the Hz per bin (zoom/span/sample rate) changes; when the left edge frequency (view centre - half span)
+moves by whole bins the buffer is shifted like `rx_panadapter_peak_hold_shift`. Updated once per new analyzer row (10 rows/s, not per UI
+frame, so `fps` = 10 as in the averaging conversion): mode 1 per-bin maximum, never decays; mode 2 new maximum sets age 0, after
+`hold_frames = (int)(hold_sec*fps+0.5)` frames the bin drops by `drop/fps` per frame. TX (only with "Enable PEAKS & HOLD for TX", never in
+duplex because the main panadapter then shows the RX): tx_panadapter.c's fast attack / slow release at the Drop rate, whatever the type.
+TX line/fill colour: the main panadapter while transmitting (outline always, fill at the existing alpha 110) and the duplex "TX" window's line.
 
 ## Open items
 
-* Phase 2: draw the peak labels (peaks.rs exists); Peak Blobs & Hold; "Peak Labels as S-Meter values".
 * Phase 3: Worldmap, 3D waterfall, info bar / solar data, clock & UDP broadcast, ADC OVF alarm.
-* Verify on the Pi: layout capture, Panadapter Automatic behaviour on real signals, panadapter-off layout.
+* Verify on the Pi: layout capture of the three pages, Panadapter Automatic behaviour on real signals, panadapter-off layout, and the
+  Phase 2 drawing (labels, hold line, decay timing, shift while retuning/zooming, TX colour), none of which has been run on hardware.
+* Peak labels / hold on the extra receivers' panadapters (not drawn there).
 
 ## Decisions recorded with the owner (CU2ED)
 
@@ -85,9 +115,57 @@ field). The "!" says the labels are not drawn yet. The TX Menu page is unchanged
   (smoothed minimum, own block in main.rs, only while `agc_auto` is on), because deskHPSDR's 60th-percentile floor sits well above the minimum and
   would shift the AGC reference. **Decision: stay as it is for now.** Switching AGC Auto to the new measurement is an open option and should be
   tested with real signals first.
-* Phase 1 scope approved: General Settings page with real effect; Peak Labels page bound to the existing fields (labels not yet drawn);
-  Blobs & Hold and the large features (worldmap, 3D waterfall, info bar, solar data, clock/UDP) visible but inactive.
+* Phase 1 scope approved: General Settings page with real effect; Peak Labels page bound to the existing fields (labels not yet drawn in Phase 1, done in Phase 2);
+  Blobs & Hold (done in Phase 2) and the large features (worldmap, 3D waterfall, info bar, solar data, clock/UDP) visible but inactive.
 * Ranges follow deskHPSDR (Panadapter/Waterfall levels -175..50, grid step 1..20, FPS 5..60), the Auto algorithms were replaced by deskHPSDR's
-  (see above), Peak Labels will leave the TX Menu when the labels are drawn (Phase 2), the old Spectrum tab stays in sync until it is retired,
+  (see above), Peak Labels left the TX Menu in Phase 2, the old Spectrum tab stays in sync until it is retired,
   and the Display window edits the primary receiver and mirrors the changed fields to the extra receivers.
 * Known deviation: the averaging-time conversion uses the analyzer's fixed 10 frames/s, not the FPS setting (here FPS only paces UI redraws).
+
+## Open investigation: S-meter vs spectrum (Peak Labels "S4" vs S-meter "S9")
+
+Observed by the owner (Pi, 20 m, USB, 14.099 MHz): a narrow spike showed **S4** (about -103 dBm) as a Peak Label and in the spectrum axis,
+while the S-meter showed **S9 / -73 dBm** (S-meter mode "PK" in the meter). **Deferred: needs more study.**
+
+What is known:
+* The Peak Label is faithful to the displayed spectrum (the spike sits at about -103 dBm on the axis). The disagreement is **spectrum vs
+  S-meter**, and it is older than the labels.
+* It is **not a missing calibration offset**: the S-meter (`GetRXAMeter(RXA_S_AV | RXA_S_PK)`, spectrum.rs) and the spectrum pixels (`GetPixels`)
+  receive the same `meter_calibration_db` / `rx_display_correction_db` (RX Gain Cal, the HL2 attenuator term, Alex, XVTR gain), in main.rs.
+* The structure matches deskHPSDR: `receiver.c` does `GetRXAMeter(S_PK|S_AV) + (rx_gain_calibration - band->gain) + attenuation - adc gain`
+  (+ Alex/Charly25) and its panadapter uses the same offset. The HL2 term here is `rx_gain_calibration - (stored_rx_atten - 12)`; the exact
+  equivalence with deskHPSDR's `adc.attenuation - adc.gain` for the HL2 was not checked.
+* The obvious explanations do **not** add up to 30 dB for a narrow signal: Detector=Average lowers a narrow tone by about 8-12 dB; integrating
+  the noise over a 2.7 kHz filter adds about 26 dB to a per-bin noise floor (about -104 dBm); peak vs average meter mode is another few dB.
+  For a wide signal (speech, noise, RADE) a single bin holds only a fraction of the channel power (10*log10(BW/RBW), about 26 dB for 2.4 kHz
+  at about 6 Hz per bin), so the label is *meant* to read lower than the meter there (same in deskHPSDR).
+
+Diagnostic (temporary, main.rs, next to the Peaks & Hold code): while `/tmp/hpsdr_diag.enable` exists, one line per second (receive only) is
+appended to `/tmp/hpsdr_perf.log`:
+
+    smeter_diag: meter=<dBm> smeter_mode=<peak|avg> freq=<Hz> mode=<..> pass_bins=<lo>..<hi> (<Hz>) pass_max=<dBm>@bin<n>
+                 pass_sum=<dBm> row_median=<dBm> row_max=<dBm> hz_per_bin=<..> zoom=<..> sr=<..>
+
+Use: `touch /tmp/hpsdr_diag.enable`, wait about 20 s with the signal in the filter, `rm /tmp/hpsdr_diag.enable` (the same file also enables the older
+per-frame CSV diagnostics, so do not leave it), then `grep smeter_diag /tmp/hpsdr_perf.log`. Reading it: if `pass_sum` is close to `meter` and
+`pass_max` far below, the difference is bandwidth; if neither gets close, the meter is seeing something else (other signal, noise, spur) or the two
+paths differ in some other way. Next steps when this is picked up: capture with the diagnostic on the same signal, tune the signal out of the
+filter and see whether the meter follows, try Detector=Peak and meter mode Average, and ideally repeat the author's test with a signal generator
+(50 uV = -73 dBm = S9).
+
+### RESOLVED: the S4 vs S9 discrepancy was the spectrum smoothing (owner confirmed after build 0.8.7-379)
+
+Root cause: `smooth_spectrum_values` (5-tap kernel [0.06, 0.24, 0.40, 0.24, 0.06]) averages the **dB values** of neighbouring bins, not their
+power. A narrow carrier occupying a single bin at -73 dBm over a -130 dBm floor comes out as
+`0.40*(-73) + 0.24*2*(-130) + 0.06*2*(-130) = -107 dBm`: about **34 dB lower**, i.e. S9 became S4. The Peak Labels were computed on that
+smoothed row, so they inherited it. The S-meter and the raw spectrum were right all along. The explanations written above ("bandwidth",
+detector, noise integration) were wrong for this case. With "Smooth trace" OFF (the new default, which draws the raw row like deskHPSDR) the label
+and the S-meter agree (both S9 / -73 dBm in the owner's capture).
+
+Consequence to keep in mind: with "Smooth trace" ON the Peak Labels and the Peaks & Hold line still use the smoothed row and will read narrow
+signals low again. deskHPSDR uses the raw row for labels. Suggested follow-up (not done): always compute labels and hold on the raw row, whatever
+the trace option. The temporary `smeter_diag` block in main.rs is no longer needed and can be removed.
+
+**Follow-up done:** the Peak Labels and the Peaks & Hold line now ALWAYS use the raw (corrected) spectrum row, whatever the "Smooth trace" option
+(like deskHPSDR), so narrow signals read correctly even with the smooth trace on. The temporary `smeter_diag` block was removed from main.rs
+(the `/tmp/hpsdr_diag.enable` file no longer produces `smeter_diag` lines).

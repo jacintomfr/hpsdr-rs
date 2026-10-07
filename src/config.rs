@@ -473,6 +473,10 @@ pub struct Config {
     pub spectrum_filled: Option<bool>,
     #[serde(default)]
     pub spectrum_gradient: Option<bool>,
+    /// "Smooth trace" (Settings -> Display): the old 5-tap smoothing + spline of the panadapter trace. Default off =
+    /// deskHPSDR's raw per-pixel polyline.
+    #[serde(default)]
+    pub spectrum_smooth_trace: Option<bool>,
     /// Settings -> Display (display_window.rs, deskHPSDR display_menu.c): noise-floor margin of Panadapter Automatic
     /// (-20..10, default -5), panadapter detector (0 Peak, 1 Rosenfell, 2 Average, 3 Sample; default 2), averaging mode
     /// (0 None, 1 Recursive, 2 Time Window, 3 Log Recursive; default 3), averaging time in ms (default 250) and
@@ -1138,6 +1142,17 @@ pub struct TxUiExtra {
     pub peaks_num: i32,
     pub peaks_ignore_divider: i32,
     pub peaks_noise_percentile: i32,
+    /// Settings -> Display (deskHPSDR): peak labels as S-meter values, and the Peaks & Hold page.
+    pub peaks_as_smeter: bool,
+    pub peak_hold_on: bool,
+    /// 1 = Peaks hold, 2 = Peaks decay.
+    pub peak_hold_mode: u8,
+    pub peak_hold_sec: f32,
+    pub peak_hold_drop_db: f32,
+    pub peak_hold_tx: bool,
+    /// RGBA 0..1: Peaks & Hold line, and the TX panadapter line/fill.
+    pub peak_line_col: [f32; 4],
+    pub tx_pan_col: [f32; 4],
     pub tx_extra: Option<crate::tx::TxExtra>,
 }
 
@@ -1156,7 +1171,15 @@ impl Default for TxUiExtra {
             peaks_hide_noise: true,
             peaks_num: 4,
             peaks_ignore_divider: 24,
-            peaks_noise_percentile: 50,
+            peaks_noise_percentile: 80,
+            peaks_as_smeter: false,
+            peak_hold_on: false,
+            peak_hold_mode: 2,
+            peak_hold_sec: 2.0,
+            peak_hold_drop_db: 6.0,
+            peak_hold_tx: false,
+            peak_line_col: [0.70, 0.70, 0.70, 1.00],
+            tx_pan_col: [0.0, 1.0, 0.0, 1.0],
             tx_extra: None,
         }
     }

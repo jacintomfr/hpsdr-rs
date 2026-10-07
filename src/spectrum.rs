@@ -1403,17 +1403,13 @@ impl SpectrumAnalyzer {
                 max_w,
             );
 
-            wdsp::SetDisplayDetectorMode(channel, 0, wdsp::DETECTOR_MODE_AVERAGE as c_int);
-            wdsp::SetDisplayAverageMode(channel, 0, wdsp::AVERAGE_MODE_LOG_RECURSIVE as c_int);
-            // Pixout 1 (waterfall) deliberately left at WDSP's raw/no-average
-            // default -- confirmed from deskHPSDR's own rx_set_average()
-            // (src/receiver.c), which only ever calls SetDisplayAverageMode/
-            // SetDisplayDetectorMode with pixout index 0 (the panadapter),
-            // never 1. We previously applied the same LOG_RECURSIVE IIR
-            // smoothing to the waterfall as the spectrum line, which blends
-            // each new row with prior ones -- exactly the "memory effect"
-            // (ghosting/lag in color transitions) the user reported. The
-            // waterfall should show each frame's own value, unsmoothed.
+            // Both pixouts (0 = panadapter, 1 = waterfall) get the same detector/averaging:
+            // deskHPSDR's waterfall draws the very same averaged pixels (rx_get_pixels reads
+            // pixout 0 only) as its panadapter.
+            for px in 0..2 {
+                wdsp::SetDisplayDetectorMode(channel, px, wdsp::DETECTOR_MODE_AVERAGE as c_int);
+                wdsp::SetDisplayAverageMode(channel, px, wdsp::AVERAGE_MODE_LOG_RECURSIVE as c_int);
+            }
             wdsp::SetDisplayNormOneHz(channel, 0, 1);
             // BUG FIX for a real report: only pixout 0 (spectrum trace)
             // was ever bandwidth-normalized, never pixout 1 (waterfall).
@@ -1586,15 +1582,12 @@ impl SpectrumAnalyzer {
                 // SetAnalyzer resets the display averaging: put the Display-menu choice back (no NONE detour needed).
                 Some(d) => Self::write_display_avg(self.channel, d, false),
                 None => {
-                    wdsp::SetDisplayDetectorMode(self.channel, 0, wdsp::DETECTOR_MODE_AVERAGE as c_int);
-                    wdsp::SetDisplayAverageMode(self.channel, 0, wdsp::AVERAGE_MODE_LOG_RECURSIVE as c_int);
+                    for px in 0..2 {
+                        wdsp::SetDisplayDetectorMode(self.channel, px, wdsp::DETECTOR_MODE_AVERAGE as c_int);
+                        wdsp::SetDisplayAverageMode(self.channel, px, wdsp::AVERAGE_MODE_LOG_RECURSIVE as c_int);
+                    }
                 }
             }
-            // Pixout 1 (waterfall) deliberately left unset here, same
-            // reasoning as open()'s own identical comment -- re-applying
-            // LOG_RECURSIVE on every zoom/pan change (as this function
-            // used to) reintroduced the "memory effect" ghosting the
-            // moment the user touched zoom, undoing that fix.
             wdsp::SetDisplayNormOneHz(self.channel, 0, 1);
             wdsp::SetDisplayNormOneHz(self.channel, 1, 1);
             // width*zoom (the UNSNAPPED value, not a_fft_size) -- matches
@@ -1615,15 +1608,22 @@ impl SpectrumAnalyzer {
         let t = 0.001 * d.time_ms.max(1) as f64;
         let backmult = (-1.0 / (fps * t)).exp();
         let num = std::cmp::max(2, (fps * t).min(60.0) as c_int);
+        // Pixout 0 (panadapter) and 1 (waterfall) alike.
         unsafe {
-            wdsp::SetDisplayDetectorMode(channel, 0, d.detector.min(3) as c_int);
-            wdsp::SetDisplayAvBackmult(channel, 0, backmult);
-            wdsp::SetDisplayNumAverage(channel, 0, num);
+            for px in 0..2 {
+                wdsp::SetDisplayDetectorMode(channel, px, d.detector.min(3) as c_int);
+                wdsp::SetDisplayAvBackmult(channel, px, backmult);
+                wdsp::SetDisplayNumAverage(channel, px, num);
+                if nudge {
+                    wdsp::SetDisplayAverageMode(channel, px, wdsp::AVERAGE_MODE_NONE as c_int);
+                }
+            }
             if nudge {
-                wdsp::SetDisplayAverageMode(channel, 0, wdsp::AVERAGE_MODE_NONE as c_int);
                 std::thread::sleep(Duration::from_millis(50));
             }
-            wdsp::SetDisplayAverageMode(channel, 0, d.mode.min(3) as c_int);
+            for px in 0..2 {
+                wdsp::SetDisplayAverageMode(channel, px, d.mode.min(3) as c_int);
+            }
         }
     }
 

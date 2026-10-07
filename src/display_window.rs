@@ -21,10 +21,11 @@ const R1: f32 = 966.0;
 const SPIN_W: f32 = 168.0;
 
 const NOT_IMPLEMENTED: &str = "Not implemented yet; the control is shown for parity with deskHPSDR and does nothing.";
-const PEAKS_HELP: &str = "The peak labels are not drawn on the panadapter yet (planned for a later phase). These settings are stored and are the same ones as the TX Menu's Peak Labels page.";
+const PEAKS_TX_HELP: &str = "Enable Peaks & Hold for the TX panadapter. Usable only as Peaks decay (fast attack, slow release at the Drop rate), Peaks hold is not available with TX. NOT usable if Duplex TX mode is active.";
 const PAN_AUTO_HELP: &str = "deskHPSDR's algorithm: once a second the 60th percentile of the visible spectrum + 3 dB is measured and smoothed; every 5 s the panadapter Low is set to that noise floor rounded down to 10 dB, plus the Noisefloor Margin, minus 5 dB (limits -220..-95). Low only moves if it differs by more than 10 dB or is below the new value. A High of -50 or lower is set to -50. Not applied while transmitting.";
 const WF_AUTO_HELP: &str = "deskHPSDR's algorithm: Low = mean level of the waterfall row - 5 dB, High = Low + 55 dB, updated with every new row.";
 const FPS_HELP: &str = "Paces how often the screen is redrawn (receive and transmit). The analyzer itself runs at a fixed 10 frames per second.";
+const SMOOTH_HELP: &str = "Off (default, like deskHPSDR): the panadapter trace is the raw per-pixel row joined by straight segments. On: the row is smoothed across neighbouring pixels and drawn as a spline.";
 const AVG_HELP: &str = "Detector and averaging of the panadapter trace (WDSP). Av. Time sets the length of the averaging.";
 
 // ======================================================================= automatic levels (deskHPSDR)
@@ -291,7 +292,7 @@ pub fn display_window(ui: &mut egui::Ui, connected: &mut ConnectedState) -> (boo
 
             match page {
                 0 => general_page(ui, w, connected, &mut changed),
-                1 => blobs_page(ui, w),
+                1 => blobs_page(ui, w, connected, &mut changed),
                 _ => peak_labels_page(ui, w, connected, &mut changed),
             }
         });
@@ -470,11 +471,27 @@ fn general_page(ui: &mut egui::Ui, w: f32, c: &mut ConnectedState, changed: &mut
 
     // ---- row 10: Waterfall palette chips (right column)
     let row = new_row(ui, w, GRID_H);
+    {
+        // Left column of this row was free: "Smooth trace" (off = deskHPSDR's raw per-pixel trace).
+        let mut cc = cell(ui, row, L0, L1, 0.0, true);
+        cc.spacing_mut().item_spacing.x = 12.0;
+        let mut s = c.spectrum_smooth_trace;
+        if std_checkbox(&mut cc, &mut s, "Smooth trace").changed() {
+            c.spectrum_smooth_trace = s;
+            *changed = true;
+        }
+        help_button(&mut cc, "dsp_smooth_help", SMOOTH_HELP);
+    }
     label(ui, row, R0, "Palette:", true);
     {
-        let mut cc = cell(ui, row, R0 + 80.0, R1, 0.0, true);
-        cc.spacing_mut().item_spacing.x = 12.0;
-        for (p, cw) in ALL_PALETTES.iter().zip([70.0f32, 80.0, 90.0, 110.0]) {
+        let mut cc = cell(ui, row, R0 + 72.0, R1, 0.0, true);
+        cc.spacing_mut().item_spacing.x = 8.0;
+        // Five chips must fit the 394 px right of "Palette:": each is as wide as its label needs (measured, so the
+        // kiosk UI scale cannot make it overflow) plus the button padding.
+        let font = egui::TextStyle::Button.resolve(cc.style());
+        for p in ALL_PALETTES.iter() {
+            let tw = cc.painter().layout_no_wrap(p.label().to_string(), font.clone(), egui::Color32::WHITE).size().x;
+            let cw = (tw + 18.0).max(48.0);
             if cc.add(chip_button(p.label(), *p == c.waterfall_palette).min_size(egui::vec2(cw, 34.0))).clicked() {
                 c.waterfall_palette = *p;
                 *changed = true;
@@ -483,35 +500,75 @@ fn general_page(ui: &mut egui::Ui, w: f32, c: &mut ConnectedState, changed: &mut
     }
 }
 
-// ======================================================================= Peak Blobs & Hold (inactive)
+// ======================================================================= Peak Blobs & Hold
 
-fn blobs_page(ui: &mut egui::Ui, w: f32) {
-    let row = new_row(ui, w, GRID_H);
-    inactive_check(ui, row, L0, 600.0, "dsp_pk_hold_help", "Enable PEAKS & HOLD");
+/// "R"/"G"/"B" spin buttons (0..255, step 5) and a swatch for an RGBA colour (alpha is not editable). True when changed.
+fn colour_row(ui: &mut egui::Ui, row: egui::Rect, text: &str, id: &str, col: &mut [f32; 4]) -> bool {
+    label(ui, row, L0, text, true);
+    let sw = egui::Rect::from_min_size(egui::pos2(row.left() + 250.0, row.center().y - 15.0), egui::vec2(60.0, 30.0));
+    let shown = egui::Color32::from_rgb((col[0] * 255.0).round() as u8, (col[1] * 255.0).round() as u8, (col[2] * 255.0).round() as u8);
+    ui.painter().rect(sw, 5.0, shown, egui::Stroke::new(1.0, egui::Color32::from_gray(150)), egui::StrokeKind::Inside);
+    let mut changed = false;
+    for (k, name) in ["R", "G", "B"].iter().enumerate() {
+        let x0 = 330.0 + k as f32 * 196.0;
+        label(ui, row, x0 - 4.0, name, true);
+        let mut v = (col[k] * 255.0).round() as f64;
+        let mut c = cell(ui, row, x0 + 16.0, x0 + 16.0 + SPIN_W, -6.0, true);
+        if spin_buttons_full(&mut c, &format!("{id}_{name}"), &mut v, 0.0, 255.0, 5.0, 0, None, SPIN_W - 98.0).changed() {
+            col[k] = (v.clamp(0.0, 255.0) / 255.0) as f32;
+            changed = true;
+        }
+    }
+    changed
+}
+
+fn blobs_page(ui: &mut egui::Ui, w: f32, c: &mut ConnectedState, changed: &mut bool) {
+    let mut t = c.tx_ui;
+    let t0 = t;
+    const SX: f32 = 330.0;
 
     let row = new_row(ui, w, GRID_H);
-    label(ui, row, L0, "Type of Peaks & Hold function:", false);
+    check_cell(ui, row, L0, 600.0, &mut t.peak_hold_on, "Enable PEAKS & HOLD");
+
+    let row = new_row(ui, w, GRID_H);
+    label(ui, row, L0, "Type of Peaks & Hold function:", true);
     {
-        let mut cc = cell(ui, row, 330.0, 600.0, 0.0, false);
+        let mut cc = cell(ui, row, SX, SX + 270.0, 0.0, true);
         let items: [(&str, bool); 2] = [("Peaks hold", true), ("Peaks decay", true)];
-        choice_combo_h(&mut cc, "dsp_pk_type", 200.0, 0, &items, 34.0);
+        if let Some(i) = choice_combo_h(&mut cc, "dsp_pk_type", 200.0, if t.peak_hold_mode == 1 { 0 } else { 1 }, &items, 34.0) {
+            t.peak_hold_mode = if i == 0 { 1 } else { 2 };
+        }
     }
 
     let row = new_row(ui, w, GRID_H);
-    let mut hold = 1.0f64;
-    spin_row(ui, row, L0, 330.0, "Decay hold time (s):", "dsp_pk_time", &mut hold, 0.1, 5.0, 0.1, 1, false);
+    let mut hold = t.peak_hold_sec as f64;
+    if spin_row(ui, row, L0, SX, "Decay hold time (s):", "dsp_pk_time", &mut hold, 0.1, 5.0, 0.1, 1, true) {
+        t.peak_hold_sec = (hold.clamp(0.1, 5.0) * 10.0).round() as f32 / 10.0;
+    }
 
     let row = new_row(ui, w, GRID_H);
-    let mut drop = 3.0f64;
-    spin_row(ui, row, L0, 330.0, "Drop (dbm/s):", "dsp_pk_drop", &mut drop, 1.0, 10.0, 0.5, 1, false);
+    let mut drop = t.peak_hold_drop_db as f64;
+    if spin_row(ui, row, L0, SX, "Drop (dbm/s):", "dsp_pk_drop", &mut drop, 1.0, 10.0, 0.5, 1, true) {
+        t.peak_hold_drop_db = (drop.clamp(1.0, 10.0) * 2.0).round() as f32 / 2.0;
+    }
 
     let row = new_row(ui, w, GRID_H);
-    inactive_check(ui, row, L0, 600.0, "dsp_pk_tx", "Enable PEAKS & HOLD for TX");
+    {
+        let mut cc = cell(ui, row, L0, 600.0, 0.0, true);
+        cc.spacing_mut().item_spacing.x = 12.0;
+        std_checkbox(&mut cc, &mut t.peak_hold_tx, "Enable PEAKS & HOLD for TX");
+        help_button(&mut cc, "dsp_pk_tx_help", PEAKS_TX_HELP);
+    }
 
     let row = new_row(ui, w, GRID_H);
-    label(ui, row, L0, "PEAKS & HOLD line color", false);
-    let sw = egui::Rect::from_min_size(egui::pos2(row.left() + 330.0, row.center().y - 15.0), egui::vec2(90.0, 30.0));
-    ui.painter().rect(sw, 5.0, egui::Color32::from_gray(60), egui::Stroke::new(1.0, egui::Color32::from_gray(95)), egui::StrokeKind::Inside);
+    colour_row(ui, row, "PEAKS & HOLD line color", "dsp_pk_col", &mut t.peak_line_col);
+    let row = new_row(ui, w, GRID_H);
+    colour_row(ui, row, "TX pan line/fill color", "dsp_tx_col", &mut t.tx_pan_col);
+
+    if t != t0 {
+        c.tx_ui = t;
+        *changed = true;
+    }
 }
 
 // ======================================================================= Peak Labels
@@ -521,12 +578,9 @@ fn peak_labels_page(ui: &mut egui::Ui, w: f32, c: &mut ConnectedState, changed: 
     let t0 = t;
 
     let row = new_row(ui, w, GRID_H);
-    {
-        let mut cc = cell(ui, row, L0, 700.0, 0.0, true);
-        cc.spacing_mut().item_spacing.x = 12.0;
-        std_checkbox(&mut cc, &mut t.peaks_on, "Enable Peak Labels on Panadapter");
-        help_button(&mut cc, "dsp_pk_labels_help", PEAKS_HELP);
-    }
+    check_cell(ui, row, L0, 700.0, &mut t.peaks_on, "Enable Peak Labels on Panadapter");
+    let row = new_row(ui, w, GRID_H);
+    check_cell(ui, row, L0, 700.0, &mut t.peaks_as_smeter, "Peak Labels as S-Meter values");
     let row = new_row(ui, w, GRID_H);
     check_cell(ui, row, L0, 700.0, &mut t.peaks_in_passband, "Peak Labels in Passband Only");
     let row = new_row(ui, w, GRID_H);

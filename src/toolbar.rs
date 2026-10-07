@@ -85,6 +85,7 @@ impl ToolbarFn {
                 MidiAction::VoxMenu => "VOX SET",
                 MidiAction::EqMenu => "EQ",
                 MidiAction::ToolbarFuncRev => "FNC-",
+                MidiAction::NewMenu => "NEW MENU",
                 MidiAction::AgcMenu => "AGC SET",
                 MidiAction::NoiseMenu => "NOISE",
                 MidiAction::TxMenu => "TX SET",
