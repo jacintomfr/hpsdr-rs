@@ -22146,6 +22146,19 @@ fn render_sdr_device(ui: &mut egui::Ui, connected: &mut ConnectedState, settings
                     }
                     ui.add_space(2.0);
 
+                    // The capture (REC) records the received audio, so it belongs to the receive side.
+                    if connected.tx_handle.is_some() {
+                        ui.horizontal(|ui| {
+                            ui.label("Audio Capture Time (s):");
+                            help_button(ui, "sdr_capture_time", "Maximum length of the REC recording used for reports (the REC / PLAY buttons), 10 to 120 seconds.");
+                        });
+                        let mut secs = report_recorder::max_seconds() as f64;
+                        if spin_buttons_full(ui, "capture_secs", &mut secs, 10.0, 120.0, 10.0, 0, None, 80.0).changed() {
+                            report_recorder::set_max_seconds(secs.round() as u32);
+                            *settings_changed = true;
+                        }
+                        ui.add_space(2.0);
+                    }
                 }
 
                 // ---- column 2: calibrations and gains as spin buttons
@@ -22191,7 +22204,7 @@ fn render_sdr_device(ui: &mut egui::Ui, connected: &mut ConnectedState, settings
                         let mut allow_oob = connected.allow_out_of_band_tx.load(Ordering::Relaxed);
                         if ui
                             .horizontal(|ui| {
-                                let r = touch_checkbox(ui, &mut allow_oob, "Allow TX outside ham bands");
+                                let r = touch_checkbox(ui, &mut allow_oob, "Allow out-of-band TX");
                                 help_button(ui, "sdr_allow_oob", "Off (default): TX is blocked outside the defined ham band allocations, e.g. on \"Gen\". Enable only for MARS/CAP or other explicitly authorized out-of-band operation -- this does not check any regulatory database, it only removes this app's own safety check.");
                                 r
                             })
@@ -22278,18 +22291,6 @@ fn render_sdr_device(ui: &mut egui::Ui, connected: &mut ConnectedState, settings
                         let mut mic_bias_enabled = connected.session.mic_bias_enabled.load(Ordering::Relaxed);
                         if touch_checkbox(ui, &mut mic_bias_enabled, "Mic Bias Enabled").changed() {
                             connected.session.mic_bias_enabled.store(mic_bias_enabled, Ordering::Relaxed);
-                            *settings_changed = true;
-                        }
-                    }
-                    if connected.tx_handle.is_some() {
-                        ui.add_space(2.0);
-                        ui.horizontal(|ui| {
-                            ui.label("Audio Capture Time (s):");
-                            help_button(ui, "sdr_capture_time", "Maximum length of the REC recording used for reports (the REC / PLAY buttons), 10 to 120 seconds.");
-                        });
-                        let mut secs = report_recorder::max_seconds() as f64;
-                        if spin_buttons_full(ui, "capture_secs", &mut secs, 10.0, 120.0, 10.0, 0, None, 80.0).changed() {
-                            report_recorder::set_max_seconds(secs.round() as u32);
                             *settings_changed = true;
                         }
                     }
