@@ -27,5 +27,11 @@ measure, image offset, RX IQ gain / phase, Reset, Auto RX IQ and the IQ status.
 * The correction is applied in place to each IQ chunk before the analyzer and the demodulator (`spectrum.rs`, run loop): I stays, Q = (Q*g + I*sin(phi)) / cos(phi), g = 10^(dB/20).
   The raw IQ tap for TCI is taken before it.
 
-## Phase 3 (planned): Auto RX IQ
-One-shot search of gain / phase that maximises the IRR (needs a calibration signal), with status text.
+## Phase 3 (done): Auto RX IQ (IQ page, header row)
+The deskHPSDR `rx_iq_auto_thread` algorithm, run as a state machine one step per UI frame (`iq_auto_tick` in `dsp_window.rs`):
+* Needs RX Image Measure on and a calibration signal (signal level above -100 dB), otherwise the status says "No calibration signal".
+* Candidates: gain 0 / phase 0 first, then sweeps around the best value so far: gain +-0.05 dB step 0.005, phase +-0.50 deg step 0.05, gain
+  +-0.01 step 0.001, phase +-0.10 step 0.01. Each candidate: set, wait 250 ms, then 5 IRR samples 100 ms apart, averaged.
+* The best |IRR| wins; it is kept only if it is at least 0.5 dB better than at the start ("Complete (x.x dB)"), otherwise the old correction
+  comes back ("No improvement"). Longest run 10 s, as in deskHPSDR (`AUTO_DEADLINE`): the full sweep list needs about 64 s, so a run normally ends by the time limit with the best value found so far.
+* Reset (or switching the measurement off) cancels a run and restores the old values; the status texts are Idle, Auto calibrating..., Complete, No improvement, No calibration signal, Cancelled.

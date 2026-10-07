@@ -2517,6 +2517,9 @@ struct ConnectedState {
     /// DSP menu "RX Image Measure" (not saved, like deskHPSDR) and its last result: (signal dB, rejection dB).
     image_measure: bool,
     image_irr: Option<(f32, f32)>,
+    /// DSP menu IQ page: the running Auto RX IQ calibration and its status text.
+    iq_auto: Option<dsp_window::IqAuto>,
+    iq_status: String,
     /// DSP menu, IQ page: the spectrum/waterfall ratio the user had before the page lowered it (restored when the page or the window closes).
     dsp_saved_ratio: Option<f32>,
     /// The full-screen Menu window (menu_window.rs), opened by the NEW MENU action.
@@ -4180,6 +4183,8 @@ fn connect_to_device(device: Device, cfg: &Config) -> Result<ConnectedState, Str
                 dsp_window_open: false,
                 image_measure: false,
                 image_irr: None,
+                iq_auto: None,
+                iq_status: "Idle".to_string(),
                 dsp_saved_ratio: None,
                 menu_window_open: false,
                 menu_return: false,
@@ -6856,6 +6861,7 @@ impl eframe::App for HpsdrApp {
                         }
                     }
 
+                    dsp_window::iq_auto_tick(connected, ui.ctx());
                     // The IQ page of the DSP window lowers the spectrum/waterfall ratio; give it back as soon as the window is gone.
                     if !connected.dsp_window_open {
                         if let Some(r) = connected.dsp_saved_ratio.take() {
