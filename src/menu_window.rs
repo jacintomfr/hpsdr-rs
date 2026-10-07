@@ -18,6 +18,7 @@ const NOT_AVAILABLE: &str = "Not available in this version.";
 #[derive(Clone, Copy)]
 enum Target {
     Sdr,
+    Toolbar,
     Vfo,
     Rx,
     Tx,
@@ -46,7 +47,7 @@ const GRID: [[Option<(&str, Target)>; COLS]; 6] = [
         Some(("RX", Target::Rx)),
         Some(("TX", Target::Tx)),
         Some(("DSP", Target::Grey)),
-        Some(("Toolbar", Target::Tab(SettingsTab::Toolbar))),
+        Some(("Toolbar", Target::Toolbar)),
     ],
     [
         Some(("Screen", Target::Tab(SettingsTab::Screen))),
@@ -90,6 +91,7 @@ pub(crate) fn close_overlays(c: &mut ConnectedState) {
     c.rx_window_open = false;
     c.tx_window_open = false;
     c.pa_window_open = false;
+    c.toolbar_window_open = false;
     c.display_window_open = false;
     c.noise_window_open = false;
     c.sdr_window_open = false;
@@ -108,6 +110,7 @@ fn any_overlay_open(c: &ConnectedState) -> bool {
     c.rx_window_open
         || c.tx_window_open
         || c.pa_window_open
+        || c.toolbar_window_open
         || c.display_window_open
         || c.noise_window_open
         || c.sdr_window_open
@@ -161,6 +164,7 @@ fn open(c: &mut ConnectedState, target: Target) {
             }
         }
         Target::Pa => c.pa_window_open = true,
+        Target::Toolbar => c.toolbar_window_open = true,
         Target::Display => c.display_window_open = true,
         Target::Noise => c.noise_window_open = true,
         Target::Eq => c.eq_window_open = true,

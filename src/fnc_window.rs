@@ -41,6 +41,7 @@ pub(crate) fn covered(c: &ConnectedState) -> bool {
         || c.rx_window_open
         || c.tx_window_open
         || c.pa_window_open
+        || c.toolbar_window_open
         || c.display_window_open
         || c.noise_window_open
         || c.sdr_window_open

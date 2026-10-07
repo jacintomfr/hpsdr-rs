@@ -26,6 +26,7 @@ mod eq_window;
 mod noise_window;
 mod pa_window;
 mod menu_window;
+mod toolbar_window;
 mod display_window;
 mod peaks;
 mod agc_window;
@@ -2487,6 +2488,8 @@ struct ConnectedState {
     display_window_open: bool,
     /// The full-screen Menu window (menu_window.rs), opened by the NEW MENU action.
     menu_window_open: bool,
+    /// The full-screen Toolbar editor (toolbar_window.rs), opened from the Menu.
+    toolbar_window_open: bool,
     /// A window was opened from the Menu window: when nothing is open any more, the Menu comes back (menu_window.rs `return_tick`).
     menu_return: bool,
     /// Settings -> Display: noise-floor margin of Panadapter Automatic (dB), WDSP detector (0 Peak, 1 Rosenfell,
@@ -4138,6 +4141,7 @@ fn connect_to_device(device: Device, cfg: &Config) -> Result<ConnectedState, Str
                 display_window_open: false,
                 menu_window_open: false,
                 menu_return: false,
+                toolbar_window_open: false,
                 panadapter_noise_margin: cfg.panadapter_noise_margin.unwrap_or(-5).clamp(-20, 10),
                 display_detector: cfg.display_detector.unwrap_or(2).min(3),
                 display_average_mode: cfg.display_average_mode.unwrap_or(3).min(3),
@@ -6749,6 +6753,14 @@ impl eframe::App for HpsdrApp {
                         }
                         if close_now {
                             connected.menu_window_open = false;
+                        }
+                    }
+
+                    // Toolbar editor (Menu -> Toolbar), see toolbar_window.rs.
+                    if connected.toolbar_window_open {
+                        let (close_now, _changed) = toolbar_window::toolbar_window(ui, connected);
+                        if close_now {
+                            connected.toolbar_window_open = false;
                         }
                     }
 
@@ -11160,6 +11172,7 @@ Waterfall rebuilds: {prof_wf_n:.0}/s, {prof_wf_ms:.1} ms each."
                                                 | SettingsTab::Display
                                                 | SettingsTab::RxMenu
                                                 | SettingsTab::Equalizer
+                                                | SettingsTab::Toolbar
                                         )
                                     {
                                         continue;
@@ -18388,7 +18401,7 @@ fn show_toolbar_chooser(ctx: &egui::Context, connected: &mut ConnectedState, fro
 /// piHPSDR's "Toolbar configuration", shown directly in Settings -> Toolbar: every layer with its
 /// eight boxes (highest layer on top, layer 0 at the bottom like the real toolbar),
 /// and a click on a button goes straight to the function chooser.
-fn render_toolbar_config(ui: &mut egui::Ui, connected: &mut ConnectedState) {
+pub(crate) fn render_toolbar_config(ui: &mut egui::Ui, connected: &mut ConnectedState) {
     let mut open_slot = None;
     // A label column FNC(0)..FNC(7) (as in the FNC's list, same order: FNC(0) on top) and eight columns of boxes.
     const LABEL_W: f32 = 62.0;

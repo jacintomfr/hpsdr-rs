@@ -68,3 +68,12 @@ is closed, instead of leaving the main screen. Implementation: `menu_return` (Co
 (`any_overlay_open`), re-opens the Menu and clears the flag. This needs no change in the individual windows (their own CLOSE keeps working) and also
 covers targets that open nothing (TX without a transmitter, the RADE toggle). The flag is cleared when the Menu itself is closed or toggled
 from MIDI/toolbar ("NEW MENU"). Windows opened by other means (the MENU button, other MIDI actions) do not return to the Menu.
+
+## Toolbar moved into the Menu (owner request)
+
+The Toolbar editor (8 layers x 8 boxes, FNC(0)..FNC(7)) is now its own full-screen window, `src/toolbar_window.rs`, opened by the **Toolbar** button of the
+Menu (`Target::Toolbar`, flag `toolbar_window_open`). It reuses `render_toolbar_config` and the function chooser unchanged; title "hpsdr-rs - Toolbar",
+the yellow CLOSE at the top right, Escape closes (not while the function chooser is open), and CLOSE returns to the Menu (`return_tick` /
+`any_overlay_open` include the window). In the kiosk the **Settings -> Toolbar tab is removed** from the tab strip (the arm stays for the desktop code
+path). The FNC's list closes when this window opens (`fnc_window::covered`). Checked on the Pi: Menu -> Toolbar, CLOSE back to the Menu, and the
+Settings strip without the Toolbar tab.
