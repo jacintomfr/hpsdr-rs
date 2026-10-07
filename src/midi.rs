@@ -230,6 +230,8 @@ pub enum MidiAction {
     ToolbarFuncRev,
     /// The full-screen Menu window with every menu in one grid (menu_window.rs).
     NewMenu,
+    /// Quick jump to any toolbar layer (fnc_window.rs): toggles the layer list.
+    ToolbarFuncList,
 }
 
 impl MidiAction {
@@ -336,6 +338,7 @@ impl MidiAction {
             MidiAction::Toolbar8 => "Function",
             MidiAction::ToolbarFuncRev => "FuncRev",
             MidiAction::NewMenu => "NEW MENU",
+            MidiAction::ToolbarFuncList => "FNC's",
         }
     }
 }
@@ -418,6 +421,7 @@ pub const KEY_ACTIONS: &[MidiAction] = &[
     MidiAction::Toolbar8,
     MidiAction::ToolbarFuncRev,
     MidiAction::NewMenu,
+    MidiAction::ToolbarFuncList,
 ];
 
 /// Actions valid for a Knob (absolute value) binding.

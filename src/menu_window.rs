@@ -86,6 +86,7 @@ const GRID: [[Option<(&str, Target)>; COLS]; 6] = [
 /// Closes every overlay that could share the screen with the Menu: the full-screen windows, the compact popups and the
 /// Settings window.
 pub(crate) fn close_overlays(c: &mut ConnectedState) {
+    c.fnc_list_open = false;
     c.rx_window_open = false;
     c.tx_window_open = false;
     c.pa_window_open = false;

@@ -1,5 +1,5 @@
 //! Bottom toolbar of the 1024x600 kiosk panel: eight boxes under the spectrum, F1..F7 plus
-//! `FNC(n)`, modelled on piHPSDR's toolbar -- 9 layers of 7 function buttons, `FNC` steps
+//! `FNC(n)`, modelled on piHPSDR's toolbar -- 8 layers of 7 function buttons, `FNC` steps
 //! through the layers (and `FuncRev` / a long press on `FNC` steps back), and every button can be assigned any function from the list below.
 //!
 //! The list is what hpsdr-rs can do today: every MIDI key action (so the toolbar and a MIDI
@@ -11,7 +11,7 @@ use crate::midi::{MidiAction, KEY_ACTIONS};
 /// Function buttons per layer; the eighth box is `FNC`.
 pub const BUTTONS: usize = 7;
 /// Number of layers `FNC` steps through.
-pub const LAYERS: usize = 9;
+pub const LAYERS: usize = 8;
 
 pub type Layers = [[ToolbarFn; BUTTONS]; LAYERS];
 
@@ -85,6 +85,7 @@ impl ToolbarFn {
                 MidiAction::VoxMenu => "VOX SET",
                 MidiAction::EqMenu => "EQ",
                 MidiAction::ToolbarFuncRev => "FNC-",
+                MidiAction::ToolbarFuncList => "FNC's",
                 MidiAction::NewMenu => "NEW MENU",
                 MidiAction::AgcMenu => "AGC SET",
                 MidiAction::NoiseMenu => "NOISE",
@@ -271,8 +272,7 @@ pub fn default_layers() -> Layers {
             Midi(M::Band15m),
             Midi(M::Band10m),
         ],
-        // The layers added after the first six (FNC(6)..FNC(8)) start empty (None): the user assigns them.
-        [ToolbarFn::None; BUTTONS],
+        // The layers added after the first six (FNC(6), FNC(7)) start empty (None): the user assigns them.
         [ToolbarFn::None; BUTTONS],
         [ToolbarFn::None; BUTTONS],
     ]
@@ -317,6 +317,19 @@ mod tests {
         assert_eq!(l[0][0], ToolbarFn::Midi(MidiAction::Mox));
         assert_eq!(l[0][1], ToolbarFn::None);
         assert_eq!(l[1], d[1]);
+        // A config saved with nine layers keeps the first eight; the ninth is dropped.
+        let nine: Vec<Vec<String>> = (0..9).map(|_| vec!["Tune".to_string(); BUTTONS]).collect();
+        let l = layers_from_config(Some(&nine));
+        assert_eq!(l.len(), 8);
+        assert_eq!(l[7][0], ToolbarFn::Midi(MidiAction::Tune));
+    }
+
+    #[test]
+    fn fnc_list_is_assignable() {
+        assert_eq!(LAYERS, 8);
+        assert!(ToolbarFn::all().contains(&ToolbarFn::Midi(MidiAction::ToolbarFuncList)));
+        assert_eq!(ToolbarFn::Midi(MidiAction::ToolbarFuncList).short_label(), "FNC's");
+        assert_eq!(ToolbarFn::from_key("ToolbarFuncList"), ToolbarFn::Midi(MidiAction::ToolbarFuncList));
     }
 
     #[test]

@@ -29,6 +29,7 @@ mod menu_window;
 mod display_window;
 mod peaks;
 mod agc_window;
+mod fnc_window;
 mod filter_window;
 mod filters;
 mod rx_window;
@@ -1453,6 +1454,7 @@ fn dispatch_midi_binding(
         MidiAction::RxMenu => connected.rx_window_open = !connected.rx_window_open,
         MidiAction::SdrMenu => connected.sdr_window_open = !connected.sdr_window_open,
         MidiAction::NewMenu => menu_window::toggle(connected),
+        MidiAction::ToolbarFuncList => fnc_window::toggle(connected),
         // deskHPSDR: KnobOrWheel(vox_threshold, 0.0, 1.0, 0.01).
         MidiAction::VoxLevel => {
             connected.vox_threshold = if binding.kind == MidiBindingKind::Wheel {
@@ -1644,12 +1646,20 @@ fn dispatch_midi_binding(
                 MidiAction::Toolbar6 => 5,
                 _ => 6,
             };
-            let f = connected.toolbar_layers[connected.toolbar_layer][slot];
             connected.toolbar_flash[slot] = Some(Instant::now());
+            if connected.fnc_list_open {
+                fnc_window::pick(connected, slot);
+                return;
+            }
+            let f = connected.toolbar_layers[connected.toolbar_layer][slot];
             run_toolbar_fn(connected, f, freq_hz, sample_rate, passband);
         }
         MidiAction::Toolbar8 => {
             connected.toolbar_flash[toolbar::BUTTONS] = Some(Instant::now());
+            if connected.fnc_list_open {
+                fnc_window::pick(connected, toolbar::BUTTONS);
+                return;
+            }
             connected.toolbar_layer = (connected.toolbar_layer + 1) % toolbar::LAYERS;
             connected.settings_dirty.store(true, Ordering::Relaxed);
         }
@@ -2523,6 +2533,8 @@ struct ConnectedState {
     /// button's own handler; `toolbar_choose` is the button being reassigned,.
     toolbar_layers: toolbar::Layers,
     toolbar_layer: usize,
+    /// The quick layer-jump list (FNC's, fnc_window.rs) is open: the toolbar shows FNC(0)..FNC(7).
+    fnc_list_open: bool,
     /// Ids (DIAG_ITEMS) of the diagnostic values shown above the spectrum.
     diag_items: Vec<String>,
     toolbar_pending: Option<toolbar::ToolbarFn>,
@@ -4161,8 +4173,9 @@ fn connect_to_device(device: Device, cfg: &Config) -> Result<ConnectedState, Str
                 step_last_mode: None,
                 rit_step_hz,
                 toolbar_layers: toolbar::layers_from_config(cfg.toolbar_layers.as_ref()),
-                toolbar_layer: cfg.toolbar_layer.unwrap_or(0).min(toolbar::LAYERS - 1),
+                toolbar_layer: cfg.toolbar_layer.filter(|l| *l < toolbar::LAYERS).unwrap_or(0),
                 diag_items: cfg.diag_items.clone(),
+                fnc_list_open: false,
                 toolbar_pending: None,
                 toolbar_flash: [None; 8],
                 align_x: (0.0, 0.0),
@@ -6540,6 +6553,14 @@ impl eframe::App for HpsdrApp {
                         }
                         if close_now {
                             connected.agc_window_open = false;
+                        }
+                    }
+                    // Quick layer-jump list (FNC's), see fnc_window.rs; closes itself behind other windows.
+                    if connected.fnc_list_open {
+                        if fnc_window::covered(connected) {
+                            connected.fnc_list_open = false;
+                        } else if fnc_window::fnc_window(ui, connected) {
+                            connected.fnc_list_open = false;
                         }
                     }
                     // Set RX Filter (deskHPSDR filter_menu.c), see filter_window.rs.
@@ -18161,6 +18182,7 @@ fn toolbar_fn_active(connected: &ConnectedState, f: toolbar::ToolbarFn) -> bool 
         ToolbarFn::Midi(MidiAction::RxMenu) => connected.rx_window_open,
         ToolbarFn::Midi(MidiAction::SdrMenu) => connected.sdr_window_open,
         ToolbarFn::Midi(MidiAction::NewMenu) => connected.menu_window_open,
+        ToolbarFn::Midi(MidiAction::ToolbarFuncList) => connected.fnc_list_open,
         ToolbarFn::Midi(MidiAction::RxEqToggle) => connected.spectrum.eq().enabled,
         _ => false,
     }
@@ -18179,10 +18201,11 @@ fn render_toolbar(ui: &mut egui::Ui, connected: &mut ConnectedState) {
     ui.horizontal(|ui| {
         ui.spacing_mut().item_spacing.x = GAP;
         for slot in 0..count {
-            let is_fnc = slot == toolbar::BUTTONS;
+            let list_mode = connected.fnc_list_open;
+            let is_fnc = slot == toolbar::BUTTONS || list_mode;
             let f = if is_fnc { toolbar::ToolbarFn::None } else { connected.toolbar_layers[layer][slot] };
-            let label = if is_fnc { format!("FNC({layer})") } else { f.short_label().to_string() };
-            let active = !is_fnc && toolbar_fn_active(connected, f);
+            let label = if is_fnc { format!("FNC({})", if list_mode { slot } else { layer }) } else { f.short_label().to_string() };
+            let active = if list_mode { slot == layer } else { !is_fnc && toolbar_fn_active(connected, f) };
             let (rect, resp) = ui.allocate_exact_size(egui::vec2(width, HEIGHT), egui::Sense::click());
             // "Pressed" look while held, and for a moment after any press (screen or MIDI key).
             let flashing = connected.toolbar_flash[slot].is_some_and(|t| t.elapsed() < TOOLBAR_FLASH);
@@ -18221,7 +18244,9 @@ fn render_toolbar(ui: &mut egui::Ui, connected: &mut ConnectedState) {
             }
             match press_gesture(ui, &resp, &format!("toolbar_btn_{slot}")) {
                 PressGesture::Short => {
-                    if is_fnc {
+                    if list_mode {
+                        fnc_window::pick(connected, slot);
+                    } else if is_fnc {
                         connected.toolbar_layer = (layer + 1) % toolbar::LAYERS;
                         connected.settings_dirty.store(true, Ordering::Relaxed);
                     } else if f != toolbar::ToolbarFn::None {
@@ -18229,7 +18254,9 @@ fn render_toolbar(ui: &mut egui::Ui, connected: &mut ConnectedState) {
                     }
                 }
                 PressGesture::Long => {
-                    if is_fnc {
+                    if list_mode {
+                        // No previous-layer / chooser in the quick-jump mode.
+                    } else if is_fnc {
                         connected.toolbar_layer = (layer + toolbar::LAYERS - 1) % toolbar::LAYERS;
                         connected.settings_dirty.store(true, Ordering::Relaxed);
                     } else {
