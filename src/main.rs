@@ -2518,6 +2518,8 @@ struct ConnectedState {
     toolbar_window_open: bool,
     /// A window was opened from the Menu window: when nothing is open any more, the Menu comes back (menu_window.rs `return_tick`).
     menu_return: bool,
+    /// Menu -> Discovery (1) or Restart Protocol (2): picked in the NEW MENU, carried out by the main loop (it owns `self.state`).
+    menu_session_request: u8,
     /// Settings -> Display: noise-floor margin of Panadapter Automatic (dB), WDSP detector (0 Peak, 1 Rosenfell,
     /// 2 Average, 3 Sample), averaging mode (0 None, 1 Recursive, 2 Time Window, 3 Log Recursive), averaging time (ms)
     /// and "Display Panadapter".
@@ -4170,6 +4172,7 @@ fn connect_to_device(device: Device, cfg: &Config) -> Result<ConnectedState, Str
                 display_window_open: false,
                 menu_window_open: false,
                 menu_return: false,
+                menu_session_request: 0,
                 toolbar_window_open: false,
                 panadapter_noise_margin: cfg.panadapter_noise_margin.unwrap_or(-5).clamp(-20, 10),
                 display_detector: cfg.display_detector.unwrap_or(2).min(3),
@@ -5490,9 +5493,11 @@ impl eframe::App for HpsdrApp {
                                 // own control's actual valid range
                                 // instead of theirs.
                                 let target = (-smoothed + connected.agc_auto_offset_db).clamp(0.0, 140.0);
-                                // Whole dB only: every change of AGC Top makes WDSP re-set the AGC, which stalls the DSP thread for about one block
-                                // (proc 12 ms, red) -- with the smoothed floor drifting every second that happened constantly.
-                                connected.spectrum.set_agc_top_db(target.round() as f64);
+                                // Every change of AGC Top makes WDSP re-set the AGC, which stalls the DSP thread for about one block (proc 10-12 ms,
+                                // red). The smoothed floor drifts all the time, so only follow it when it has moved by 3 dB or more.
+                                if (connected.spectrum.agc_params().agc_top_db - target as f64).abs() >= 3.0 {
+                                    connected.spectrum.set_agc_top_db(target.round() as f64);
+                                }
                             }
                         }
                     }
@@ -5705,6 +5710,18 @@ impl eframe::App for HpsdrApp {
                 // reassigning self.state can't happen while `connected`
                 // (borrowed from it) is still needed by code below.
                 let mut restart_after_firmware_update: Option<Device> = None;
+                // NEW MENU: Discovery = what Stop does (back to the device list); Restart Protocol = stop the session and
+                // reconnect to the same radio, the way the in-app firmware update does.
+                match std::mem::take(&mut connected.menu_session_request) {
+                    1 => stop_clicked = true,
+                    2 => {
+                        connected.spectrum.recorder.stop();
+                        freedv_reporter::stop();
+                        connected.session.stop();
+                        restart_after_firmware_update = Some(connected.device);
+                    }
+                    _ => {}
+                }
                 egui::CentralPanel::default().show(ui, |ui| {
                     ui.add_space(4.0);
                     // Kiosk: the band row (indicators, SNB/ANF/BIN, RIT/XIT, AGC) is the first row of the screen.

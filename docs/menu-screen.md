@@ -77,3 +77,11 @@ the yellow CLOSE at the top right, Escape closes (not while the function chooser
 `any_overlay_open` include the window). In the kiosk the **Settings -> Toolbar tab is removed** from the tab strip (the arm stays for the desktop code
 path). The FNC's list closes when this window opens (`fnc_window::covered`). Checked on the Pi: Menu -> Toolbar, CLOSE back to the Menu, and the
 Settings strip without the Toolbar tab.
+
+## Restart Protocol, Iconify, Discovery (working)
+
+* **Restart Protocol**: stops the radio session and reconnects to the same radio (the flow the in-app firmware update uses), so the protocol starts from scratch with the saved settings.
+* **Iconify**: minimises the application window (egui `ViewportCommand::Minimized`); restore it from the desktop taskbar.
+* **Discovery**: the same as Stop: saves the settings, disconnects and returns to the device list.
+
+None of the three comes back to the Menu afterwards. The "!" help circles of the inert buttons were removed; the remaining inert buttons (DSP, BandStack, Memory, Extras) are simply greyed. All Menu buttons use the same 22 px font.

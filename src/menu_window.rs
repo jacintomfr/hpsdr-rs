@@ -33,6 +33,12 @@ enum Target {
     Agc,
     Meter,
     Rade,
+    /// Back to the device list (what Stop does).
+    Discovery,
+    /// Stop the session and reconnect to the same radio.
+    Restart,
+    /// Minimise the window.
+    Iconify,
     /// Opens the Settings window on this tab.
     Tab(SettingsTab),
     /// Visible but inert, with a "!" help.
@@ -81,7 +87,7 @@ const GRID: [[Option<(&str, Target)>; COLS]; 6] = [
         Some(("Extras", Target::Grey)),
         None,
     ],
-    [Some(("Discovery", Target::Grey)), None, None, Some(("CW", Target::Tab(SettingsTab::Cw))), None, None],
+    [Some(("Discovery", Target::Discovery)), None, None, Some(("CW", Target::Tab(SettingsTab::Cw))), None, None],
 ];
 
 /// Closes every overlay that could share the screen with the Menu: the full-screen windows, the compact popups and the
@@ -183,6 +189,15 @@ fn open(c: &mut ConnectedState, target: Target) {
             c.settings_tab = tab;
             c.show_settings_window = true;
         }
+        Target::Discovery => {
+            c.menu_return = false;
+            c.menu_session_request = 1;
+        }
+        Target::Restart => {
+            c.menu_return = false;
+            c.menu_session_request = 2;
+        }
+        Target::Iconify => c.menu_return = false,   // the window command is sent by menu_window()
         Target::Grey => {}
     }
 }
@@ -229,9 +244,15 @@ pub fn menu_window(ui: &mut egui::Ui, connected: &mut ConnectedState) -> (bool, 
             {
                 let mut c = child(ui, row, 0.0, w - 110.0, false, 0.0);
                 c.spacing_mut().item_spacing.x = 12.0;
-                for (label, id, bw) in [("Restart Protocol", "menu_restart_help", 190.0), ("Iconify", "menu_iconify_help", 130.0)] {
-                    c.add_enabled(false, crate::chip_button(label, false).min_size(egui::vec2(bw, 40.0)));
-                    help_button(&mut c, id, NOT_IMPLEMENTED);
+                for (label, target, bw) in [("Restart Protocol", Target::Restart, 230.0), ("Iconify", Target::Iconify, 150.0)] {
+                    let b = egui::Button::new(egui::RichText::new(label).size(22.0).color(egui::Color32::from_gray(205)))
+                        .fill(crate::chip_idle_fill())
+                        .stroke(egui::Stroke::new(1.0, egui::Color32::from_gray(95)))
+                        .corner_radius(5.0)
+                        .min_size(egui::vec2(bw, 48.0));
+                    if c.add(b).clicked() {
+                        picked = Some(target);
+                    }
                     c.add_space(12.0);
                 }
             }
@@ -254,7 +275,7 @@ pub fn menu_window(ui: &mut egui::Ui, connected: &mut ConnectedState) -> (bool, 
                     let x0 = ci as f32 * (cell_w + GAP_X);
                     let rect = egui::Rect::from_min_size(egui::pos2(row.left() + x0, row.top()), egui::vec2(cell_w, btn_h));
                     let mut c = ui.new_child(egui::UiBuilder::new().max_rect(rect).layout(egui::Layout::centered_and_justified(egui::Direction::LeftToRight)));
-                    let text = egui::RichText::new(*label).size(16.0);
+                    let text = egui::RichText::new(*label).size(22.0);
                     let tx_missing = matches!(target, Target::Tx) && connected.tx_handle.is_none();
                     let grey = matches!(target, Target::Grey) || tx_missing;
                     let btn = egui::Button::new(text.color(egui::Color32::from_gray(205)))
@@ -264,11 +285,6 @@ pub fn menu_window(ui: &mut egui::Ui, connected: &mut ConnectedState) -> (bool, 
                         .min_size(rect.size());
                     if grey {
                         c.add_enabled(false, btn);
-                        // The "!" sits inside the cell, at its right end.
-                        let hr = egui::Rect::from_min_size(egui::pos2(rect.right() - 34.0, rect.center().y - 15.0), egui::vec2(30.0, 30.0));
-                        let mut h = ui.new_child(egui::UiBuilder::new().max_rect(hr));
-                        let msg = if tx_missing { "TX is not available on this connection." } else { NOT_AVAILABLE };
-                        help_button(&mut h, &format!("menu_help_{ri}_{ci}"), msg);
                     } else if c.add(btn).clicked() {
                         picked = Some(*target);
                     }
@@ -281,7 +297,7 @@ pub fn menu_window(ui: &mut egui::Ui, connected: &mut ConnectedState) -> (bool, 
             let aw = 2.0 * cell_w + GAP_X;
             let rect = egui::Rect::from_min_size(egui::pos2(row.center().x - aw / 2.0, row.top()), egui::vec2(aw, btn_h));
             let mut c = ui.new_child(egui::UiBuilder::new().max_rect(rect).layout(egui::Layout::centered_and_justified(egui::Direction::LeftToRight)));
-            let about = egui::Button::new(egui::RichText::new("About").size(16.0).color(egui::Color32::from_gray(205)))
+            let about = egui::Button::new(egui::RichText::new("About").size(22.0).color(egui::Color32::from_gray(205)))
                 .fill(crate::chip_idle_fill())
                 .stroke(egui::Stroke::new(1.0, egui::Color32::from_gray(95)))
                 .corner_radius(5.0)
@@ -292,6 +308,9 @@ pub fn menu_window(ui: &mut egui::Ui, connected: &mut ConnectedState) -> (bool, 
         });
 
     if let Some(t) = picked {
+        if matches!(t, Target::Iconify) {
+            ui.ctx().send_viewport_cmd(egui::ViewportCommand::Minimized(true));
+        }
         open(connected, t);
         ui.ctx().request_repaint_of(egui::ViewportId::ROOT);
     }
