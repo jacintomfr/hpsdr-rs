@@ -125,7 +125,7 @@ pub fn tx_window(ui: &mut egui::Ui, connected: &mut ConnectedState) -> (bool, bo
 
             match section {
                 0 => basic(ui, w, connected, &mut ex, &mut tui, digital, local_mic, popup_id, &mut changed),
-                1 => audio_tools(ui, w, connected, &mut ex),
+                1 => audio_tools(ui, w, connected, &mut ex, &mut changed),
                 2 => cfc_section(ui, w, connected, &mut ex),
                 _ => peaks_section(ui, w, &mut tui),
             }
@@ -463,7 +463,7 @@ fn popups(ui: &mut egui::Ui, connected: &mut ConnectedState, popup_id: egui::Id,
 
 // ======================================================================= WDSP TX Audio Tools
 
-fn audio_tools(ui: &mut egui::Ui, w: f32, connected: &mut ConnectedState, ex: &mut TxExtra) {
+fn audio_tools(ui: &mut egui::Ui, w: f32, connected: &mut ConnectedState, ex: &mut TxExtra, changed: &mut bool) {
     let tx = connected.tx_handle.as_ref().unwrap();
     // Row 0: Phase rotator
     let row = new_row(ui, w, ROW_H + 4.0);
@@ -504,6 +504,12 @@ fn audio_tools(ui: &mut egui::Ui, w: f32, connected: &mut ConnectedState, ex: &m
     // Row 3: EQ Ctfmode
     let row = new_row(ui, w, ROW_H + 4.0);
     check(ui, row, 0.0, 400.0, &mut ex.eq_ctfmode, "WDSP TX EQ Ctfmode");
+    // RNNoise noise reduction on the microphone (moved here from the TX panel in the kiosk).
+    let mut on = tx.tx_denoiser_enabled();
+    if check(ui, row, 480.0, 800.0, &mut on, "Noise Reduction") {
+        tx.set_tx_denoiser_enabled(on);
+        *changed = true;   // persist (tx_denoiser_enabled is saved with the config)
+    }
     sep(ui);
     // DEXP
     let row = new_row(ui, w, ROW_H);

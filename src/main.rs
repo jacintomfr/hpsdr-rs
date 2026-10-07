@@ -12991,6 +12991,8 @@ Waterfall rebuilds: {prof_wf_n:.0}/s, {prof_wf_ms:.1} ms each."
                                         // request after hearing what it does
                                         // for RADE. See TxParams::
                                         // tx_denoiser_enabled's doc comment.
+                                        // Kiosk: Noise Reduction lives in the TX Menu (WDSP TX Audio Tools).
+                                        if !lcd_kiosk_mode() {
                                         let mut denoise = tx.tx_denoiser_enabled();
                                         if std_checkbox(ui, &mut denoise, "Noise Reduction")
                                             .on_hover_text(
@@ -13001,6 +13003,7 @@ Waterfall rebuilds: {prof_wf_n:.0}/s, {prof_wf_ms:.1} ms each."
                                         {
                                             tx.set_tx_denoiser_enabled(denoise);
                                             settings_changed = true;
+                                        }
                                         }
                                         // Leveler / Compressor / CFC live in the TX Menu window in the kiosk.
                                         if !lcd_kiosk_mode() {
@@ -13163,31 +13166,7 @@ Waterfall rebuilds: {prof_wf_n:.0}/s, {prof_wf_ms:.1} ms each."
                                     ui.add_space(8.0);
                                     }
 
-                                    // Real request: a safety default
-                                    // against accidentally transmitting
-                                    // outside the ham bands (e.g. while
-                                    // parked on "Gen"/general coverage --
-                                    // see gen_band's own doc comment) --
-                                    // off by default, checked by every
-                                    // PTT path (tx_frequency_allowed's own
-                                    // doc comment has the full list).
-                                    {
-                                        let mut allow_oob =
-                                            connected.allow_out_of_band_tx.load(Ordering::Relaxed);
-                                        if std_checkbox(ui, &mut allow_oob, "Allow TX outside ham bands")
-                                            .on_hover_text(
-                                                "Off (default): TX is blocked outside the defined ham \
-                                                 band allocations, e.g. on \"Gen\". Enable only for \
-                                                 MARS/CAP or other explicitly authorized out-of-band \
-                                                 operation -- this does not check any regulatory \
-                                                 database, it only removes this app's own safety check.",
-                                            )
-                                            .changed()
-                                        {
-                                            connected.allow_out_of_band_tx.store(allow_oob, Ordering::Relaxed);
-                                            settings_changed = true;
-                                        }
-                                    }
+                                    // "Allow TX outside ham bands" moved to Settings -> SDR Device (TRANSMIT column).
                                     // RX-888: receive-only hardware, no TX capability at
                                     // all -- don't let this checkbox re-enable the MOX/
                                     // TUNE/etc. row the connect-time override above hides.
@@ -22207,6 +22186,23 @@ fn render_sdr_device(ui: &mut egui::Ui, connected: &mut ConnectedState, settings
                         *settings_changed = true;
                     }
                     {
+                        // Safety default against transmitting outside the ham bands (e.g. on "Gen"): off by default,
+                        // checked by every PTT path (tx_frequency_allowed's doc comment has the full list).
+                        let mut allow_oob = connected.allow_out_of_band_tx.load(Ordering::Relaxed);
+                        if ui
+                            .horizontal(|ui| {
+                                let r = touch_checkbox(ui, &mut allow_oob, "Allow TX outside ham bands");
+                                help_button(ui, "sdr_allow_oob", "Off (default): TX is blocked outside the defined ham band allocations, e.g. on \"Gen\". Enable only for MARS/CAP or other explicitly authorized out-of-band operation -- this does not check any regulatory database, it only removes this app's own safety check.");
+                                r
+                            })
+                            .inner
+                            .changed()
+                        {
+                            connected.allow_out_of_band_tx.store(allow_oob, Ordering::Relaxed);
+                            *settings_changed = true;
+                        }
+                    }
+                    {
                         let mut v = connected.session.tx_inhibit_enabled.load(Ordering::Relaxed);
                         if ui
                             .horizontal(|ui| {
@@ -22284,16 +22280,6 @@ fn render_sdr_device(ui: &mut egui::Ui, connected: &mut ConnectedState, settings
                             connected.session.mic_bias_enabled.store(mic_bias_enabled, Ordering::Relaxed);
                             *settings_changed = true;
                         }
-                    }
-                    ui.add_space(2.0);
-                    ui.horizontal(|ui| {
-                        ui.label("VFO Encoder Divisor:");
-                        help_button(ui, "sdr_vfo_divisor", "How many encoder ticks make one VFO step (piHPSDR/deskHPSDR VFO encoder divisor). Higher = slower tuning when turning slowly; turning faster still speeds it up.");
-                    });
-                    let mut div = connected.vfo_encoder_divisor as f64;
-                    if spin_buttons_full(ui, "vfo_divisor", &mut div, 1.0, 50.0, 1.0, 0, None, 80.0).changed() {
-                        connected.vfo_encoder_divisor = div.round() as f32;
-                        *settings_changed = true;
                     }
                     if connected.tx_handle.is_some() {
                         ui.add_space(2.0);
@@ -22405,6 +22391,17 @@ fn render_sdr_device(ui: &mut egui::Ui, connected: &mut ConnectedState, settings
                             }
                         }
                     });
+                    // Moved here (under IARU Region) from the TRANSMIT column, which is now full.
+                    ui.add_space(2.0);
+                    ui.horizontal(|ui| {
+                        ui.label("VFO Encoder Divisor:");
+                        help_button(ui, "sdr_vfo_divisor", "How many encoder ticks make one VFO step (piHPSDR/deskHPSDR VFO encoder divisor). Higher = slower tuning when turning slowly; turning faster still speeds it up.");
+                    });
+                    let mut div = connected.vfo_encoder_divisor as f64;
+                    if spin_buttons_full(ui, "vfo_divisor", &mut div, 1.0, 50.0, 1.0, 0, None, 80.0).changed() {
+                        connected.vfo_encoder_divisor = div.round() as f32;
+                        *settings_changed = true;
+                    }
                 }
             });
         });
