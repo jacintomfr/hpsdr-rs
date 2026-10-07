@@ -71,7 +71,7 @@ from MIDI/toolbar ("NEW MENU"). Windows opened by other means (the MENU button, 
 
 ## Toolbar moved into the Menu (owner request)
 
-The Toolbar editor (8 layers x 8 boxes, FNC(0)..FNC(7)) is now its own full-screen window, `src/toolbar_window.rs`, opened by the **Toolbar** button of the
+The Toolbar editor (8 layers x 8 boxes, FNC(1)..FNC(8)) is now its own full-screen window, `src/toolbar_window.rs`, opened by the **Toolbar** button of the
 Menu (`Target::Toolbar`, flag `toolbar_window_open`). It reuses `render_toolbar_config` and the function chooser unchanged; title "hpsdr-rs - Toolbar",
 the yellow CLOSE at the top right, Escape closes (not while the function chooser is open), and CLOSE returns to the Menu (`return_tick` /
 `any_overlay_open` include the window). In the kiosk the **Settings -> Toolbar tab is removed** from the tab strip (the arm stays for the desktop code

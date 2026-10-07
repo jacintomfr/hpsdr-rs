@@ -1,6 +1,6 @@
 //! "FNC's": quick jump to any toolbar layer. A compact window (same style and placement as the AGC / Band / Filter popups)
 //! lists the eight layers with the functions of their eight boxes; while it is open the bottom toolbar shows
-//! FNC(0)..FNC(7) and pressing box k (screen or MIDI) selects layer k and closes the list.
+//! FNC(1)..FNC(8) and pressing box k (screen or MIDI) selects layer k and closes the list.
 //!
 //! Size budget (1024x600): layer column 78 px + 8 cells x 108 px = 942 px of rows (+ window frame ~ 16 px = ~958 px, inside 1024 - 2 x 24 = 976);
 //! height CLOSE row 46 + 8 rows x 30 px + 8 gaps x 10 px = ~370 px, anchored 72 px above the bottom edge.
@@ -89,7 +89,7 @@ pub fn fnc_window(ui: &mut egui::Ui, connected: &mut ConnectedState) -> bool {
                 p.text(
                     egui::pos2(rect.left() + 8.0, rect.center().y),
                     egui::Align2::LEFT_CENTER,
-                    format!("FNC({layer})"),
+                    format!("FNC({})", layer + 1),
                     egui::FontId::proportional(FONT),
                     egui::Color32::from_rgb(235, 195, 40),
                 );

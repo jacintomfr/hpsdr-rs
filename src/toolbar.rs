@@ -274,7 +274,7 @@ pub fn default_layers() -> Layers {
             Midi(M::Band15m),
             Midi(M::Band10m),
         ],
-        // The layers added after the first six (FNC(6), FNC(7)) start empty (None): the user assigns them.
+        // The layers added after the first six (FNC(7), FNC(8)) start empty (None): the user assigns them.
         [ToolbarFn::None; 7],
         [ToolbarFn::None; 7],
     ];

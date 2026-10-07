@@ -2558,7 +2558,7 @@ struct ConnectedState {
     /// button's own handler; `toolbar_choose` is the button being reassigned,.
     toolbar_layers: toolbar::Layers,
     toolbar_layer: usize,
-    /// The quick layer-jump list (FNC's, fnc_window.rs) is open: the toolbar shows FNC(0)..FNC(7).
+    /// The quick layer-jump list (FNC's, fnc_window.rs) is open: the toolbar shows FNC(1)..FNC(8).
     fnc_list_open: bool,
     /// Ids (DIAG_ITEMS) of the diagnostic values shown above the spectrum.
     diag_items: Vec<String>,
@@ -4650,11 +4650,12 @@ impl eframe::App for HpsdrApp {
                             let rev = connected.spectrum.display.lock().unwrap().revision;
                             let (gap, proc_ms, q) = spectrum::dsp_stats_take();
                             let (set, zp, feed) = spectrum::dsp_parts_take();
+                            let groups = spectrum::dsp_groups_take();
                             let (ui_fps, ui_ms, _wf_ms, wf_n, passes) = ui_prof_snapshot();
                             if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open("/tmp/hpsdr_perf.log") {
                                 let _ = writeln!(
                                     f,
-                                    "ui_fps={ui_fps:.1} passes={passes:.1} ui_ms={ui_ms:.1} wf_rebuilds={wf_n:.1} | dsp_chunks/s={} disp_rev/s={} | gap={gap:.1} proc={proc_ms:.1} q={q} set={set:.1} zp={zp:.1} feed={feed:.1} | sr={} zoom={} mode={:?} | mox={} audio_underruns={} fwd_raw={} rev_raw={} fwd_sm={:.0} rev_sm={:.0} swr={:.2}",
+                                    "ui_fps={ui_fps:.1} passes={passes:.1} ui_ms={ui_ms:.1} wf_rebuilds={wf_n:.1} | dsp_chunks/s={} disp_rev/s={} | gap={gap:.1} proc={proc_ms:.1} q={q} set={set:.1} zp={zp:.1} feed={feed:.1} | sr={} zoom={} mode={:?} | mox={} audio_underruns={} fwd_raw={} rev_raw={} fwd_sm={:.0} rev_sm={:.0} swr={:.2} groups={:?}",
                                     chunks.wrapping_sub(last.1),
                                     (rev as u64).wrapping_sub(last.2),
                                     connected.sample_rate,
@@ -4667,6 +4668,7 @@ impl eframe::App for HpsdrApp {
                                     connected.smoothed_fwd_power,
                                     connected.smoothed_rev_power,
                                     connected.smoothed_swr,
+                                    groups.map(|g| (g * 10.0).round() / 10.0),
                                 );
                             }
                             last.1 = chunks;
@@ -5488,7 +5490,9 @@ impl eframe::App for HpsdrApp {
                                 // own control's actual valid range
                                 // instead of theirs.
                                 let target = (-smoothed + connected.agc_auto_offset_db).clamp(0.0, 140.0);
-                                connected.spectrum.set_agc_top_db(target as f64);
+                                // Whole dB only: every change of AGC Top makes WDSP re-set the AGC, which stalls the DSP thread for about one block
+                                // (proc 12 ms, red) -- with the smoothed floor drifting every second that happened constantly.
+                                connected.spectrum.set_agc_top_db(target.round() as f64);
                             }
                         }
                     }
@@ -11588,7 +11592,7 @@ Waterfall rebuilds: {prof_wf_n:.0}/s, {prof_wf_ms:.1} ms each."
 
                                 SettingsTab::Toolbar => {
                                     ui.label(
-                                        "Each row is one layer, FNC(0) to FNC(7); the eight boxes at the bottom of the screen run the functions of the current layer. Tap a box to change its function.\nAssign FNC (next layer) or FNC- to a box to step through the layers, or FNC's to open the list and jump to any layer.",
+                                        "Each row is one layer, FNC(1) to FNC(8); the eight boxes at the bottom of the screen run the functions of the current layer. Tap a box to change its function.\nAssign FNC (next layer) or FNC- to a box to step through the layers, or FNC's to open the list and jump to any layer.",
                                     );
                                     ui.add_space(6.0);
                                     render_toolbar_config(ui, connected);
@@ -18304,7 +18308,7 @@ fn toolbar_fn_active(connected: &ConnectedState, f: toolbar::ToolbarFn) -> bool 
 /// The kiosk's bottom toolbar: eight assignable function boxes, piHPSDR style. Grey box with a thin
 /// outline; lighter box and text while pressed; lighter box and whiter text while the function is
 /// on. Click runs the function; holding a function box ~0.6 s opens the function chooser for that
-/// box; the FNC function (wherever assigned) steps to the next layer (hold: previous).
+/// box (the FNC box too); the FNC function (wherever assigned) steps to the next layer, FNC- steps back.
 fn render_toolbar(ui: &mut egui::Ui, connected: &mut ConnectedState) {
     const GAP: f32 = 6.0;
     const HEIGHT: f32 = TOOLBAR_HEIGHT;
@@ -18316,12 +18320,12 @@ fn render_toolbar(ui: &mut egui::Ui, connected: &mut ConnectedState) {
         for slot in 0..count {
             let list_mode = connected.fnc_list_open;
             let f = connected.toolbar_layers[layer][slot];
-            // The FNC function shows the current layer; in the FNC's list mode every box is FNC(slot).
+            // The FNC function shows the current layer; in the FNC's list mode every box is FNC(slot + 1).
             let is_fnc = f == toolbar::ToolbarFn::Midi(MidiAction::ToolbarFuncNext);
             let label = if list_mode {
-                format!("FNC({slot})")
+                format!("FNC({})", slot + 1)
             } else if is_fnc {
-                format!("FNC({layer})")
+                format!("FNC({})", layer + 1)
             } else {
                 f.short_label().to_string()
             };
@@ -18373,10 +18377,6 @@ fn render_toolbar(ui: &mut egui::Ui, connected: &mut ConnectedState) {
                 PressGesture::Long => {
                     if list_mode {
                         // No previous-layer / chooser in the quick-jump mode.
-                    } else if is_fnc {
-                        // Long press on the FNC function: previous layer, wherever it is assigned.
-                        connected.toolbar_layer = (layer + toolbar::LAYERS - 1) % toolbar::LAYERS;
-                        connected.settings_dirty.store(true, Ordering::Relaxed);
                     } else {
                         connected.toolbar_choose = Some(ToolbarChoose {
                             layer,
@@ -18507,7 +18507,7 @@ fn show_toolbar_chooser(ctx: &egui::Context, connected: &mut ConnectedState, fro
 /// and a click on a button goes straight to the function chooser.
 pub(crate) fn render_toolbar_config(ui: &mut egui::Ui, connected: &mut ConnectedState) {
     let mut open_slot = None;
-    // A label column FNC(0)..FNC(7) (as in the FNC's list, same order: FNC(0) on top) and eight columns of boxes.
+    // A label column FNC(1)..FNC(8) (as in the FNC's list, same order: FNC(1) on top) and eight columns of boxes.
     const LABEL_W: f32 = 62.0;
     let cell_w = ((ui.available_width() - LABEL_W - 8.0) / 8.0 - 5.0).clamp(56.0, 120.0).floor();
     let current_layer = connected.toolbar_layer;
@@ -18519,7 +18519,7 @@ pub(crate) fn render_toolbar_config(ui: &mut egui::Ui, connected: &mut Connected
             } else {
                 (egui::Color32::from_gray(190), false)
             };
-            let mut label = egui::RichText::new(format!("FNC({layer})")).color(txt_col);
+            let mut label = egui::RichText::new(format!("FNC({})", layer + 1)).color(txt_col);
             if strong {
                 label = label.strong();
             }

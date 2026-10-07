@@ -1,4 +1,4 @@
-//! Full-screen Toolbar window (Menu -> Toolbar): the editor of the 8 layers x 8 boxes of the bottom toolbar (FNC(0)..FNC(7)).
+//! Full-screen Toolbar window (Menu -> Toolbar): the editor of the 8 layers x 8 boxes of the bottom toolbar (FNC(1)..FNC(8)).
 //! It was the Settings -> Toolbar tab; in the kiosk the tab is gone and this window is the only way in. The grid itself
 //! (`render_toolbar_config`) and the function chooser are the same code as before.
 
@@ -40,7 +40,7 @@ pub fn toolbar_window(ui: &mut egui::Ui, connected: &mut ConnectedState) -> (boo
             // Left of the CLOSE button: 96 px + 24 px margin are kept free on the right of the help text.
             ui.allocate_ui(egui::vec2(w - 130.0, 40.0), |ui| {
                 ui.label(
-                    "Each row is one layer, FNC(0) to FNC(7); the eight boxes at the bottom of the screen run the functions of the current layer. Tap a box to change its function.\nAssign FNC (next layer) or FNC- to a box to step through the layers, or FNC's to open the list and jump to any layer.",
+                    "Each row is one layer, FNC(1) to FNC(8); the eight boxes at the bottom of the screen run the functions of the current layer. Tap a box to change its function.\nAssign FNC (next layer) or FNC- to a box to step through the layers, or FNC's to open the list and jump to any layer.",
                 );
             });
             ui.add_space(6.0);
