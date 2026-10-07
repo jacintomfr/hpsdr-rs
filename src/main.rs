@@ -24,6 +24,7 @@ mod discovery_ui;
 mod eq_curve;
 mod eq_window;
 mod noise_window;
+mod pa_window;
 mod peaks;
 mod agc_window;
 mod filter_window;
@@ -1710,6 +1711,7 @@ enum SettingsTab {
     SdrDevice,
     Noise,
     TxMenu,
+    Pa,
     RxMenu,
     Network,
     Audio,
@@ -2467,6 +2469,8 @@ struct ConnectedState {
     noise_window_open: bool,
     /// The TX Menu window (tx_window.rs), the UI-only TX options and the mic profile slot names.
     tx_window_open: bool,
+    /// The PA calibration window (pa_window.rs).
+    pa_window_open: bool,
     /// The RX Menu window (rx_window.rs) and its radio/audio-layer options.
     rx_window_open: bool,
     rx_ui: config::RxUiExtra,
@@ -4095,6 +4099,7 @@ fn connect_to_device(device: Device, cfg: &Config) -> Result<ConnectedState, Str
                 eq_window_open: false,
                 noise_window_open: false,
                 tx_window_open: false,
+                pa_window_open: false,
                 rx_window_open: false,
                 rx_ui: cfg.rx_ui,
                 tx_ui: {
@@ -4168,7 +4173,7 @@ fn connect_to_device(device: Device, cfg: &Config) -> Result<ConnectedState, Str
                 ps_auto_attenuate: false,
                 auto_atten_last_seen_feedback: None,
                 auto_atten_last_check: None,
-                pa_calibration: cfg.pa_calibration.clone(),
+                pa_calibration: pa_window::clamped(&cfg.pa_calibration),
                 pa_drive_adjust: cfg.pa_drive_adjust.clone(),
                 // Always exactly MAX_XVTRS slots so the settings tab has a
                 // stable fixed-size row list to render/edit -- a config
@@ -6707,6 +6712,17 @@ impl eframe::App for HpsdrApp {
                         }
                         if close_now {
                             connected.tx_window_open = false;
+                        }
+                    }
+
+                    // PA calibration window (deskHPSDR pa_menu.c), see pa_window.rs.
+                    if connected.pa_window_open {
+                        let (close_now, changed) = pa_window::pa_window(ui, connected);
+                        if changed {
+                            settings_changed = true;
+                        }
+                        if close_now {
+                            connected.pa_window_open = false;
                         }
                     }
 
@@ -10931,6 +10947,7 @@ Waterfall rebuilds: {prof_wf_n:.0}/s, {prof_wf_ms:.1} ms each."
                                     (SettingsTab::Midi, "MIDI"),
                                     (SettingsTab::Network, "Network"),
                                     (SettingsTab::OpenCollector, "Open Collector"),
+                                    (SettingsTab::Pa, "PA"),
                                     (SettingsTab::PaCalibration, "PA Calibration"),
                                     (SettingsTab::PureSignal, "PureSignal"),
                                     (SettingsTab::Agc, "RX"),
@@ -12374,6 +12391,17 @@ Waterfall rebuilds: {prof_wf_n:.0}/s, {prof_wf_ms:.1} ms each."
                                         ui.label("TX is not available on this connection.");
                                     }
                                 }
+                                SettingsTab::Pa => {
+                                    // The PA page is a full-screen window (pa_window.rs) in the kiosk, opened straight from the tab.
+                                    if lcd_kiosk_mode() {
+                                        connected.pa_window_open = true;
+                                        connected.show_settings_window = false;
+                                        connected.settings_tab = SettingsTab::About;
+                                        ui.ctx().request_repaint_of(egui::ViewportId::ROOT);
+                                    } else {
+                                        ui.label("The PA calibration window is only available in the kiosk; use the PA Calibration tab.");
+                                    }
+                                }
                                 SettingsTab::Noise => {
                                     // The Noise page is a full-screen window (noise_window.rs), opened straight from the tab.
                                     connected.noise_window_open = true;
@@ -13396,7 +13424,7 @@ Waterfall rebuilds: {prof_wf_n:.0}/s, {prof_wf_ms:.1} ms each."
                                                 ui,
                                                 &mut connected.slider_scroll_accum,
                                                 &mut gain_db,
-                                                20.0..=50.0,
+                                                38.8..=70.0,
                                                 0.1,
                                             ) {
                                                 connected
@@ -21541,6 +21569,7 @@ fn render_extra_receiver_settings(ui: &mut egui::Ui, rx: &Arc<Mutex<ExtraReceive
         SettingsTab::SdrDevice => rx.settings_tab = SettingsTab::Agc,
         SettingsTab::Noise => rx.settings_tab = SettingsTab::Agc,
         SettingsTab::TxMenu => rx.settings_tab = SettingsTab::Agc,
+        SettingsTab::Pa => rx.settings_tab = SettingsTab::Agc,
         SettingsTab::RxMenu => rx.settings_tab = SettingsTab::Agc,
         SettingsTab::PaCalibration => rx.settings_tab = SettingsTab::Agc,
         SettingsTab::PureSignal => rx.settings_tab = SettingsTab::Agc,
@@ -22198,23 +22227,7 @@ fn render_sdr_device(ui: &mut egui::Ui, connected: &mut ConnectedState, settings
                     {
                         *settings_changed = true;
                     }
-                    {
-                        // Safety default against transmitting outside the ham bands (e.g. on "Gen"): off by default,
-                        // checked by every PTT path (tx_frequency_allowed's doc comment has the full list).
-                        let mut allow_oob = connected.allow_out_of_band_tx.load(Ordering::Relaxed);
-                        if ui
-                            .horizontal(|ui| {
-                                let r = touch_checkbox(ui, &mut allow_oob, "Allow out-of-band TX");
-                                help_button(ui, "sdr_allow_oob", "Off (default): TX is blocked outside the defined ham band allocations, e.g. on \"Gen\". Enable only for MARS/CAP or other explicitly authorized out-of-band operation -- this does not check any regulatory database, it only removes this app's own safety check.");
-                                r
-                            })
-                            .inner
-                            .changed()
-                        {
-                            connected.allow_out_of_band_tx.store(allow_oob, Ordering::Relaxed);
-                            *settings_changed = true;
-                        }
-                    }
+                    // "Transmit out of band" (allow_out_of_band_tx) lives in the PA window (pa_window.rs).
                     {
                         let mut v = connected.session.tx_inhibit_enabled.load(Ordering::Relaxed);
                         if ui
