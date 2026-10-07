@@ -1629,14 +1629,15 @@ fn dispatch_midi_binding(
             connected.session.diversity_phase_deg.store(new_phase.to_bits(), Ordering::Relaxed);
         }
         // The on-screen toolbar boxes, pressed from outside (e.g. the physical switches under the
-        // screen via MIDI): F1-F7 run whatever is assigned to that box in the current layer, F8 is FNC.
+        // screen via MIDI): F1-F8 run whatever is assigned to that box in the current layer.
         MidiAction::Toolbar1
         | MidiAction::Toolbar2
         | MidiAction::Toolbar3
         | MidiAction::Toolbar4
         | MidiAction::Toolbar5
         | MidiAction::Toolbar6
-        | MidiAction::Toolbar7 => {
+        | MidiAction::Toolbar7
+        | MidiAction::Toolbar8 => {
             let slot = match binding.action {
                 MidiAction::Toolbar1 => 0,
                 MidiAction::Toolbar2 => 1,
@@ -1644,7 +1645,8 @@ fn dispatch_midi_binding(
                 MidiAction::Toolbar4 => 3,
                 MidiAction::Toolbar5 => 4,
                 MidiAction::Toolbar6 => 5,
-                _ => 6,
+                MidiAction::Toolbar7 => 6,
+                _ => 7,
             };
             connected.toolbar_flash[slot] = Some(Instant::now());
             if connected.fnc_list_open {
@@ -1654,17 +1656,11 @@ fn dispatch_midi_binding(
             let f = connected.toolbar_layers[connected.toolbar_layer][slot];
             run_toolbar_fn(connected, f, freq_hz, sample_rate, passband);
         }
-        MidiAction::Toolbar8 => {
-            connected.toolbar_flash[toolbar::BUTTONS] = Some(Instant::now());
-            if connected.fnc_list_open {
-                fnc_window::pick(connected, toolbar::BUTTONS);
-                return;
-            }
+        MidiAction::ToolbarFuncNext => {
             connected.toolbar_layer = (connected.toolbar_layer + 1) % toolbar::LAYERS;
             connected.settings_dirty.store(true, Ordering::Relaxed);
         }
         MidiAction::ToolbarFuncRev => {
-            connected.toolbar_flash[toolbar::BUTTONS] = Some(Instant::now());
             connected.toolbar_layer = (connected.toolbar_layer + toolbar::LAYERS - 1) % toolbar::LAYERS;
             connected.settings_dirty.store(true, Ordering::Relaxed);
         }
@@ -2538,7 +2534,7 @@ struct ConnectedState {
     /// Ids (DIAG_ITEMS) of the diagnostic values shown above the spectrum.
     diag_items: Vec<String>,
     toolbar_pending: Option<toolbar::ToolbarFn>,
-    /// When each toolbar box (F1-F7, FNC) was last pressed, so it can show "pressed" briefly -- also
+    /// When each toolbar box (F1-F8) was last pressed, so it can show "pressed" briefly -- also
     /// for a press that came from a MIDI key and not from the screen.
     toolbar_flash: [Option<Instant>; 8],
     /// Kiosk: screen x of the centre of the TCI TX gain value box and of the NB chip, recorded each frame so
@@ -11482,7 +11478,7 @@ Waterfall rebuilds: {prof_wf_n:.0}/s, {prof_wf_ms:.1} ms each."
 
                                 SettingsTab::Toolbar => {
                                     ui.label(
-                                        "The eight boxes at the bottom of the screen: F1-F7 run a function and FNC steps \n                                         through six layers. You can also hold a box for a moment to change it.",
+                                        "Each row is one layer, FNC(0) to FNC(7); the eight boxes at the bottom of the screen run the functions of the current layer. Tap a box to change its function.\nAssign FNC (next layer) or FNC- to a box to step through the layers, or FNC's to open the list and jump to any layer.",
                                     );
                                     ui.add_space(6.0);
                                     render_toolbar_config(ui, connected);
@@ -18188,24 +18184,31 @@ fn toolbar_fn_active(connected: &ConnectedState, f: toolbar::ToolbarFn) -> bool 
     }
 }
 
-/// The kiosk's bottom toolbar: seven function boxes plus FNC, piHPSDR style. Grey box with a thin
+/// The kiosk's bottom toolbar: eight assignable function boxes, piHPSDR style. Grey box with a thin
 /// outline; lighter box and text while pressed; lighter box and whiter text while the function is
 /// on. Click runs the function; holding a function box ~0.6 s opens the function chooser for that
-/// box; FNC steps to the next layer (hold: previous).
+/// box; the FNC function (wherever assigned) steps to the next layer (hold: previous).
 fn render_toolbar(ui: &mut egui::Ui, connected: &mut ConnectedState) {
     const GAP: f32 = 6.0;
     const HEIGHT: f32 = TOOLBAR_HEIGHT;
-    let count = toolbar::BUTTONS + 1;
+    let count = toolbar::BUTTONS;
     let width = ((ui.available_width() - GAP * (count as f32 - 1.0)) / count as f32).floor().max(40.0);
     let layer = connected.toolbar_layer;
     ui.horizontal(|ui| {
         ui.spacing_mut().item_spacing.x = GAP;
         for slot in 0..count {
             let list_mode = connected.fnc_list_open;
-            let is_fnc = slot == toolbar::BUTTONS || list_mode;
-            let f = if is_fnc { toolbar::ToolbarFn::None } else { connected.toolbar_layers[layer][slot] };
-            let label = if is_fnc { format!("FNC({})", if list_mode { slot } else { layer }) } else { f.short_label().to_string() };
-            let active = if list_mode { slot == layer } else { !is_fnc && toolbar_fn_active(connected, f) };
+            let f = connected.toolbar_layers[layer][slot];
+            // The FNC function shows the current layer; in the FNC's list mode every box is FNC(slot).
+            let is_fnc = f == toolbar::ToolbarFn::Midi(MidiAction::ToolbarFuncNext);
+            let label = if list_mode {
+                format!("FNC({slot})")
+            } else if is_fnc {
+                format!("FNC({layer})")
+            } else {
+                f.short_label().to_string()
+            };
+            let active = if list_mode { slot == layer } else { toolbar_fn_active(connected, f) };
             let (rect, resp) = ui.allocate_exact_size(egui::vec2(width, HEIGHT), egui::Sense::click());
             // "Pressed" look while held, and for a moment after any press (screen or MIDI key).
             let flashing = connected.toolbar_flash[slot].is_some_and(|t| t.elapsed() < TOOLBAR_FLASH);
@@ -18246,9 +18249,6 @@ fn render_toolbar(ui: &mut egui::Ui, connected: &mut ConnectedState) {
                 PressGesture::Short => {
                     if list_mode {
                         fnc_window::pick(connected, slot);
-                    } else if is_fnc {
-                        connected.toolbar_layer = (layer + 1) % toolbar::LAYERS;
-                        connected.settings_dirty.store(true, Ordering::Relaxed);
                     } else if f != toolbar::ToolbarFn::None {
                         connected.toolbar_pending = Some(f);
                     }
@@ -18257,6 +18257,7 @@ fn render_toolbar(ui: &mut egui::Ui, connected: &mut ConnectedState) {
                     if list_mode {
                         // No previous-layer / chooser in the quick-jump mode.
                     } else if is_fnc {
+                        // Long press on the FNC function: previous layer, wherever it is assigned.
                         connected.toolbar_layer = (layer + toolbar::LAYERS - 1) % toolbar::LAYERS;
                         connected.settings_dirty.store(true, Ordering::Relaxed);
                     } else {
@@ -18385,14 +18386,27 @@ fn show_toolbar_chooser(ctx: &egui::Context, connected: &mut ConnectedState, fro
 }
 
 /// piHPSDR's "Toolbar configuration", shown directly in Settings -> Toolbar: every layer with its
-/// seven buttons (highest layer on top, layer 0 at the bottom like the real toolbar), the FNC box
-/// at the end of each row, and a click on a button goes straight to the function chooser.
+/// eight boxes (highest layer on top, layer 0 at the bottom like the real toolbar),
+/// and a click on a button goes straight to the function chooser.
 fn render_toolbar_config(ui: &mut egui::Ui, connected: &mut ConnectedState) {
     let mut open_slot = None;
-    // Eight columns across the available width.
-    let cell_w = ((ui.available_width() - 8.0) / 8.0 - 5.0).clamp(60.0, 120.0).floor();
+    // A label column FNC(0)..FNC(7) (as in the FNC's list, same order: FNC(0) on top) and eight columns of boxes.
+    const LABEL_W: f32 = 62.0;
+    let cell_w = ((ui.available_width() - LABEL_W - 8.0) / 8.0 - 5.0).clamp(56.0, 120.0).floor();
+    let current_layer = connected.toolbar_layer;
     egui::Grid::new("toolbar_config_grid").spacing([5.0, 5.0]).show(ui, |ui| {
-        for layer in (0..toolbar::LAYERS).rev() {
+        for layer in 0..toolbar::LAYERS {
+            // The layer of the bottom toolbar right now is highlighted.
+            let (txt_col, strong) = if layer == current_layer {
+                (egui::Color32::from_rgb(232, 150, 46), true)
+            } else {
+                (egui::Color32::from_gray(190), false)
+            };
+            let mut label = egui::RichText::new(format!("FNC({layer})")).color(txt_col);
+            if strong {
+                label = label.strong();
+            }
+            ui.add_sized([LABEL_W, 34.0], egui::Label::new(label));
             for slot in 0..toolbar::BUTTONS {
                 let f = connected.toolbar_layers[layer][slot];
                 let text = if f == toolbar::ToolbarFn::None { "None" } else { f.short_label() };
@@ -18400,8 +18414,6 @@ fn render_toolbar_config(ui: &mut egui::Ui, connected: &mut ConnectedState) {
                     open_slot = Some((layer, slot));
                 }
             }
-            // The last box of every layer is FNC itself, which is not assignable.
-            ui.add_sized([cell_w, 34.0], egui::Label::new(egui::RichText::new(format!("FNC({layer})")).weak()));
             ui.end_row();
         }
     });

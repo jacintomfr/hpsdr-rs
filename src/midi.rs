@@ -232,6 +232,8 @@ pub enum MidiAction {
     NewMenu,
     /// Quick jump to any toolbar layer (fnc_window.rs): toggles the layer list.
     ToolbarFuncList,
+    /// Next toolbar layer (the assignable FNC function; long press on the toolbar box = previous).
+    ToolbarFuncNext,
 }
 
 impl MidiAction {
@@ -339,6 +341,7 @@ impl MidiAction {
             MidiAction::ToolbarFuncRev => "FuncRev",
             MidiAction::NewMenu => "NEW MENU",
             MidiAction::ToolbarFuncList => "FNC's",
+            MidiAction::ToolbarFuncNext => "FNC (next layer)",
         }
     }
 }
@@ -422,6 +425,7 @@ pub const KEY_ACTIONS: &[MidiAction] = &[
     MidiAction::ToolbarFuncRev,
     MidiAction::NewMenu,
     MidiAction::ToolbarFuncList,
+    MidiAction::ToolbarFuncNext,
 ];
 
 /// Actions valid for a Knob (absolute value) binding.

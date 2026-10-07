@@ -1,6 +1,7 @@
-//! Bottom toolbar of the 1024x600 kiosk panel: eight boxes under the spectrum, F1..F7 plus
-//! `FNC(n)`, modelled on piHPSDR's toolbar -- 8 layers of 7 function buttons, `FNC` steps
-//! through the layers (and `FuncRev` / a long press on `FNC` steps back), and every button can be assigned any function from the list below.
+//! Bottom toolbar of the 1024x600 kiosk panel: eight boxes under the spectrum, modelled on
+//! piHPSDR's toolbar -- 8 layers of 8 assignable function boxes. The layer step is an ordinary
+//! function (`FNC`, `MidiAction::ToolbarFuncNext`: tap = next layer, long press = previous), as are
+//! `FNC-` and `FNC's` (quick jump list); every box can be assigned any function from the list below.
 //!
 //! The list is what hpsdr-rs can do today: every MIDI key action (so the toolbar and a MIDI
 //! controller share one dispatcher in `main.rs`), plus Two Tone and the zoom/pan controls that
@@ -8,8 +9,8 @@
 
 use crate::midi::{MidiAction, KEY_ACTIONS};
 
-/// Function buttons per layer; the eighth box is `FNC`.
-pub const BUTTONS: usize = 7;
+/// Assignable function boxes per layer.
+pub const BUTTONS: usize = 8;
 /// Number of layers `FNC` steps through.
 pub const LAYERS: usize = 8;
 
@@ -84,6 +85,7 @@ impl ToolbarFn {
                 MidiAction::Vox => "VOX",
                 MidiAction::VoxMenu => "VOX SET",
                 MidiAction::EqMenu => "EQ",
+                MidiAction::ToolbarFuncNext => "FNC",
                 MidiAction::ToolbarFuncRev => "FNC-",
                 MidiAction::ToolbarFuncList => "FNC's",
                 MidiAction::NewMenu => "NEW MENU",
@@ -225,7 +227,7 @@ pub fn is_toolbar_action(a: MidiAction) -> bool {
 pub fn default_layers() -> Layers {
     use MidiAction as M;
     use ToolbarFn::{Midi, PanLeft, PanRight, TwoTone, ZoomIn, ZoomOut, ZoomReset};
-    [
+    let base: [[ToolbarFn; 7]; LAYERS] = [
         [
             Midi(M::Mox),
             Midi(M::Tune),
@@ -273,12 +275,21 @@ pub fn default_layers() -> Layers {
             Midi(M::Band10m),
         ],
         // The layers added after the first six (FNC(6), FNC(7)) start empty (None): the user assigns them.
-        [ToolbarFn::None; BUTTONS],
-        [ToolbarFn::None; BUTTONS],
-    ]
+        [ToolbarFn::None; 7],
+        [ToolbarFn::None; 7],
+    ];
+    // The eighth box of every layer is the FNC (next layer) function, as the old fixed button was.
+    let mut layers = [[ToolbarFn::None; BUTTONS]; LAYERS];
+    for (l, row) in base.iter().enumerate() {
+        layers[l][..7].copy_from_slice(row);
+        layers[l][7] = Midi(M::ToolbarFuncNext);
+    }
+    layers
 }
 
 /// Layers from the saved config; anything missing or unknown keeps the factory assignment.
+/// Migration: rows saved by the old 7-box layout have no eighth entry, so the eighth box keeps its
+/// factory value, the FNC (next layer) function; rows with eight entries load as they are.
 pub fn layers_from_config(saved: Option<&Vec<Vec<String>>>) -> Layers {
     let mut layers = default_layers();
     if let Some(saved) = saved {
@@ -322,6 +333,30 @@ mod tests {
         let l = layers_from_config(Some(&nine));
         assert_eq!(l.len(), 8);
         assert_eq!(l[7][0], ToolbarFn::Midi(MidiAction::Tune));
+    }
+
+    #[test]
+    fn old_seven_entry_rows_get_fnc_as_eighth() {
+        let fnc = ToolbarFn::Midi(MidiAction::ToolbarFuncNext);
+        assert_eq!(BUTTONS, 8);
+        let old: Vec<Vec<String>> = (0..8).map(|_| vec!["Tune".to_string(); 7]).collect();
+        let l = layers_from_config(Some(&old));
+        for row in l.iter() {
+            assert_eq!(row[6], ToolbarFn::Midi(MidiAction::Tune));
+            assert_eq!(row[7], fnc);
+        }
+        assert!(default_layers().iter().all(|r| r[7] == fnc));
+    }
+
+    #[test]
+    fn eight_entry_rows_round_trip() {
+        let mut d = default_layers();
+        d[3][7] = ToolbarFn::Midi(MidiAction::Tune);
+        d[2][0] = ToolbarFn::Midi(MidiAction::ToolbarFuncNext);
+        let saved = layers_to_config(&d);
+        assert!(saved.iter().all(|r| r.len() == 8));
+        assert_eq!(layers_from_config(Some(&saved)), d);
+        assert!(ToolbarFn::all().contains(&ToolbarFn::Midi(MidiAction::ToolbarFuncNext)));
     }
 
     #[test]

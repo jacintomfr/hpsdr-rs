@@ -1,16 +1,16 @@
 //! "FNC's": quick jump to any toolbar layer. A compact window (same style and placement as the AGC / Band / Filter popups)
-//! lists the eight layers with the functions of their seven buttons; while it is open the bottom toolbar shows
+//! lists the eight layers with the functions of their eight boxes; while it is open the bottom toolbar shows
 //! FNC(0)..FNC(7) and pressing box k (screen or MIDI) selects layer k and closes the list.
 //!
-//! Size budget (1024x600): layer column 78 px + 7 cells x 112 px = 862 px of rows (+ window margins ~ 892 px < 1024);
-//! height CLOSE row 46 + 8 rows x 30 px + 8 gaps x 10 px = ~370 px, anchored 58 px above the bottom edge.
+//! Size budget (1024x600): layer column 78 px + 8 cells x 108 px = 942 px of rows (+ window frame ~ 16 px = ~958 px, inside 1024 - 2 x 24 = 976);
+//! height CLOSE row 46 + 8 rows x 30 px + 8 gaps x 10 px = ~370 px, anchored 72 px above the bottom edge.
 
 use crate::{toolbar, touch_close_button, ConnectedState};
 
 const ROW_H: f32 = 30.0;
 const GAP: f32 = 10.0;
 const LAYER_W: f32 = 78.0;
-const CELL_W: f32 = 112.0;
+const CELL_W: f32 = 108.0;
 const FONT: f32 = 15.0;
 
 /// FNC's pressed: open or close the list. Opening closes the other compact popups that share its place.
@@ -65,7 +65,7 @@ pub fn fnc_window(ui: &mut egui::Ui, connected: &mut ConnectedState) -> bool {
         .title_bar(false)
         .collapsible(false)
         .resizable(false)
-        .anchor(egui::Align2::CENTER_BOTTOM, egui::vec2(0.0, -58.0))
+        .anchor(egui::Align2::CENTER_BOTTOM, egui::vec2(0.0, -72.0))
         .show(ui.ctx(), |ui| {
             if ui.input(|i| i.key_pressed(egui::Key::Escape)) {
                 close_now = true;
