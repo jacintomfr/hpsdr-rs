@@ -2471,6 +2471,8 @@ struct ConnectedState {
     tx_window_open: bool,
     /// The PA calibration window (pa_window.rs).
     pa_window_open: bool,
+    /// The PA window's drive-linearization measurement assistant (pa_window.rs); None when idle.
+    pa_measure: Option<pa_window::Measure>,
     /// The RX Menu window (rx_window.rs) and its radio/audio-layer options.
     rx_window_open: bool,
     rx_ui: config::RxUiExtra,
@@ -4100,6 +4102,7 @@ fn connect_to_device(device: Device, cfg: &Config) -> Result<ConnectedState, Str
                 noise_window_open: false,
                 tx_window_open: false,
                 pa_window_open: false,
+                pa_measure: None,
                 rx_window_open: false,
                 rx_ui: cfg.rx_ui,
                 tx_ui: {
@@ -5014,6 +5017,7 @@ impl eframe::App for HpsdrApp {
                 vox_tick(ui.ctx(), connected);
                 eq_window::mode_tick(connected);
                 radio_inputs_tick(connected);
+                pa_window::measure_tick(connected);
                 filter_window::tick(connected);
                 spectrum::set_smeter_peak(connected.smeter_mode == SMeterMode::Peak);
                 tx::set_alc_mode(match connected.alc_mode {
