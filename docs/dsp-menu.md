@@ -18,9 +18,14 @@ measure, image offset, RX IQ gain / phase, Reset, Auto RX IQ and the IQ status.
 * CESSB only runs when the low-latency filter is off (deskHPSDR `transmitter.c`).
 * RX2 (extra receivers) is not in the window yet: their DSP parameters are saved by a separate mechanism.
 
-## Phase 2 (planned): RX image measure + manual IQ correction
-Image measure (signal at +offset, mirror at -offset in the panadapter -> "IRR x dB"), offset 100..10000 Hz, RX IQ gain -5..+5 dB,
-phase -20..+20 deg, Reset. The correction is applied to the IQ samples before WDSP: Q' = (Q*g + I*sin(phi)) / cos(phi).
+## Phase 2 (done): RX image measure + manual IQ correction (RX1)
+* **RX Image Measure** (not saved, like deskHPSDR): the panadapter row is read at +offset and -offset from the centre of the display (maximum of +-2 bins);
+  signal minus mirror is shown as "IRR x dB" at the bottom left of the spectrum. Not measured while transmitting, and not when the offset falls
+  outside the visible span.
+* **Image Offset Hz** 100..10000 (step 10), **RX IQ Gain** -5..+5 dB and **RX IQ Phase** -20..+20 deg (step 0.01), **Reset**: stored in `RxExtra`
+  (`image_measure_hz`, `iq_gain_db`, `iq_phase_deg`, saved with the configuration).
+* The correction is applied in place to each IQ chunk before the analyzer and the demodulator (`spectrum.rs`, run loop): I stays, Q = (Q*g + I*sin(phi)) / cos(phi), g = 10^(dB/20).
+  The raw IQ tap for TCI is taken before it.
 
 ## Phase 3 (planned): Auto RX IQ
 One-shot search of gain / phase that maximises the IRR (needs a calibration signal), with status text.

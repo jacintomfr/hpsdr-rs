@@ -2514,6 +2514,11 @@ struct ConnectedState {
     /// The Display window (display_window.rs).
     display_window_open: bool,
     dsp_window_open: bool,
+    /// DSP menu "RX Image Measure" (not saved, like deskHPSDR) and its last result: (signal dB, rejection dB).
+    image_measure: bool,
+    image_irr: Option<(f32, f32)>,
+    /// DSP menu, IQ page: the spectrum/waterfall ratio the user had before the page lowered it (restored when the page or the window closes).
+    dsp_saved_ratio: Option<f32>,
     /// The full-screen Menu window (menu_window.rs), opened by the NEW MENU action.
     menu_window_open: bool,
     /// The full-screen Toolbar editor (toolbar_window.rs), opened from the Menu.
@@ -4173,6 +4178,9 @@ fn connect_to_device(device: Device, cfg: &Config) -> Result<ConnectedState, Str
                 pa_window_open: false,
                 display_window_open: false,
                 dsp_window_open: false,
+                image_measure: false,
+                image_irr: None,
+                dsp_saved_ratio: None,
                 menu_window_open: false,
                 menu_return: false,
                 menu_session_request: 0,
@@ -6848,6 +6856,12 @@ impl eframe::App for HpsdrApp {
                         }
                     }
 
+                    // The IQ page of the DSP window lowers the spectrum/waterfall ratio; give it back as soon as the window is gone.
+                    if !connected.dsp_window_open {
+                        if let Some(r) = connected.dsp_saved_ratio.take() {
+                            connected.spectrum_waterfall_ratio = r;
+                        }
+                    }
                     // DSP window (deskHPSDR fft_menu.c), see dsp_window.rs.
                     if connected.dsp_window_open {
                         let (close_now, changed) = dsp_window::dsp_window(ui, connected);
@@ -9655,6 +9669,33 @@ impl eframe::App for HpsdrApp {
                         } else {
                             // Not filled: deskHPSDR PAN_LINE_THICK 1.0 (raw trace) / the previous 1.5 (smooth trace).
                             plot_painter.add(egui::Shape::line(trace_points, trace_stroke(if smooth_trace_on { 1.5 } else { 1.0 })));
+                        }
+
+                        // DSP menu "RX Image Measure" (deskHPSDR rx_panadapter_update_image_measure / _draw_image_measure): the signal at
+                        // +offset from the centre of the display against its mirror at -offset (maximum of +-2 bins), shown as "IRR x dB".
+                        connected.image_irr = None;
+                        if connected.image_measure && !transmitting {
+                            let nb = spectrum_row.len();
+                            let hz_per_bin = 2.0 * visible_half_span_hz / nb.max(1) as f64;
+                            let measure_hz = connected.spectrum.rx_extra().image_measure_hz.abs() as f64;
+                            if nb > 6 && hz_per_bin > 0.0 && measure_hz > 0.0 {
+                                let center = (nb / 2) as i64;
+                                let off = (measure_hz / hz_per_bin).round() as i64;
+                                let (sx, mx) = (center + off, center - off);
+                                let last = nb as i64 - 3;
+                                if off > 2 && off < center - 2 && sx > 2 && sx < last && mx > 2 && mx < last {
+                                    let peak = |i: i64| (-2i64..=2).map(|k| spectrum_row[(i + k) as usize]).fold(f32::MIN, f32::max);
+                                    let (s, m) = (peak(sx), peak(mx));
+                                    connected.image_irr = Some((s, s - m));
+                                }
+                            }
+                        }
+                        if let Some((_, rej)) = connected.image_irr {
+                            let text = format!("IRR {:.1} dB", rej.abs());
+                            let galley = ui.painter().layout_no_wrap(text, egui::FontId::proportional(16.0), egui::Color32::WHITE);
+                            let pos = egui::pos2(rect.left() + 60.0, rect.top() + rect.height() * 0.95 - galley.size().y);
+                            ui.painter().rect_filled(egui::Rect::from_min_size(pos, galley.size()).expand2(egui::vec2(6.0, 4.0)), 0.0, egui::Color32::from_black_alpha(217));
+                            ui.painter().galley(pos, galley, egui::Color32::WHITE);
                         }
 
                         // Peaks & Hold trace and Peak Labels (Settings -> Display), ported from deskHPSDR's rx_panadapter.c /
@@ -15571,7 +15612,7 @@ Waterfall rebuilds: {prof_wf_n:.0}/s, {prof_wf_ms:.1} ms each."
                         meter_style: Some(connected.meter_style),
                         smeter_mode: Some(connected.smeter_mode),
                         alc_mode: Some(connected.alc_mode),
-                        spectrum_waterfall_ratio: Some(connected.spectrum_waterfall_ratio),
+                        spectrum_waterfall_ratio: Some(connected.dsp_saved_ratio.unwrap_or(connected.spectrum_waterfall_ratio)),
                         waterfall_enabled: Some(connected.waterfall_enabled),
                         spectrum_zoom: Some(connected.spectrum_zoom),
                         spectrum_pan: Some(connected.spectrum_pan),

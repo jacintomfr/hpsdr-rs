@@ -684,6 +684,12 @@ pub struct RxExtra {
     /// coefficients NC (2048, 4096, 8192 or 16384; RXASetNC).
     pub fir_low_latency: bool,
     pub fir_nc: i32,
+    /// DSP menu RX image measure: offset in Hz (100..10000) of the measured signal; the mirror image is at the same offset below the centre.
+    pub image_measure_hz: i32,
+    /// DSP menu manual RX IQ correction (gain in dB -5..5, phase in degrees -20..20), applied to the IQ samples before WDSP
+    /// (deskHPSDR receiver.c rx_apply_iq_correction).
+    pub iq_gain_db: f32,
+    pub iq_phase_deg: f32,
 }
 
 impl Default for RxExtra {
@@ -696,6 +702,9 @@ impl Default for RxExtra {
             local_audio: true,
             fir_low_latency: false,
             fir_nc: 2048,
+            image_measure_hz: 1000,
+            iq_gain_db: 0.0,
+            iq_phase_deg: 0.0,
         }
     }
 }
@@ -2409,6 +2418,18 @@ fn run(
         // the analyzer -- a rare, edge-detected event, see its own doc
         // comment -- ahead of this iteration's Spectrum0/GetPixels call.
         let mut params = *demod_params.lock().unwrap();
+        // Manual RX IQ correction (DSP menu), before the analyzer and the demodulator like deskHPSDR rx_add_iq_samples:
+        // I stays, Q = (Q * gain + I * sin(phase)) / cos(phase).
+        if params.rx_extra.iq_gain_db != 0.0 || params.rx_extra.iq_phase_deg != 0.0 {
+            let g = 10f64.powf(params.rx_extra.iq_gain_db as f64 / 20.0);
+            let ph = (params.rx_extra.iq_phase_deg as f64).to_radians();
+            let (s, c) = (ph.sin(), ph.cos());
+            if c.abs() > 1.0e-12 {
+                for smp in chunk.iter_mut() {
+                    smp.q = ((smp.q as f64 * g + smp.i as f64 * s) / c).round() as i32;
+                }
+            }
+        }
         if params.muted {
             params.gain = 0.0;
         }

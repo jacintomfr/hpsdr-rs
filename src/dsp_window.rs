@@ -1,25 +1,46 @@
 //! The "DSP" menu (deskHPSDR fft_menu.c, the DSP button of the Menu): same in-app window style as the AGC / BAND / MODE /
-//! FILTER menus (compact, anchored above the toolbar, Close top left, stays open until Close), one column per channel (RX1, TX).
-//! Phase 1: WDSP FIR filter type (linear phase / low latency), FIR size NC (2048..16384) and Binaural (RX only).
+//! FILTER menus (compact, anchored above the toolbar, Close top left, stays open until Close).
+//! Two pages, because the full deskHPSDR table is too tall for the 1024x600 screen and would hide the spectrum:
+//! * **Filters** (one column per channel, RX1 and TX): WDSP FIR filter type (linear phase / low latency), FIR size NC
+//!   (2048..16384) and Binaural (RX only).
+//! * **IQ** (RX1): RX image measure, offset, manual IQ gain / phase and Reset in a short strip, so the spectrum and the
+//!   image stay visible while adjusting; the measured IRR is also shown inside the window.
 //! The settings live in `RxExtra` / `TxExtra` (already saved with the configuration) and are sent to WDSP by the DSP
 //! threads when they change (spectrum.rs `last_fir`, tx.rs `last_fir`).
 
 use crate::noise_window::choice_combo_h;
-use crate::{help_button, std_checkbox, touch_close_button, ConnectedState};
+use crate::{help_button, spin_buttons_full, std_checkbox, touch_close_button, ConnectedState};
 
 const LABEL_W: f32 = 228.0;
 const COL_W: f32 = 172.0;
 const ROW_H: f32 = 46.0;
 const GAP: f32 = 6.0;
+/// Width of the value cells of the IQ page.
+const IQ_CELL_W: f32 = 176.0;
+/// Spectrum / waterfall ratio while the IQ page is open (45 %).
+const IQ_RATIO: f32 = 0.45;
 const NC_VALUES: [i32; 4] = [2048, 4096, 8192, 16384];
 const TYPE_HELP: &str = "TX Low Latency sets CESSB option to DISABLED.\n\nThese two functions cannot be used simultaneously. Setting Linear Phase is REQUIRED when using CESSB.\n\nNote: RX is not affected. Selection is unrestricted.";
 const NC_HELP: &str = "Sets the number of coefficients (NC) used by the WDSP FIR filters.\n\nHigher values provide steeper filter skirts at the cost of increased CPU load.\n\nDefault setting: 2048 (change only for a specific reason).";
 const BIN_HELP: &str = "Outputs I and Q on the Left and Right audio channels.\n\nIf the audio output device is mono or NNR is active, the Binaural option is not available or switched off.";
+const MEASURE_HELP: &str = "RX Image Measure: enables the RX image rejection measurement in the panadapter. The signal at +offset from the centre of the display is compared with its mirror at -offset and shown as IRR (dB); the larger, the better.\n\nImage Offset Hz: offset in Hz of the measured signal (100 to 10000). Put a strong, narrow signal at that offset above the centre of the display.";
+const IQ_HELP: &str = "RX IQ Gain: manual RX IQ gain correction in dB.\nRX IQ Phase: manual RX IQ phase correction in degrees.\nReset: sets both back to 0.00.\n\nAdjust them while watching the IRR value: the mirror image gets smaller when the correction is right.";
 
-fn label_box(ui: &mut egui::Ui, text: &str) {
-    let (rect, _) = ui.allocate_exact_size(egui::vec2(LABEL_W, ROW_H), egui::Sense::hover());
+fn label_box_w(ui: &mut egui::Ui, text: &str, w: f32) {
+    let (rect, _) = ui.allocate_exact_size(egui::vec2(w, ROW_H), egui::Sense::hover());
     ui.painter().rect(rect, 5.0, egui::Color32::from_gray(40), egui::Stroke::new(1.0, egui::Color32::from_gray(95)), egui::StrokeKind::Inside);
     ui.painter().text(rect.center(), egui::Align2::CENTER_CENTER, text, egui::FontId::proportional(16.0), egui::Color32::from_gray(225));
+}
+
+/// A fixed-width cell (so the two IQ rows line up); `f` draws its content.
+fn cell(ui: &mut egui::Ui, w: f32, f: impl FnOnce(&mut egui::Ui)) {
+    let (rect, _) = ui.allocate_exact_size(egui::vec2(w, ROW_H), egui::Sense::hover());
+    let mut c = ui.new_child(egui::UiBuilder::new().max_rect(rect).layout(egui::Layout::left_to_right(egui::Align::Center)));
+    f(&mut c);
+}
+
+fn label_box(ui: &mut egui::Ui, text: &str) {
+    label_box_w(ui, text, LABEL_W);
 }
 
 /// Column header text, centred over a column.
@@ -39,6 +60,11 @@ pub fn dsp_window(ui: &mut egui::Ui, connected: &mut ConnectedState) -> (bool, b
     let tx0 = tx;
     let mut binaural = connected.spectrum.binaural();
     let binaural0 = binaural;
+    let mut image_measure = connected.image_measure;
+    let image_measure0 = image_measure;
+    let irr = connected.image_irr;
+    let tab_id = egui::Id::new("dsp_window_tab");
+    let mut tab: u8 = ui.ctx().data(|d| d.get_temp(tab_id)).unwrap_or(0);
 
     egui::Window::new("dsp_menu")
         .id(egui::Id::new("dsp_menu_window"))
@@ -57,64 +83,137 @@ pub fn dsp_window(ui: &mut egui::Ui, connected: &mut ConnectedState) -> (bool, b
                     close_now = true;
                 }
                 ui.label("DSP");
-            });
-            // Column headers.
-            ui.horizontal(|ui| {
-                ui.add_space(LABEL_W + GAP);
-                header(ui, "RX1");
-                if can_tx {
-                    header(ui, "TX");
+                ui.add_space(12.0);
+                // Page tabs: the active one is blue, like the other pages of the kiosk menus.
+                for (i, label) in ["Filters", "IQ"].iter().enumerate() {
+                    let active = tab == i as u8;
+                    let btn = egui::Button::new(egui::RichText::new(*label).color(if active { egui::Color32::WHITE } else { egui::Color32::from_gray(210) }))
+                        .fill(if active { egui::Color32::from_rgb(70, 150, 245) } else { egui::Color32::from_gray(48) })
+                        .min_size(egui::vec2(100.0, ROW_H))
+                        .corner_radius(5.0);
+                    if ui.add(btn).clicked() {
+                        tab = i as u8;
+                    }
                 }
             });
 
-            let items = [("Linear Phase", true), ("Low Latency", true)];
-            let labels: Vec<String> = NC_VALUES.iter().map(|v| v.to_string()).collect();
-            let nc_items: Vec<(&str, bool)> = labels.iter().map(|s| (s.as_str(), true)).collect();
-            let pos = |nc: i32| NC_VALUES.iter().position(|v| *v == nc).unwrap_or(0);
+            if tab == 0 {
+                // Column headers.
+                ui.horizontal(|ui| {
+                    ui.add_space(LABEL_W + GAP);
+                    header(ui, "RX1");
+                    if can_tx {
+                        header(ui, "TX");
+                    }
+                });
 
-            // FIR filter type.
-            ui.horizontal(|ui| {
-                label_box(ui, "WDSP FIR Filter Type");
-                if let Some(i) = choice_combo_h(ui, "dsp_rx_type", COL_W, rx.fir_low_latency as usize, &items, 34.0) {
-                    rx.fir_low_latency = i == 1;
-                }
-                if let Some(t) = tx.as_mut() {
-                    if let Some(i) = choice_combo_h(ui, "dsp_tx_type", COL_W, t.fir_low_latency as usize, &items, 34.0) {
-                        t.fir_low_latency = i == 1;
-                        if t.fir_low_latency {
-                            // deskHPSDR tx_set_latency(): low latency and CESSB exclude each other.
-                            t.cessb_enable = false;
+                let items = [("Linear Phase", true), ("Low Latency", true)];
+                let labels: Vec<String> = NC_VALUES.iter().map(|v| v.to_string()).collect();
+                let nc_items: Vec<(&str, bool)> = labels.iter().map(|s| (s.as_str(), true)).collect();
+                let pos = |nc: i32| NC_VALUES.iter().position(|v| *v == nc).unwrap_or(0);
+
+                // FIR filter type.
+                ui.horizontal(|ui| {
+                    label_box(ui, "WDSP FIR Filter Type");
+                    if let Some(i) = choice_combo_h(ui, "dsp_rx_type", COL_W, rx.fir_low_latency as usize, &items, 34.0) {
+                        rx.fir_low_latency = i == 1;
+                    }
+                    if let Some(t) = tx.as_mut() {
+                        if let Some(i) = choice_combo_h(ui, "dsp_tx_type", COL_W, t.fir_low_latency as usize, &items, 34.0) {
+                            t.fir_low_latency = i == 1;
+                            if t.fir_low_latency {
+                                // deskHPSDR tx_set_latency(): low latency and CESSB exclude each other.
+                                t.cessb_enable = false;
+                            }
                         }
                     }
-                }
-                help_button(ui, "dsp_help_type", TYPE_HELP);
-            });
-            // FIR size.
-            ui.horizontal(|ui| {
-                label_box(ui, "WDSP FIR Filter NC");
-                if let Some(i) = choice_combo_h(ui, "dsp_rx_nc", COL_W, pos(rx.fir_nc), &nc_items, 34.0) {
-                    rx.fir_nc = NC_VALUES[i];
-                }
-                if let Some(t) = tx.as_mut() {
-                    if let Some(i) = choice_combo_h(ui, "dsp_tx_nc", COL_W, pos(t.fir_nc), &nc_items, 34.0) {
-                        t.fir_nc = NC_VALUES[i];
+                    help_button(ui, "dsp_help_type", TYPE_HELP);
+                });
+                // FIR size.
+                ui.horizontal(|ui| {
+                    label_box(ui, "WDSP FIR Filter NC");
+                    if let Some(i) = choice_combo_h(ui, "dsp_rx_nc", COL_W, pos(rx.fir_nc), &nc_items, 34.0) {
+                        rx.fir_nc = NC_VALUES[i];
                     }
-                }
-                help_button(ui, "dsp_help_nc", NC_HELP);
-            });
-            // Binaural (RX only).
-            ui.horizontal(|ui| {
-                label_box(ui, "Binaural");
-                // Both cells reserve their full width so the "!" lines up with the other rows.
-                let (rect, _) = ui.allocate_exact_size(egui::vec2(COL_W, ROW_H), egui::Sense::hover());
-                let mut c = ui.new_child(egui::UiBuilder::new().max_rect(rect).layout(egui::Layout::left_to_right(egui::Align::Center)));
-                std_checkbox(&mut c, &mut binaural, "");
-                if can_tx {
-                    ui.allocate_exact_size(egui::vec2(COL_W, ROW_H), egui::Sense::hover());
-                }
-                help_button(ui, "dsp_help_bin", BIN_HELP);
-            });
+                    if let Some(t) = tx.as_mut() {
+                        if let Some(i) = choice_combo_h(ui, "dsp_tx_nc", COL_W, pos(t.fir_nc), &nc_items, 34.0) {
+                            t.fir_nc = NC_VALUES[i];
+                        }
+                    }
+                    help_button(ui, "dsp_help_nc", NC_HELP);
+                });
+                // Binaural (RX only).
+                ui.horizontal(|ui| {
+                    label_box(ui, "Binaural");
+                    // Both cells reserve their full width so the "!" lines up with the other rows.
+                    let (rect, _) = ui.allocate_exact_size(egui::vec2(COL_W, ROW_H), egui::Sense::hover());
+                    let mut c = ui.new_child(egui::UiBuilder::new().max_rect(rect).layout(egui::Layout::left_to_right(egui::Align::Center)));
+                    std_checkbox(&mut c, &mut binaural, "");
+                    if can_tx {
+                        ui.allocate_exact_size(egui::vec2(COL_W, ROW_H), egui::Sense::hover());
+                    }
+                    help_button(ui, "dsp_help_bin", BIN_HELP);
+                });
+            } else {
+                // IQ page: two short rows, so the spectrum above stays visible.
+                ui.horizontal(|ui| {
+                    label_box_w(ui, "RX Image Measure", 160.0);
+                    cell(ui, IQ_CELL_W, |ui| {
+                        std_checkbox(ui, &mut image_measure, "");
+                    });
+                    label_box_w(ui, "Image Offset Hz", 130.0);
+                    cell(ui, IQ_CELL_W, |ui| {
+                        let mut v = rx.image_measure_hz as f64;
+                        if spin_buttons_full(ui, "dsp_image_offset", &mut v, 100.0, 10000.0, 10.0, 0, None, 70.0).changed() {
+                            rx.image_measure_hz = v.round() as i32;
+                        }
+                    });
+                    // The measured value, readable here even when the spectrum label is hidden behind the window.
+                    let (rect, _) = ui.allocate_exact_size(egui::vec2(150.0, ROW_H), egui::Sense::hover());
+                    ui.painter().rect_filled(rect, 5.0, egui::Color32::from_gray(20));
+                    let (text, col) = match irr {
+                        Some((_, rej)) => (format!("IRR {:.1} dB", rej.abs()), egui::Color32::WHITE),
+                        None => ("IRR --".to_string(), egui::Color32::from_gray(120)),
+                    };
+                    ui.painter().text(rect.center(), egui::Align2::CENTER_CENTER, text, egui::FontId::proportional(20.0), col);
+                    help_button(ui, "dsp_help_measure", MEASURE_HELP);
+                });
+                ui.horizontal(|ui| {
+                    label_box_w(ui, "RX IQ Gain", 160.0);
+                    cell(ui, IQ_CELL_W, |ui| {
+                        let mut v = rx.iq_gain_db as f64;
+                        if spin_buttons_full(ui, "dsp_iq_gain", &mut v, -5.0, 5.0, 0.01, 2, None, 70.0).changed() {
+                            rx.iq_gain_db = ((v * 100.0).round() / 100.0) as f32;
+                        }
+                    });
+                    label_box_w(ui, "RX IQ Phase", 130.0);
+                    cell(ui, IQ_CELL_W, |ui| {
+                        let mut v = rx.iq_phase_deg as f64;
+                        if spin_buttons_full(ui, "dsp_iq_phase", &mut v, -20.0, 20.0, 0.01, 2, None, 70.0).changed() {
+                            rx.iq_phase_deg = ((v * 100.0).round() / 100.0) as f32;
+                        }
+                    });
+                    cell(ui, 150.0, |ui| {
+                        if ui.add(egui::Button::new("Reset").min_size(egui::vec2(150.0, 38.0))).clicked() {
+                            rx.iq_gain_db = 0.0;
+                            rx.iq_phase_deg = 0.0;
+                        }
+                    });
+                    help_button(ui, "dsp_help_iq", IQ_HELP);
+                });
+            }
         });
+    ui.ctx().data_mut(|d| d.insert_temp(tab_id, tab));
+    // IQ page: spectrum/waterfall ratio down to  so the IRR label and the image stay above the window; the old value
+    // comes back when the page is left (or, in main.rs, when the window closes).
+    if tab == 1 {
+        if connected.dsp_saved_ratio.is_none() {
+            connected.dsp_saved_ratio = Some(connected.spectrum_waterfall_ratio);
+            connected.spectrum_waterfall_ratio = IQ_RATIO;
+        }
+    } else if let Some(r) = connected.dsp_saved_ratio.take() {
+        connected.spectrum_waterfall_ratio = r;
+    }
 
     if rx != rx0 {
         connected.spectrum.set_rx_extra(rx);
@@ -125,6 +224,9 @@ pub fn dsp_window(ui: &mut egui::Ui, connected: &mut ConnectedState) -> (bool, b
             h.set_tx_extra(t);
             changed = true;
         }
+    }
+    if image_measure != image_measure0 {
+        connected.image_measure = image_measure;
     }
     if binaural != binaural0 {
         connected.spectrum.set_binaural(binaural);
