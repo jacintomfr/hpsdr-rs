@@ -204,3 +204,33 @@ Result of the audit of this port against deskHPSDR (rx_panadapter.c, waterfall.c
 
 **Left for part 2:** y clamp, edge columns, flat-mode stroke colour, waterfall 1:1 and per-row colours, extra receivers path, hold line width, hold
 clear on span change.
+
+## Audit corrections, part 2
+
+Drawing code of the spectrum/waterfall (all in `src/main.rs`):
+
+1. **y is not clamped** (RX and TX share the code, "Smooth trace" OFF). Values below Low / above High land outside the plot like in cairo; the trace,
+   fill and hold line are painted with a clip rect equal to the plot area, so the fill keeps its shape and the trace no longer flattens along the
+   bottom when Low is above the noise floor. y is only limited to plot -10000..+10000 px (overflow guard); non-finite values count as -200 dBm.
+   The gradient colour is a function of the vertex height (saturates), the geometry is the unclamped y. Smooth trace ON keeps the old clamped path.
+2. **Edge columns.** With Smooth trace OFF the first and last sample of the DRAWN trace are forced to -200 dBm (local copy; peaks, hold and the noise
+   measurement use the real row), so the fill closes at the bottom with steep edges.
+3. **Flat-mode stroke colour (RX, Gradient off):** white alpha 0.50 (128/255, COLOUR_PAN_FILL2) when filled, white alpha 0.75 (191/255,
+   COLOUR_PAN_FILL3) when not filled; it replaces the light green. TX keeps its configured colour. Widths unchanged: 0.5 filled / 1.0 unfilled
+   (raw trace).
+4. **Exact gradient stops.** The fill mesh now uses horizontal rows at absolute heights: 13 uniform levels plus one exactly at each RX stop
+   (0.20 / 0.55 / 0.80 / 1.0 x S9n), sorted (at most 17 rows per column; a column only gets the levels below its own top; the flat fill uses 2
+   rows). TX gradient: uniform rows only. The vertex count per column is about the same or lower than before (26).
+5. **Waterfall colours are baked per row** (like deskHPSDR's pixbuf): `WaterfallBake` keeps a rolling colour image (row length x display rows); a new
+   row is coloured once with the limits current at that moment and the older rows scroll down, so with Waterfall Automatic the history no longer
+   re-shades. New rows are found by identity (the newest baked row is kept as an `Arc` and searched in the history; its position = number of new
+   rows), not by revision (revision also counts spectrum-only updates). Full rebuild from the dB rows with the current limits: palette, display
+   height, row length, TX/RX switch, Waterfall Automatic toggled, manual limits changed (or the RX gain correction that shifts them), history empty,
+   or the baked row is gone (lost rows, or as many new rows as the image is high). The upload (`tex.set`, LINEAR) only happens when the image changed.
+   Extra receivers still rebuild the whole texture.
+6. **Extra receivers** follow the "Smooth trace" option (a global atomic written by the main window): OFF = raw polyline, y floored, not clamped,
+   clipped, 1.0 px; ON = the old smoothing + spline. No fill/gradient there.
+7. **Hold line:** 1.0 px (PAN_LINE_THICK) with the same floored, unclamped, clipped y as the raw trace; still cleared on span change as before.
+
+Left: pixel count = widget width (deskHPSDR has one sample per pixel), bilinear stretch of the waterfall texture, HiDPI floor (y is floored to
+physical pixels), the "weak" (inactive receiver) gradient/fill colours.

@@ -106,7 +106,7 @@ pub(crate) fn close_overlays(c: &mut ConnectedState) {
 }
 
 /// True while any window that the Menu can open is on screen.
-fn any_overlay_open(c: &ConnectedState) -> bool {
+pub(crate) fn any_overlay_open(c: &ConnectedState) -> bool {
     c.rx_window_open
         || c.tx_window_open
         || c.pa_window_open
@@ -174,7 +174,11 @@ fn open(c: &mut ConnectedState, target: Target) {
         Target::Filter => c.filter_window_open = true,
         Target::Agc => c.agc_window_open = true,
         Target::Meter => c.meter_window_open = true,
-        Target::Rade => crate::toggle_rade_direct(c),
+        Target::Rade => {
+            // The RADE panel is part of the main screen, not an overlay: show it, do not come back to the Menu.
+            c.menu_return = false;
+            crate::toggle_rade_direct(c);
+        }
         Target::Tab(tab) => {
             c.settings_tab = tab;
             c.show_settings_window = true;
@@ -193,7 +197,13 @@ pub fn menu_window(ui: &mut egui::Ui, connected: &mut ConnectedState) -> (bool, 
         None => "hpsdr-rs - Menu".to_string(),
     };
 
-    let frame = egui::Frame::window(ui.style()).inner_margin(egui::Margin::symmetric(24, 4)).corner_radius(0.0);
+    // Not full screen: the window covers the spectrum/waterfall area and stops above the bottom toolbar (TOOLBAR_HEIGHT + TOOLBAR_MARGIN) and
+    // the grey strip between them (the frame adds 8 px to this height: the window ends 553 px from the top of a 600 px screen, where the waterfall ends), so the toolbar stays
+    // visible and usable. The buttons keep BTN_H; the space below About is simply empty.
+    let btn_h = BTN_H;
+    let win_h = screen.height() - (crate::TOOLBAR_HEIGHT + crate::TOOLBAR_MARGIN) - 11.0;
+    // No window shadow: it would darken the top of the bottom toolbar, which this window deliberately leaves visible.
+    let frame = egui::Frame::window(ui.style()).inner_margin(egui::Margin::symmetric(24, 4)).corner_radius(0.0).shadow(egui::Shadow::NONE);
     egui::Window::new("Menu")
         .id(egui::Id::new("menu_window"))
         .title_bar(false)
@@ -202,14 +212,14 @@ pub fn menu_window(ui: &mut egui::Ui, connected: &mut ConnectedState) -> (bool, 
         .frame(frame)
         .fixed_pos(screen.min)
         .constrain_to(screen)
-        .fixed_size(screen.size() - egui::vec2(58.0, 10.0))
+        .fixed_size(egui::vec2(screen.width() - 58.0, win_h))
         .show(ui.ctx(), |ui| {
             if ui.input(|i| i.key_pressed(egui::Key::Escape)) {
                 close_now = true;
             }
             let w = screen.width() - 58.0;
             ui.set_width(w);
-            ui.set_min_height(screen.height() - 10.0);
+            ui.set_min_height(win_h);
             ui.spacing_mut().item_spacing = egui::vec2(6.0, 0.0);
             let (tr, _) = ui.allocate_exact_size(egui::vec2(w, 22.0), egui::Sense::hover());
             ui.painter().text(tr.center(), egui::Align2::CENTER_CENTER, title, egui::FontId::proportional(16.0), egui::Color32::from_gray(225));
@@ -238,11 +248,11 @@ pub fn menu_window(ui: &mut egui::Ui, connected: &mut ConnectedState) -> (bool, 
             // The grid of menu buttons.
             let cell_w = (w - GAP_X * (COLS as f32 - 1.0)) / COLS as f32;
             for (ri, cells) in GRID.iter().enumerate() {
-                let row = new_row(ui, w, BTN_H);
+                let row = new_row(ui, w, btn_h);
                 for (ci, cell) in cells.iter().enumerate() {
                     let Some((label, target)) = cell else { continue };
                     let x0 = ci as f32 * (cell_w + GAP_X);
-                    let rect = egui::Rect::from_min_size(egui::pos2(row.left() + x0, row.top()), egui::vec2(cell_w, BTN_H));
+                    let rect = egui::Rect::from_min_size(egui::pos2(row.left() + x0, row.top()), egui::vec2(cell_w, btn_h));
                     let mut c = ui.new_child(egui::UiBuilder::new().max_rect(rect).layout(egui::Layout::centered_and_justified(egui::Direction::LeftToRight)));
                     let text = egui::RichText::new(*label).size(16.0);
                     let tx_missing = matches!(target, Target::Tx) && connected.tx_handle.is_none();
@@ -267,9 +277,9 @@ pub fn menu_window(ui: &mut egui::Ui, connected: &mut ConnectedState) -> (bool, 
             }
 
             // About, centred under the grid (wider button).
-            let row = new_row(ui, w, BTN_H);
+            let row = new_row(ui, w, btn_h);
             let aw = 2.0 * cell_w + GAP_X;
-            let rect = egui::Rect::from_min_size(egui::pos2(row.center().x - aw / 2.0, row.top()), egui::vec2(aw, BTN_H));
+            let rect = egui::Rect::from_min_size(egui::pos2(row.center().x - aw / 2.0, row.top()), egui::vec2(aw, btn_h));
             let mut c = ui.new_child(egui::UiBuilder::new().max_rect(rect).layout(egui::Layout::centered_and_justified(egui::Direction::LeftToRight)));
             let about = egui::Button::new(egui::RichText::new("About").size(16.0).color(egui::Color32::from_gray(205)))
                 .fill(crate::chip_idle_fill())

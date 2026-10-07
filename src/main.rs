@@ -1165,22 +1165,22 @@ fn dispatch_midi_binding(
         }
         // One menu at a time, like deskHPSDR (opening one closes the other two).
         MidiAction::BandMenu => {
-            connected.agc_window_open = false;
             let open = !connected.band_window_open;
+            menu_window::close_overlays(connected);
             connected.mode_window_open = false;
             connected.filter_window_open = false;
             connected.band_window_open = open;
         }
         MidiAction::ModeMenu => {
-            connected.agc_window_open = false;
             let open = !connected.mode_window_open;
+            menu_window::close_overlays(connected);
             connected.band_window_open = false;
             connected.filter_window_open = false;
             connected.mode_window_open = open;
         }
         MidiAction::FilterMenu => {
-            connected.agc_window_open = false;
             let open = !connected.filter_window_open;
+            menu_window::close_overlays(connected);
             connected.band_window_open = false;
             connected.mode_window_open = false;
             connected.filter_window_open = open;
@@ -1437,23 +1437,43 @@ fn dispatch_midi_binding(
         MidiAction::Vox => {
             connected.vox_enabled = !connected.vox_enabled;
         }
-        MidiAction::VoxMenu => connected.vox_window_open = !connected.vox_window_open,
-        MidiAction::EqMenu => connected.eq_window_open = !connected.eq_window_open,
+        MidiAction::VoxMenu => {
+            let open = !connected.vox_window_open;
+            menu_window::close_overlays(connected);
+            connected.vox_window_open = open;
+        }
+        MidiAction::EqMenu => {
+            let open = !connected.eq_window_open;
+            menu_window::close_overlays(connected);
+            connected.eq_window_open = open;
+        }
         MidiAction::AgcMenu => {
             let open = !connected.agc_window_open;
-            connected.band_window_open = false;
-            connected.mode_window_open = false;
-            connected.filter_window_open = false;
+            menu_window::close_overlays(connected);
             connected.agc_window_open = open;
         }
-        MidiAction::NoiseMenu => connected.noise_window_open = !connected.noise_window_open,
+        MidiAction::NoiseMenu => {
+            let open = !connected.noise_window_open;
+            menu_window::close_overlays(connected);
+            connected.noise_window_open = open;
+        }
         MidiAction::TxMenu => {
             if connected.tx_handle.is_some() {
-                connected.tx_window_open = !connected.tx_window_open;
+                let open = !connected.tx_window_open;
+                menu_window::close_overlays(connected);
+                connected.tx_window_open = open;
             }
         }
-        MidiAction::RxMenu => connected.rx_window_open = !connected.rx_window_open,
-        MidiAction::SdrMenu => connected.sdr_window_open = !connected.sdr_window_open,
+        MidiAction::RxMenu => {
+            let open = !connected.rx_window_open;
+            menu_window::close_overlays(connected);
+            connected.rx_window_open = open;
+        }
+        MidiAction::SdrMenu => {
+            let open = !connected.sdr_window_open;
+            menu_window::close_overlays(connected);
+            connected.sdr_window_open = open;
+        }
         MidiAction::NewMenu => menu_window::toggle(connected),
         MidiAction::ToolbarFuncList => fnc_window::toggle(connected),
         // deskHPSDR: KnobOrWheel(vox_threshold, 0.0, 1.0, 0.01).
@@ -2126,6 +2146,8 @@ struct ConnectedState {
     waterfall_texture: Option<egui::TextureHandle>,
     /// See ExtraReceiver::waterfall_signature's identical doc comment.
     waterfall_signature: Option<(u64, Palette, f32, f32, usize)>,
+    /// Rolling colour image of the main waterfall, rows baked with the limits of the moment (see WaterfallBake).
+    waterfall_bake: WaterfallBake,
     /// See ExtraReceiver::waterfall_display_rows's doc comment.
     waterfall_display_rows: usize,
     scroll_accum: f32,
@@ -4015,6 +4037,7 @@ fn connect_to_device(device: Device, cfg: &Config) -> Result<ConnectedState, Str
                 cw_remote_busy,
                 waterfall_texture: None,
                 waterfall_signature: None,
+                waterfall_bake: WaterfallBake::default(),
                 waterfall_display_rows: spectrum::WATERFALL_HISTORY,
                 scroll_accum: 0.0,
                 zoom_accum: 0.0,
@@ -5631,33 +5654,32 @@ impl eframe::App for HpsdrApp {
                     wf_db_high,
                     connected.waterfall_display_rows,
                 );
-                if connected.waterfall_signature != Some(wanted_signature) {
+                SPECTRUM_SMOOTH_TRACE.store(connected.spectrum_smooth_trace, Ordering::Relaxed);
+                if connected.waterfall_signature != Some(wanted_signature) || connected.waterfall_bake.tx != transmitting {
                     let _wf_prof = WfProfGuard(Instant::now());
-                    let waterfall_rows: Vec<Arc<Vec<f32>>> = {
+                    // Rows are baked with the limits of the moment they arrived (deskHPSDR's pixbuf); see WaterfallBake.
+                    let wf_args = (connected.waterfall_palette, transmitting, connected.waterfall_db_low_auto, connected.waterfall_display_rows, wf_db_low, wf_db_high);
+                    let (wf_full, wf_new_rows) = {
                         let d = if transmitting {
                             connected.tx_spectrum.display.lock().unwrap()
                         } else {
                             connected.spectrum.display.lock().unwrap()
                         };
-                        d.waterfall_rows.iter().cloned().collect()
+                        connected.waterfall_bake.collect(&d.waterfall_rows, wf_args)
                     };
-                    let waterfall_image = build_waterfall_image(
-                        &waterfall_rows,
-                        connected.waterfall_palette,
-                        wf_db_low,
-                        wf_db_high,
-                        connected.waterfall_display_rows,
-                    );
-                    if let Some(image) = &waterfall_image {
-                        match &mut connected.waterfall_texture {
-                            Some(tex) => tex.set(image.clone(), egui::TextureOptions::LINEAR),
-                            None => {
-                                let tex = ui.ctx().load_texture(
-                                    "waterfall",
-                                    image.clone(),
-                                    egui::TextureOptions::LINEAR,
-                                );
-                                connected.waterfall_texture = Some(tex);
+                    let wf_changed = connected.waterfall_bake.apply(wf_full, &wf_new_rows, wf_args);
+                    if let Some(image) = &connected.waterfall_bake.image {
+                        if wf_changed || connected.waterfall_texture.is_none() {
+                            match &mut connected.waterfall_texture {
+                                Some(tex) => tex.set(image.clone(), egui::TextureOptions::LINEAR),
+                                None => {
+                                    let tex = ui.ctx().load_texture(
+                                        "waterfall",
+                                        image.clone(),
+                                        egui::TextureOptions::LINEAR,
+                                    );
+                                    connected.waterfall_texture = Some(tex);
+                                }
                             }
                         }
                         connected.waterfall_signature = Some(wanted_signature);
@@ -6750,6 +6772,12 @@ impl eframe::App for HpsdrApp {
                         if close_now {
                             connected.tx_window_open = false;
                         }
+                    }
+
+                    // A toolbar function (AGC SET, VOX SET, ...) opened an overlay while the Menu was up: the Menu steps aside.
+                    if connected.menu_window_open && menu_window::any_overlay_open(connected) {
+                        connected.menu_window_open = false;
+                        connected.menu_return = false;
                     }
 
                     // Back to the Menu when a window opened from it has been closed.
@@ -9286,9 +9314,30 @@ impl eframe::App for HpsdrApp {
                         let smoothed_row = if smooth_trace_on {
                             smooth_spectrum_values(&spectrum_row, connected.spectrum_zoom)
                         } else {
-                            spectrum_row.to_vec()
+                            // deskHPSDR (rx_panadapter.c:1670): the first and last visible samples are forced to -200 dBm,
+                            // so the fill closes at the bottom with steep edges. Only the DRAWN trace gets this local copy;
+                            // the peaks/hold and the noise measurement use the untouched row.
+                            let mut r = spectrum_row.to_vec();
+                            if let Some(v) = r.first_mut() {
+                                *v = -200.0;
+                            }
+                            if let Some(v) = r.last_mut() {
+                                *v = -200.0;
+                            }
+                            r
                         };
                         let ppp_px = ui.ctx().pixels_per_point().max(0.5);
+                        // deskHPSDR does not clamp y: values below Low / above High land outside the plot and cairo clips
+                        // them (the fill keeps its shape). Same here with the clip rect below; the only limit is a generous
+                        // range against geometry overflow. Non-finite values count as the minimum.
+                        let raw_y = move |v: f32| -> f32 {
+                            let v = if v.is_finite() { v } else { -200.0 };
+                            let off = ((db_high - v) * plot_height / range * ppp_px).floor() / ppp_px;
+                            (rect.top() + off).clamp(rect.top() - 10000.0, plot_bottom + 10000.0)
+                        };
+                        let plot_clip = egui::Rect::from_min_max(rect.min, egui::pos2(rect.right(), plot_bottom))
+                            .intersect(ui.painter().clip_rect());
+                        let plot_painter = ui.painter().with_clip_rect(plot_clip);
                         let points: Vec<egui::Pos2> = smoothed_row
                             .iter()
                             .enumerate()
@@ -9298,9 +9347,7 @@ impl eframe::App for HpsdrApp {
                                     let t = ((v - db_low) / range).clamp(0.0, 1.0);
                                     plot_bottom - t * plot_height
                                 } else {
-                                    // deskHPSDR: floor((high - s) * height / (high - low)) from the top.
-                                    let off = ((db_high - v) * plot_height / range * ppp_px).floor() / ppp_px;
-                                    (rect.top() + off).clamp(rect.top(), plot_bottom)
+                                    raw_y(v)
                                 };
                                 egui::pos2(x, y)
                             })
@@ -9390,8 +9437,10 @@ impl eframe::App for HpsdrApp {
                             let c = connected.tx_ui.tx_pan_col.map(|v| (v.clamp(0.0, 1.0) * 255.0).round() as u8);
                             (egui::Color32::from_rgb(c[0], c[1], c[2]), egui::Color32::from_rgba_unmultiplied(c[0], c[1], c[2], 110))
                         } else {
-                            // RX flat fill: deskHPSDR COLOUR_PAN_FILL2 (white, alpha 0.50, active + filled).
-                            (egui::Color32::LIGHT_GREEN, egui::Color32::from_rgba_unmultiplied(255, 255, 255, 128))
+                            // RX flat (Gradient off): deskHPSDR strokes with the same source as the fill: COLOUR_PAN_FILL2 (white,
+                            // alpha 0.50 = 128) when filled, COLOUR_PAN_FILL3 (white, alpha 0.75 = 191) when not filled.
+                            let line = if connected.spectrum_filled { 128 } else { 191 };
+                            (egui::Color32::from_rgba_unmultiplied(255, 255, 255, line), egui::Color32::from_rgba_unmultiplied(255, 255, 255, 128))
                         };
                         // RX gradient: deskHPSDR's exact stops (rx_panadapter.c), opaque, positions along the whole
                         // panadapter height (0 = Low at the bottom, 1 = High at the top); S9 = -73 dBm (-93 above 30 MHz)
@@ -9496,18 +9545,42 @@ impl eframe::App for HpsdrApp {
                             // columns agree much more closely at any
                             // given absolute y, reading as proper
                             // horizontal layers.
+                            //
+                            // Update (audit part 2): the rows are now horizontal levels in absolute height above the plot
+                            // bottom (like cairo's pattern in device space): 13 uniform ones plus, for the RX gradient, one
+                            // exactly at each deskHPSDR stop (0.20/0.55/0.80/1.0 x S9n), sorted, so the kinks are exact.
+                            // A column only gets the levels below its own top; a vertex of a column whose trace is lower than
+                            // a level sits at the trace itself. Flat fill: just 2 rows. The trace may lie outside the plot
+                            // (y not clamped): the colour is a function of the vertex height (saturates), the clip rect cuts.
                             const BANDS: usize = 12;
+                            let mut levels: Vec<f32> = vec![0.0];
+                            if connected.spectrum_gradient {
+                                levels.extend((1..=BANDS).map(|k| plot_height * k as f32 / BANDS as f32));
+                                if !grad_tx {
+                                    levels.extend([0.20f32, 0.55, 0.80, 1.0].map(|f| desk_s9n * f * plot_height));
+                                }
+                                levels.sort_by(|a, b| a.total_cmp(b));
+                                levels.dedup_by(|a, b| (*a - *b).abs() < 0.25);
+                            }
                             for w in trace_points.windows(2) {
                                 let (p0, p1) = (w[0], w[1]);
-                                let base = mesh.vertices.len() as u32;
-                                for k in 0..=BANDS {
-                                    let f = k as f32 / BANDS as f32;
-                                    let y0 = plot_bottom + (p0.y - plot_bottom) * f;
-                                    let y1 = plot_bottom + (p1.y - plot_bottom) * f;
-                                    mesh.colored_vertex(egui::pos2(p0.x, y0), color_at(y0));
-                                    mesh.colored_vertex(egui::pos2(p1.x, y1), color_at(y1));
+                                let (h0, h1) = (plot_bottom - p0.y, plot_bottom - p1.y);
+                                let top = h0.max(h1);
+                                if top <= 0.0 {
+                                    continue; // the whole column is below the plot: nothing to see
                                 }
-                                for k in 0..BANDS as u32 {
+                                let base = mesh.vertices.len() as u32;
+                                let mut rows = 0u32;
+                                for &l in levels.iter().take_while(|&&l| l < top || l == 0.0) {
+                                    let (a, b) = (l.min(h0), l.min(h1));
+                                    mesh.colored_vertex(egui::pos2(p0.x, plot_bottom - a), color_at(plot_bottom - a));
+                                    mesh.colored_vertex(egui::pos2(p1.x, plot_bottom - b), color_at(plot_bottom - b));
+                                    rows += 1;
+                                }
+                                mesh.colored_vertex(p0, color_at(p0.y));
+                                mesh.colored_vertex(p1, color_at(p1.y));
+                                rows += 1;
+                                for k in 0..rows - 1 {
                                     let row = base + k * 2;
                                     mesh.indices.extend_from_slice(&[
                                         row, row + 1, row + 3,
@@ -9515,7 +9588,7 @@ impl eframe::App for HpsdrApp {
                                     ]);
                                 }
                             }
-                            ui.painter().add(egui::Shape::mesh(mesh));
+                            plot_painter.add(egui::Shape::mesh(mesh));
                             // Thin outline on top of the fill, matching
                             // deskHPSDR's PAN_LINE_THIN (it uses a
                             // thicker bare line only when NOT filled).
@@ -9543,10 +9616,10 @@ impl eframe::App for HpsdrApp {
                             // Update: RX with Gradient now strokes with the same gradient as the fill (deskHPSDR uses
                             // one pattern for both) through a single PathStroke::new_uv path, so there is still no seam.
                             // Width: deskHPSDR PAN_LINE_THIN 0.5 (raw trace) / the previous 1.0 (smooth trace).
-                            ui.painter().add(egui::Shape::line(trace_points, trace_stroke(if smooth_trace_on { 1.0 } else { 0.5 })));
+                            plot_painter.add(egui::Shape::line(trace_points, trace_stroke(if smooth_trace_on { 1.0 } else { 0.5 })));
                         } else {
                             // Not filled: deskHPSDR PAN_LINE_THICK 1.0 (raw trace) / the previous 1.5 (smooth trace).
-                            ui.painter().add(egui::Shape::line(trace_points, trace_stroke(if smooth_trace_on { 1.5 } else { 1.0 })));
+                            plot_painter.add(egui::Shape::line(trace_points, trace_stroke(if smooth_trace_on { 1.5 } else { 1.0 })));
                         }
 
                         // Peaks & Hold trace and Peak Labels (Settings -> Display), ported from deskHPSDR's rx_panadapter.c /
@@ -9576,12 +9649,12 @@ impl eframe::App for HpsdrApp {
                                         .iter()
                                         .enumerate()
                                         .map(|(i, &v)| {
-                                            let t = ((v - db_low) / range).clamp(0.0, 1.0);
-                                            egui::pos2(rect.left() + (i as f32 / n as f32) * rect.width(), plot_bottom - t * plot_height)
+                                            // Same y mapping as the raw trace (floored, not clamped, clipped to the plot), PAN_LINE_THICK 1.0.
+                                            egui::pos2(rect.left() + (i as f32 / n as f32) * rect.width(), raw_y(v))
                                         })
                                         .collect();
                                     let c = tu.peak_line_col.map(|v| (v.clamp(0.0, 1.0) * 255.0).round() as u8);
-                                    ui.painter().add(egui::Shape::line(pts, egui::Stroke::new(1.5, egui::Color32::from_rgba_unmultiplied(c[0], c[1], c[2], c[3]))));
+                                    plot_painter.add(egui::Shape::line(pts, egui::Stroke::new(1.0, egui::Color32::from_rgba_unmultiplied(c[0], c[1], c[2], c[3]))));
                                 }
                             }
                             if tu.peaks_on && nbins > 2 {
@@ -18214,6 +18287,9 @@ fn toolbar_fn_active(connected: &ConnectedState, f: toolbar::ToolbarFn) -> bool 
         ToolbarFn::Midi(MidiAction::VoxMenu) => connected.vox_window_open,
         ToolbarFn::Midi(MidiAction::EqMenu) => connected.eq_window_open,
         ToolbarFn::Midi(MidiAction::AgcMenu) => connected.agc_window_open,
+        ToolbarFn::Midi(MidiAction::BandMenu) => connected.band_window_open,
+        ToolbarFn::Midi(MidiAction::ModeMenu) => connected.mode_window_open,
+        ToolbarFn::Midi(MidiAction::FilterMenu) => connected.filter_window_open,
         ToolbarFn::Midi(MidiAction::NoiseMenu) => connected.noise_window_open,
         ToolbarFn::Midi(MidiAction::TxMenu) => connected.tx_window_open,
         ToolbarFn::Midi(MidiAction::RxMenu) => connected.rx_window_open,
@@ -21542,21 +21618,42 @@ fn render_extra_receiver_ui(ui: &mut egui::Ui, rx: &Arc<Mutex<ExtraReceiver>>) {
         // here (WDSP's own analyzer already returns just the visible
         // window's data).
         let n = spectrum_row.len().saturating_sub(1).max(1);
-        let smoothed_row = smooth_spectrum_values(&spectrum_row, rx.spectrum_zoom);
-        let points: Vec<egui::Pos2> = smoothed_row
-            .iter()
-            .enumerate()
-            .map(|(i, &v)| {
-                let x = rect.left() + (i as f32 / n as f32) * rect.width();
-                let t = ((v - db_low) / range).clamp(0.0, 1.0);
-                let y = plot_bottom - t * plot_height;
-                egui::pos2(x, y)
-            })
-            .collect();
-        ui.painter().add(egui::Shape::line(
-            smooth_trace(&points),
-            egui::Stroke::new(1.5, egui::Color32::LIGHT_GREEN),
-        ));
+        // Follows the global "Smooth trace" option like the main panel: OFF = raw polyline (y floored, not clamped,
+        // clipped to the plot, 1.0 px), ON = the old smoothing + spline. No fill/gradient here.
+        let smooth_on = SPECTRUM_SMOOTH_TRACE.load(Ordering::Relaxed);
+        if smooth_on {
+            let smoothed_row = smooth_spectrum_values(&spectrum_row, rx.spectrum_zoom);
+            let points: Vec<egui::Pos2> = smoothed_row
+                .iter()
+                .enumerate()
+                .map(|(i, &v)| {
+                    let x = rect.left() + (i as f32 / n as f32) * rect.width();
+                    let t = ((v - db_low) / range).clamp(0.0, 1.0);
+                    let y = plot_bottom - t * plot_height;
+                    egui::pos2(x, y)
+                })
+                .collect();
+            ui.painter().add(egui::Shape::line(
+                smooth_trace(&points),
+                egui::Stroke::new(1.5, egui::Color32::LIGHT_GREEN),
+            ));
+        } else {
+            let ppp_px = ui.ctx().pixels_per_point().max(0.5);
+            let points: Vec<egui::Pos2> = spectrum_row
+                .iter()
+                .enumerate()
+                .map(|(i, &v)| {
+                    let x = rect.left() + (i as f32 / n as f32) * rect.width();
+                    let v = if v.is_finite() { v } else { -200.0 };
+                    let off = ((db_high - v) * plot_height / range * ppp_px).floor() / ppp_px;
+                    egui::pos2(x, (rect.top() + off).clamp(rect.top() - 10000.0, plot_bottom + 10000.0))
+                })
+                .collect();
+            let clip = egui::Rect::from_min_max(rect.min, egui::pos2(rect.right(), plot_bottom)).intersect(ui.painter().clip_rect());
+            ui.painter()
+                .with_clip_rect(clip)
+                .add(egui::Shape::line(points, egui::Stroke::new(1.0, egui::Color32::LIGHT_GREEN)));
+        }
     }
 
     // See draw_band_edge_markers's own doc comment for why this moved
@@ -23704,20 +23801,102 @@ fn build_waterfall_image(
     // Same fixed range as the spectrum trace/gridlines, rather than
     // each row auto-normalizing to its own min/max -- keeps waterfall
     // color and spectrum trace level in sync with each other.
-    let range = (db_high - db_low).max(1.0);
     for (row_idx, row) in rows.iter().enumerate().take(height) {
-        for (col_idx, &v) in row.iter().enumerate() {
-            if col_idx >= width {
-                break;
-            }
-            // deskHPSDR palette sees the unclamped fraction (black below low, yellow above high).
-            let raw = (v - db_low) / range;
-            let t = if palette == Palette::DeskHpsdr { raw } else { raw.clamp(0.0, 1.0) };
-            image.pixels[row_idx * width + col_idx] = palette.color(t);
-        }
+        waterfall_colour_row(&mut image.pixels[row_idx * width..(row_idx + 1) * width], row, palette, db_low, db_high);
     }
 
     Some(image)
+}
+
+/// Colours one dB row into `out` (one image row) with the given palette and limits.
+fn waterfall_colour_row(out: &mut [egui::Color32], row: &[f32], palette: Palette, db_low: f32, db_high: f32) {
+    let range = (db_high - db_low).max(1.0);
+    out.fill(egui::Color32::BLACK);
+    for (px, &v) in out.iter_mut().zip(row.iter()) {
+        // deskHPSDR palette sees the unclamped fraction (black below low, yellow above high).
+        let raw = (v - db_low) / range;
+        let t = if palette == Palette::DeskHpsdr { raw } else { raw.clamp(0.0, 1.0) };
+        *px = palette.color(t);
+    }
+}
+
+/// Global "Smooth trace" option for the extra receiver windows (their own viewports have no access to ConnectedState);
+/// written by the main window every frame.
+static SPECTRUM_SMOOTH_TRACE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Arguments shared by WaterfallBake::collect/apply: (palette, transmitting, waterfall auto, display rows, low, high).
+type WaterfallBakeArgs = (Palette, bool, bool, usize, f32, f32);
+
+/// The main waterfall as a rolling colour image, like deskHPSDR's pixbuf: every row is coloured ONCE, with the limits
+/// current when it arrived, and then only scrolls down, so with Waterfall Automatic the old rows keep their colours.
+/// New rows are found by identity, not by counting revisions (the analyzer bumps `revision` also for spectrum-only updates
+/// and pauses the waterfall during TX): `front` keeps the newest row already baked (an Arc clone, so its address cannot be
+/// reused), and the number of new rows is its position in the deque (0 = nothing new). A full rebuild from the dB rows with
+/// the current limits happens when: no image yet / history empty, palette, display size or row length changed, TX/RX
+/// switch, Waterfall Automatic toggled, the MANUAL limits changed, or `front` is no longer in the history (lost rows, or
+/// >= display height new rows at once).
+#[derive(Default)]
+struct WaterfallBake {
+    image: Option<egui::ColorImage>,
+    palette: Option<Palette>,
+    tx: bool,
+    auto: bool,
+    display_rows: usize,
+    limits: (f32, f32),
+    front: Option<Arc<Vec<f32>>>,
+}
+
+impl WaterfallBake {
+    /// Decides between full rebuild and incremental update and clones only the rows needed (cheap, under the display
+    /// lock). Returns (full, rows newest first).
+    fn collect(&self, rows: &VecDeque<Arc<Vec<f32>>>, args: WaterfallBakeArgs) -> (bool, Vec<Arc<Vec<f32>>>) {
+        let (palette, tx, auto, display_rows, low, high) = args;
+        let height = display_rows.min(spectrum::WATERFALL_HISTORY).max(1);
+        let width = rows.front().map_or(0, |r| r.len());
+        let manual = tx || !auto;
+        let mut full = width == 0
+            || self.palette != Some(palette)
+            || self.tx != tx
+            || self.auto != auto
+            || self.display_rows != display_rows
+            || self.image.as_ref().is_none_or(|i| i.size != [width, height])
+            || (manual && self.limits != (low, high));
+        let mut new_count = 0;
+        if !full {
+            match self.front.as_ref().and_then(|f| rows.iter().position(|r| Arc::ptr_eq(r, f))) {
+                Some(k) if k < height && rows.iter().take(k).all(|r| r.len() == width) => new_count = k,
+                _ => full = true,
+            }
+        }
+        if full {
+            (true, rows.iter().take(height).cloned().collect())
+        } else {
+            (false, rows.iter().take(new_count).cloned().collect())
+        }
+    }
+
+    /// Applies what `collect` returned. Returns true when the image changed (and must be uploaded).
+    fn apply(&mut self, full: bool, rows: &[Arc<Vec<f32>>], args: WaterfallBakeArgs) -> bool {
+        let (palette, tx, auto, display_rows, low, high) = args;
+        if full {
+            self.image = build_waterfall_image(rows, palette, low, high, display_rows);
+            self.front = if self.image.is_some() { rows.first().cloned() } else { None };
+            (self.palette, self.tx, self.auto, self.display_rows, self.limits) = (Some(palette), tx, auto, display_rows, (low, high));
+            return self.image.is_some();
+        }
+        let Some(img) = self.image.as_mut() else { return false };
+        if rows.is_empty() {
+            return false;
+        }
+        let [w, h] = img.size;
+        let k = rows.len().min(h);
+        img.pixels.copy_within(0..(h - k) * w, k * w);
+        for (j, row) in rows.iter().take(k).enumerate() {
+            waterfall_colour_row(&mut img.pixels[j * w..(j + 1) * w], row, palette, low, high);
+        }
+        self.front = rows.first().cloned();
+        true
+    }
 }
 
 /// S-meter style (Settings -> Meter) -- Analog is draw_s_meter's
