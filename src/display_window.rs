@@ -22,8 +22,8 @@ const SPIN_W: f32 = 168.0;
 
 const NOT_IMPLEMENTED: &str = "Not implemented yet; the control is shown for parity with deskHPSDR and does nothing.";
 const PEAKS_TX_HELP: &str = "Enable Peaks & Hold for the TX panadapter. Usable only as Peaks decay (fast attack, slow release at the Drop rate), Peaks hold is not available with TX. NOT usable if Duplex TX mode is active.";
-const PAN_AUTO_HELP: &str = "deskHPSDR's algorithm: once a second the 60th percentile of the visible spectrum + 3 dB is measured and smoothed; every 5 s the panadapter Low is set to that noise floor rounded down to 10 dB, plus the Noisefloor Margin, minus 5 dB (limits -220..-95). Low only moves if it differs by more than 10 dB or is below the new value. A High of -50 or lower is set to -50. Not applied while transmitting.";
-const WF_AUTO_HELP: &str = "deskHPSDR's algorithm: Low = mean level of the waterfall row - 5 dB, High = Low + 55 dB, updated with every new row.";
+const PAN_AUTO_HELP: &str = "deskHPSDR's algorithm: once a second the 60th percentile of the visible spectrum + 3 dB is measured and smoothed; every 5 s the panadapter Low is set to that noise floor rounded down to 10 dB, plus the Noisefloor Margin, minus 5 dB (limits -220..-95). Low only moves if it differs by more than 10 dB or is below the new value. When Automatic is switched on, a High of -50 or lower is set to -50 once (deskHPSDR does it every time; here your High then stays). Not applied while transmitting.";
+const WF_AUTO_HELP: &str = "deskHPSDR's algorithm: Low = mean level of the waterfall row - 5 dB, High = Low + 55 dB, updated with every new row. Your own Waterfall High/Low stay as they are and are used again when Automatic is switched off.";
 const FPS_HELP: &str = "Paces how often the screen is redrawn (receive and transmit). The analyzer itself runs at a fixed 10 frames per second.";
 const SMOOTH_HELP: &str = "Off (default, like deskHPSDR): the panadapter trace is the raw per-pixel row joined by straight segments. On: the row is smoothed across neighbouring pixels and drawn as a spline.";
 const AVG_HELP: &str = "Detector and averaging of the panadapter trace (WDSP). Av. Time sets the length of the averaging.";
@@ -41,6 +41,11 @@ pub struct AutoState {
     /// True once the first calculation after Automatic was switched on has run.
     calculated: bool,
     was_pan_auto: bool,
+    /// False until the first tick: the state found at start-up (Automatic already on from the saved config) is not a switch-on.
+    started: bool,
+    /// The "High -50" rule of Panadapter Automatic is applied only once, at the first calculation after Automatic was
+    /// switched on (deliberate deviation from deskHPSDR, which forces it on every calculation).
+    high_rule_pending: bool,
     last_wf_rev: Option<u64>,
 }
 
@@ -53,6 +58,15 @@ pub(crate) fn autoscale_low(noise: f64, margin: i32) -> i32 {
 }
 
 impl AutoState {
+    /// deskHPSDR rx_panadapter_force_noisefloor_update(): forget the noise-floor state so the next tick measures and
+    /// calculates at once (used when the Noisefloor Margin changes).
+    pub fn force(&mut self) {
+        self.smoothed = None;
+        self.last_measure = None;
+        self.last_calc = None;
+        self.calculated = false;
+    }
+
     /// `row` is the visible spectrum with the display correction already added (deskHPSDR: samples + soffset), `wf_row`
     /// the newest raw waterfall row and `corr` the same display correction (the waterfall levels are stored in the
     /// corrected domain, see main.rs wf_correction). `lv` = (panadapter low, high, waterfall low, high).
@@ -69,12 +83,17 @@ impl AutoState {
         lv: (&mut f32, &mut f32, &mut f32, &mut f32),
     ) {
         let (lo, hi, wlo, whi) = lv;
+        if !self.started {
+            // At start-up an already-on Automatic must not count as "switched on": the High rule (-50 once) would otherwise
+            // reset a saved High like -60 at every launch.
+            self.started = true;
+            self.was_pan_auto = pan_auto;
+        }
         if pan_auto {
             if !self.was_pan_auto {
                 // Switched on: measure and apply at once (deskHPSDR's "first run").
-                self.smoothed = None;
-                self.last_measure = None;
-                self.calculated = false;
+                self.force();
+                self.high_rule_pending = true;
             }
             let now = Instant::now();
             let due = self.smoothed.is_none() || self.last_measure.is_none_or(|t| now.duration_since(t) >= Duration::from_secs(1));
@@ -98,13 +117,17 @@ impl AutoState {
                 if let Some(noise) = self.smoothed {
                     let adjusted = autoscale_low(noise, margin) - 5;
                     let current = lo.round() as i32;
-                    if (adjusted - current).abs() > 10 || current < adjusted {
+                    // The first calculation (after switching on or a force) always applies.
+                    if !self.calculated || (adjusted - current).abs() > 10 || current < adjusted {
                         if current != adjusted {
                             *lo = adjusted as f32;
                         }
                     }
-                    if *hi <= -50.0 {
-                        *hi = -50.0;
+                    if self.high_rule_pending {
+                        self.high_rule_pending = false;
+                        if *hi <= -50.0 {
+                            *hi = -50.0;
+                        }
                     }
                     self.last_calc = Some(now);
                     self.calculated = true;
@@ -416,8 +439,9 @@ fn general_page(ui: &mut egui::Ui, w: f32, c: &mut ConnectedState, changed: &mut
 
     // ---- row 5: Waterfall High | Show Worldmap
     let row = new_row(ui, w, GRID_H);
-    let mut v = c.waterfall_db_high as f64;
-    if spin_row(ui, row, L0, LS, "Waterfall High:", "dsp_wf_high", &mut v, -175.0, 50.0, 1.0, 0, !wf_auto) {
+    // While Waterfall Automatic is on the greyed spin shows the live automatic value; the manual one is untouched.
+    let mut v = if wf_auto { c.wf_auto_high } else { c.waterfall_db_high } as f64;
+    if spin_row(ui, row, L0, LS, "Waterfall High:", "dsp_wf_high", &mut v, -175.0, 50.0, 1.0, 0, !wf_auto) && !wf_auto {
         c.waterfall_db_high = v.round() as f32;
         *changed = true;
     }
@@ -425,8 +449,8 @@ fn general_page(ui: &mut egui::Ui, w: f32, c: &mut ConnectedState, changed: &mut
 
     // ---- row 6: Waterfall Low | 3D Waterfall History
     let row = new_row(ui, w, GRID_H);
-    let mut v = c.waterfall_db_low as f64;
-    if spin_row(ui, row, L0, LS, "Waterfall Low:", "dsp_wf_low", &mut v, -175.0, 50.0, 1.0, 0, !wf_auto) {
+    let mut v = if wf_auto { c.wf_auto_low } else { c.waterfall_db_low } as f64;
+    if spin_row(ui, row, L0, LS, "Waterfall Low:", "dsp_wf_low", &mut v, -175.0, 50.0, 1.0, 0, !wf_auto) && !wf_auto {
         c.waterfall_db_low = v.round() as f32;
         *changed = true;
     }
@@ -465,6 +489,7 @@ fn general_page(ui: &mut egui::Ui, w: f32, c: &mut ConnectedState, changed: &mut
     let mut v = c.panadapter_noise_margin as f64;
     if spin_row(ui, row, L0, LS, "Noisefloor Margin:", "dsp_margin", &mut v, -20.0, 10.0, 1.0, 0, true) {
         c.panadapter_noise_margin = v.round() as i32;
+        c.display_auto.force();
         *changed = true;
     }
     inactive_check(ui, row, R0, R1, "dsp_clock", "Show clock & UDP broadcast");
@@ -573,34 +598,61 @@ fn blobs_page(ui: &mut egui::Ui, w: f32, c: &mut ConnectedState, changed: &mut b
 
 // ======================================================================= Peak Labels
 
+/// Two columns: RX (left, S-meter option as deskHPSDR's receive panadapter) and TX (right, its own parameter set, labels
+/// always in dBm). Budget: 8 rows x 44 px = 352 px of the ~500 px below the page selector; each column is 470 / 476 px
+/// wide inside the 966 px content (24 px side margins, 20 px between the columns), spin cell 168 px at x = 250.
 fn peak_labels_page(ui: &mut egui::Ui, w: f32, c: &mut ConnectedState, changed: &mut bool) {
     let mut t = c.tx_ui;
     let t0 = t;
+    const LX: f32 = 250.0; // spin cell start inside a column
 
     let row = new_row(ui, w, GRID_H);
     check_cell(ui, row, L0, 700.0, &mut t.peaks_on, "Enable Peak Labels on Panadapter");
-    let row = new_row(ui, w, GRID_H);
-    check_cell(ui, row, L0, 700.0, &mut t.peaks_as_smeter, "Peak Labels as S-Meter values");
-    let row = new_row(ui, w, GRID_H);
-    check_cell(ui, row, L0, 700.0, &mut t.peaks_in_passband, "Peak Labels in Passband Only");
-    let row = new_row(ui, w, GRID_H);
-    check_cell(ui, row, L0, 700.0, &mut t.peaks_hide_noise, "Hide Peaks Below Noise Floor");
 
-    let sx = 400.0;
+    let row = new_row(ui, w, GRID_H);
+    label(ui, row, L0, "RX", true);
+    label(ui, row, R0, "TX", true);
+
+    let row = new_row(ui, w, GRID_H);
+    check_cell(ui, row, L0, L1, &mut t.peaks_as_smeter, "Peak Labels as S-Meter values");
+    label(ui, row, R0, "(TX labels are always in dBm)", false);
+
+    let row = new_row(ui, w, GRID_H);
+    check_cell(ui, row, L0, L1, &mut t.peaks_in_passband, "Peak Labels in Passband Only");
+    check_cell(ui, row, R0, R1, &mut t.peaks_tx_in_passband, "Peak Labels in Passband Only");
+
+    let row = new_row(ui, w, GRID_H);
+    check_cell(ui, row, L0, L1, &mut t.peaks_hide_noise, "Hide Peaks Below Noise Floor");
+    check_cell(ui, row, R0, R1, &mut t.peaks_tx_hide_noise, "Hide Peaks Below Noise Floor");
+
     let row = new_row(ui, w, GRID_H);
     let mut v = t.peaks_num as f64;
-    if spin_row(ui, row, L0, sx, "Number of Peaks to label:", "dsp_pk_num", &mut v, 1.0, 10.0, 1.0, 0, true) {
+    if spin_row(ui, row, L0, LX, "Number of Peaks:", "dsp_pk_num", &mut v, 1.0, 10.0, 1.0, 0, true) {
         t.peaks_num = v.round() as i32;
     }
+    let mut v = t.peaks_tx_num as f64;
+    if spin_row(ui, row, R0, R0 + LX, "Number of Peaks:", "dsp_pk_tx_num", &mut v, 1.0, 10.0, 1.0, 0, true) {
+        t.peaks_tx_num = v.round() as i32;
+    }
+
     let row = new_row(ui, w, GRID_H);
     let mut v = t.peaks_ignore_divider as f64;
-    if spin_row(ui, row, L0, sx, "Panadapter Ignore Adjacent Peaks:", "dsp_pk_ign", &mut v, 1.0, 150.0, 1.0, 0, true) {
+    if spin_row(ui, row, L0, LX, "Ignore Adjacent Peaks:", "dsp_pk_ign", &mut v, 1.0, 150.0, 1.0, 0, true) {
         t.peaks_ignore_divider = v.round() as i32;
     }
+    let mut v = t.peaks_tx_divider as f64;
+    if spin_row(ui, row, R0, R0 + LX, "Ignore Adjacent Peaks:", "dsp_pk_tx_ign", &mut v, 1.0, 150.0, 1.0, 0, true) {
+        t.peaks_tx_divider = v.round() as i32;
+    }
+
     let row = new_row(ui, w, GRID_H);
     let mut v = t.peaks_noise_percentile as f64;
-    if spin_row(ui, row, L0, sx, "Panadapter Noise Floor Percentile:", "dsp_pk_pct", &mut v, 1.0, 100.0, 1.0, 0, true) {
+    if spin_row(ui, row, L0, LX, "Noise Floor Percentile:", "dsp_pk_pct", &mut v, 1.0, 100.0, 1.0, 0, true) {
         t.peaks_noise_percentile = v.round() as i32;
+    }
+    let mut v = t.peaks_tx_percentile as f64;
+    if spin_row(ui, row, R0, R0 + LX, "Noise Floor Percentile:", "dsp_pk_tx_pct", &mut v, 1.0, 100.0, 1.0, 0, true) {
+        t.peaks_tx_percentile = v.round() as i32;
     }
 
     if t != t0 {

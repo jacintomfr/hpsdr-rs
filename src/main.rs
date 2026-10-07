@@ -2178,6 +2178,10 @@ struct ConnectedState {
     /// goal -- not needing to manually re-tune the waterfall levels
     /// after adjusting gain -- is the same one this mirrors).
     waterfall_db_low_auto: bool,
+    /// Live limits computed by Waterfall Automatic (display_window.rs AutoState). Runtime only: not saved, not in band
+    /// memory; waterfall_db_low/high (the manual values) are untouched and used again when Automatic is off.
+    wf_auto_low: f32,
+    wf_auto_high: f32,
     /// "AGC Auto" (Settings -> RX, next to AGC Gain) -- ported from
     /// deskHPSDR's own rx->agc_auto/agc_auto_offset (receiver.h/
     /// rx_panadapter.c): continuously re-targets AGC Top (agc_top_db)
@@ -4017,12 +4021,14 @@ fn connect_to_device(device: Device, cfg: &Config) -> Result<ConnectedState, Str
                 drag_tune_accum_hz: 0.0,
                 sample_rate: settings.sample_rate,
                 db_low: cfg.db_low.unwrap_or(-140.0),
-                db_low_auto: cfg.db_low_auto.unwrap_or(true),
+                db_low_auto: cfg.db_low_auto.unwrap_or(false),
                 db_low_auto_smoothed: None,
-                db_high: cfg.db_high.unwrap_or(-40.0),
+                db_high: cfg.db_high.unwrap_or(-55.0),
                 waterfall_db_low: cfg.waterfall_db_low.unwrap_or(-140.0),
-                waterfall_db_high: cfg.waterfall_db_high.unwrap_or(-60.0),
-                waterfall_db_low_auto: cfg.waterfall_db_low_auto.unwrap_or(false),
+                waterfall_db_high: cfg.waterfall_db_high.unwrap_or(-55.0),
+                waterfall_db_low_auto: cfg.waterfall_db_low_auto.unwrap_or(true),
+                wf_auto_low: cfg.waterfall_db_low.unwrap_or(-140.0),
+                wf_auto_high: cfg.waterfall_db_high.unwrap_or(-55.0),
                 agc_auto: cfg.agc_auto.unwrap_or(false),
                 agc_auto_offset_db: cfg.agc_auto_offset_db.unwrap_or(-25.0),
                 rade_filter_wide: cfg.rade_filter_wide.unwrap_or(false),
@@ -4037,12 +4043,12 @@ fn connect_to_device(device: Device, cfg: &Config) -> Result<ConnectedState, Str
                 tx_waterfall_db_high: cfg
                     .tx_waterfall_db_high
                     .unwrap_or(cfg.waterfall_db_high.unwrap_or(-60.0) + 60.0),
-                panadapter_step_db: cfg.panadapter_step_db.unwrap_or(10.0),
+                panadapter_step_db: cfg.panadapter_step_db.unwrap_or(20.0),
                 tx_panadapter_step_db: cfg.tx_panadapter_step_db.unwrap_or(10.0),
-                spectrum_fps: cfg.spectrum_fps.unwrap_or(30),
-                tx_spectrum_fps: cfg.tx_spectrum_fps.unwrap_or(30),
-                spectrum_filled: cfg.spectrum_filled.unwrap_or(false),
-                spectrum_gradient: cfg.spectrum_gradient.unwrap_or(false),
+                spectrum_fps: cfg.spectrum_fps.unwrap_or(10).clamp(5, 60),
+                tx_spectrum_fps: cfg.tx_spectrum_fps.unwrap_or(10).clamp(5, 60),
+                spectrum_filled: cfg.spectrum_filled.unwrap_or(true),
+                spectrum_gradient: cfg.spectrum_gradient.unwrap_or(true),
                 spectrum_smooth_trace: cfg.spectrum_smooth_trace.unwrap_or(false),
                 waterfall_palette: cfg.waterfall_palette.unwrap_or(Palette::DeskHpsdr),
                 meter_style: cfg.meter_style.unwrap_or(MeterStyle::Analog),
@@ -4051,7 +4057,7 @@ fn connect_to_device(device: Device, cfg: &Config) -> Result<ConnectedState, Str
                 meter_window_open: false,
                 spectrum_waterfall_ratio: cfg
                     .spectrum_waterfall_ratio
-                    .unwrap_or(150.0 / 350.0),
+                    .unwrap_or(0.70),
                 waterfall_enabled: cfg.waterfall_enabled.unwrap_or(true),
                 spectrum_zoom: cfg.spectrum_zoom.unwrap_or(1),
                 spectrum_pan: cfg.spectrum_pan.unwrap_or(0.0),
@@ -5416,13 +5422,13 @@ impl eframe::App for HpsdrApp {
                     let wf_rev = waterfall_data_revision;
                     let corr = rx_display_correction_db as f32;
                     let (db_low_auto, margin, wf_auto) = (connected.db_low_auto, connected.panadapter_noise_margin, connected.waterfall_db_low_auto);
-                    let (mut lo, mut hi, mut wlo, mut whi) = (connected.db_low, connected.db_high, connected.waterfall_db_low, connected.waterfall_db_high);
+                    let (mut lo, mut hi, mut wlo, mut whi) = (connected.db_low, connected.db_high, connected.wf_auto_low, connected.wf_auto_high);
                     connected.display_auto.tick(&spectrum_row, wf_row.as_deref().map(|v| v.as_slice()), wf_rev, corr, db_low_auto, wf_auto, margin, (&mut lo, &mut hi, &mut wlo, &mut whi));
-                    if (lo, hi, wlo, whi) != (connected.db_low, connected.db_high, connected.waterfall_db_low, connected.waterfall_db_high) {
+                    if (lo, hi, wlo, whi) != (connected.db_low, connected.db_high, connected.wf_auto_low, connected.wf_auto_high) {
                         connected.db_low = lo;
                         connected.db_high = hi;
-                        connected.waterfall_db_low = wlo;
-                        connected.waterfall_db_high = whi;
+                        connected.wf_auto_low = wlo;
+                        connected.wf_auto_high = whi;
                     }
                 }
                 // "AGC Auto" keeps its own tracker (a smoothed minimum of the trace) -- see
@@ -5582,7 +5588,11 @@ impl eframe::App for HpsdrApp {
                 } else {
                     (base_high, base_high + 1.0)
                 };
-                let (wf_rx_low, wf_rx_high) = (connected.waterfall_db_low, connected.waterfall_db_high);
+                let (wf_rx_low, wf_rx_high) = if connected.waterfall_db_low_auto {
+                    (connected.wf_auto_low, connected.wf_auto_high)
+                } else {
+                    (connected.waterfall_db_low, connected.waterfall_db_high)
+                };
                 let (wf_tx_low, wf_tx_high) = (connected.tx_waterfall_db_low, connected.tx_waterfall_db_high);
                 let (wf_base_low, wf_base_high) =
                     if transmitting { (wf_tx_low, wf_tx_high) } else { (wf_rx_low, wf_rx_high) };
@@ -9245,7 +9255,9 @@ impl eframe::App for HpsdrApp {
                                 [egui::pos2(rect.left(), y), egui::pos2(rect.right(), y)],
                                 egui::Stroke::new(1.0, egui::Color32::from_gray(55)),
                             );
-                            if ((db / grid_step_db).round() as i32).rem_euclid(label_every) == 0 {
+                            // The label hangs below its line: when that would run into the frequency-axis strip at the bottom
+                            // (the lowest line) nothing is written there.
+                            if y + 14.0 <= plot_bottom && ((db / grid_step_db).round() as i32).rem_euclid(label_every) == 0 {
                                 ui.painter().text(
                                     egui::pos2(rect.left() + 2.0, y),
                                     egui::Align2::LEFT_TOP,
@@ -9573,13 +9585,25 @@ impl eframe::App for HpsdrApp {
                                 }
                             }
                             if tu.peaks_on && nbins > 2 {
-                                let pp = peaks::PeakParams {
-                                    on: true,
-                                    in_passband: tu.peaks_in_passband,
-                                    hide_noise: tu.peaks_hide_noise,
-                                    num_peaks: tu.peaks_num,
-                                    ignore_range_divider: tu.peaks_ignore_divider,
-                                    noise_percentile: tu.peaks_noise_percentile,
+                                // TX uses its own parameter set (deskHPSDR transmitter.c) and never S-meter values.
+                                let pp = if transmitting {
+                                    peaks::PeakParams {
+                                        on: true,
+                                        in_passband: tu.peaks_tx_in_passband,
+                                        hide_noise: tu.peaks_tx_hide_noise,
+                                        num_peaks: tu.peaks_tx_num,
+                                        ignore_range_divider: tu.peaks_tx_divider,
+                                        noise_percentile: tu.peaks_tx_percentile,
+                                    }
+                                } else {
+                                    peaks::PeakParams {
+                                        on: true,
+                                        in_passband: tu.peaks_in_passband,
+                                        hide_noise: tu.peaks_hide_noise,
+                                        num_peaks: tu.peaks_num,
+                                        ignore_range_divider: tu.peaks_ignore_divider,
+                                        noise_percentile: tu.peaks_noise_percentile,
+                                    }
                                 };
                                 let nl = if pp.hide_noise { Some(connected.peak_state.noise_level(raw_row, pp.noise_percentile, transmitting)) } else { None };
                                 let to_bin = |x: f32| (((x - rect.left()) / rect.width()).clamp(0.0, 1.0) * n as f32).round() as usize;
@@ -9593,8 +9617,8 @@ impl eframe::App for HpsdrApp {
                                     let painter = ui.painter();
                                     let width_of = |s: &str| painter.layout_no_wrap(s.to_string(), font.clone(), egui::Color32::WHITE).size().x;
                                     let freq_now = freq_hz as u64;
-                                    let as_smeter = tu.peaks_as_smeter;
-                                    let text_fn = |db: f32| if as_smeter { peaks::smeter_text(freq_now, db).to_string() } else { peaks::dbm_text(db) };
+                                    let as_smeter = tu.peaks_as_smeter && !transmitting;
+                                    let text_fn = |db: f32| if transmitting { format!("{:.1} dBm", db) } else if as_smeter { peaks::smeter_text(freq_now, db).to_string() } else { peaks::dbm_text(db) };
                                     // cairo text extents.height of 16 px digits is about 12 px.
                                     let labels = peaks::layout_labels_w(&found_px, db_high, db_low, plot_height, rect.width(), 12.0, &width_of, &text_fn);
                                     for l in &labels {
@@ -12957,7 +12981,7 @@ Waterfall rebuilds: {prof_wf_n:.0}/s, {prof_wf_ms:.1} ms each."
                                             ui,
                                             &mut connected.slider_scroll_accum,
                                             &mut fps,
-                                            1..=64,
+                                            5..=60,
                                             1,
                                             "",
                                         ) {
@@ -13015,7 +13039,9 @@ Waterfall rebuilds: {prof_wf_n:.0}/s, {prof_wf_ms:.1} ms each."
                                         }
                                     });
                                     ui.horizontal(|ui| {
-                                        let mut wlow = connected.waterfall_db_low;
+                                        // While Waterfall Automatic is on the (disabled) sliders show the live automatic limits;
+                                        // the manual values are untouched.
+                                        let mut wlow = if connected.waterfall_db_low_auto { connected.wf_auto_low } else { connected.waterfall_db_low };
                                         ui.label("Low:");
                                         ui.add_enabled_ui(!connected.waterfall_db_low_auto, |ui| {
                                             if scroll_slider_f32(
@@ -13051,27 +13077,29 @@ Waterfall rebuilds: {prof_wf_n:.0}/s, {prof_wf_ms:.1} ms each."
                                             connected.waterfall_db_low_auto = !connected.waterfall_db_low_auto;
                                             settings_changed = true;
                                         }
-                                        let mut whigh = connected.waterfall_db_high;
+                                        let mut whigh = if connected.waterfall_db_low_auto { connected.wf_auto_high } else { connected.waterfall_db_high };
                                         ui.label("High:");
-                                        if scroll_slider_f32(
-                                            ui,
-                                            &mut connected.slider_scroll_accum,
-                                            &mut whigh,
-                                            -180.0..=0.0,
-                                            2.0,
-                                        ) {
-                                            connected.waterfall_db_high = whigh;
-                                            remember_band_settings(
-                                                &mut connected.band_memory,
-                                                freq_hz,
-                                                connected.db_low,
-                                                connected.db_high,
-                                                connected.waterfall_db_low,
-                                                connected.waterfall_db_high,
-                                                current_mode,
-                                            );
-                                            settings_changed = true;
-                                        }
+                                        ui.add_enabled_ui(!connected.waterfall_db_low_auto, |ui| {
+                                            if scroll_slider_f32(
+                                                ui,
+                                                &mut connected.slider_scroll_accum,
+                                                &mut whigh,
+                                                -180.0..=0.0,
+                                                2.0,
+                                            ) {
+                                                connected.waterfall_db_high = whigh;
+                                                remember_band_settings(
+                                                    &mut connected.band_memory,
+                                                    freq_hz,
+                                                    connected.db_low,
+                                                    connected.db_high,
+                                                    connected.waterfall_db_low,
+                                                    connected.waterfall_db_high,
+                                                    current_mode,
+                                                );
+                                                settings_changed = true;
+                                            }
+                                        });
                                     });
 
                                     ui.separator();
@@ -23150,13 +23178,13 @@ fn spawn_extra_receiver(
         slider_scroll_accum: 0.0,
         drag_tune_accum_hz: 0.0,
         db_low: saved.map(|s| s.db_low).unwrap_or(-140.0),
-        db_low_auto: saved.map(|s| s.db_low_auto).unwrap_or(true),
+        db_low_auto: saved.map(|s| s.db_low_auto).unwrap_or(false),
         db_low_auto_smoothed: None,
-        db_high: saved.map(|s| s.db_high).unwrap_or(-40.0),
+        db_high: saved.map(|s| s.db_high).unwrap_or(-55.0),
         waterfall_db_low: saved.map(|s| s.waterfall_db_low).unwrap_or(-140.0),
-        waterfall_db_high: saved.map(|s| s.waterfall_db_high).unwrap_or(-60.0),
+        waterfall_db_high: saved.map(|s| s.waterfall_db_high).unwrap_or(-55.0),
         waterfall_palette: saved.map(|s| s.waterfall_palette).unwrap_or(Palette::DeskHpsdr),
-        spectrum_waterfall_ratio: saved.map(|s| s.spectrum_waterfall_ratio).unwrap_or(150.0 / 350.0),
+        spectrum_waterfall_ratio: saved.map(|s| s.spectrum_waterfall_ratio).unwrap_or(0.70),
         waterfall_enabled: saved.map(|s| s.waterfall_enabled).unwrap_or(true),
         spectrum_zoom: saved.map(|s| s.spectrum_zoom).unwrap_or(1),
         spectrum_pan: saved.map(|s| s.spectrum_pan).unwrap_or(0.0),

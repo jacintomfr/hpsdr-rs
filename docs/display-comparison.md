@@ -155,3 +155,38 @@ rows, and the whole-pixel flooring on the Pi's `pixels_per_point`.
 Found afterwards: the 5-tap smoothing averages dB values, which lowered a narrow single-bin carrier by about 34 dB (S9 read as S4 in the Peak
 Label); see `docs/display-menu.md` ("RESOLVED"). With "Smooth trace" OFF the label and the S-meter agree. To keep this true when the option is ON,
 the Peak Labels and the Peaks & Hold line now always use the raw row (as deskHPSDR does); only the drawn trace follows the option.
+
+## 10. Audit corrections, part 1
+
+Result of the audit of this port against deskHPSDR (rx_panadapter.c, waterfall.c, receiver.c, transmitter.c, tx_panadapter.c). Part 1 changes:
+
+1. **Panadapter High is no longer forced every 5 s.** deskHPSDR (rx_panadapter.c:2067) sets High to -50 at every automatic calculation when it is -50 or
+   lower, so a manual -60 snapped back while Panadapter Automatic was on. *Deliberate deviation:* the rule is applied only ONCE, at the first
+   calculation after Panadapter Automatic is switched on (`AutoState::high_rule_pending`); afterwards the user's High stays. Help text updated.
+2. **Waterfall Automatic no longer overwrites the manual Waterfall High/Low.** The automatic limits live in runtime-only
+   `ConnectedState::wf_auto_low/high` (not saved, not in band memory). While Automatic is on the texture build, the greyed Display spins and the old
+   Settings -> Spectrum sliders use/show them; switching Automatic off uses the untouched manual values again. Band memory, TX waterfall values and
+   extra receivers still use the manual values.
+3. **Noisefloor Margin applies at once** (`AutoState::force()`, like rx_panadapter_force_noisefloor_update()): the next tick measures and calculates
+   immediately, and the first calculation always applies (the "moves only if |diff| > 10 or below" gate no longer swallows it).
+4. **Defaults like deskHPSDR** (only for configs without a stored value; stored values untouched, FPS clamped to 5..60 on load).
+5. **Peak labels RX/TX parameter sets.** RX defaults 3 / 20 / 80 (unset values only). A separate TX set (`peaks_tx_num` 4, `peaks_tx_divider` 24,
+   `peaks_tx_percentile` 50, `peaks_tx_hide_noise` true, `peaks_tx_in_passband` false) is used while transmitting, labels formatted `%.1f dBm`
+   (never S-meter). One enable (`peaks_on`) for both. The Peak Labels page has an RX and a TX column. The noise-level cache is keyed by
+   (percentile, tx) so it is recomputed when the set switches.
+
+| Setting | Old default | New default |
+|---|---|---|
+| Panadapter High | -40 | -55 |
+| Waterfall High | -60 | -55 |
+| Panadapter Step | 10 | 20 |
+| Panadapter Automatic | on | off |
+| Waterfall Automatic | off | on |
+| Fill / Gradient Panadapter | off / off | on / on |
+| Relation Pan<->Waterfall | 150/350 (43 %) | 70 % |
+| Frames per second | 30 | 10 |
+| Peak labels RX number / divider / percentile | 4 / 24 / 80 | 3 / 20 / 80 |
+| Peak labels TX number / divider / percentile / hide / passband | (shared with RX) | 4 / 24 / 50 / on / off |
+
+**Left for part 2:** y clamp, edge columns, flat-mode stroke colour, waterfall 1:1 and per-row colours, extra receivers path, hold line width, hold
+clear on span change.

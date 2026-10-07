@@ -913,7 +913,7 @@ pub struct ExtraReceiverConfig {
 }
 
 fn default_db_low_auto() -> bool {
-    true
+    false
 }
 
 fn default_spectrum_zoom() -> i32 {
@@ -921,7 +921,7 @@ fn default_spectrum_zoom() -> i32 {
 }
 
 fn default_spectrum_waterfall_ratio() -> f32 {
-    150.0 / 350.0
+    0.70
 }
 
 fn default_waterfall_enabled() -> bool {
@@ -1144,6 +1144,12 @@ pub struct TxUiExtra {
     pub peaks_noise_percentile: i32,
     /// Settings -> Display (deskHPSDR): peak labels as S-meter values, and the Peaks & Hold page.
     pub peaks_as_smeter: bool,
+    /// Separate TX parameter set of the peak labels (deskHPSDR transmitter.c defaults); `peaks_on` enables both.
+    pub peaks_tx_num: i32,
+    pub peaks_tx_divider: i32,
+    pub peaks_tx_percentile: i32,
+    pub peaks_tx_hide_noise: bool,
+    pub peaks_tx_in_passband: bool,
     pub peak_hold_on: bool,
     /// 1 = Peaks hold, 2 = Peaks decay.
     pub peak_hold_mode: u8,
@@ -1169,10 +1175,15 @@ impl Default for TxUiExtra {
             peaks_on: false,
             peaks_in_passband: false,
             peaks_hide_noise: true,
-            peaks_num: 4,
-            peaks_ignore_divider: 24,
+            peaks_num: 3,
+            peaks_ignore_divider: 20,
             peaks_noise_percentile: 80,
             peaks_as_smeter: false,
+            peaks_tx_num: 4,
+            peaks_tx_divider: 24,
+            peaks_tx_percentile: 50,
+            peaks_tx_hide_noise: true,
+            peaks_tx_in_passband: false,
             peak_hold_on: false,
             peak_hold_mode: 2,
             peak_hold_sec: 2.0,
