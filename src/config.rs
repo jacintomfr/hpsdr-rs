@@ -473,6 +473,20 @@ pub struct Config {
     pub spectrum_filled: Option<bool>,
     #[serde(default)]
     pub spectrum_gradient: Option<bool>,
+    /// Settings -> Display (display_window.rs, deskHPSDR display_menu.c): noise-floor margin of Panadapter Automatic
+    /// (-20..10, default -5), panadapter detector (0 Peak, 1 Rosenfell, 2 Average, 3 Sample; default 2), averaging mode
+    /// (0 None, 1 Recursive, 2 Time Window, 3 Log Recursive; default 3), averaging time in ms (default 250) and
+    /// "Display Panadapter" (default on). Missing in older configs: the defaults keep the previous behaviour.
+    #[serde(default)]
+    pub panadapter_noise_margin: Option<i32>,
+    #[serde(default)]
+    pub display_detector: Option<u8>,
+    #[serde(default)]
+    pub display_average_mode: Option<u8>,
+    #[serde(default)]
+    pub display_average_time_ms: Option<u32>,
+    #[serde(default)]
+    pub display_panadapter: Option<bool>,
     #[serde(default)]
     pub band_settings: std::collections::HashMap<String, BandSettings>,
     /// Last frequency (IF) and mode of each transverter slot, by its name: selecting the slot again returns there

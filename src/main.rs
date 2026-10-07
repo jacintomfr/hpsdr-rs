@@ -25,6 +25,7 @@ mod eq_curve;
 mod eq_window;
 mod noise_window;
 mod pa_window;
+mod display_window;
 mod peaks;
 mod agc_window;
 mod filter_window;
@@ -1712,6 +1713,7 @@ enum SettingsTab {
     Noise,
     TxMenu,
     Pa,
+    Display,
     RxMenu,
     Network,
     Audio,
@@ -2471,6 +2473,18 @@ struct ConnectedState {
     tx_window_open: bool,
     /// The PA calibration window (pa_window.rs).
     pa_window_open: bool,
+    /// The Display window (display_window.rs).
+    display_window_open: bool,
+    /// Settings -> Display: noise-floor margin of Panadapter Automatic (dB), WDSP detector (0 Peak, 1 Rosenfell,
+    /// 2 Average, 3 Sample), averaging mode (0 None, 1 Recursive, 2 Time Window, 3 Log Recursive), averaging time (ms)
+    /// and "Display Panadapter".
+    panadapter_noise_margin: i32,
+    display_detector: u8,
+    display_average_mode: u8,
+    display_average_time_ms: u32,
+    display_panadapter: bool,
+    /// Runtime state of the deskHPSDR-style Panadapter/Waterfall Automatic (display_window.rs).
+    display_auto: display_window::AutoState,
     /// The PA window's drive-linearization measurement assistant (pa_window.rs); None when idle.
     pa_measure: Option<pa_window::Measure>,
     /// The RX Menu window (rx_window.rs) and its radio/audio-layer options.
@@ -4102,6 +4116,13 @@ fn connect_to_device(device: Device, cfg: &Config) -> Result<ConnectedState, Str
                 noise_window_open: false,
                 tx_window_open: false,
                 pa_window_open: false,
+                display_window_open: false,
+                panadapter_noise_margin: cfg.panadapter_noise_margin.unwrap_or(-5).clamp(-20, 10),
+                display_detector: cfg.display_detector.unwrap_or(2).min(3),
+                display_average_mode: cfg.display_average_mode.unwrap_or(3).min(3),
+                display_average_time_ms: cfg.display_average_time_ms.unwrap_or(250).clamp(1, 9999),
+                display_panadapter: cfg.display_panadapter.unwrap_or(true),
+                display_auto: display_window::AutoState::default(),
                 pa_measure: None,
                 rx_window_open: false,
                 rx_ui: cfg.rx_ui,
@@ -5043,6 +5064,7 @@ impl eframe::App for HpsdrApp {
                 let rx_effective_pan =
                     if rx_max_pan_hz > 0.0 { (rx_pan_offset_hz / rx_max_pan_hz) as f32 } else { 0.0 };
                 connected.spectrum.set_zoom_pan(connected.spectrum_zoom, rx_effective_pan);
+                connected.spectrum.set_display_avg(display_window::display_avg_of(connected));
                 // TX has no CTUN concept -- tx_spectrum's own generated IQ
                 // is always centered on the real TX carrier (see the "force
                 // ctun_offset_hz to 0 while transmitting" passband-overlay
@@ -5356,17 +5378,29 @@ impl eframe::App for HpsdrApp {
                     }
                 }
 
-                // "Auto" Low (Settings -> Spectrum) -- see
-                // ConnectedState::db_low_auto's doc comment. RX only:
-                // spectrum_row is tx_spectrum's data while transmitting,
-                // which isn't a "find the noise floor" scenario (see the
-                // TX range's own doc comment just below). Drives both
-                // db_low_auto (spectrum trace) and waterfall_db_low_auto
-                // (waterfall color mapping) from the one smoothed
-                // tracked minimum -- see waterfall_db_low_auto's own doc
-                // comment for why they share it rather than each
-                // computing their own copy of the same thing.
-                if (connected.db_low_auto || connected.waterfall_db_low_auto || connected.agc_auto) && !transmitting {
+                // Panadapter/Waterfall Automatic (Settings -> Display) -- deskHPSDR's algorithms, see display_window.rs
+                // (AutoState::tick). RX only; the rows are the corrected ones the trace is drawn from.
+                if !transmitting {
+                    let wf_row: Option<Arc<Vec<f32>>> = if connected.waterfall_db_low_auto {
+                        connected.spectrum.display.lock().unwrap().waterfall_rows.front().cloned()
+                    } else {
+                        None
+                    };
+                    let wf_rev = waterfall_data_revision;
+                    let corr = rx_display_correction_db as f32;
+                    let (db_low_auto, margin, wf_auto) = (connected.db_low_auto, connected.panadapter_noise_margin, connected.waterfall_db_low_auto);
+                    let (mut lo, mut hi, mut wlo, mut whi) = (connected.db_low, connected.db_high, connected.waterfall_db_low, connected.waterfall_db_high);
+                    connected.display_auto.tick(&spectrum_row, wf_row.as_deref().map(|v| v.as_slice()), wf_rev, corr, db_low_auto, wf_auto, margin, (&mut lo, &mut hi, &mut wlo, &mut whi));
+                    if (lo, hi, wlo, whi) != (connected.db_low, connected.db_high, connected.waterfall_db_low, connected.waterfall_db_high) {
+                        connected.db_low = lo;
+                        connected.db_high = hi;
+                        connected.waterfall_db_low = wlo;
+                        connected.waterfall_db_high = whi;
+                    }
+                }
+                // "AGC Auto" keeps its own tracker (a smoothed minimum of the trace) -- see
+                // ConnectedState::agc_auto's doc comment. RX only, as the Auto Low it used to share this with.
+                if connected.agc_auto && !transmitting {
                     let n = spectrum_row.len();
                     let edge = (n / AUTO_DB_LOW_EDGE_EXCLUDE_FRACTION).max(AUTO_DB_LOW_MIN_EDGE_EXCLUDE);
                     if n > edge * 2 {
@@ -5375,53 +5409,6 @@ impl eframe::App for HpsdrApp {
                             let prev = connected.db_low_auto_smoothed.unwrap_or(raw_min);
                             let smoothed = prev + AUTO_DB_LOW_SMOOTHING_ALPHA * (raw_min - prev);
                             connected.db_low_auto_smoothed = Some(smoothed);
-                            if connected.db_low_auto {
-                                connected.db_low = smoothed.clamp(-180.0, connected.db_high - 1.0);
-                            }
-                            if connected.waterfall_db_low_auto {
-                                // No zoom-dependent correction here anymore --
-                                // this used to add an empirical
-                                // AUTO_WATERFALL_ZOOM_COMPENSATION_STRENGTH-scaled
-                                // offset to work around the waterfall
-                                // pixout's level genuinely drifting with
-                                // zoom (WDSP's per-pixel RBW grows/shrinks
-                                // with the FFT size zoom uses). That drift
-                                // is now fixed at the actual source --
-                                // spectrum.rs's open()/set_zoom_pan() call
-                                // SetDisplayNormOneHz on pixout 1 (the
-                                // waterfall) the same as pixout 0 already
-                                // did -- so `smoothed` (from pixout 0,
-                                // already zoom-consistent) applies to the
-                                // waterfall unchanged too. Re-applying the
-                                // old empirical offset on top of the real
-                                // fix double-corrected and reintroduced
-                                // the exact same zoom-dependent colour
-                                // shift it was meant to remove, just in
-                                // the other direction -- a real report.
-                                //
-                                // BUG FIX for a real report ("auto fica
-                                // demasiado brilhante" -- Auto tracked
-                                // -131, the user's own preferred manual
-                                // value was -121, 10dB higher): `smoothed`
-                                // is the literal tracked MINIMUM bin
-                                // value, i.e. sits right at/below the true
-                                // noise floor -- using it as-is for the
-                                // waterfall's black point means ordinary
-                                // noise fluctuation (which is almost
-                                // always a few dB ABOVE the instantaneous
-                                // minimum) already reads as some colour
-                                // instead of staying black/blue, giving
-                                // exactly the "too bright, washed out"
-                                // look reported. A good manual choice
-                                // (like the user's own -121) sets the
-                                // black point a bit ABOVE the floor on
-                                // purpose, so only genuinely
-                                // stronger-than-average bins show colour.
-                                // Adding a fixed margin reproduces that
-                                // same headroom automatically.
-                                connected.waterfall_db_low =
-                                    (smoothed + AUTO_WATERFALL_LOW_MARGIN_DB).clamp(-180.0, connected.waterfall_db_high - 1.0);
-                            }
                             if connected.agc_auto {
                                 // Ported from deskHPSDR's rx_panadapter.c
                                 // (the block right after its own noise-
@@ -6727,6 +6714,17 @@ impl eframe::App for HpsdrApp {
                         }
                         if close_now {
                             connected.pa_window_open = false;
+                        }
+                    }
+
+                    // Display window (deskHPSDR display_menu.c), see display_window.rs.
+                    if connected.display_window_open {
+                        let (close_now, changed) = display_window::display_window(ui, connected);
+                        if changed {
+                            settings_changed = true;
+                        }
+                        if close_now {
+                            connected.display_window_open = false;
                         }
                     }
 
@@ -8615,8 +8613,15 @@ impl eframe::App for HpsdrApp {
                     // drops.
                     let waterfall_effectively_enabled =
                         connected.waterfall_enabled && (!connected.session.mox_active() || connected.spectrum.duplex());
+                    // "Display Panadapter" off (Settings -> Display): only a thin strip (frequency axis, dial marker) stays above the
+                    // waterfall, which takes the rest. While the waterfall is not drawn (TX) the panadapter always is.
+                    let panadapter_shown = connected.display_panadapter || !waterfall_effectively_enabled;
                     let spectrum_height = if waterfall_effectively_enabled {
-                        (spectrum_waterfall_height * connected.spectrum_waterfall_ratio).max(80.0)
+                        if panadapter_shown {
+                            (spectrum_waterfall_height * connected.spectrum_waterfall_ratio).max(80.0)
+                        } else {
+                            PANADAPTER_HIDDEN_STRIP_HEIGHT
+                        }
                     } else {
                         spectrum_waterfall_height
                     };
@@ -9139,7 +9144,7 @@ impl eframe::App for HpsdrApp {
                     // numbers shift.
                     draw_freq_axis_ticks(ui.painter(), rect, view_center_hz, visible_half_span_hz, xvtr_rf_offset_hz);
 
-                    if spectrum_row.len() > 1 {
+                    if spectrum_row.len() > 1 && panadapter_shown {
                         let range = (db_high - db_low).max(1.0);
 
                         // Reserve space at the bottom for the frequency
@@ -9173,6 +9178,8 @@ impl eframe::App for HpsdrApp {
                             if transmitting { connected.tx_panadapter_step_db } else { connected.panadapter_step_db }
                                 .max(1.0);
                         let mut db = (db_low / grid_step_db).ceil() * grid_step_db;
+                        // Steps of 1..4 dB (Settings -> Display) would stack the labels: label every n-th line then.
+                        let label_every = (14.0 / (grid_step_db / range * plot_height).max(0.1)).ceil().max(1.0) as i32;
                         while db <= db_high {
                             let frac = (db - db_low) / range;
                             let y = plot_bottom - frac * plot_height;
@@ -9180,13 +9187,15 @@ impl eframe::App for HpsdrApp {
                                 [egui::pos2(rect.left(), y), egui::pos2(rect.right(), y)],
                                 egui::Stroke::new(1.0, egui::Color32::from_gray(55)),
                             );
-                            ui.painter().text(
-                                egui::pos2(rect.left() + 2.0, y),
-                                egui::Align2::LEFT_TOP,
-                                format!("{db:.0} dB"),
-                                egui::FontId::monospace(14.0),
-                                egui::Color32::GRAY,
-                            );
+                            if ((db / grid_step_db).round() as i32).rem_euclid(label_every) == 0 {
+                                ui.painter().text(
+                                    egui::pos2(rect.left() + 2.0, y),
+                                    egui::Align2::LEFT_TOP,
+                                    format!("{db:.0} dB"),
+                                    egui::FontId::monospace(14.0),
+                                    egui::Color32::GRAY,
+                                );
+                            }
                             db += grid_step_db;
                         }
 
@@ -9535,7 +9544,7 @@ impl eframe::App for HpsdrApp {
                     // spectrum pane's own bottom edge instead of the
                     // waterfall's.
                     let waterfall_bottom = if waterfall_effectively_enabled {
-                        if spectrum_waterfall_divider(
+                        if panadapter_shown && spectrum_waterfall_divider(
                             ui,
                             &mut connected.spectrum_waterfall_ratio,
                             spectrum_waterfall_height,
@@ -10952,6 +10961,7 @@ Waterfall rebuilds: {prof_wf_n:.0}/s, {prof_wf_ms:.1} ms each."
                                     (SettingsTab::Network, "Network"),
                                     (SettingsTab::OpenCollector, "Open Collector"),
                                     (SettingsTab::Pa, "PA"),
+                                    (SettingsTab::Display, "Display"),
                                     (SettingsTab::PaCalibration, "PA Calibration"),
                                     (SettingsTab::PureSignal, "PureSignal"),
                                     (SettingsTab::Agc, "RX"),
@@ -12404,6 +12414,18 @@ Waterfall rebuilds: {prof_wf_n:.0}/s, {prof_wf_ms:.1} ms each."
                                         ui.ctx().request_repaint_of(egui::ViewportId::ROOT);
                                     } else {
                                         ui.label("The PA calibration window is only available in the kiosk; use the PA Calibration tab.");
+                                    }
+                                }
+                                SettingsTab::Display => {
+                                    // The Display page is a full-screen window (display_window.rs) in the kiosk; elsewhere the
+                                    // Spectrum tab keeps editing the same fields.
+                                    if lcd_kiosk_mode() {
+                                        connected.display_window_open = true;
+                                        connected.show_settings_window = false;
+                                        connected.settings_tab = SettingsTab::About;
+                                        ui.ctx().request_repaint_of(egui::ViewportId::ROOT);
+                                    } else {
+                                        ui.label("The Display window is only available in the kiosk; use the Spectrum tab.");
                                     }
                                 }
                                 SettingsTab::Noise => {
@@ -15216,6 +15238,11 @@ Waterfall rebuilds: {prof_wf_n:.0}/s, {prof_wf_ms:.1} ms each."
                         tx_spectrum_fps: Some(connected.tx_spectrum_fps),
                         spectrum_filled: Some(connected.spectrum_filled),
                         spectrum_gradient: Some(connected.spectrum_gradient),
+                        panadapter_noise_margin: Some(connected.panadapter_noise_margin),
+                        display_detector: Some(connected.display_detector),
+                        display_average_mode: Some(connected.display_average_mode),
+                        display_average_time_ms: Some(connected.display_average_time_ms),
+                        display_panadapter: Some(connected.display_panadapter),
                         waterfall_palette: Some(connected.waterfall_palette),
                         meter_style: Some(connected.meter_style),
                         smeter_mode: Some(connected.smeter_mode),
@@ -15646,12 +15673,8 @@ const AUTO_DB_LOW_MIN_EDGE_EXCLUDE: usize = 4;
 /// visibly moving".
 const AUTO_DB_LOW_SMOOTHING_ALPHA: f32 = 0.01;
 
-/// Headroom added above the tracked noise floor for the waterfall's Auto
-/// Low (Settings -> Spectrum) -- see its own call site's doc comment for
-/// the reasoning. Tuned to a real report comparing Auto (which tracked
-/// -131) against that user's own preferred manual value (-121) on the
-/// same signal -- 10dB matched.
-const AUTO_WATERFALL_LOW_MARGIN_DB: f32 = 10.0;
+/// Height of the strip kept above the waterfall when "Display Panadapter" is off (frequency axis margin + a little room).
+const PANADAPTER_HIDDEN_STRIP_HEIGHT: f32 = 44.0;
 
 /// Draggable divider between the spectrum and waterfall displays.
 /// Updates `ratio` (spectrum's share of their combined height, see
@@ -21574,6 +21597,8 @@ fn render_extra_receiver_settings(ui: &mut egui::Ui, rx: &Arc<Mutex<ExtraReceive
         SettingsTab::Noise => rx.settings_tab = SettingsTab::Agc,
         SettingsTab::TxMenu => rx.settings_tab = SettingsTab::Agc,
         SettingsTab::Pa => rx.settings_tab = SettingsTab::Agc,
+        // Display (full-screen window of the main receiver) edits the main receiver and mirrors to the extra ones.
+        SettingsTab::Display => rx.settings_tab = SettingsTab::Agc,
         SettingsTab::RxMenu => rx.settings_tab = SettingsTab::Agc,
         SettingsTab::PaCalibration => rx.settings_tab = SettingsTab::Agc,
         SettingsTab::PureSignal => rx.settings_tab = SettingsTab::Agc,

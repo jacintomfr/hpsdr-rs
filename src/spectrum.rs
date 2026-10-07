@@ -694,6 +694,21 @@ impl Default for RxExtra {
     }
 }
 
+/// Panadapter detector/averaging (Settings -> Display, deskHPSDR display_menu.c): `detector` and `mode` are WDSP's own
+/// DETECTOR_MODE_*/AVERAGE_MODE_* numbers, `time_ms` is deskHPSDR's "Av. Time (ms)".
+#[derive(Copy, Clone, PartialEq, Eq, Debug)]
+pub struct DisplayAvg {
+    pub detector: u8,
+    pub mode: u8,
+    pub time_ms: u32,
+}
+
+impl Default for DisplayAvg {
+    fn default() -> Self {
+        Self { detector: wdsp::DETECTOR_MODE_AVERAGE as u8, mode: wdsp::AVERAGE_MODE_LOG_RECURSIVE as u8, time_ms: 250 }
+    }
+}
+
 #[derive(Copy, Clone)]
 pub struct DemodParams {
     pub mode: Mode,
@@ -813,6 +828,9 @@ pub struct DemodParams {
     /// stretching a fixed-resolution trace.
     pub zoom: i32,
     pub pan: f32,
+    /// Detector / averaging of the panadapter pixout (Settings -> Display). None (the TX analyzer, never set) leaves
+    /// what open() configures: Average detector, Log Recursive averaging, WDSP's own averaging constants.
+    pub display_avg: Option<DisplayAvg>,
     /// S-meter/spectrum calibration offset (dB), added directly to
     /// WDSP's own `GetRXAMeter` reading (see SpectrumHandle::start's own
     /// run loop, where this is applied to meter_db) AND to every pixel
@@ -897,6 +915,7 @@ impl Default for DemodParams {
             eq: EqualizerParams::default(),
             zoom: 1,
             pan: 0.0,
+            display_avg: None,
             meter_calibration_db: 0.0,
             noise_extra: NoiseExtra::default(),
             explicit_passband: None,
@@ -1053,6 +1072,8 @@ struct SpectrumAnalyzer {
     /// reconfiguring the analyzer to the same values it already has.
     last_zoom: Option<i32>,
     last_pan: Option<f32>,
+    /// The Display-menu detector/averaging last applied (None = only open()'s defaults), see set_display_avg.
+    last_display_avg: Option<DisplayAvg>,
 }
 
 impl SpectrumAnalyzer {
@@ -1447,6 +1468,7 @@ impl SpectrumAnalyzer {
                 last_fexchange_error: None,
                 last_zoom: Some(1),
                 last_pan: Some(0.0),
+                last_display_avg: None,
             }
         }
     }
@@ -1560,8 +1582,14 @@ impl SpectrumAnalyzer {
                 0.0,
                 max_w,
             );
-            wdsp::SetDisplayDetectorMode(self.channel, 0, wdsp::DETECTOR_MODE_AVERAGE as c_int);
-            wdsp::SetDisplayAverageMode(self.channel, 0, wdsp::AVERAGE_MODE_LOG_RECURSIVE as c_int);
+            match self.last_display_avg {
+                // SetAnalyzer resets the display averaging: put the Display-menu choice back (no NONE detour needed).
+                Some(d) => Self::write_display_avg(self.channel, d, false),
+                None => {
+                    wdsp::SetDisplayDetectorMode(self.channel, 0, wdsp::DETECTOR_MODE_AVERAGE as c_int);
+                    wdsp::SetDisplayAverageMode(self.channel, 0, wdsp::AVERAGE_MODE_LOG_RECURSIVE as c_int);
+                }
+            }
             // Pixout 1 (waterfall) deliberately left unset here, same
             // reasoning as open()'s own identical comment -- re-applying
             // LOG_RECURSIVE on every zoom/pan change (as this function
@@ -1576,6 +1604,40 @@ impl SpectrumAnalyzer {
             // (possibly much larger, tier-snapped) FFT size.
             wdsp::SetDisplaySampleRate(self.channel, pixels * zoom);
         }
+    }
+
+    /// deskHPSDR rx_set_detector() + rx_set_average() on the panadapter pixout. The analyzer here runs at the fixed
+    /// SPECTRUM_FPS (the Display-menu "Frames Per Second" only paces the UI), so that is the `fps` of deskHPSDR's
+    /// time conversion. With `nudge` the averaging is switched to NONE first and given ~50 ms (deskHPSDR's artifact
+    /// workaround; this runs on the spectrum thread, never the UI thread).
+    fn write_display_avg(channel: i32, d: DisplayAvg, nudge: bool) {
+        let fps = SPECTRUM_FPS as f64;
+        let t = 0.001 * d.time_ms.max(1) as f64;
+        let backmult = (-1.0 / (fps * t)).exp();
+        let num = std::cmp::max(2, (fps * t).min(60.0) as c_int);
+        unsafe {
+            wdsp::SetDisplayDetectorMode(channel, 0, d.detector.min(3) as c_int);
+            wdsp::SetDisplayAvBackmult(channel, 0, backmult);
+            wdsp::SetDisplayNumAverage(channel, 0, num);
+            if nudge {
+                wdsp::SetDisplayAverageMode(channel, 0, wdsp::AVERAGE_MODE_NONE as c_int);
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            wdsp::SetDisplayAverageMode(channel, 0, d.mode.min(3) as c_int);
+        }
+    }
+
+    /// Edge-detected like set_zoom_pan: cheap to call every iteration. `None` (TX analyzer) changes nothing.
+    fn set_display_avg(&mut self, want: Option<DisplayAvg>) {
+        let Some(d) = want else { return };
+        if self.last_display_avg == Some(d) {
+            return;
+        }
+        let prev = self.last_display_avg.unwrap_or_default();
+        // The first call after open() only differs from open()'s defaults if the setting does.
+        let nudge = prev.mode != d.mode || prev.time_ms != d.time_ms;
+        Self::write_display_avg(self.channel, d, nudge);
+        self.last_display_avg = Some(d);
     }
 
     /// Feed exactly BUFFER_SIZE IQ samples in. Returns (spectrum_row,
@@ -2369,6 +2431,7 @@ fn run(
         }
         let t_zp = Instant::now();
         analyzer.set_zoom_pan(params.zoom, params.pan, sample_rate);
+        analyzer.set_display_avg(params.display_avg);
         DSP_MAX_ZP_US.fetch_max(t_zp.elapsed().as_micros() as u64, Ordering::Relaxed);
 
         let t_feed = Instant::now();
@@ -3335,6 +3398,11 @@ impl SpectrumHandle {
         let mut p = self.demod_params.lock().unwrap();
         p.zoom = zoom.max(1);
         p.pan = pan.clamp(-1.0, 1.0);
+    }
+
+    /// Panadapter detector/averaging from Settings -> Display; picked up (edge-detected) by the analyzer thread.
+    pub fn set_display_avg(&self, v: DisplayAvg) {
+        self.demod_params.lock().unwrap().display_avg = Some(v);
     }
 
     /// Mirrors the actual hardware/LO frequency into the analyzer thread
