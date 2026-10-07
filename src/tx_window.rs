@@ -499,7 +499,10 @@ fn audio_tools(ui: &mut egui::Ui, w: f32, connected: &mut ConnectedState, ex: &m
     if spin(ui, row, 310.0, 500.0, "tx_comp", &mut v, 0.0, 20.0, 1.0, 0) {
         tx.set_compressor_gain_db(v.round() as f32);
     }
-    check(ui, row, 520.0, 800.0, &mut ex.cessb_enable, "Auto CESSB");
+    if check(ui, row, 520.0, 800.0, &mut ex.cessb_enable, "Auto CESSB") && ex.cessb_enable {
+        // deskHPSDR tx_menu.c: switching CESSB on switches the low-latency TX filter off (DSP menu).
+        ex.fir_low_latency = false;
+    }
     // Row 3: EQ Ctfmode
     let row = new_row(ui, w, ROW_H + 4.0);
     check(ui, row, 0.0, 400.0, &mut ex.eq_ctfmode, "WDSP TX EQ Ctfmode");

@@ -28,6 +28,7 @@ mod pa_window;
 mod menu_window;
 mod toolbar_window;
 mod display_window;
+mod dsp_window;
 mod peaks;
 mod agc_window;
 mod fnc_window;
@@ -2512,6 +2513,7 @@ struct ConnectedState {
     pa_window_open: bool,
     /// The Display window (display_window.rs).
     display_window_open: bool,
+    dsp_window_open: bool,
     /// The full-screen Menu window (menu_window.rs), opened by the NEW MENU action.
     menu_window_open: bool,
     /// The full-screen Toolbar editor (toolbar_window.rs), opened from the Menu.
@@ -4170,6 +4172,7 @@ fn connect_to_device(device: Device, cfg: &Config) -> Result<ConnectedState, Str
                 tx_window_open: false,
                 pa_window_open: false,
                 display_window_open: false,
+                dsp_window_open: false,
                 menu_window_open: false,
                 menu_return: false,
                 menu_session_request: 0,
@@ -6842,6 +6845,17 @@ impl eframe::App for HpsdrApp {
                         }
                         if close_now {
                             connected.display_window_open = false;
+                        }
+                    }
+
+                    // DSP window (deskHPSDR fft_menu.c), see dsp_window.rs.
+                    if connected.dsp_window_open {
+                        let (close_now, changed) = dsp_window::dsp_window(ui, connected);
+                        if changed {
+                            settings_changed = true;
+                        }
+                        if close_now {
+                            connected.dsp_window_open = false;
                         }
                     }
 

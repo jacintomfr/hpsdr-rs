@@ -569,6 +569,8 @@ pub struct TxExtra {
     pub phrot_freq_hz: i32,           // 338 (1..500)
     pub eq_ctfmode: bool,             // false
     pub cessb_enable: bool,           // true  (Auto CESSB: osctrl runs when compressor on && cessb_enable && compressor gain > 0)
+    pub fir_low_latency: bool,       // false (DSP menu: WDSP FIR filter type, false = linear phase; TXASetMP)
+    pub fir_nc: i32,                 // 2048 (DSP menu: WDSP FIR NC 2048..16384; TXASetNC)
     pub dexp: bool,                   // false (TX noise gate)
     pub dexp_filter: bool,            // false (side channel filter)
     pub dexp_exp_db: i32,             // 20   (0..30)
@@ -611,6 +613,8 @@ impl Default for TxExtra {
             phrot_freq_hz: 338,
             eq_ctfmode: false,
             cessb_enable: true,
+            fir_low_latency: false,
+            fir_nc: 2048,
             dexp: false,
             dexp_filter: false,
             dexp_exp_db: 20,
@@ -819,6 +823,8 @@ struct TxProcessor {
     last_leveler: Option<(bool, f32, i32)>,
     /// See TxParams::compressor_enabled/compressor_gain_db's doc comment.
     last_compressor: Option<(bool, f32, bool)>,
+    /// (low_latency, nc) last sent to WDSP; starts at the values the channel is opened with.
+    last_fir: Option<(bool, i32)>,
     /// See TxParams::cfc_enabled's doc comment (key = every field the CFC calls depend on).
     last_cfc: Option<CfcKey>,
     /// TxExtra as last applied (phase rotator / EQ ctfmode / CTCSS / FM emphasis / AM carrier groups diff against it).
@@ -1265,6 +1271,7 @@ impl TxProcessor {
             last_eq: None,
             last_leveler: None,
             last_compressor: None,
+            last_fir: Some((false, 2048)),
             last_cfc: None,
             last_extra: None,
             last_dexp: None,
@@ -1594,10 +1601,22 @@ impl TxProcessor {
             self.last_leveler = Some((leveler_enabled, leveler_gain_db, leveler_decay_ms));
         }
 
+        // DSP menu: FIR filter type and size (deskHPSDR tx_set_latency / tx_set_fft_size).
+        let fir = (extra.fir_low_latency, extra.fir_nc.clamp(2048, 16384));
+        if self.last_fir != Some(fir) {
+            unsafe {
+                wdsp::TXASetMP(self.channel, fir.0 as c_int);
+                wdsp::TXASetNC(self.channel, fir.1);
+            }
+            self.last_fir = Some(fir);
+        }
+        // CESSB cannot run with the low-latency filter (deskHPSDR transmitter.c).
+        let cessb_allowed = extra.cessb_enable && !extra.fir_low_latency;
+
         // Simple Compressor ("PROC") -- see TxParams::compressor_enabled's
         // doc comment. Gain set before Run, same order as deskHPSDR's own
         // tx_menu.c/transmitter.c.
-        if self.last_compressor != Some((compressor_enabled, compressor_gain_db, extra.cessb_enable)) {
+        if self.last_compressor != Some((compressor_enabled, compressor_gain_db, cessb_allowed)) {
             unsafe {
                 wdsp::SetTXACompressorGain(self.channel, compressor_gain_db as f64);
                 wdsp::SetTXACompressorRun(self.channel, compressor_enabled as c_int);
@@ -1614,10 +1633,10 @@ impl TxProcessor {
                 // pushed harder without the overshoot that would
                 // otherwise cause, more average TX power for the same
                 // peak envelope.
-                let cessb_on = compressor_enabled && extra.cessb_enable && compressor_gain_db > 0.0;
+                let cessb_on = compressor_enabled && cessb_allowed && compressor_gain_db > 0.0;
                 wdsp::SetTXAosctrlRun(self.channel, cessb_on as c_int);
             }
-            self.last_compressor = Some((compressor_enabled, compressor_gain_db, extra.cessb_enable));
+            self.last_compressor = Some((compressor_enabled, compressor_gain_db, cessb_allowed));
         }
 
         // CFC (multiband Continuous Frequency Compressor + post-EQ) --

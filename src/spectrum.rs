@@ -680,6 +680,10 @@ pub struct RxExtra {
     pub mute_when_not_active: bool,
     /// false = nothing goes to the computer's local audio output (audio to the radio keeps working).
     pub local_audio: bool,
+    /// DSP menu (deskHPSDR fft_menu.c): WDSP FIR filter type (false = linear phase, true = low latency; RXASetMP) and number of
+    /// coefficients NC (2048, 4096, 8192 or 16384; RXASetNC).
+    pub fir_low_latency: bool,
+    pub fir_nc: i32,
 }
 
 impl Default for RxExtra {
@@ -690,6 +694,8 @@ impl Default for RxExtra {
             audio_channel: 0,
             mute_when_not_active: false,
             local_audio: true,
+            fir_low_latency: false,
+            fir_nc: 2048,
         }
     }
 }
@@ -1055,6 +1061,8 @@ struct SpectrumAnalyzer {
     last_noise_extra: Option<NoiseExtra>,
     last_binaural: Option<bool>,
     last_rx_extra: Option<RxExtra>,
+    /// (low_latency, nc) last sent to WDSP; starts at the values the channel is opened with.
+    last_fir: Option<(bool, i32)>,
     last_ctun: Option<bool>,
     last_ctun_offset: Option<f64>,
     last_lo_frequency: Option<f64>,
@@ -1455,6 +1463,7 @@ impl SpectrumAnalyzer {
                 last_noise_extra: None,
                 last_binaural: None,
                 last_rx_extra: None,
+                last_fir: Some((false, 2048)),
                 last_ctun: None,
                 last_ctun_offset: None,
                 last_lo_frequency: None,
@@ -1933,6 +1942,15 @@ impl SpectrumAnalyzer {
         // doc comment. Same edge-detected Set*-call pattern as every
         // other toggle above; off by default matches open()'s own
         // startup call, this just takes over from there.
+        // DSP menu: FIR filter type and size (deskHPSDR rx_set_fft_latency / rx_set_fft_size).
+        let fir = (params.rx_extra.fir_low_latency, params.rx_extra.fir_nc.clamp(2048, 16384));
+        if self.last_fir != Some(fir) {
+            unsafe {
+                wdsp::RXASetMP(self.channel, fir.0 as c_int);
+                wdsp::RXASetNC(self.channel, fir.1);
+            }
+            self.last_fir = Some(fir);
+        }
         if self.last_binaural != Some(params.binaural) {
             unsafe {
                 wdsp::SetRXAPanelBinaural(self.channel, params.binaural as c_int);
