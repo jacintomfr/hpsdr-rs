@@ -9991,6 +9991,43 @@ impl eframe::App for HpsdrApp {
                             ui.painter().galley(pos, galley, egui::Color32::WHITE);
                         }
 
+                        // AGC lines (deskHPSDR rx_panadapter.c "AGC line"): "AGC-G" is the AGC threshold (the knee, WDSP GetRXAAGCThresh), "AGC-Th" the
+                        // hang threshold (GetRXAAGCHangLevel), only for AGC Long / Slow. Both in the spectrum's own dB (the same correction as the trace),
+                        // coral (GRAD_CORAL) lines from x = 40 to width - 40 with an 8x8 square above the left end, 12 pt bold labels with a black outline: the
+                        // Th label coral, the G label white ("AGC-G Auto" while AGC Gain is automatic). Drawn on top of the trace, clipped to the plot.
+                        let agc_mode = connected.spectrum.agc();
+                        if !transmitting && agc_mode != spectrum::Agc::Off {
+                            let (thresh_db, hang_db) = {
+                                let d = connected.spectrum.display.lock().unwrap();
+                                (d.agc_thresh_db + rx_display_correction_db, d.agc_hang_db + rx_display_correction_db)
+                            };
+                            let coral = egui::Color32::from_rgb(255, 128, 79);
+                            let (x0, x1) = (rect.left() + 40.0, rect.right() - 40.0);
+                            let agc_label = |p: &egui::Painter, x: f32, base_y: f32, text: &str, fill: egui::Color32| {
+                                let font = egui::FontId::proportional(13.0);
+                                let pos = egui::pos2(x, base_y + 2.5);
+                                for (dx, dy) in [(-1.0, 0.0), (1.0, 0.0), (0.0, -1.0), (0.0, 1.0), (-1.0, -1.0), (1.0, -1.0), (-1.0, 1.0), (1.0, 1.0)] {
+                                    p.text(pos + egui::vec2(dx, dy), egui::Align2::LEFT_BOTTOM, text, font.clone(), egui::Color32::BLACK);
+                                }
+                                // Bold: the label twice, half a pixel apart.
+                                p.text(pos, egui::Align2::LEFT_BOTTOM, text, font.clone(), fill);
+                                p.text(pos + egui::vec2(0.6, 0.0), egui::Align2::LEFT_BOTTOM, text, font, fill);
+                            };
+                            let line = |p: &egui::Painter, y: f32| {
+                                p.rect_filled(egui::Rect::from_min_max(egui::pos2(x0, y - 8.0), egui::pos2(x0 + 8.0, y)), 0.0, coral);
+                                p.line_segment([egui::pos2(x0, y), egui::pos2(x1, y)], egui::Stroke::new(1.0, coral));
+                            };
+                            if matches!(agc_mode, spectrum::Agc::Long | spectrum::Agc::Slow) {
+                                let y = raw_y(hang_db as f32);
+                                line(&plot_painter, y);
+                                agc_label(&plot_painter, x0 + 10.0, y - 2.0, &format!("AGC-Th {}dbm", hang_db as i32), coral);
+                            }
+                            let y = raw_y(thresh_db as f32);
+                            line(&plot_painter, y);
+                            let g_text = if connected.agc_auto { "AGC-G Auto".to_string() } else { format!("AGC-G {}dbm", thresh_db as i32) };
+                            agc_label(&plot_painter, x0 + 11.0, y - 2.0, &g_text, egui::Color32::WHITE);
+                        }
+
                         // Peaks & Hold trace and Peak Labels (Settings -> Display), ported from deskHPSDR's rx_panadapter.c /
                         // tx_panadapter.c -- see peaks.rs and docs/display-menu.md. They use the RAW row (like deskHPSDR), never the smoothed one: the
                         // dB-domain smoothing flattens narrow signals by ~30 dB (S9 read as S4).

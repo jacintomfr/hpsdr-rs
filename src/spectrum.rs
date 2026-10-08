@@ -342,6 +342,10 @@ pub struct SpectrumDisplay {
     pub spectrum: Vec<f32>,
     pub waterfall_rows: VecDeque<Arc<Vec<f32>>>,
     pub meter_db: f64,
+    /// WDSP AGC threshold (GetRXAAGCThresh) and hang level (GetRXAAGCHangLevel) in the spectrum's own dB (with the meter calibration), for the
+    /// panadapter's "AGC-G" / "AGC-Th" lines (deskHPSDR rx_panadapter.c). The UI adds the RX display correction.
+    pub agc_thresh_db: f64,
+    pub agc_hang_db: f64,
     /// Bumped every time feed() below produces fresh spectrum/waterfall
     /// pixel data -- i.e. at roughly SPECTRUM_FPS (10/sec), not once
     /// per UI repaint. The UI compares this against what it last saw
@@ -1762,6 +1766,10 @@ impl SpectrumAnalyzer {
                 wdsp::SetRXAAGCMode(self.channel, params.agc as c_int);
             }
             self.last_agc = Some(params.agc);
+            // WDSP's SetRXAAGCMode resets the hang threshold to 100 for Medium / Fast and leaves it alone otherwise, so after a mode change the
+            // configured threshold must be applied again (deskHPSDR rx_set_agc does it for Long / Slow every time): otherwise going back from
+            // Medium / Fast to Long / Slow kept 100 (the "AGC-Th" line off the top of the panadapter) until the value was touched.
+            self.last_agc_hang_thr = None;
         }
         if self.last_agc_hang_thr != Some(params.agc_hang_threshold) {
             unsafe {
@@ -2152,6 +2160,16 @@ impl SpectrumAnalyzer {
     /// thread as every other WDSP call on this channel -- WDSP isn't
     /// confirmed thread-safe for concurrent access from multiple
     /// threads, so this can't be polled directly from the UI thread.
+    /// (threshold, hang level) of the AGC as WDSP reports them (deskHPSDR rx_set_agc: GetRXAAGCHangLevel, GetRXAAGCThresh(4096, rate)).
+    fn agc_levels(&self, rate: f64) -> (f64, f64) {
+        let (mut thresh, mut hang) = (0.0f64, 0.0f64);
+        unsafe {
+            wdsp::GetRXAAGCHangLevel(self.channel, &mut hang);
+            wdsp::GetRXAAGCThresh(self.channel, &mut thresh, 4096.0, rate);
+        }
+        (thresh, hang)
+    }
+
     fn meter_db(&self) -> f64 {
         let kind = if SMETER_PEAK.load(std::sync::atomic::Ordering::Relaxed) {
             wdsp::rxaMeterType_RXA_S_PK
@@ -2612,7 +2630,13 @@ fn run(
         };
         // See DemodParams::meter_calibration_db's own doc comment.
         let meter_db = analyzer.meter_db() + params.meter_calibration_db;
-        display.lock().unwrap().meter_db = meter_db;
+        {
+            let (t, h) = analyzer.agc_levels(sample_rate as f64);
+            let mut d = display.lock().unwrap();
+            d.meter_db = meter_db;
+            d.agc_thresh_db = t + params.meter_calibration_db;
+            d.agc_hang_db = h + params.meter_calibration_db;
+        }
         let cw_mode = matches!(params.mode, Mode::Cwl | Mode::Cwu);
         let cw_active = cw_mode && cw_decode_enabled.load(Ordering::Relaxed);
         if !cw_active {
