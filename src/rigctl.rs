@@ -543,6 +543,7 @@ fn handle_command(
             let text = cmd.get(op.len()..).unwrap_or("").trim();
             if !text.is_empty() {
                 cw_remote_pending.lock().unwrap().push_back(text.to_string());
+                crate::wake_ui();
             }
             "RPRT 0\n".to_string()
         }

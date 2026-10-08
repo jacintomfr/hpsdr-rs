@@ -809,12 +809,14 @@ fn connect(
     // than stalling the MIDI driver.
     let callback = move |_stamp_us: u64, bytes: &[u8], _: &mut ()| {
         let Some(ev) = parse_midi_bytes(bytes) else { return };
+        crate::cw_latency::midi_event();
         if let Ok(mut q) = events.lock() {
             if q.len() >= QUEUE_CAPACITY {
                 q.pop_front();
             }
             q.push_back(ev);
         }
+        crate::wake_ui();
     };
     input.connect(&port, "hpsdr-rs-midi-in", callback, ()).map_err(|e| e.to_string())
 }

@@ -2387,7 +2387,13 @@ impl CwTextGen {
             if self.current.is_none() && !aborting {
                 match self.elements.lock().unwrap().pop_front() {
                     Some((on, duration)) => self.current = Some((on, duration as i64)),
-                    None => self.busy.store(false, Ordering::Relaxed), // drained naturally
+                    None => {
+                        // drained naturally
+                        if self.busy.swap(false, Ordering::Relaxed) {
+                            crate::cw_latency::text_ended();
+                            crate::wake_ui();
+                        }
+                    }
                 }
             }
             let target: f32 = match self.current {
@@ -2419,6 +2425,7 @@ impl CwTextGen {
             self.current = None;
             self.elements.lock().unwrap().clear();
             self.busy.store(false, Ordering::Relaxed);
+            crate::wake_ui();
         }
     }
 }
@@ -2880,6 +2887,7 @@ fn run(
                     }
                     out.push_back(v);
                 }
+                crate::cw_latency::chunk_pushed();
             }
             {
                 let mut mon = tx_audio_monitor.lock().unwrap();
@@ -3759,6 +3767,7 @@ impl TxHandle {
     pub fn send_cw_text(&self, text: &str, speed_wpm: u32, weight: u32) {
         let elements = crate::cw_encoder::text_to_elements(text, speed_wpm, weight, self.duc_rate as u32);
         *self.cw_text_elements.lock().unwrap() = elements.into_iter().collect();
+        crate::cw_latency::send_started();
         // busy before active -- see CwTextGen's own doc comment on why
         // this generator's background thread only ever reads `active`
         // once `elements` is fully loaded, but the UI-visible `busy`
@@ -3795,6 +3804,7 @@ impl TxHandle {
         let was_busy = self.cw_text_busy.load(Ordering::Relaxed);
         self.cw_text_elements.lock().unwrap().extend(elements);
         if !was_busy {
+            crate::cw_latency::send_started();
             self.cw_text_busy.store(true, Ordering::Relaxed);
             self.cw_text_active.store(true, Ordering::Relaxed);
         }

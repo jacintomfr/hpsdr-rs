@@ -17,6 +17,7 @@ mod bootloader_ui;
 mod cat;
 mod config;
 mod cw_decoder;
+mod cw_latency;
 mod cw_encoder;
 mod debug_log;
 mod discovery;
@@ -29,8 +30,8 @@ mod ps_window;
 mod menu_window;
 mod toolbar_window;
 mod display_window;
-mod dsp_window;
 mod cw_window;
+mod dsp_window;
 mod peaks;
 mod agc_window;
 mod fnc_window;
@@ -2840,9 +2841,9 @@ struct ConnectedState {
     two_tone_after_noise: bool,
     /// The PureSignal menu (ps_window.rs) is open.
     ps_window_open: bool,
-    ps_hw_peak: f64,
     /// The CW menu (cw_window.rs) is open.
     cw_window_open: bool,
+    ps_hw_peak: f64,
     ps_mox_delay: f64,
     ps_loop_delay: f64,
     ps_tx_delay_ns: f64,
@@ -4040,8 +4041,7 @@ fn connect_to_device(device: Device, cfg: &Config) -> Result<ConnectedState, Str
             // audio_out (the main receiver's local-speaker queue), so
             // no new audio device/output is needed.
             let cw_sidetone = audio::CwSidetone::start(
-                Arc::clone(&spectrum.audio_out),
-                Arc::clone(&session.mox),
+                cfg.audio_output_device.as_deref(),
                 Arc::clone(&session.cw_mode_active),
                 Arc::clone(&session.cw_ptt_active),
                 Arc::clone(&session.cw_paddle_contacts),
@@ -4420,6 +4420,16 @@ fn connect_to_device(device: Device, cfg: &Config) -> Result<ConnectedState, Str
     }
 }
 
+/// The UI context, kept so background threads (radio receiver, MIDI, CAT) can wake the UI the moment a keying-related event arrives
+/// instead of waiting for the next timed repaint (100 ms at the default 10 fps): CW break-in (`cw_ptt_active` -> MOX), MIDI keys, CAT KY.
+static UI_WAKE_CTX: std::sync::OnceLock<egui::Context> = std::sync::OnceLock::new();
+
+pub(crate) fn wake_ui() {
+    if let Some(ctx) = UI_WAKE_CTX.get() {
+        ctx.request_repaint();
+    }
+}
+
 impl eframe::App for HpsdrApp {
     /// Fully transparent clear colour: only matters for the undecorated transparent VFO window (rounded corners); the main window is opaque and
     /// covered by its panels.
@@ -4431,6 +4441,7 @@ impl eframe::App for HpsdrApp {
     // https://github.com/emilk/egui/blob/main/CHANGELOG.md (0.35.0).
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let _prof = UiProfGuard(Instant::now(), ui.ctx().current_pass_index() == 0);
+        UI_WAKE_CTX.get_or_init(|| ui.ctx().clone());
         kiosk_keyboard::begin(ui.ctx());
         // Kiosk mode assumes an exact 1024x600 PHYSICAL pixel panel (see
         // main()'s ViewportBuilder::with_inner_size for that mode) --
@@ -4910,10 +4921,12 @@ impl eframe::App for HpsdrApp {
                     if radio_keyed {
                         if !connected.session.mox_active() {
                             connected.session.set_mox(true);
+                            cw_latency::mirror_set_mox(true);
                             connected.cw_break_in_active = true;
                         }
                     } else if connected.cw_break_in_active {
                         connected.session.set_mox(false);
+                        cw_latency::mirror_set_mox(false);
                         connected.cw_break_in_active = false;
                     }
                 } else if connected.cw_break_in_active {
@@ -5030,6 +5043,7 @@ impl eframe::App for HpsdrApp {
                         connected.midi_learn.captured = Some(ev);
                         break;
                     }
+                    cw_latency::midi_handled();
                     dispatch_midi_event(connected, ev, freq_hz, sample_rate, passband);
                 }
                 if let Some(f) = connected.toolbar_pending.take() {
@@ -6963,6 +6977,17 @@ impl eframe::App for HpsdrApp {
                             connected.spectrum_waterfall_ratio = r;
                         }
                     }
+                    // CW menu (deskHPSDR cw_menu.c), see cw_window.rs.
+                    if connected.cw_window_open {
+                        let (close_now, changed) = cw_window::cw_window(ui, connected);
+                        if changed {
+                            settings_changed = true;
+                        }
+                        if close_now {
+                            connected.cw_window_open = false;
+                        }
+                    }
+
                     // PureSignal menu (deskHPSDR ps_menu.c), see ps_window.rs. The Auto Attenuate timer runs even when it is closed.
                     ps_window::auto_tick(connected, ui.ctx());
                     ps_window::warning_window(ui, connected);
@@ -6977,17 +7002,6 @@ impl eframe::App for HpsdrApp {
                     }
 
                     // DSP window (deskHPSDR fft_menu.c), see dsp_window.rs.
-                    // CW menu (deskHPSDR cw_menu.c), see cw_window.rs.
-                    if connected.cw_window_open {
-                        let (close_now, changed) = cw_window::cw_window(ui, connected);
-                        if changed {
-                            settings_changed = true;
-                        }
-                        if close_now {
-                            connected.cw_window_open = false;
-                        }
-                    }
-
                     if connected.dsp_window_open {
                         let (close_now, changed) = dsp_window::dsp_window(ui, connected);
                         if changed {
@@ -8695,6 +8709,7 @@ impl eframe::App for HpsdrApp {
                                     }
                                     connected.session.set_mox(false);
                                     connected.cw_text_sending = false;
+                                    cw_latency::text_mox_off();
                                 }
                             }
 
@@ -11534,6 +11549,7 @@ Waterfall rebuilds: {prof_wf_n:.0}/s, {prof_wf_ms:.1} ms each."
                                                 | SettingsTab::RxMenu
                                                 | SettingsTab::Equalizer
                                                 | SettingsTab::Toolbar
+                                                | SettingsTab::Cw
                                         )
                                     {
                                         continue;
@@ -11549,7 +11565,6 @@ Waterfall rebuilds: {prof_wf_n:.0}/s, {prof_wf_ms:.1} ms each."
                                     // session launched a juice process.
                                     if tab == SettingsTab::Juice && connected.juice_console.is_none() {
                                         continue;
-                                                | SettingsTab::Cw
                                     }
                                     if ui
                                         .selectable_label(connected.settings_tab == tab, label)
@@ -19037,7 +19052,9 @@ fn render_status_row(
         connected.ps_was_correcting = correcting_now;
         // Under VFO A: "PS" while idle (ready), then while transmitting "PS Correcting" (green) or "PS no corr." (red). A fixed slot, so
         // nothing around it moves when the text changes.
-        let live = status.is_some() && connected.session.mox_active();
+        // PureSignal does not apply to CW (deskHPSDR skips the correction there), so in CWL/CWU the badge stays at the idle "PS".
+        let cw_mode = matches!(connected.spectrum.mode(), spectrum::Mode::Cwl | spectrum::Mode::Cwu);
+        let live = status.is_some() && connected.session.mox_active() && !cw_mode;
         let (color, hover) = match status {
             Some(s) if s.correcting => (
                 egui::Color32::from_rgb(80, 200, 80),

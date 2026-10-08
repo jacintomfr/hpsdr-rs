@@ -552,6 +552,7 @@ fn handle_command(
                 let text = suffix.strip_prefix(['0', '1']).unwrap_or(suffix).trim_end();
                 if !text.is_empty() {
                     cw_remote_pending.lock().unwrap().push_back(text.to_string());
+                    crate::wake_ui();
                 }
                 None
             }

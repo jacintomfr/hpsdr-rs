@@ -3247,6 +3247,9 @@ fn fill_tx_payload(
         }
         let i_sample = pacer.held_i;
         let q_sample = pacer.held_q;
+        if i_sample != 0 && crate::cw_latency::wire_pending() {
+            crate::cw_latency::iq_on_wire("P1, IQ popped for the packet");
+        }
         frame[b + 4] = (i_sample >> 8) as u8;
         frame[b + 6] = (q_sample >> 8) as u8;
         // See is_hermes_lite's own doc comment just above -- clearing
@@ -5928,14 +5931,21 @@ fn parse_iq_stream(
         let address = (c0 >> 3) & 0x1F;
         // See RadioSession::cw_ptt_active's doc comment -- bit 0
         // ("local_ptt" in piHPSDR), NOT the dot/dash contact bits.
-        cw_ptt_active.store(c0 & 0x01 != 0, Ordering::Relaxed);
+        let ptt_now = c0 & 0x01 != 0;
+        if cw_ptt_active.swap(ptt_now, Ordering::Relaxed) != ptt_now {
+            crate::cw_latency::ptt_edge(ptt_now);
+            // Wake the UI at once so the break-in MOX mirror does not wait for the next timed repaint.
+            crate::wake_ui();
+        }
         // See RadioSession::cw_paddle_contacts's doc comment -- P1's
         // raw bit positions are SWAPPED relative to P2's (confirmed
         // against piHPSDR's old_protocol.c: bit 2 = dot, bit 1 = dash),
         // normalized here to bit 0 = dot, bit 1 = dash either way.
         let dot = (c0 >> 2) & 0x01;
         let dash = (c0 >> 1) & 0x01;
-        cw_paddle_contacts.store(dot | (dash << 1), Ordering::Relaxed);
+        if cw_paddle_contacts.swap(dot | (dash << 1), Ordering::Relaxed) != (dot | (dash << 1)) {
+            crate::cw_latency::paddle_edge(dot | (dash << 1));
+        }
         if address == 1 {
             let forward = u16::from_be_bytes([frame[6], frame[7]]) as u32;
             // ROOT CAUSE FIX for a real HL2 report (meter settling at a
@@ -7922,7 +7932,11 @@ fn p2_receiver_loop(
                         // RadioSession::cw_ptt_active's doc comment. Byte
                         // 4 bit 0x01 ("local_ptt" in piHPSDR), NOT the
                         // dot/dash contact bits (0x02/0x04).
-                        cw_ptt_active.store(buf[4] & 0x01 != 0, Ordering::Relaxed);
+                        let ptt_now = buf[4] & 0x01 != 0;
+                        if cw_ptt_active.swap(ptt_now, Ordering::Relaxed) != ptt_now {
+                            crate::cw_latency::ptt_edge(ptt_now);
+                            crate::wake_ui();
+                        }
                         // See RadioSession::cw_paddle_contacts's doc
                         // comment -- P2's raw bit positions (bit 1 =
                         // dot, bit 2 = dash) already match the
@@ -7930,7 +7944,9 @@ fn p2_receiver_loop(
                         // unlike P1.
                         let dot = (buf[4] >> 1) & 0x01;
                         let dash = (buf[4] >> 2) & 0x01;
-                        cw_paddle_contacts.store(dot | (dash << 1), Ordering::Relaxed);
+                        if cw_paddle_contacts.swap(dot | (dash << 1), Ordering::Relaxed) != (dot | (dash << 1)) {
+                            crate::cw_latency::paddle_edge(dot | (dash << 1));
+                        }
                     }
                     // External TxInhibit/AutoTune inputs -- byte 59, active
                     // low, confirmed against deskHPSDR's new_protocol.c.
@@ -8197,6 +8213,9 @@ fn p2_tx_iq_loop(
             // dropout with no clue left behind to tell them apart.
             eprintln!("tx: DUC IQ socket.send_to failed, stopping TX IQ streaming: {e}");
             return; // socket closed or radio gone; stop this thread
+        }
+        if warmed_up {
+            crate::cw_latency::iq_on_wire("P2, first real DUC packet sent");
         }
         if starved {
             starved_packets_this_window += 1;

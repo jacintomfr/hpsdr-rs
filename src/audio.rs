@@ -322,6 +322,26 @@ impl AudioOutput {
         device_name: Option<&str>,
         expect_silence: Option<Arc<AtomicBool>>,
     ) -> Result<Self, String> {
+        Self::start_inner(buffer, device_name, expect_silence, false, None)
+    }
+
+    /// Output stream for the PC CW sidetone only: no jitter-buffer prime (the first queued sample plays at the next callback) and an empty
+    /// queue is plain silence -- not an underrun, no slew limiting, nothing counted. Everything else is `start`.
+    pub fn start_sidetone(
+        buffer: Arc<Mutex<VecDeque<(f32, f32)>>>,
+        device_name: Option<&str>,
+        fixed_frames: Option<u32>,
+    ) -> Result<Self, String> {
+        Self::start_inner(buffer, device_name, None, true, fixed_frames)
+    }
+
+    fn start_inner(
+        buffer: Arc<Mutex<VecDeque<(f32, f32)>>>,
+        device_name: Option<&str>,
+        expect_silence: Option<Arc<AtomicBool>>,
+        sidetone: bool,
+        fixed_frames: Option<u32>,
+    ) -> Result<Self, String> {
         let host = cpal::default_host();
         let device = match device_name {
             Some(name) => find_device(name, true)
@@ -338,7 +358,10 @@ impl AudioOutput {
         let config = cpal::StreamConfig {
             channels: OUTPUT_CHANNELS,
             sample_rate: OUTPUT_SAMPLE_RATE,
-            buffer_size: cpal::BufferSize::Default,
+            buffer_size: match fixed_frames {
+                Some(n) => cpal::BufferSize::Fixed(n),
+                None => cpal::BufferSize::Default,
+            },
         };
 
         // Output slew limiter: caps how fast (l, r) can change from one
@@ -402,7 +425,7 @@ impl AudioOutput {
                 // binaural is on (genuinely different L/R) or off
                 // (L==R, same as this project's own former duplicated-
                 // mono behavior).
-                move |data: &mut [f32], _: &cpal::OutputCallbackInfo| {
+                move |data: &mut [f32], info: &cpal::OutputCallbackInfo| {
                     let mut buf = buffer.lock().unwrap();
                     let depth = buf.len();
                     win_min = win_min.min(depth);
@@ -411,6 +434,23 @@ impl AudioOutput {
                         cb_min_depth.store(win_min as u64, Ordering::Relaxed);
                         win_min = usize::MAX;
                         win_frames = 0;
+                    }
+                    if sidetone {
+                        let mut idx = 0usize;
+                        for frame in data.chunks_mut(OUTPUT_CHANNELS as usize) {
+                            let (l, r) = buf.pop_front().unwrap_or((0.0, 0.0));
+                            if (l != 0.0 || r != 0.0) && crate::cw_latency::sidetone_pending() {
+                                let ts = info.timestamp();
+                                let dev = ts.playback.duration_since(&ts.callback).map(|d| d.as_nanos() as u64).unwrap_or(0);
+                                crate::cw_latency::sidetone_audible(dev, idx);
+                            }
+                            idx += 1;
+                            if let [left, right, ..] = frame {
+                                *left = l;
+                                *right = r;
+                            }
+                        }
+                        return;
                     }
                     if !primed && depth >= prime_frames() {
                         primed = true;
@@ -506,6 +546,9 @@ impl AudioOutput {
 /// just some, consistent with near-constant chopping rather than an
 /// occasional real desync.
 const CW_SIDETONE_BUFFER_CAPACITY: usize = 14_400;
+
+/// Device buffer (frames at 48 kHz) requested for the sidetone output stream: 256 = 5.3 ms (deskHPSDR uses a 256-frame period too).
+const CW_SIDETONE_DEVICE_FRAMES: u32 = 256;
 
 /// How long the sidetone's on/off envelope takes to ramp fully up or
 /// down, in samples at OUTPUT_SAMPLE_RATE. Same purpose as piHPSDR's own
@@ -705,6 +748,8 @@ pub struct CwSidetone {
     pub enabled: Arc<AtomicBool>,
     stop: Arc<AtomicBool>,
     thread: Option<thread::JoinHandle<()>>,
+    /// The sidetone's own output stream; kept alive as long as the sidetone.
+    _output: Option<AudioOutput>,
 }
 
 impl CwSidetone {
@@ -715,8 +760,7 @@ impl CwSidetone {
     /// it can share the queue with spectrum.rs's real RX-audio producer
     /// without a dedicated output device or a mixing stage.
     pub fn start(
-        audio_out: Arc<Mutex<VecDeque<(f32, f32)>>>,
-        mox: Arc<AtomicBool>,
+        device_name: Option<&str>,
         cw_mode_active: Arc<AtomicBool>,
         cw_ptt_active: Arc<AtomicBool>,
         cw_paddle_contacts: Arc<AtomicU8>,
@@ -726,19 +770,24 @@ impl CwSidetone {
         let stop = Arc::new(AtomicBool::new(false));
         let thread_enabled = Arc::clone(&enabled);
         let thread_stop = Arc::clone(&stop);
+        // The sidetone has its OWN queue and output stream (no prime gate, no sharing with the RX audio queue), so it needs neither the
+        // MOX flag nor a queue flush on every key edge.
+        let audio_out: Arc<Mutex<VecDeque<(f32, f32)>>> = Arc::new(Mutex::new(VecDeque::new()));
+        // A small fixed buffer keeps the device's own playback delay low (the default is ~42 ms on the Pi, measured); fall back to the default
+        // buffer if the device refuses it.
+        let output = match AudioOutput::start_sidetone(Arc::clone(&audio_out), device_name, Some(CW_SIDETONE_DEVICE_FRAMES))
+            .or_else(|_| AudioOutput::start_sidetone(Arc::clone(&audio_out), device_name, None))
+        {
+            Ok(o) => Some(o),
+            Err(e) => {
+                eprintln!("cw sidetone output unavailable: {e}");
+                None
+            }
+        };
         let thread = thread::spawn(move || {
-            run(
-                audio_out,
-                mox,
-                cw_mode_active,
-                cw_ptt_active,
-                cw_paddle_contacts,
-                cw_keyer,
-                thread_enabled,
-                thread_stop,
-            );
+            run(audio_out, cw_mode_active, cw_ptt_active, cw_paddle_contacts, cw_keyer, thread_enabled, thread_stop);
         });
-        Self { enabled, stop, thread: Some(thread) }
+        Self { enabled, stop, thread: Some(thread), _output: output }
     }
 
     pub fn stop(&mut self) {
@@ -820,7 +869,6 @@ impl Drop for CwSidetone {
 /// comment on what's deliberately narrower than the reference).
 fn run(
     audio_out: Arc<Mutex<VecDeque<(f32, f32)>>>,
-    mox: Arc<AtomicBool>,
     cw_mode_active: Arc<AtomicBool>,
     cw_ptt_active: Arc<AtomicBool>,
     cw_paddle_contacts: Arc<AtomicU8>,
@@ -831,7 +879,6 @@ fn run(
     let mut last = Instant::now();
     let mut phase: f32 = 0.0;
     let mut gain: f32 = 0.0;
-    let mut was_keyed = false;
     let mut iambic = IambicSimulator::new();
     while !stop.load(Ordering::Relaxed) {
         // Short tick (2ms): tighter envelope/edge timing than the
@@ -856,8 +903,8 @@ fn run(
         // starting, a one-time transition delay, not ongoing jitter --
         // once active it drops straight back to the tight 2ms cadence
         // this loop always used.
-        let could_key =
-            enabled.load(Ordering::Relaxed) && mox.load(Ordering::Relaxed) && cw_mode_active.load(Ordering::Relaxed);
+        // No `mox` here any more: the sidetone has its own output, and `mox` is raised from the UI frame (late) after the radio keys.
+        let could_key = enabled.load(Ordering::Relaxed) && cw_mode_active.load(Ordering::Relaxed);
         let idle = !could_key && gain <= 0.0;
         thread::sleep(Duration::from_millis(if idle { 20 } else { 2 }));
         let now = Instant::now();
@@ -893,19 +940,9 @@ fn run(
         } else {
             cw_ptt_active.load(Ordering::Relaxed)
         };
-        let keyed =
-            enabled.load(Ordering::Relaxed) && mox.load(Ordering::Relaxed) && cw_mode_active.load(Ordering::Relaxed) && radio_keyed;
-        if keyed != was_keyed {
-            // Any transition -- see this function's own doc comment
-            // (bug #2): drop anything already queued (stale RX audio
-            // from just before mox went up, or this generator's own
-            // backlog from before the transition) so only what's
-            // generated AFTER this point -- the fresh tone on a rising
-            // edge, or the fresh ramp-down on a falling edge -- is ever
-            // heard following it.
-            audio_out.lock().unwrap().clear();
-        }
-        was_keyed = keyed;
+        let keyed = could_key && radio_keyed;
+        // Own queue, nothing else writes to it: no flush on key edges needed; a tick produces ~2 ms of samples and the output stream
+        // drains them in real time, so the queue stays near empty.
         let target = if keyed { 1.0 } else { 0.0 };
         let freq_hz = cw_keyer.sidetone_freq_hz.load(Ordering::Relaxed).max(1) as f32;
         // Same 0-255 full-byte range as P2's own sidetone_volume byte
@@ -916,6 +953,9 @@ fn run(
         let amplitude = (cw_keyer.sidetone_volume.load(Ordering::Relaxed).min(255) as f32) / 255.0;
         let step = 2.0 * std::f32::consts::PI * freq_hz / OUTPUT_SAMPLE_RATE as f32;
         let ramp_step = 1.0 / CW_SIDETONE_RAMP_SAMPLES;
+        if keyed && gain <= 0.0 {
+            crate::cw_latency::sidetone_queued();
+        }
         let mut samples: Vec<(f32, f32)> = Vec::with_capacity(samples_needed);
         for _ in 0..samples_needed {
             if gain < target {
