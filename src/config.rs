@@ -1160,6 +1160,9 @@ pub struct TxUiExtra {
     pub peak_line_col: [f32; 4],
     pub tx_pan_col: [f32; 4],
     pub tx_extra: Option<crate::tx::TxExtra>,
+    /// PureSignal menu: OneShot and PS Stability (0 Strict, 1 Medium, 2 Relaxed), saved like deskHPSDR (ps_oneshot, ps_tolerance_mode).
+    pub ps_oneshot: bool,
+    pub ps_stability: u8,
 }
 
 impl Default for TxUiExtra {
@@ -1192,6 +1195,8 @@ impl Default for TxUiExtra {
             peak_line_col: [0.70, 0.70, 0.70, 1.00],
             tx_pan_col: [0.0, 1.0, 0.0, 1.0],
             tx_extra: None,
+            ps_oneshot: false,
+            ps_stability: 2,
         }
     }
 }

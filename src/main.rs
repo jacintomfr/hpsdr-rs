@@ -25,6 +25,7 @@ mod eq_curve;
 mod eq_window;
 mod noise_window;
 mod pa_window;
+mod ps_window;
 mod menu_window;
 mod toolbar_window;
 mod display_window;
@@ -2801,6 +2802,10 @@ struct ConnectedState {
     /// See tx::PsParams::oneshot's doc comment. Not persisted, same as
     /// ps_enabled -- always starts false (continuous) each session.
     ps_oneshot: bool,
+    /// PureSignal menu "PS Stability": 0 Strict, 1 Medium, 2 Relaxed (see tx::PsParams::tolerance_mode).
+    ps_stability: u8,
+    /// The PureSignal menu (ps_window.rs) is open.
+    ps_window_open: bool,
     ps_hw_peak: f64,
     ps_mox_delay: f64,
     ps_loop_delay: f64,
@@ -3889,6 +3894,8 @@ fn connect_to_device(device: Device, cfg: &Config) -> Result<ConnectedState, Str
                     tx_handle.set_ps_mox_delay(ps_mox_delay);
                     tx_handle.set_ps_loop_delay(ps_loop_delay);
                     tx_handle.set_ps_tx_delay_ns(ps_tx_delay_ns);
+                    tx_handle.set_ps_oneshot(cfg.tx_ui.ps_oneshot);
+                    tx_handle.set_ps_tolerance(cfg.tx_ui.ps_stability);
                     if let Some(v) = cfg.tx_eq {
                         tx_handle.set_eq(v);
                     }
@@ -4264,7 +4271,9 @@ fn connect_to_device(device: Device, cfg: &Config) -> Result<ConnectedState, Str
                 mic_gain,
                 tci_tx_gain,
                 ps_enabled,
-                ps_oneshot: false,
+                ps_oneshot: cfg.tx_ui.ps_oneshot,
+                ps_stability: cfg.tx_ui.ps_stability.min(2),
+                ps_window_open: false,
                 ps_hw_peak,
                 ps_mox_delay,
                 ps_loop_delay,
@@ -4674,7 +4683,7 @@ impl eframe::App for HpsdrApp {
                             if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open("/tmp/hpsdr_perf.log") {
                                 let _ = writeln!(
                                     f,
-                                    "ui_fps={ui_fps:.1} passes={passes:.1} ui_ms={ui_ms:.1} wf_rebuilds={wf_n:.1} | dsp_chunks/s={} disp_rev/s={} | gap={gap:.1} proc={proc_ms:.1} q={q} set={set:.1} zp={zp:.1} feed={feed:.1} | sr={} zoom={} mode={:?} | mox={} audio_underruns={} fwd_raw={} rev_raw={} fwd_sm={:.0} rev_sm={:.0} swr={:.2} groups={:?}",
+                                    "ui_fps={ui_fps:.1} passes={passes:.1} ui_ms={ui_ms:.1} wf_rebuilds={wf_n:.1} | dsp_chunks/s={} disp_rev/s={} | gap={gap:.1} proc={proc_ms:.1} q={q} set={set:.1} zp={zp:.1} feed={feed:.1} | sr={} zoom={} mode={:?} | mox={} audio_underruns={} fwd_raw={} rev_raw={} fwd_sm={:.0} rev_sm={:.0} swr={:.2} groups={:?} | pa: watts={} max={} gain={:.2} adj={:+.2} drive={} | ps: on={} fb_lvl={} corr={} state={} cnt={} maxtx={:.3} att={} oneshot={}",
                                     chunks.wrapping_sub(last.1),
                                     (rev as u64).wrapping_sub(last.2),
                                     connected.sample_rate,
@@ -4688,6 +4697,19 @@ impl eframe::App for HpsdrApp {
                                     connected.smoothed_rev_power,
                                     connected.smoothed_swr,
                                     groups.map(|g| (g * 10.0).round() / 10.0),
+                                    connected.session.tx_power_watts.load(Ordering::Relaxed),
+                                    connected.max_tx_power_watts,
+                                    f32::from_bits(connected.session.pa_gain_db.load(Ordering::Relaxed)),
+                                    resolved_pa_drive_adjust_db(&connected.pa_drive_adjust, connected.session.tx_frequency_hz.load(Ordering::Relaxed), connected.session.tx_power_watts.load(Ordering::Relaxed), connected.max_tx_power_watts),
+                                    radio::drive_byte_for_watts(connected.session.tx_power_watts.load(Ordering::Relaxed) as f32, f32::from_bits(connected.session.pa_gain_db.load(Ordering::Relaxed))),
+                                    connected.puresignal_enabled as u8,
+                                    connected.tx_handle.as_ref().map(|t| t.ps_status.lock().unwrap().feedback_level).unwrap_or(-1),
+                                    connected.tx_handle.as_ref().map(|t| t.ps_status.lock().unwrap().correcting as u8).unwrap_or(0),
+                                    connected.tx_handle.as_ref().map(|t| t.ps_status.lock().unwrap().state).unwrap_or(-1),
+                                    connected.tx_handle.as_ref().map(|t| t.ps_status.lock().unwrap().cal_count).unwrap_or(-1),
+                                    connected.tx_handle.as_ref().map(|t| t.ps_status.lock().unwrap().max_tx).unwrap_or(0.0),
+                                    connected.session.ps_tx_attenuation.load(Ordering::Relaxed) as i32,
+                                    connected.ps_oneshot as u8,
                                 );
                             }
                             last.1 = chunks;
@@ -6884,6 +6906,18 @@ impl eframe::App for HpsdrApp {
                             connected.spectrum_waterfall_ratio = r;
                         }
                     }
+                    // PureSignal menu (deskHPSDR ps_menu.c), see ps_window.rs. The Auto Attenuate timer runs even when it is closed.
+                    ps_window::auto_tick(connected, ui.ctx());
+                    if connected.ps_window_open {
+                        let (close_now, changed) = ps_window::ps_window(ui, connected);
+                        if changed {
+                            settings_changed = true;
+                        }
+                        if close_now {
+                            connected.ps_window_open = false;
+                        }
+                    }
+
                     // DSP window (deskHPSDR fft_menu.c), see dsp_window.rs.
                     if connected.dsp_window_open {
                         let (close_now, changed) = dsp_window::dsp_window(ui, connected);
@@ -13684,6 +13718,8 @@ Waterfall rebuilds: {prof_wf_n:.0}/s, {prof_wf_ms:.1} ms each."
                                                     tx_handle.set_ps_mox_delay(connected.ps_mox_delay);
                                                     tx_handle.set_ps_loop_delay(connected.ps_loop_delay);
                                                     tx_handle.set_ps_tx_delay_ns(connected.ps_tx_delay_ns);
+                                                    tx_handle.set_ps_oneshot(connected.ps_oneshot);
+                                                    tx_handle.set_ps_tolerance(connected.ps_stability);
                                                     // See connect_to_device's identical restore --
                                                     // this rebuild also opens a fresh WDSP channel
                                                     // with no calibration history of its own.
@@ -14491,96 +14527,8 @@ Waterfall rebuilds: {prof_wf_n:.0}/s, {prof_wf_ms:.1} ms each."
                                                      TX audio) and MOX active to have anything to act on.",
                                                 );
 
-                                                // Ported from piHPSDR/deskHPSDR's ps_menu.c
-                                                // (transmitter->auto_on handling) -- see this
-                                                // session's PureSignal investigation,
-                                                // memory/wdsp_210_port.md, for why the underlying
-                                                // attenuation value/target (~152) and the
-                                                // reset-then-recalibrate-after-a-change behavior
-                                                // are exactly what that reference does, just
-                                                // reusing this project's own already-fixed
-                                                // "Calibrate Now" (tx.ps_calibrate()) for the
-                                                // reset+resume step instead of a separate hand-
-                                                // rolled state machine.
-                                                if connected.ps_auto_attenuate && connected.session.mox_active() {
-                                                    const AUTO_ATTEN_TARGET: f64 = 152.293;
-                                                    const AUTO_ATTEN_LOW: i32 = 140;
-                                                    const AUTO_ATTEN_HIGH: i32 = 165;
-                                                    const AUTO_ATTEN_MIN: i32 = 0;
-                                                    const AUTO_ATTEN_MAX: i32 = 31;
-                                                    // How long to wait before re-evaluating an
-                                                    // unchanged feedback_level as if it were fresh.
-                                                    // GetPSInfo's info[4] only refreshes once per
-                                                    // completed WDSP calibration cycle (calcc.c's
-                                                    // calc()), not continuously -- see
-                                                    // ConnectedState::auto_atten_last_seen_feedback's
-                                                    // doc comment for why this can't just check
-                                                    // every frame.
-                                                    const AUTO_ATTEN_RECHECK: Duration = Duration::from_secs(3);
-
-                                                    let feedback = status.feedback_level;
-                                                    let now = Instant::now();
-                                                    let changed =
-                                                        connected.auto_atten_last_seen_feedback != Some(feedback);
-                                                    let due = connected
-                                                        .auto_atten_last_check
-                                                        .map(|t| now.duration_since(t) >= AUTO_ATTEN_RECHECK)
-                                                        .unwrap_or(true);
-                                                    if changed || due {
-                                                        connected.auto_atten_last_seen_feedback = Some(feedback);
-                                                        connected.auto_atten_last_check = Some(now);
-
-                                                        let current = connected
-                                                            .session
-                                                            .ps_tx_attenuation
-                                                            .load(Ordering::Relaxed)
-                                                            as i32;
-                                                        if (feedback > AUTO_ATTEN_HIGH && current < AUTO_ATTEN_MAX)
-                                                            || (feedback < AUTO_ATTEN_LOW
-                                                                && current > AUTO_ATTEN_MIN)
-                                                        {
-                                                            // One-step dB correction (not iterative
-                                                            // guessing) -- 20*log10(ratio) is exactly
-                                                            // how many dB of attenuation change would
-                                                            // move `feedback` to the target, since
-                                                            // feedback level scales linearly with the
-                                                            // (un-attenuated) RF amplitude. Special-
-                                                            // cased +-15dB jumps for very strong/weak
-                                                            // readings match piHPSDR's own handling of
-                                                            // ADC-clipping/overflow at the extremes,
-                                                            // where the log formula's input isn't
-                                                            // trustworthy anyway.
-                                                            let delta_att = if feedback > 275 {
-                                                                15
-                                                            } else if feedback < 25 {
-                                                                -15
-                                                            } else {
-                                                                (20.0
-                                                                    * (feedback as f64 / AUTO_ATTEN_TARGET).log10())
-                                                                .round()
-                                                                    as i32
-                                                            };
-                                                            let new_atten = (current + delta_att)
-                                                                .clamp(AUTO_ATTEN_MIN, AUTO_ATTEN_MAX);
-                                                            if new_atten != current {
-                                                                connected
-                                                                    .session
-                                                                    .ps_tx_attenuation
-                                                                    .store(new_atten as u32, Ordering::Relaxed);
-                                                                // Old collected samples are from the
-                                                                // PREVIOUS attenuation -- not valid to
-                                                                // mix with new ones, so force a fresh
-                                                                // attempt exactly like clicking
-                                                                // "Calibrate Now" (which, since this
-                                                                // session's fix, correctly resumes in
-                                                                // whichever mode -- Running/OneShot --
-                                                                // is currently selected).
-                                                                tx.ps_calibrate();
-                                                                settings_changed = true;
-                                                            }
-                                                        }
-                                                    }
-                                                }
+                                                // The Auto Attenuate algorithm itself now runs every frame in ps_window::auto_tick (the PureSignal menu), so it
+                                                // also works when this tab is not shown.
                                             }
 
                                             ui.add_space(4.0);
@@ -15549,6 +15497,8 @@ Waterfall rebuilds: {prof_wf_n:.0}/s, {prof_wf_ms:.1} ms each."
                         },
                         tx_ui: config::TxUiExtra {
                             tx_extra: connected.tx_handle.as_ref().map(|t| t.tx_extra()),
+                            ps_oneshot: connected.ps_oneshot,
+                            ps_stability: connected.ps_stability,
                             ..connected.tx_ui
                         },
                         mic_gain: Some(connected.mic_gain),

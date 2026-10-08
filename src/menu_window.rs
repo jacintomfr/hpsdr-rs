@@ -19,6 +19,8 @@ const NOT_AVAILABLE: &str = "Not available in this version.";
 enum Target {
     Sdr,
     Dsp,
+    /// The PureSignal menu (ps_window.rs).
+    Ps,
     Toolbar,
     Vfo,
     Rx,
@@ -76,7 +78,7 @@ const GRID: [[Option<(&str, Target)>; COLS]; 6] = [
         Some(("Meter", Target::Meter)),
         Some(("Mode", Target::Mode)),
         Some(("AGC", Target::Agc)),
-        Some(("PS", Target::Tab(SettingsTab::PureSignal))),
+        Some(("PS", Target::Ps)),
         Some(("OC Output", Target::Tab(SettingsTab::OpenCollector))),
         None,
     ],
@@ -101,6 +103,7 @@ pub(crate) fn close_overlays(c: &mut ConnectedState) {
     c.toolbar_window_open = false;
     c.display_window_open = false;
     c.dsp_window_open = false;
+    c.ps_window_open = false;
     c.noise_window_open = false;
     c.sdr_window_open = false;
     c.eq_window_open = false;
@@ -121,6 +124,7 @@ pub(crate) fn any_overlay_open(c: &ConnectedState) -> bool {
         || c.toolbar_window_open
         || c.display_window_open
         || c.dsp_window_open
+        || c.ps_window_open
         || c.noise_window_open
         || c.sdr_window_open
         || c.eq_window_open
@@ -176,6 +180,12 @@ fn open(c: &mut ConnectedState, target: Target) {
         Target::Toolbar => c.toolbar_window_open = true,
         Target::Display => c.display_window_open = true,
         Target::Dsp => c.dsp_window_open = true,
+        Target::Ps => {
+            crate::ps_window::show_full();
+            if c.tx_handle.is_some() {
+                c.ps_window_open = true;
+            }
+        }
         Target::Noise => c.noise_window_open = true,
         Target::Eq => c.eq_window_open = true,
         Target::Vox => c.vox_window_open = true,
