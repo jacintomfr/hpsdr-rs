@@ -98,6 +98,8 @@ impl ToolbarFn {
                 MidiAction::ReportPlay => "PLAY",
                 MidiAction::RecordWav => "RECORD",
                 MidiAction::Tune => "TUNE",
+                MidiAction::TuneFull => "TUNE F",
+                MidiAction::TuneMemory => "TUNE M",
                 MidiAction::Split => "SPLIT",
                 MidiAction::RitToggle => "RIT",
                 MidiAction::RitClear => "RIT CLR",

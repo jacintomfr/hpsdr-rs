@@ -26,6 +26,7 @@ mod discovery_ui;
 mod eq_curve;
 mod eq_window;
 mod noise_window;
+mod oc_window;
 mod pa_window;
 mod ps_window;
 mod menu_window;
@@ -1123,6 +1124,19 @@ fn dispatch_midi_binding(
         // tune_may_start excludes Two-Tone/CW-text-sending and an
         // externally-keyed transmission.
         MidiAction::Tune => tune_set(connected, !connected.tune_active),
+        // deskHPSDR TUNE_FULL / TUNE_MEMORY: arm the next TUNE as a Full or Memory tune (OC Output window times).
+        MidiAction::TuneFull => {
+            if connected.tx_handle.is_some() && !ev.off {
+                connected.tune_full_armed = !connected.tune_full_armed;
+                connected.tune_memory_armed = false;
+            }
+        }
+        MidiAction::TuneMemory => {
+            if connected.tx_handle.is_some() && !ev.off {
+                connected.tune_memory_armed = !connected.tune_memory_armed;
+                connected.tune_full_armed = false;
+            }
+        }
         MidiAction::Split => connected.split = !connected.split,
         MidiAction::RitToggle => {
             connected.rit_enabled = !connected.rit_enabled;
@@ -2850,6 +2864,17 @@ struct ConnectedState {
     ps_window_open: bool,
     /// The CW menu (cw_window.rs) is open.
     cw_window_open: bool,
+    /// The OC Output window (oc_window.rs).
+    oc_window_open: bool,
+    /// deskHPSDR OCfull_tune_time / OCmemory_tune_time (ms): how long the Tune OC outputs stay on after an armed TUNE. 0 = no limit.
+    oc_full_tune_ms: u32,
+    oc_memory_tune_ms: u32,
+    /// TUNE edge detection for the two times above, and the end of the current armed window.
+    oc_prev_tune: bool,
+    oc_tune_deadline: Option<Instant>,
+    /// deskHPSDR full_tune / memory_tune: which kind the next TUNE is (mutually exclusive; toolbar / MIDI / the OC window). Not saved.
+    tune_full_armed: bool,
+    tune_memory_armed: bool,
     ps_hw_peak: f64,
     ps_mox_delay: f64,
     ps_loop_delay: f64,
@@ -4329,6 +4354,13 @@ fn connect_to_device(device: Device, cfg: &Config) -> Result<ConnectedState, Str
                 two_tone_after_noise: false,
                 ps_window_open: false,
                 cw_window_open: false,
+                oc_window_open: false,
+                oc_full_tune_ms: cfg.oc_full_tune_time,
+                oc_memory_tune_ms: cfg.oc_memory_tune_time,
+                oc_prev_tune: false,
+                oc_tune_deadline: None,
+                tune_full_armed: false,
+                tune_memory_armed: false,
                 ps_hw_peak,
                 ps_mox_delay,
                 ps_loop_delay,
@@ -5357,7 +5389,31 @@ impl eframe::App for HpsdrApp {
                     None => band_for_frequency(freq_hz).map(|b| b.name).unwrap_or("Gen"),
                 };
                 let oc = connected.oc_settings.get(current_band_name).copied().unwrap_or_default();
-                let oc_tx_resolved = if connected.tune_active { oc.tx | connected.oc_tune } else { oc.tx };
+                // deskHPSDR radio.c / old_protocol.c: a TUNE armed as Full or Memory starts a window (OCfull_tune_time / OCmemory_tune_time ms);
+                // with OCmemory_tune_time != 0 the Tune outputs are only on inside it. Both 0 (default here): on for the whole TUNE.
+                let tune_rising = connected.tune_active && !connected.oc_prev_tune;
+                connected.oc_prev_tune = connected.tune_active;
+                if tune_rising {
+                    let now = Instant::now();
+                    if connected.tune_full_armed && connected.oc_full_tune_ms != 0 {
+                        connected.oc_tune_deadline = Some(now + Duration::from_millis(connected.oc_full_tune_ms as u64));
+                    }
+                    if connected.tune_memory_armed && connected.oc_memory_tune_ms != 0 {
+                        connected.oc_tune_deadline = Some(now + Duration::from_millis(connected.oc_memory_tune_ms as u64));
+                    }
+                }
+                let oc_tune_now = if connected.oc_memory_tune_ms != 0 {
+                    match connected.oc_tune_deadline {
+                        Some(d) if Instant::now() < d => {
+                            ui.ctx().request_repaint_after(Duration::from_millis(50));
+                            connected.oc_tune
+                        }
+                        _ => 0,
+                    }
+                } else {
+                    connected.oc_tune
+                };
+                let oc_tx_resolved = if connected.tune_active { oc.tx | oc_tune_now } else { oc.tx };
                 connected.session.oc_rx.store(oc.rx, std::sync::atomic::Ordering::Relaxed);
                 connected.session.oc_tx.store(oc_tx_resolved, std::sync::atomic::Ordering::Relaxed);
                 // RX/TX antenna -- see AntennaMask's doc comment. Same
@@ -6999,6 +7055,17 @@ impl eframe::App for HpsdrApp {
                             connected.spectrum_waterfall_ratio = r;
                         }
                     }
+                    // OC Output window (deskHPSDR oc_menu.c), see oc_window.rs.
+                    if connected.oc_window_open {
+                        let (close_now, changed) = oc_window::oc_window(ui, connected);
+                        if changed {
+                            settings_changed = true;
+                        }
+                        if close_now {
+                            connected.oc_window_open = false;
+                        }
+                    }
+
                     // CW menu (deskHPSDR cw_menu.c), see cw_window.rs.
                     if connected.cw_window_open {
                         let (close_now, changed) = cw_window::cw_window(ui, connected);
@@ -14222,6 +14289,13 @@ Waterfall rebuilds: {prof_wf_n:.0}/s, {prof_wf_ms:.1} ms each."
                                     connected.xvtr_edit = Some(edit);
                                 }
                                 SettingsTab::OpenCollector => {
+                                    // The kiosk has its own OC Output window (oc_window.rs), opened straight from the tab.
+                                    if lcd_kiosk_mode() {
+                                        connected.oc_window_open = true;
+                                        connected.show_settings_window = false;
+                                        connected.settings_tab = SettingsTab::About;
+                                        ui.ctx().request_repaint_of(egui::ViewportId::ROOT);
+                                    } else {
                                     // See OcMask's doc comment. Board-
                                     // agnostic (no per-board gating) --
                                     // harmless on boards without the
@@ -14336,6 +14410,7 @@ Waterfall rebuilds: {prof_wf_n:.0}/s, {prof_wf_ms:.1} ms each."
                                         }
                                         ui.end_row();
                                     });
+                                    }
                                 }
                                 SettingsTab::Antenna => {
                                     // See AntennaMask's doc comment. Board-
@@ -15882,6 +15957,8 @@ Waterfall rebuilds: {prof_wf_n:.0}/s, {prof_wf_ms:.1} ms each."
                         active_xvtr: connected.active_xvtr.clone(),
                         oc_settings: connected.oc_settings.clone(),
                         oc_tune: connected.oc_tune,
+                        oc_full_tune_time: connected.oc_full_tune_ms,
+                        oc_memory_tune_time: connected.oc_memory_tune_ms,
                         autogain_enabled: Some(connected.autogain_enabled),
                         autogain_time_enabled: Some(connected.autogain_time_enabled),
                         antenna_settings: connected.antenna_settings.clone(),
@@ -18516,6 +18593,8 @@ fn toolbar_fn_active(connected: &ConnectedState, f: toolbar::ToolbarFn) -> bool 
         ToolbarFn::Midi(MidiAction::ReportPlay) => connected.spectrum.report_recorder.is_playing(),
         ToolbarFn::Midi(MidiAction::RecordWav) => connected.spectrum.recorder.is_enabled(),
         ToolbarFn::Midi(MidiAction::Tune) => connected.tune_active,
+        ToolbarFn::Midi(MidiAction::TuneFull) => connected.tune_full_armed,
+        ToolbarFn::Midi(MidiAction::TuneMemory) => connected.tune_memory_armed,
         ToolbarFn::Midi(MidiAction::Vox) => connected.vox_enabled,
         ToolbarFn::Midi(MidiAction::DigitalMenu) => connected.show_digital_window,
         ToolbarFn::Midi(MidiAction::VoxMenu) => connected.vox_window_open,

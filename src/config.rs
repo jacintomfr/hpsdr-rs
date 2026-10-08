@@ -760,6 +760,11 @@ pub struct Config {
     /// doc comment.
     #[serde(default)]
     pub oc_tune: u8,
+    /// OC Output window: deskHPSDR OCfull_tune_time / OCmemory_tune_time in ms (0 = Tune outputs on for the whole TUNE, the old behaviour).
+    #[serde(default)]
+    pub oc_full_tune_time: u32,
+    #[serde(default)]
+    pub oc_memory_tune_time: u32,
     /// "HL2 ADC Auto Gain RxPGA" -- see main.rs's
     /// ConnectedState::autogain_enabled/autogain_time_enabled own doc
     /// comments.

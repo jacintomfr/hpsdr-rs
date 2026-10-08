@@ -23,6 +23,8 @@ enum Target {
     Ps,
     /// The CW menu (cw_window.rs).
     Cw,
+    /// The OC Output window (oc_window.rs).
+    Oc,
     Toolbar,
     Vfo,
     Rx,
@@ -81,7 +83,7 @@ const GRID: [[Option<(&str, Target)>; COLS]; 6] = [
         Some(("Mode", Target::Mode)),
         Some(("AGC", Target::Agc)),
         Some(("PS", Target::Ps)),
-        Some(("OC Output", Target::Tab(SettingsTab::OpenCollector))),
+        Some(("OC Output", Target::Oc)),
         None,
     ],
     [
@@ -107,6 +109,7 @@ pub(crate) fn close_overlays(c: &mut ConnectedState) {
     c.dsp_window_open = false;
     c.ps_window_open = false;
     c.cw_window_open = false;
+    c.oc_window_open = false;
     c.noise_window_open = false;
     c.sdr_window_open = false;
     c.eq_window_open = false;
@@ -129,6 +132,7 @@ pub(crate) fn any_overlay_open(c: &ConnectedState) -> bool {
         || c.dsp_window_open
         || c.ps_window_open
         || c.cw_window_open
+        || c.oc_window_open
         || c.noise_window_open
         || c.sdr_window_open
         || c.eq_window_open
@@ -185,6 +189,7 @@ fn open(c: &mut ConnectedState, target: Target) {
         Target::Display => c.display_window_open = true,
         Target::Dsp => c.dsp_window_open = true,
         Target::Cw => c.cw_window_open = true,
+        Target::Oc => c.oc_window_open = true,
         Target::Ps => {
             crate::ps_window::show_full();
             if c.tx_handle.is_some() {

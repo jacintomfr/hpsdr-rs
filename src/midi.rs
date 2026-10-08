@@ -222,6 +222,9 @@ pub enum MidiAction {
     CwStraightKey,
     CwKeyerKeydown,
     CwKeyerPtt,
+    /// deskHPSDR TUNE_FULL / TUNE_MEMORY: arm the next TUNE as a Full or Memory tune (OC Output window times, for an ATU driven by the OC lines).
+    TuneFull,
+    TuneMemory,
     /// The on-screen toolbar boxes (kiosk), named like piHPSDR's TOOLBAR1-7 and FUNCTION: ToolBar1-7
     /// run the function currently assigned to that box, Function steps to the next layer -- so
     /// physical switches can drive the toolbar.
@@ -342,6 +345,8 @@ impl MidiAction {
             MidiAction::CwStraightKey => "CW Straight Key",
             MidiAction::CwKeyerKeydown => "CW Key (Keyer)",
             MidiAction::CwKeyerPtt => "PTT (CW Keyer)",
+            MidiAction::TuneFull => "Tune Full",
+            MidiAction::TuneMemory => "Tune Memory",
             MidiAction::Toolbar1 => "ToolBar1",
             MidiAction::Toolbar2 => "ToolBar2",
             MidiAction::Toolbar3 => "ToolBar3",
@@ -374,6 +379,8 @@ pub const KEY_ACTIONS: &[MidiAction] = &[
     MidiAction::ReportPlay,
     MidiAction::RecordWav,
     MidiAction::Tune,
+    MidiAction::TuneFull,
+    MidiAction::TuneMemory,
     MidiAction::Split,
     MidiAction::RitToggle,
     MidiAction::RitClear,
