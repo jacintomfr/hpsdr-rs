@@ -29,6 +29,7 @@ mod noise_window;
 mod oc_window;
 mod ant_window;
 mod bandstack;
+mod digital_inapp;
 mod pa_window;
 mod ps_window;
 mod menu_window;
@@ -2428,6 +2429,8 @@ struct ConnectedState {
     /// SpectrumHandle being rebuilt on a sample-rate change (TxHandle holds
     /// a clone of `rtty`/`rade`).
     show_digital_window: bool,
+    /// Set when the kiosk overlay (digital_inapp.rs) switched the digital mode: the Digital window refits the passband on its first frame.
+    digital_refit: bool,
     /// Which of the three decoders the window is currently showing -- only
     /// the selected one is fed audio (see spectrum.rs's own rx_enabled
     /// gating), so switching doesn't run all three DSPs for no UI anyone is
@@ -4202,6 +4205,7 @@ fn connect_to_device(device: Device, cfg: &Config) -> Result<ConnectedState, Str
                 juice_console: None,
                 sim_handle: None,
                 show_digital_window: false,
+                digital_refit: false,
                 digital_mode: match cfg.digital_mode { Some(1) => DigitalMode::Sstv, Some(2) => DigitalMode::Rade, _ => DigitalMode::Rtty },
                 rtty,
                 rtty_tx_input: String::new(),
@@ -5312,6 +5316,7 @@ impl eframe::App for HpsdrApp {
                 if xvtr_remember(connected) {
                     connected.settings_dirty.store(true, Ordering::Relaxed);
                 }
+                digital_inapp::sync_zoom(connected, ui.ctx());
                 if bandstack::remember(connected) {
                     connected.settings_dirty.store(true, Ordering::Relaxed);
                 }
@@ -8294,6 +8299,9 @@ impl eframe::App for HpsdrApp {
                             }
                             framed_label(ui, "Filter width:", col4_w);
                             filter_slider!(ui);
+                            if lcd_kiosk_mode() && connected.puresignal_enabled {
+                                ps_badge(ui, connected, 84.0);
+                            }
                             ui.end_row();
                         }
 
@@ -9088,8 +9096,10 @@ impl eframe::App for HpsdrApp {
                     } else {
                         below_waterfall_reserve
                     };
+                    // SSTV in-app layout: the control strip takes the bottom of the area, under the spectrum / waterfall.
+                    let digital_strip_h = if digital_inapp::active(connected) { digital_inapp::strip_height(ui.ctx()) + 6.0 } else { 0.0 };
                     let spectrum_waterfall_height =
-                        (ui.available_height() - below_waterfall_reserve).max(200.0);
+                        (ui.available_height() - below_waterfall_reserve - digital_strip_h).max(if digital_strip_h > 0.0 { 100.0 } else { 200.0 });
                     // Waterfall disabled (Settings -> Spectrum): give the
                     // spectrum trace the FULL combined height instead of
                     // its ratio-based share -- no divider to drag against
@@ -9113,7 +9123,7 @@ impl eframe::App for HpsdrApp {
                     let panadapter_shown = connected.display_panadapter || !waterfall_effectively_enabled;
                     let spectrum_height = if waterfall_effectively_enabled {
                         if panadapter_shown {
-                            (spectrum_waterfall_height * connected.spectrum_waterfall_ratio).max(80.0)
+                            (spectrum_waterfall_height * connected.spectrum_waterfall_ratio).max(if digital_strip_h > 0.0 { 46.0 } else { 80.0 })
                         } else {
                             PANADAPTER_HIDDEN_STRIP_HEIGHT
                         }
@@ -9138,8 +9148,11 @@ impl eframe::App for HpsdrApp {
                     let rade_panel_visible = connected.digital_mode == DigitalMode::Rade
                         && !connected.show_digital_window
                         && matches!(connected.spectrum.mode(), spectrum::Mode::Digu | spectrum::Mode::Digl);
+                    let sstv_panel_visible = digital_inapp::active(connected);
+                    // SSTV: the panel takes the right half of the screen (digital_inapp.rs); the CW decoder / RADE panel keep their narrow column.
+                    let panel_w = if sstv_panel_visible { digital_inapp::PANEL_WIDTH } else { CW_PANEL_WIDTH };
                     let cw_panel_reserved_width =
-                        if cw_panel_visible || rade_panel_visible { CW_PANEL_WIDTH + CW_PANEL_GAP } else { 0.0 };
+                        if cw_panel_visible || rade_panel_visible || sstv_panel_visible { panel_w + CW_PANEL_GAP } else { 0.0 };
                     let (rect, spectrum_resp) = ui.allocate_exact_size(
                         egui::vec2(ui.available_width() - cw_panel_reserved_width, spectrum_height),
                         egui::Sense::click_and_drag(),
@@ -10284,7 +10297,7 @@ impl eframe::App for HpsdrApp {
                         ) {
                             settings_changed = true;
                         }
-                        let waterfall_height = (spectrum_waterfall_height - spectrum_height).max(80.0);
+                        let waterfall_height = (spectrum_waterfall_height - spectrum_height).max(if digital_strip_h > 0.0 { 46.0 } else { 80.0 });
                         let (rect, waterfall_click_resp) = ui.allocate_exact_size(
                             egui::vec2(ui.available_width() - cw_panel_reserved_width, waterfall_height),
                             egui::Sense::click_and_drag(),
@@ -10614,6 +10627,19 @@ impl eframe::App for HpsdrApp {
                             egui::Rect::from_min_max(
                                 egui::pos2(spectrum_right + CW_PANEL_GAP, spectrum_top),
                                 egui::pos2(spectrum_right + CW_PANEL_GAP + CW_PANEL_WIDTH, waterfall_bottom),
+                            ),
+                        );
+                    } else if sstv_panel_visible {
+                        digital_inapp::panel(
+                            ui,
+                            connected,
+                            egui::Rect::from_min_max(
+                                egui::pos2(spectrum_right + CW_PANEL_GAP, spectrum_top),
+                                egui::pos2(spectrum_right + CW_PANEL_GAP + panel_w, waterfall_bottom + digital_inapp::strip_height(ui.ctx())),
+                            ),
+                            egui::Rect::from_min_max(
+                                egui::pos2(spectrum_rect.left(), waterfall_bottom + 6.0),
+                                egui::pos2(spectrum_right, waterfall_bottom + digital_inapp::strip_height(ui.ctx())),
                             ),
                         );
                     } else if rade_panel_visible {
@@ -15233,7 +15259,7 @@ Waterfall rebuilds: {prof_wf_n:.0}/s, {prof_wf_ms:.1} ms each."
 
                 // "Digital..." window -- same viewport pattern as the
                 // Settings window.
-                if connected.show_digital_window {
+                if connected.show_digital_window && !digital_inapp::active(connected) {
                     let light_visuals = with_orange_selection(egui::Visuals::dark());
                     let light_style = egui::Style { visuals: light_visuals.clone(), ..Default::default() };
                     let mut close_requested = false;
@@ -15352,6 +15378,13 @@ Waterfall rebuilds: {prof_wf_n:.0}/s, {prof_wf_ms:.1} ms each."
                     // closing the app right after moving the window
                     // shouldn't lose that move.
                     let mut digital_window_geometry_out: Option<WindowGeometry> = None;
+                    if std::mem::take(&mut connected.digital_refit) {
+                        match digital_mode {
+                            DigitalMode::Rtty => fit_filter_clicked = true,
+                            DigitalMode::Sstv => sstv_fit_filter_clicked = true,
+                            DigitalMode::Rade => rade_fit_filter_clicked = true,
+                        }
+                    }
                     ui.ctx().show_viewport_immediate(
                         egui::ViewportId::from_hash_of("digital_modes_window"),
                         digital_viewport,
@@ -15457,6 +15490,7 @@ Waterfall rebuilds: {prof_wf_n:.0}/s, {prof_wf_ms:.1} ms each."
                                                 mox,
                                                 mode,
                                                 dial_freq_hz,
+                                                SstvPart::All,
                                             );
                                             fit_filter_clicked |= clicked;
                                             rtty_mox_request = rtty_mox_request.or(mox_request);
@@ -15475,6 +15509,7 @@ Waterfall rebuilds: {prof_wf_n:.0}/s, {prof_wf_ms:.1} ms each."
                                                 rade_callsign,
                                                 tx_available,
                                                 mox,
+                                                SstvPart::All,
                                             );
                                             sstv_fit_filter_clicked |= clicked;
                                             digital_quick_tune_hz = digital_quick_tune_hz.or(quick_tune);
@@ -16831,7 +16866,7 @@ fn help_button(ui: &mut egui::Ui, id: &str, text: &str) {
 
 /// The standard checkbox of the kiosk (rule: a filled box shows a big X, not a tick): `touch_checkbox_sized` at 30 px. Every
 /// `ui.checkbox(...)` of the settings pages goes through this.
-fn std_checkbox(ui: &mut egui::Ui, value: &mut bool, label: impl AsRef<str>) -> egui::Response {
+pub(crate) fn std_checkbox(ui: &mut egui::Ui, value: &mut bool, label: impl AsRef<str>) -> egui::Response {
     touch_checkbox_sized(ui, value, label.as_ref(), 30.0)
 }
 
@@ -17173,6 +17208,7 @@ fn render_digital_panel(
     mox: bool,
     mode: spectrum::Mode,
     dial_freq_hz: u32,
+    part: SstvPart,
 ) -> (bool, Option<bool>) {
     let mut fit_filter_clicked = false;
     // Some(true)/Some(false) the frame CALL CQ/Send or CLEAR is clicked
@@ -17206,6 +17242,7 @@ fn render_digital_panel(
             if ui.button("Clear RX").clicked() {
                 rtty.clear_rx_text();
             }
+            if part == SstvPart::All {
             let (rect, _) = ui.allocate_exact_size(egui::vec2(14.0, 14.0), egui::Sense::hover());
             let color = if st.lock >= 1.0 {
                 green
@@ -17224,8 +17261,10 @@ fn render_digital_panel(
             if s.afc {
                 ui.label(format!("AFC {:+.0} Hz", st.afc_offset_hz));
             }
+            }
         }
     };
+    if matches!(part, SstvPart::All | SstvPart::Rx) {
     if lcd_kiosk_mode() {
         ui.horizontal_wrapped(first_row);
     } else {
@@ -17274,6 +17313,7 @@ fn render_digital_panel(
     let on_air = |audio_hz: f64| -> f64 {
         if lsb_sense { dial_freq_hz as f64 - audio_hz } else { dial_freq_hz as f64 + audio_hz }
     };
+    if part == SstvPart::All {
     ui.horizontal(|ui| {
         ui.label(format!(
             "On-air: mark {:.6} MHz  space {:.6} MHz  center {:.6} MHz",
@@ -17282,6 +17322,7 @@ fn render_digital_panel(
             on_air(s.center_hz) / 1e6,
         ));
     });
+    }
 
     if !lcd_kiosk_mode() {
     ui.horizontal(|ui| {
@@ -17312,6 +17353,7 @@ fn render_digital_panel(
         ui.colored_label(amber, "RTTY needs USB/DIGU (or LSB/DIGL with Reverse) selected.");
     }
 
+    }
     // ROOT CAUSE FIX for a real report: bumped from 90.0 -- that figure
     // predated the TX box going multiline (a real request, ~56px tall
     // plus its own frame padding, replacing what was a single ~20px-tall
@@ -17319,6 +17361,7 @@ fn render_digital_panel(
     // needed more reserved height than before or the bottom of it
     // (the Send button) got pushed outside the window's own visible
     // area instead of the RX area simply shrinking to make room.
+    if part == SstvPart::All {
     let rx_height = (ui.available_height() - 140.0).max(80.0);
     egui::ScrollArea::vertical()
         .id_salt("rtty_rx_text")
@@ -17329,7 +17372,9 @@ fn render_digital_panel(
             ui.label(egui::RichText::new(rtty.rx_text()).monospace());
         });
     ui.separator();
+    }
 
+    if part != SstvPart::Rx {
     if !tx_available {
         ui.weak("TX unavailable (transmit disabled or no mic input device).");
     }
@@ -17447,6 +17492,7 @@ fn render_digital_panel(
             }
         });
     });
+    }
     // 100ms was needlessly aggressive compared to every other utility
     // window in this codebase (Juice Console uses 300ms at its own
     // call site) -- RTTY text updates aren't time-critical the way
@@ -17481,6 +17527,50 @@ fn render_digital_panel(
 const SSTV_QUICK_TUNE_HZ: [(&str, u32); 5] =
     [("80m", 3_730_000), ("40m", 7_033_000), ("30m", 10_132_000), ("20m", 14_230_000), ("15m", 21_340_000)];
 
+/// Which part of the SSTV panel to draw: everything (the Digital window), only the receive controls or only the transmit controls (the kiosk's
+/// bottom overlay, digital_inapp.rs; the picture and the status then go to the side panel).
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SstvPart {
+    All,
+    Rx,
+    Tx,
+    /// Only the picture-file row (Load Picture, Mode, banner, Send, Abort), shown under the TX preview.
+    TxSend,
+}
+
+/// The in-app strip's Quick Tune: one button that opens the calling frequencies in a popup above it.
+pub(crate) fn sstv_quick_popup(ui: &mut egui::Ui, quick_tune_hz: &mut Option<u32>) {
+    let open_id = egui::Id::new("sstv_quick_tune_open");
+    let open: bool = ui.ctx().data(|d| d.get_temp(open_id)).unwrap_or(false);
+    let button = ui.add(chip_button("Quick Tune", open).min_size(egui::vec2(110.0, 40.0)));
+    if button.clicked() {
+        ui.ctx().data_mut(|d| d.insert_temp(open_id, !open));
+    }
+    if !open {
+        return;
+    }
+    let area = egui::Area::new(egui::Id::new("sstv_quick_tune_popup"))
+        .order(egui::Order::Foreground)
+        .fixed_pos(button.rect.left_top() + egui::vec2(0.0, -8.0))
+        .pivot(egui::Align2::LEFT_BOTTOM)
+        .show(ui.ctx(), |ui| {
+            egui::Frame::popup(ui.style()).show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    for &(label, hz) in &SSTV_QUICK_TUNE_HZ {
+                        if ui.add(chip_button(label, false).min_size(egui::vec2(72.0, 44.0))).clicked() {
+                            *quick_tune_hz = Some(hz);
+                            ui.ctx().data_mut(|d| d.insert_temp(open_id, false));
+                        }
+                    }
+                });
+            });
+        });
+    let outside = ui.input(|i| i.pointer.any_click() && i.pointer.interact_pos().is_some_and(|p| !area.response.rect.contains(p)));
+    if outside && !button.hovered() {
+        ui.ctx().data_mut(|d| d.insert_temp(open_id, false));
+    }
+}
+
 fn render_sstv_panel(
     ui: &mut egui::Ui,
     sstv: &sstv_link::SstvHandle,
@@ -17494,6 +17584,7 @@ fn render_sstv_panel(
     callsign: &mut String,
     tx_available: bool,
     mox: bool,
+    part: SstvPart,
 ) -> (bool, Option<u32>, Option<bool>) {
     let amber = egui::Color32::from_rgb(230, 150, 50);
     let red = egui::Color32::from_rgb(220, 50, 50);
@@ -17550,7 +17641,8 @@ fn render_sstv_panel(
                 .text(format!("{:.0}%", snap.sync_quality * 100.0)),
         );
     };
-    ui.horizontal(|ui| {
+    if matches!(part, SstvPart::All | SstvPart::Rx) {
+    ui.horizontal_wrapped(|ui| {
         ui.label("Decode:");
         if ui.add(egui::Button::selectable(expected.is_none(), "Auto")).clicked() {
             expected = None;
@@ -17595,7 +17687,9 @@ fn render_sstv_panel(
         // matching QSSTV) and config::sstv_image_path for the save
         // location.
         let mut auto_save = sstv.rx_auto_save();
-        if std_checkbox(ui, &mut auto_save, "Auto-save")
+        // The in-app strip draws Auto-save and Quick Tune itself, in its header row.
+        if !(lcd_kiosk_mode() && part != SstvPart::All)
+            && std_checkbox(ui, &mut auto_save, "Auto-save")
             .on_hover_text(format!(
                 "Save every completed picture as a PNG, like QSSTV does -- {}",
                 config::sstv_image_dir().map(|p| p.display().to_string()).unwrap_or_default()
@@ -17604,12 +17698,15 @@ fn render_sstv_panel(
         {
             sstv.set_rx_auto_save(auto_save);
         }
-        if lcd_kiosk_mode() {
+        if lcd_kiosk_mode() && part == SstvPart::All {
             ui.add_space(8.0);
             sync_row(ui);
         }
     });
     let quick_tune_row = |ui: &mut egui::Ui| {
+        if lcd_kiosk_mode() && part != SstvPart::All {
+            return;
+        }
         ui.label("Quick Tune:");
         for &(label, hz) in &SSTV_QUICK_TUNE_HZ {
             if ui
@@ -17624,13 +17721,15 @@ fn render_sstv_panel(
                 quick_tune_hz = Some(hz);
             }
         }
-            if lcd_kiosk_mode() {
+            if lcd_kiosk_mode() && part == SstvPart::All {
             ui.add_space(8.0);
             status_row(ui);
         }
     };
     if lcd_kiosk_mode() {
-        ui.horizontal_wrapped(quick_tune_row);
+        if part == SstvPart::All {
+            ui.horizontal_wrapped(quick_tune_row);
+        }
     } else {
         ui.horizontal(quick_tune_row);
     }
@@ -17640,13 +17739,18 @@ fn render_sstv_panel(
         ui.horizontal(status_row);
         ui.horizontal(sync_row);
     }
-    if let Some(u) = &snap.unsupported {
-        ui.colored_label(amber, format!("Header seen for {u}, which this build does not decode."));
+    if part == SstvPart::All {
+        if let Some(u) = &snap.unsupported {
+            ui.colored_label(amber, format!("Header seen for {u}, which this build does not decode."));
+        }
+        if let Some(id) = &snap.rx_id {
+            ui.label(format!("Last station ID: {id}"));
+        }
     }
-    if let Some(id) = &snap.rx_id {
-        ui.label(format!("Last station ID: {id}"));
+    if part == SstvPart::All {
+        ui.separator();
     }
-    ui.separator();
+    }
 
     // Transmit -- load a picture, pin the mode it will be sent in (SSTV
     // has no "Auto" for TX the way RX does -- the mode has to be decided
@@ -17654,7 +17758,9 @@ fn render_sstv_panel(
     // banner, then key MOX/PTT the same way RTTY/RADE's own "armed"
     // toggle works: this only decides what the mic input gets replaced
     // with while transmitting, the operator still does the actual keying.
-    if !tx_available {
+    let sstv_wide = part != SstvPart::All && ui.available_width() > 400.0;
+    if part != SstvPart::Rx {
+    if !tx_available && part != SstvPart::TxSend {
         ui.weak("TX unavailable (transmit disabled or no mic input device).");
     }
     // FSK ID and TX Lead. Kiosk: on the first TX line between My Call and TX Slant; elsewhere in the row below.
@@ -17702,7 +17808,7 @@ fn render_sstv_panel(
             let slant_tip = "Transmit clock trim to remove slant on the far-end decoder -- a receiving sound card's clock a little off from this station's stretches every line by a tiny, cumulative amount.";
             if lcd_kiosk_mode() {
                 // Touch: [ value ] [-] [0] [+]; the middle button puts it back to 0 ppm.
-                ui.label("Slant (ppm):").on_hover_text(slant_tip);
+                ui.label("Slant:").on_hover_text(slant_tip);
                 let mut v = sstv.tx_ppm() as f64;
                 if spin_buttons_full(ui, "sstv_tx_slant", &mut v, -5000.0, 5000.0, 5.0, 0, Some(0.0), 64.0).changed() {
                     sstv.set_tx_ppm(v as _);
@@ -17783,19 +17889,59 @@ fn render_sstv_panel(
                 ui.colored_label(red, "ON AIR");
             }
             ui.add_space(8.0);
-            if lcd_kiosk_mode() {
+            if lcd_kiosk_mode() && (part == SstvPart::All || sstv_wide) {
                 ui.add_space(8.0);
                 sstv_fsk_lead_controls!(ui);
                 ui.add_space(8.0);
                 sstv_slant_controls!(ui);
             }
         };
-        if lcd_kiosk_mode() {
+        if part == SstvPart::TxSend {
+        } else if lcd_kiosk_mode() && part == SstvPart::Tx {
+            // The in-app strip draws the TX toggle and FSK ID in its header row; here only Lead and Slant, on one line.
+            ui.horizontal_wrapped(|ui| {
+                ui.label("Lead (ms):");
+                let mut v = sstv.tx_lead_ms() as f64;
+                if spin_buttons_full(ui, "sstv_tx_lead", &mut v, 0.0, 3000.0, 10.0, 0, None, 64.0).changed() {
+                    sstv.set_tx_lead_ms(v.round() as u32);
+                }
+                ui.add_space(8.0);
+                ui.label("Slant:");
+                let mut v = sstv.tx_ppm() as f64;
+                if spin_buttons_full(ui, "sstv_tx_slant", &mut v, -5000.0, 5000.0, 5.0, 0, Some(0.0), 64.0).changed() {
+                    sstv.set_tx_ppm(v as _);
+                }
+            });
+        } else if lcd_kiosk_mode() {
             ui.horizontal_wrapped(first_tx_row);
         } else {
             ui.horizontal(first_tx_row);
         }
-        ui.horizontal(|ui| {
+        if lcd_kiosk_mode() && part != SstvPart::All && !sstv_wide {
+            // The narrow in-app panel: FSK ID, Lead and Slant each get their own line.
+            ui.horizontal_wrapped(|ui| {
+                let mut fsk_id = sstv.tx_fsk_id_enabled();
+                if std_checkbox(ui, &mut fsk_id, "FSK ID").changed() {
+                    sstv.set_tx_fsk_id_enabled(fsk_id);
+                }
+            });
+            ui.horizontal(|ui| {
+                ui.label("Lead (ms):");
+                let mut v = sstv.tx_lead_ms() as f64;
+                if spin_buttons_full(ui, "sstv_tx_lead", &mut v, 0.0, 3000.0, 10.0, 0, None, 64.0).changed() {
+                    sstv.set_tx_lead_ms(v.round() as u32);
+                }
+            });
+            ui.horizontal(|ui| {
+                ui.label("Slant:");
+                let mut v = sstv.tx_ppm() as f64;
+                if spin_buttons_full(ui, "sstv_tx_slant", &mut v, -5000.0, 5000.0, 5.0, 0, Some(0.0), 64.0).changed() {
+                    sstv.set_tx_ppm(v as _);
+                }
+            });
+        }
+        if part != SstvPart::Tx {
+        ui.horizontal_wrapped(|ui| {
             if ui.button("Load Picture...").clicked() {
                 if let Some(path) = rfd::FileDialog::new()
                     .add_filter("Image", &["png", "jpg", "jpeg", "bmp", "gif"])
@@ -17836,11 +17982,17 @@ fn render_sstv_panel(
             if (mode_changed || banner_changed) && tx_source.is_some() {
                 *tx_prepared = None; // Re-derived below from tx_source.
             }
-            if lcd_kiosk_mode() {
+            if lcd_kiosk_mode() && (part == SstvPart::All || sstv_wide) {
                 ui.add_space(16.0);
                 sstv_send_controls!(ui);
             }
         });
+        }
+        if lcd_kiosk_mode() && part != SstvPart::All && !sstv_wide {
+            ui.horizontal_wrapped(|ui| {
+                sstv_send_controls!(ui);
+            });
+        }
         if !lcd_kiosk_mode() {
         ui.horizontal(|ui| {
                 // A real request, matching SDRoxide's own SSTV panel (TX
@@ -17881,7 +18033,7 @@ fn render_sstv_panel(
                 *tx_texture =
                     Some(ui.ctx().load_texture("sstv_tx_image", image, egui::TextureOptions::LINEAR));
             }
-            if let Some(tex) = tx_texture {
+            if let (Some(tex), true) = (tx_texture.as_ref(), part == SstvPart::All) {
                 let max_w = 200.0_f32;
                 let scale = (max_w / *w as f32).min(1.0);
                 ui.image((tex.id(), egui::vec2(*w as f32 * scale, *h as f32 * scale)));
@@ -17893,8 +18045,12 @@ fn render_sstv_panel(
             });
         }
     });
-    ui.separator();
+    }
+    if part == SstvPart::All {
+        ui.separator();
+    }
 
+    if part == SstvPart::All {
     if snap.w > 0 && snap.h > 0 && snap.rgb.len() == snap.w as usize * snap.h as usize * 3 {
         let size = [snap.w as usize, snap.h as usize];
         let pixels: Vec<egui::Color32> = snap
@@ -17924,6 +18080,7 @@ fn render_sstv_panel(
         }
     } else {
         ui.weak("No picture yet -- waiting for a VIS header.");
+    }
     }
 
     // Same repaint cadence as render_digital_panel -- an SSTV picture takes
@@ -19303,8 +19460,16 @@ fn render_status_row(
     // for the main toolbar -- added so PS state is visible at a glance
     // without opening Settings, per a real report that this was hard to
     // tell at a glance while testing.
-    if connected.puresignal_enabled {
+    if connected.puresignal_enabled && !lcd_kiosk_mode() {
         ui.add_space(12.0);
+        ps_badge(ui, connected, 120.0);
+    }
+}
+
+/// The PureSignal badge: "PS" while idle (ready), then while transmitting "PS Correcting" (green) or "PS no corr." (red). Desktop: on the status
+/// row under VFO A; kiosk: in the Filter width row of the gain grid, in the free cell beside it (`width` < 100 uses the shorter wording).
+fn ps_badge(ui: &mut egui::Ui, connected: &mut ConnectedState, width: f32) {
+    {
         let status = connected.tx_handle.as_ref().map(|tx| *tx.ps_status.lock().unwrap());
         let correcting_now = status.is_some_and(|s| s.correcting);
         // Auto-save on a false->true edge (not "every frame it's true")
@@ -19343,9 +19508,13 @@ fn render_status_row(
         } else {
             ("PS no corr.", egui::Color32::from_rgb(230, 70, 70))
         };
-        ui.allocate_ui_with_layout(egui::vec2(120.0, 18.0), egui::Layout::left_to_right(egui::Align::Center), |ui| {
-            ui.colored_label(color, text).on_hover_text(hover);
-        });
+        // The slot keeps `width` in the layout; the text may run on into the free cell next to it (kiosk gain grid), so the long wording fits.
+        let (slot, _) = ui.allocate_exact_size(egui::vec2(width, 18.0), egui::Sense::hover());
+        let font = egui::TextStyle::Body.resolve(ui.style());
+        let galley = ui.painter().layout_no_wrap(text.to_string(), font, color);
+        let text_rect = egui::Rect::from_min_size(egui::pos2(slot.left(), slot.center().y - galley.size().y / 2.0), galley.size());
+        ui.painter().galley(text_rect.min, galley, color);
+        ui.interact(text_rect.union(slot), ui.id().with("ps_badge"), egui::Sense::hover()).on_hover_text(hover);
     }
 
     // RADE status -- see draw_rade_status_row's own doc comment. Right
