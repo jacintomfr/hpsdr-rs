@@ -4417,6 +4417,12 @@ fn connect_to_device(device: Device, cfg: &Config) -> Result<ConnectedState, Str
 }
 
 impl eframe::App for HpsdrApp {
+    /// Fully transparent clear colour: only matters for the undecorated transparent VFO window (rounded corners); the main window is opaque and
+    /// covered by its panels.
+    fn clear_color(&self, _visuals: &egui::Visuals) -> [f32; 4] {
+        [0.0, 0.0, 0.0, 0.0]
+    }
+
     // eframe 0.35 replaced `update(&Context)` with `ui(&mut Ui)` -- see
     // https://github.com/emilk/egui/blob/main/CHANGELOG.md (0.35.0).
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
@@ -7018,37 +7024,13 @@ impl eframe::App for HpsdrApp {
                         // Compact window like piHPSDR's VFO menu (keypad + the two step
                         // pickers). Bigger in kiosk mode (scaled fonts).
                         let win_size = if lcd_kiosk_mode() { [420.0, 392.0] } else { [310.0, 340.0] };
-                        let mut freq_entry_viewport = egui::ViewportBuilder::default()
+                        let freq_entry_viewport = egui::ViewportBuilder::default()
                             .with_title("VFO")
                             .with_inner_size(win_size)
                             .with_resizable(false)
                             .with_active(true);
-                        if lcd_kiosk_mode() {
-                            freq_entry_viewport = freq_entry_viewport
-                                .with_position(kiosk_centered_pos(win_size))
-                                .with_decorations(false);
-                        }
-                        ui.ctx().show_viewport_immediate(
-                            egui::ViewportId::from_hash_of("frequency_entry_window"),
-                            freq_entry_viewport,
-                            |ui, _class| {
-                                if ui.input(|i| i.viewport().close_requested()) {
-                                    close_now = true;
-                                    return;
-                                }
-                                egui::CentralPanel::default().show(ui, |ui| {
-                                    // Kiosk: a thin outline around the (undecorated) window, drawn on top.
-                                    if lcd_kiosk_mode() {
-                                        let outline = ui
-                                            .ctx()
-                                            .layer_painter(egui::LayerId::new(egui::Order::Foreground, egui::Id::new("vfo_window_outline")));
-                                        outline.rect_stroke(
-                                            ui.ctx().content_rect(),
-                                            0.0,
-                                            egui::Stroke::new(1.0, egui::Color32::from_gray(130)),
-                                            egui::StrokeKind::Inside,
-                                        );
-                                    }
+                        // The keypad itself, shared by the in-app window of the kiosk and the separate window of the desktop.
+                        let mut vfo_body = |ui: &mut egui::Ui| {
                                     let (mut vfo_b, mut digits) = match &connected.frequency_entry {
                                         Some(e) => (e.vfo_b, e.digits.clone()),
                                         None => return,
@@ -7307,9 +7289,38 @@ impl eframe::App for HpsdrApp {
                                             e.digits.clear();
                                         }
                                     }
-                                });
-                            },
-                        );
+                        };
+                        if lcd_kiosk_mode() {
+                            // Kiosk: an in-app window like the FILTER / MODE / BAND ones (same rounded frame and shadow), centred above everything.
+                            // (A separate OS window cannot be transparent here, so it could not have a shadow or rounded corners.) Lowered a little so it does not cover VFO B.
+                            let vfo_frame = egui::Frame::window(ui.style()).inner_margin(egui::Margin::same(8));
+                            egui::Window::new("vfo_entry_window")
+                                .id(egui::Id::new("vfo_entry_window"))
+                                .title_bar(false)
+                                .collapsible(false)
+                                .resizable(false)
+                                .order(egui::Order::Foreground)
+                                .frame(vfo_frame)
+                                .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 28.0))
+                                .fixed_size(egui::vec2(win_size[0] - 16.0, win_size[1] - 16.0))
+                                .show(ui.ctx(), |ui| vfo_body(ui));
+                        } else {
+                            let mut closed_by_window = false;
+                            ui.ctx().show_viewport_immediate(
+                                egui::ViewportId::from_hash_of("frequency_entry_window"),
+                                freq_entry_viewport,
+                                |ui, _class| {
+                                    if ui.input(|i| i.viewport().close_requested()) {
+                                        closed_by_window = true;
+                                        return;
+                                    }
+                                    egui::CentralPanel::default().show(ui, |ui| vfo_body(ui));
+                                },
+                            );
+                            if closed_by_window {
+                                close_now = true;
+                            }
+                        }
                         if close_now {
                             connected.frequency_entry = None;
                         }
@@ -16646,11 +16657,17 @@ fn spin_buttons_full(
                     };
                     ui.ctx().request_repaint();
                     if fire {
+                        // Windows that collapse to a bar while a value is adjusted (the Display menu) read this: where the pressed button is.
+                        ui.ctx().data_mut(|d| d.insert_temp(egui::Id::new("last_spin_press"), (btn.rect.top(), now)));
+                        // While a window asks for it (the Display menu: the first tap only switches to its bar), a press does not change the value.
+                        let suppressed = ui.ctx().data(|d| d.get_temp::<bool>(egui::Id::new("spin_suppress"))).unwrap_or(false);
+                        if !suppressed {
                         let v = ((*value + dir * step) / step).round() * step;
                         let v = v.clamp(min, max);
                         if (v - *value).abs() > 1e-9 {
                             *value = v;
                             changed = true;
+                        }
                         }
                     }
                 } else {

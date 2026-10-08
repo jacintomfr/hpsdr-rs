@@ -266,60 +266,143 @@ fn inactive_check(ui: &mut egui::Ui, row: egui::Rect, x0: f32, x1: f32, id: &str
 // ======================================================================= window
 
 /// Returns (close, changed).
+///
+/// The menu covers the spectrum and the waterfall, which is exactly what the values below change. So the first tap on any - / + collapses it to
+/// a bar at the bottom that shows only the row of that control (same code, scrolled to that row and clipped): the spectrum stays visible
+/// while it is adjusted. That first tap does NOT change the value (so the first change is seen with the spectrum already visible); the bar
+/// stays until "Show" (or Close / Esc).
+/// A press that still being held from the switch is ignored too (the `spin_suppress` flag read by spin_buttons_full).
 pub fn display_window(ui: &mut egui::Ui, connected: &mut ConnectedState) -> (bool, bool) {
     let screen = ui.ctx().content_rect();
     let mut close_now = false;
     let mut changed = false;
     let shared0 = shared_of(connected);
     let page_id = egui::Id::new("display_window_page");
+    let bar_id = egui::Id::new("display_window_bar");
+    let press_id = egui::Id::new("last_spin_press");
     let mut page: u8 = ui.ctx().data(|d| d.get_temp(page_id)).unwrap_or(0);
+    // (row offset, the press that switched to the bar is still being held)
+    let mut bar: Option<(f32, bool)> = ui.ctx().data(|d| d.get_temp(bar_id));
+    let w = screen.width() - 58.0;
+    // A press on a - / + this frame (spin_buttons_full records where): fresh when it happened in the last 0.25 s.
+    let now_t = ui.input(|i| i.time);
+    let press: Option<f32> = ui.ctx().data(|d| d.get_temp::<(f32, f64)>(press_id)).filter(|(_, t)| now_t - *t < 0.25).map(|(y, _)| y);
 
-    let frame = egui::Frame::window(ui.style()).inner_margin(egui::Margin::symmetric(24, 4)).corner_radius(0.0);
-    egui::Window::new("Display")
-        .id(egui::Id::new("display_window"))
-        .title_bar(false)
-        .collapsible(false)
-        .resizable(false)
-        .frame(frame)
-        .fixed_pos(screen.min)
-        .constrain_to(screen)
-        .fixed_size(screen.size() - egui::vec2(58.0, 10.0))
-        .show(ui.ctx(), |ui| {
-            if ui.input(|i| i.key_pressed(egui::Key::Escape)) {
-                close_now = true;
-            }
-            let w = screen.width() - 58.0;
-            ui.set_width(w);
-            ui.set_min_height(screen.height() - 10.0);
-            ui.spacing_mut().item_spacing = egui::vec2(6.0, 0.0);
-            let (tr, _) = ui.allocate_exact_size(egui::vec2(w, 22.0), egui::Sense::hover());
-            ui.painter().text(tr.center(), egui::Align2::CENTER_CENTER, "hpsdr-rs - Display", egui::FontId::proportional(16.0), egui::Color32::from_gray(225));
-
-            // Page selector (round radios) and CLOSE at the top right.
-            let row = new_row(ui, w, 54.0);
-            for (i, (x0, title)) in [(10.0, "General Settings"), (240.0, "Peak Blobs & Hold"), (480.0, "Peak Labels")].iter().enumerate() {
-                let mut c = child(ui, row, *x0, *x0 + 220.0, false, 0.0);
-                if touch_radio(&mut c, page == i as u8, title).clicked() {
-                    page = i as u8;
+    if let Some((y_off, holding)) = bar {
+        // ---- Bar mode.
+        let mut show = false;
+        let holding_now = holding && ui.input(|i| i.pointer.any_down());
+        ui.ctx().data_mut(|d| d.insert_temp(egui::Id::new("spin_suppress"), holding_now));
+        let frame = egui::Frame::window(ui.style()).inner_margin(egui::Margin::symmetric(24, 4)).corner_radius(0.0).shadow(egui::Shadow::NONE);
+        egui::Window::new("display_bar")
+            .id(egui::Id::new("display_bar_window"))
+            .title_bar(false)
+            .collapsible(false)
+            .resizable(false)
+            .frame(frame)
+            .anchor(egui::Align2::CENTER_BOTTOM, egui::vec2(0.0, -(crate::TOOLBAR_HEIGHT + crate::TOOLBAR_MARGIN + 10.0)))
+            .show(ui.ctx(), |ui| {
+                if ui.input(|i| i.key_pressed(egui::Key::Escape)) {
+                    close_now = true;
                 }
-            }
-            egui::Area::new(egui::Id::new("display_window_close"))
-                .order(egui::Order::Foreground)
-                .anchor(egui::Align2::RIGHT_TOP, egui::vec2(-24.0, 26.0))
-                .show(ui.ctx(), |ui| {
-                    if kiosk_accent_button(ui, "CLOSE").clicked() {
-                        close_now = true;
+                ui.set_width(w);
+                ui.spacing_mut().item_spacing = egui::vec2(6.0, 4.0);
+                ui.horizontal(|ui| {
+                    if kiosk_accent_button(ui, "Show").clicked() {
+                        show = true;
                     }
+                    ui.label(match page {
+                        0 => "Display - General Settings",
+                        1 => "Display - Peak Blobs & Hold",
+                        _ => "Display - Peak Labels",
+                    });
                 });
-            ui.add_space(4.0);
+                egui::ScrollArea::vertical()
+                    .id_salt("display_bar_scroll")
+                    .vertical_scroll_offset(y_off)
+                    .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysHidden)
+                    .scroll_source(egui::scroll_area::ScrollSource::NONE)
+                    .max_height(60.0)
+                    .auto_shrink([false, true])
+                    .show(ui, |ui| {
+                        ui.spacing_mut().item_spacing = egui::vec2(6.0, 0.0);
+                        match page {
+                            0 => general_page(ui, w, connected, &mut changed),
+                            1 => blobs_page(ui, w, connected, &mut changed),
+                            _ => peak_labels_page(ui, w, connected, &mut changed),
+                        }
+                    });
+            });
+        ui.ctx().data_mut(|d| d.remove::<bool>(egui::Id::new("spin_suppress")));
+        bar = if show { None } else { Some((y_off, holding_now)) };
+    } else {
+        // ---- Full menu.
+        let mut new_bar_off: Option<f32> = None;
+        // The first tap on a - / + here only switches to the bar: it must not change the value.
+        ui.ctx().data_mut(|d| d.insert_temp(egui::Id::new("spin_suppress"), true));
+        let frame = egui::Frame::window(ui.style()).inner_margin(egui::Margin::symmetric(24, 4)).corner_radius(0.0);
+        egui::Window::new("Display")
+            .id(egui::Id::new("display_window"))
+            .title_bar(false)
+            .collapsible(false)
+            .resizable(false)
+            .frame(frame)
+            .fixed_pos(screen.min)
+            .constrain_to(screen)
+            .fixed_size(screen.size() - egui::vec2(58.0, 10.0))
+            .show(ui.ctx(), |ui| {
+                if ui.input(|i| i.key_pressed(egui::Key::Escape)) {
+                    close_now = true;
+                }
+                ui.set_width(w);
+                ui.set_min_height(screen.height() - 10.0);
+                ui.spacing_mut().item_spacing = egui::vec2(6.0, 0.0);
+                let (tr, _) = ui.allocate_exact_size(egui::vec2(w, 22.0), egui::Sense::hover());
+                ui.painter().text(tr.center(), egui::Align2::CENTER_CENTER, "hpsdr-rs - Display", egui::FontId::proportional(16.0), egui::Color32::from_gray(225));
 
-            match page {
-                0 => general_page(ui, w, connected, &mut changed),
-                1 => blobs_page(ui, w, connected, &mut changed),
-                _ => peak_labels_page(ui, w, connected, &mut changed),
-            }
-        });
+                // Page selector (round radios) and CLOSE at the top right.
+                let row = new_row(ui, w, 54.0);
+                for (i, (x0, title)) in [(10.0, "General Settings"), (240.0, "Peak Blobs & Hold"), (480.0, "Peak Labels")].iter().enumerate() {
+                    let mut c = child(ui, row, *x0, *x0 + 220.0, false, 0.0);
+                    if touch_radio(&mut c, page == i as u8, title).clicked() {
+                        page = i as u8;
+                    }
+                }
+                egui::Area::new(egui::Id::new("display_window_close"))
+                    .order(egui::Order::Foreground)
+                    .anchor(egui::Align2::RIGHT_TOP, egui::vec2(-24.0, 26.0))
+                    .show(ui.ctx(), |ui| {
+                        if kiosk_accent_button(ui, "CLOSE").clicked() {
+                            close_now = true;
+                        }
+                    });
+                ui.add_space(4.0);
+
+                let page_top = ui.cursor().top();
+                match page {
+                    0 => general_page(ui, w, connected, &mut changed),
+                    1 => blobs_page(ui, w, connected, &mut changed),
+                    _ => peak_labels_page(ui, w, connected, &mut changed),
+                }
+                // A - / + was pressed in this frame: remember where its row is (a little above the buttons, so the label shows too).
+                if let Some(top) = press {
+                    new_bar_off = Some((top - page_top - 12.0).max(0.0));
+                }
+            });
+        ui.ctx().data_mut(|d| d.remove::<bool>(egui::Id::new("spin_suppress")));
+        if let Some(off) = new_bar_off {
+            bar = Some((off, true));
+        }
+    }
     ui.ctx().data_mut(|d| d.insert_temp(page_id, page));
+    if let Some(b) = bar {
+        ui.ctx().data_mut(|d| d.insert_temp(bar_id, b));
+    } else {
+        ui.ctx().data_mut(|d| d.remove::<(f32, bool)>(bar_id));
+    }
+    if close_now {
+        ui.ctx().data_mut(|d| d.remove::<(f32, bool)>(bar_id));
+    }
 
     let shared1 = shared_of(connected);
     if shared1 != shared0 {
