@@ -16553,8 +16553,13 @@ fn spin_buttons_full(
                 // Fire on press, then repeat while held (after 0.5 s, every 80 ms), like the GTK spin button.
                 let key = egui::Id::new((id, label));
                 let now = ui.input(|i| i.time);
-                if btn.is_pointer_button_down_on() {
-                    let (start, last): (f64, f64) = ui.data_mut(|d| d.get_temp(key)).unwrap_or((-1.0, -1.0));
+                // A press that started on this button keeps repeating for as long as the finger (or button) stays down, even when
+                // the touch drifts a little or lasts long enough for egui to stop calling the widget "pressed" (it then gave
+                // about five repeats and stopped).
+                let held: Option<(f64, f64)> = ui.data_mut(|d| d.get_temp(key));
+                let pointer_down = ui.input(|i| i.pointer.primary_down());
+                if btn.is_pointer_button_down_on() || (held.is_some() && pointer_down) {
+                    let (start, last): (f64, f64) = held.unwrap_or((-1.0, -1.0));
                     let fire = if start < 0.0 {
                         ui.data_mut(|d| d.insert_temp(key, (now, now)));
                         true
