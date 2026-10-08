@@ -760,6 +760,9 @@ pub struct Config {
     /// doc comment.
     #[serde(default)]
     pub oc_tune: u8,
+    /// Band stacks (bandstack.rs), by band name. Empty = the defaults.
+    #[serde(default)]
+    pub bandstacks: std::collections::HashMap<String, crate::bandstack::BandStack>,
     /// OC Output window: deskHPSDR OCfull_tune_time / OCmemory_tune_time in ms (0 = Tune outputs on for the whole TUNE, the old behaviour).
     #[serde(default)]
     pub oc_full_tune_time: u32,

@@ -25,6 +25,12 @@ enum Target {
     Cw,
     /// The OC Output window (oc_window.rs).
     Oc,
+    /// The Ant window (ant_window.rs).
+    Ant,
+    /// The MIDI window (midi_window.rs).
+    Midi,
+    /// The BandStack window (bandstack.rs).
+    BandStack,
     Toolbar,
     Vfo,
     Rx,
@@ -72,11 +78,11 @@ const GRID: [[Option<(&str, Target)>; COLS]; 6] = [
     ],
     [
         Some(("Display", Target::Display)),
-        Some(("BandStack", Target::Grey)),
+        Some(("BandStack", Target::BandStack)),
         Some(("Noise", Target::Noise)),
         Some(("VOX", Target::Vox)),
-        Some(("Ant", Target::Tab(SettingsTab::Antenna))),
-        Some(("MIDI", Target::Tab(SettingsTab::Midi))),
+        Some(("Ant", Target::Ant)),
+        Some(("MIDI", Target::Midi)),
     ],
     [
         Some(("Meter", Target::Meter)),
@@ -110,6 +116,9 @@ pub(crate) fn close_overlays(c: &mut ConnectedState) {
     c.ps_window_open = false;
     c.cw_window_open = false;
     c.oc_window_open = false;
+    c.ant_window_open = false;
+    c.midi_window_open = false;
+    c.bandstack_window_open = false;
     c.noise_window_open = false;
     c.sdr_window_open = false;
     c.eq_window_open = false;
@@ -133,6 +142,9 @@ pub(crate) fn any_overlay_open(c: &ConnectedState) -> bool {
         || c.ps_window_open
         || c.cw_window_open
         || c.oc_window_open
+        || c.ant_window_open
+        || c.midi_window_open
+        || c.bandstack_window_open
         || c.noise_window_open
         || c.sdr_window_open
         || c.eq_window_open
@@ -190,6 +202,9 @@ fn open(c: &mut ConnectedState, target: Target) {
         Target::Dsp => c.dsp_window_open = true,
         Target::Cw => c.cw_window_open = true,
         Target::Oc => c.oc_window_open = true,
+        Target::Ant => c.ant_window_open = true,
+        Target::Midi => c.midi_window_open = true,
+        Target::BandStack => c.bandstack_window_open = true,
         Target::Ps => {
             crate::ps_window::show_full();
             if c.tx_handle.is_some() {

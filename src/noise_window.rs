@@ -41,6 +41,8 @@ pub(crate) fn choice_combo_h(ui: &mut egui::Ui, id: &str, width: f32, selected: 
     ui.spacing_mut().button_padding = egui::vec2(12.0, 8.0);
     egui::ComboBox::from_id_salt(id)
         .width(width)
+        // Tall enough for the whole list (the default 200 px cut the 6 ports of the Ant window after four).
+        .height((items.len() as f32 * 48.0 + 16.0).clamp(200.0, 380.0))
         .selected_text(items.get(selected).map(|i| i.0).unwrap_or(""))
         .show_ui(ui, |ui| {
             for (i, (label, enabled)) in items.iter().enumerate() {

@@ -27,9 +27,12 @@ mod eq_curve;
 mod eq_window;
 mod noise_window;
 mod oc_window;
+mod ant_window;
+mod bandstack;
 mod pa_window;
 mod ps_window;
 mod menu_window;
+mod midi_window;
 mod meter_vintage;
 mod toolbar_window;
 mod display_window;
@@ -769,9 +772,17 @@ fn width_for_mode(width_memory: &std::collections::HashMap<String, f64>, mode: s
 /// it touches enough fields (active_xvtr, band_memory, mode, width, the TX
 /// mirror) that duplicating it risks the two call sites drifting apart.
 fn apply_band(connected: &mut ConnectedState, band: &Band) {
+    // deskHPSDR vfo_band_changed: the button of the band you are already on steps to the next band stack entry.
+    if bandstack::step_if_same_band(connected, band.name) {
+        return;
+    }
     connected.active_xvtr = None;
     let saved = connected.band_memory.get(band.name).copied();
-    let target = saved.map(|s| s.frequency_hz).unwrap_or(band.default_hz);
+    // First visit: the band's current band stack entry (band.c's defaults), as deskHPSDR.
+    let stack_entry = bandstack::current_entry(connected, band.name);
+    let target = saved
+        .map(|s| s.frequency_hz)
+        .unwrap_or((stack_entry.frequency_hz as u64).clamp(connected.device.frequency_min, connected.device.frequency_max) as u32);
     connected.session.set_frequency(target);
     connected.ctun_frequency_hz = target;
     if let Some(s) = saved {
@@ -780,7 +791,7 @@ fn apply_band(connected: &mut ConnectedState, band: &Band) {
         connected.waterfall_db_low = s.waterfall_db_low;
         connected.waterfall_db_high = s.waterfall_db_high;
     }
-    let resolved_mode = saved.and_then(|s| s.mode).unwrap_or(band.default_mode);
+    let resolved_mode = saved.and_then(|s| s.mode).unwrap_or(stack_entry.mode);
     remember_band_settings(
         &mut connected.band_memory,
         target,
@@ -2867,6 +2878,13 @@ struct ConnectedState {
     cw_window_open: bool,
     /// The OC Output window (oc_window.rs).
     oc_window_open: bool,
+    /// The Ant window (ant_window.rs).
+    ant_window_open: bool,
+    /// The MIDI window (midi_window.rs).
+    midi_window_open: bool,
+    /// Band stacks (bandstack.rs): per band a short list of frequency + mode entries with the current one.
+    bandstacks: std::collections::HashMap<String, bandstack::BandStack>,
+    bandstack_window_open: bool,
     /// deskHPSDR OCfull_tune_time / OCmemory_tune_time (ms): how long the Tune OC outputs stay on after an armed TUNE. 0 = no limit.
     oc_full_tune_ms: u32,
     oc_memory_tune_ms: u32,
@@ -4356,6 +4374,10 @@ fn connect_to_device(device: Device, cfg: &Config) -> Result<ConnectedState, Str
                 ps_window_open: false,
                 cw_window_open: false,
                 oc_window_open: false,
+                ant_window_open: false,
+                midi_window_open: false,
+                bandstacks: cfg.bandstacks.clone(),
+                bandstack_window_open: false,
                 oc_full_tune_ms: cfg.oc_full_tune_time,
                 oc_memory_tune_ms: cfg.oc_memory_tune_time,
                 oc_prev_tune: false,
@@ -5288,6 +5310,9 @@ impl eframe::App for HpsdrApp {
                     AlcMode::Gain => 2,
                 });
                 if xvtr_remember(connected) {
+                    connected.settings_dirty.store(true, Ordering::Relaxed);
+                }
+                if bandstack::remember(connected) {
                     connected.settings_dirty.store(true, Ordering::Relaxed);
                 }
                 // Zoom should keep the CTUN'd listen frequency (where the
@@ -6709,7 +6734,7 @@ impl eframe::App for HpsdrApp {
                                 continue;
                             }
                             let selected = Some(band.name) == current_band;
-                            if toggle_chip(ui, band.name, selected, 0.0, "").clicked() && !selected {
+                            if toggle_chip(ui, band.name, selected, 0.0, "").clicked() {
                                 // Explicitly leaving any active XVTR --
                                 // see ConnectedState::active_xvtr's doc
                                 // comment. Rest of the switch (recall
@@ -6728,7 +6753,7 @@ impl eframe::App for HpsdrApp {
                         {
                             let gen = gen_band(connected.device.frequency_min, connected.device.frequency_max);
                             let selected = current_band == Some("Gen");
-                            if toggle_chip(ui, "Gen", selected, 0.0, "").clicked() && !selected {
+                            if toggle_chip(ui, "Gen", selected, 0.0, "").clicked() {
                                 apply_band(connected, &gen);
                                 settings_changed = true;
                             }
@@ -7056,6 +7081,40 @@ impl eframe::App for HpsdrApp {
                             connected.spectrum_waterfall_ratio = r;
                         }
                     }
+                    // MIDI window (deskHPSDR midi_menu.c layout), see midi_window.rs.
+                    if connected.midi_window_open {
+                        let (close_now, changed) = midi_window::midi_window(ui, connected);
+                        if changed {
+                            settings_changed = true;
+                        }
+                        if close_now {
+                            connected.midi_window_open = false;
+                            connected.midi_learn = MidiLearnState::default();
+                        }
+                    }
+
+                    // BandStack window (deskHPSDR bandstack_menu.c), see bandstack.rs.
+                    if connected.bandstack_window_open {
+                        let (close_now, changed) = bandstack::bandstack_window(ui, connected);
+                        if changed {
+                            settings_changed = true;
+                        }
+                        if close_now {
+                            connected.bandstack_window_open = false;
+                        }
+                    }
+
+                    // Ant window (deskHPSDR ant_menu.c), see ant_window.rs.
+                    if connected.ant_window_open {
+                        let (close_now, changed) = ant_window::ant_window(ui, connected);
+                        if changed {
+                            settings_changed = true;
+                        }
+                        if close_now {
+                            connected.ant_window_open = false;
+                        }
+                    }
+
                     // OC Output window (deskHPSDR oc_menu.c), see oc_window.rs.
                     if connected.oc_window_open {
                         let (close_now, changed) = oc_window::oc_window(ui, connected);
@@ -12103,6 +12162,13 @@ Waterfall rebuilds: {prof_wf_n:.0}/s, {prof_wf_ms:.1} ms each."
                                 }
 
                                 SettingsTab::Midi => {
+                                    // The kiosk has its own MIDI window (midi_window.rs), opened straight from the tab.
+                                    if lcd_kiosk_mode() {
+                                        connected.midi_window_open = true;
+                                        connected.show_settings_window = false;
+                                        connected.settings_tab = SettingsTab::About;
+                                        ui.ctx().request_repaint_of(egui::ViewportId::ROOT);
+                                    } else {
                                     ui.label("MIDI control surface:");
                                     ui.horizontal(|ui| {
                                         let mut midi_enabled_ui = connected.midi.enabled.load(Ordering::Relaxed);
@@ -12637,6 +12703,7 @@ Waterfall rebuilds: {prof_wf_n:.0}/s, {prof_wf_ms:.1} ms each."
                                             connected.midi_bindings.remove(i);
                                             settings_changed = true;
                                         }
+                                    }
                                     }
                                 }
 
@@ -14492,6 +14559,13 @@ Waterfall rebuilds: {prof_wf_n:.0}/s, {prof_wf_ms:.1} ms each."
                                     }
                                 }
                                 SettingsTab::Antenna => {
+                                    // The kiosk has its own Ant window (ant_window.rs), opened straight from the tab.
+                                    if lcd_kiosk_mode() {
+                                        connected.ant_window_open = true;
+                                        connected.show_settings_window = false;
+                                        connected.settings_tab = SettingsTab::About;
+                                        ui.ctx().request_repaint_of(egui::ViewportId::ROOT);
+                                    } else {
                                     // See AntennaMask's doc comment. Board-
                                     // agnostic (no per-board gating), same as
                                     // Open Collector just above -- harmless
@@ -14624,6 +14698,7 @@ Waterfall rebuilds: {prof_wf_n:.0}/s, {prof_wf_ms:.1} ms each."
                                             ui.end_row();
                                         }
                                     });
+                                    }
                                 }
                                 SettingsTab::PureSignal => {
                                     // See radio::RadioSettings::puresignal_enabled
@@ -16037,6 +16112,7 @@ Waterfall rebuilds: {prof_wf_n:.0}/s, {prof_wf_ms:.1} ms each."
                         oc_settings: connected.oc_settings.clone(),
                         oc_tune: connected.oc_tune,
                         oc_full_tune_time: connected.oc_full_tune_ms,
+                        bandstacks: connected.bandstacks.clone(),
                         oc_memory_tune_time: connected.oc_memory_tune_ms,
                         autogain_enabled: Some(connected.autogain_enabled),
                         autogain_time_enabled: Some(connected.autogain_time_enabled),
@@ -16604,7 +16680,7 @@ fn choice_window(ui: &mut egui::Ui, id: &str, heading: &str, items: &[(String, b
             });
             egui::Grid::new(("choice_window_grid", id.to_string())).num_columns(cols).spacing([gap, gap]).show(ui, |ui| {
                 for (n, (label, selected)) in items.iter().enumerate() {
-                    if ui.add(chip_button(label, *selected).min_size(egui::vec2(key_w, key_h))).clicked() && !*selected {
+                    if ui.add(chip_button(label, *selected).min_size(egui::vec2(key_w, key_h))).clicked() {
                         picked = Some(n);
                     }
                     if (n + 1) % cols == 0 {
