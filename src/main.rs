@@ -30,6 +30,7 @@ mod menu_window;
 mod toolbar_window;
 mod display_window;
 mod dsp_window;
+mod cw_window;
 mod peaks;
 mod agc_window;
 mod fnc_window;
@@ -2840,6 +2841,8 @@ struct ConnectedState {
     /// The PureSignal menu (ps_window.rs) is open.
     ps_window_open: bool,
     ps_hw_peak: f64,
+    /// The CW menu (cw_window.rs) is open.
+    cw_window_open: bool,
     ps_mox_delay: f64,
     ps_loop_delay: f64,
     ps_tx_delay_ns: f64,
@@ -4315,6 +4318,7 @@ fn connect_to_device(device: Device, cfg: &Config) -> Result<ConnectedState, Str
                 noise_request: None,
                 two_tone_after_noise: false,
                 ps_window_open: false,
+                cw_window_open: false,
                 ps_hw_peak,
                 ps_mox_delay,
                 ps_loop_delay,
@@ -6973,6 +6977,17 @@ impl eframe::App for HpsdrApp {
                     }
 
                     // DSP window (deskHPSDR fft_menu.c), see dsp_window.rs.
+                    // CW menu (deskHPSDR cw_menu.c), see cw_window.rs.
+                    if connected.cw_window_open {
+                        let (close_now, changed) = cw_window::cw_window(ui, connected);
+                        if changed {
+                            settings_changed = true;
+                        }
+                        if close_now {
+                            connected.cw_window_open = false;
+                        }
+                    }
+
                     if connected.dsp_window_open {
                         let (close_now, changed) = dsp_window::dsp_window(ui, connected);
                         if changed {
@@ -11534,6 +11549,7 @@ Waterfall rebuilds: {prof_wf_n:.0}/s, {prof_wf_ms:.1} ms each."
                                     // session launched a juice process.
                                     if tab == SettingsTab::Juice && connected.juice_console.is_none() {
                                         continue;
+                                                | SettingsTab::Cw
                                     }
                                     if ui
                                         .selectable_label(connected.settings_tab == tab, label)
