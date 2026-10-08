@@ -319,6 +319,17 @@ pub struct PsParams {
     /// in continuous mode first, then enable OneShot before running
     /// digital traffic so the already-good table just gets applied.
     pub oneshot: bool,
+    /// Sample rate of the PureSignal feedback streams when it differs from the TX IQ rate (`duc_rate`): on Protocol 1 the
+    /// two feedback DDCs run at the session RX rate (48/96/192/384 kHz) while the TX IQ is fixed at 48 kHz. 0 = same as
+    /// `duc_rate` (Protocol 2: both 192 kHz). Used for `SetPSFeedbackRate` and to size how many feedback pairs one TX chunk
+    /// consumes (piHPSDR radio.c uses the active receiver's rate for the PS feedback on Protocol 1).
+    pub feedback_rate: i32,
+    /// Factor applied to the TX-DAC feedback samples before they go to WDSP (piHPSDR `drive_iscal` = 0.9999 / drive_scale): the Hermes
+    /// Lite 2 scales its TX IQ digitally for the lower drive levels, and the feedback of that DAC output has to be brought back
+    /// to the amplitude WDSP assumes for the TX reference. 1.0 = no scaling (every other board).
+    pub tx_feedback_iscal: f32,
+    /// deskHPSDR "PS Stability": 0 = Strict (SetPSDeadlockMinFrac 0.06), 1 = Medium (0.04), 2 = Relaxed (0.02, the default).
+    pub tolerance_mode: u8,
 }
 
 impl Default for PsParams {
@@ -333,6 +344,9 @@ impl Default for PsParams {
             save_corr_request: 0,
             restore_corr_request: 0,
             oneshot: false, // matches piHPSDR's own default (unchecked)
+            feedback_rate: 0,
+            tx_feedback_iscal: 1.0,
+            tolerance_mode: 2,
         }
     }
 }
@@ -399,6 +413,8 @@ pub struct PsStatus {
     /// number -- see `ps_state_name` below for the exact text this maps
     /// to.
     pub state: i32,
+    /// GetPSInfo's info[5] -- number of completed calibrations (deskHPSDR shows it as "cor.cnt").
+    pub cal_count: i32,
 }
 
 /// Human-readable name for `PsStatus::state`, matching deskHPSDR's own
@@ -850,6 +866,10 @@ struct TxProcessor {
     /// (while already enabled) triggers a reset-then-resume cycle the
     /// same way piHPSDR's ps_off_on does.
     last_ps_oneshot: Option<bool>,
+    /// PsParams::feedback_rate last sent to WDSP (SetPSFeedbackRate); None until a Protocol 1 rate is known.
+    last_ps_feedback_rate: Option<i32>,
+    /// PsParams::tolerance_mode last sent to WDSP (the channel is opened with 0.02 = mode 2).
+    last_ps_tolerance: Option<u8>,
     last_ps_calibrate_request: Option<u32>,
     last_ps_hw_peak: Option<f64>,
     last_ps_mox_delay: Option<f64>,
@@ -1292,6 +1312,8 @@ impl TxProcessor {
             // comparison is a true no-op, only firing on an actual
             // Calibrate Now click.
             last_ps_calibrate_request: Some(0),
+            last_ps_feedback_rate: None,
+            last_ps_tolerance: Some(2),
             last_ps_hw_peak: None,
             last_ps_mox_delay: None,
             last_ps_loop_delay: None,
@@ -1695,6 +1717,30 @@ impl TxProcessor {
     /// cheap FFI-call optimization, same pattern as last_mode/
     /// last_gain elsewhere in this struct -- not a correctness
     /// requirement.
+    /// PureSignal switched off (piHPSDR tx_ps_onoff(0)): reset the WDSP engine so no correction stays applied, tell it MOX is
+    /// off, and make a later enable start from scratch. WDSP only acts on a reset inside pscc(), so a few empty feedback
+    /// blocks are run through it when not transmitting (the same 7 x 1024 zero samples piHPSDR feeds).
+    fn ps_disable(&mut self) {
+        unsafe {
+            wdsp::SetPSControl(self.channel, 1, 0, 0, 0);
+            wdsp::SetPSMox(self.channel, 0);
+            let zeros = vec![0.0f64; 2 * 1024];
+            for _ in 0..7 {
+                wdsp::pscc(self.channel, 1024, zeros.as_ptr() as *mut f64, zeros.as_ptr() as *mut f64);
+            }
+        }
+        // Forget what was sent so the next enable sends everything again.
+        self.last_ps_mox = None;
+        self.last_ps_enabled = None;
+        self.last_ps_oneshot = None;
+        self.last_ps_feedback_rate = None;
+        self.last_ps_hw_peak = None;
+        self.last_ps_mox_delay = None;
+        self.last_ps_loop_delay = None;
+        self.last_ps_tx_delay_ns = None;
+        self.ps_ratio_baseline = None;
+    }
+
     fn set_ps_mox(&mut self, mox_on: bool) {
         if self.last_ps_mox != Some(mox_on) {
             if mox_on {
@@ -1780,6 +1826,29 @@ impl TxProcessor {
                     }
                 }
             }
+        }
+        // Feedback streams at a different rate than the TX IQ (Protocol 1): before anything else uses the rate, and before the
+        // MOX/loop delays below (SetPSFeedbackRate recomputes the delay sample counts from the current delays).
+        if ps.feedback_rate > 0 && self.last_ps_feedback_rate != Some(ps.feedback_rate) {
+            unsafe {
+                wdsp::SetPSFeedbackRate(self.channel, ps.feedback_rate);
+            }
+            self.last_ps_feedback_rate = Some(ps.feedback_rate);
+            // The delays are re-sent after the rate change.
+            self.last_ps_mox_delay = None;
+            self.last_ps_loop_delay = None;
+            self.last_ps_tx_delay_ns = None;
+        }
+        if self.last_ps_tolerance != Some(ps.tolerance_mode) {
+            let frac = match ps.tolerance_mode {
+                0 => 0.06,
+                1 => 0.04,
+                _ => 0.02,
+            };
+            unsafe {
+                wdsp::SetPSDeadlockMinFrac(self.channel, frac);
+            }
+            self.last_ps_tolerance = Some(ps.tolerance_mode);
         }
         if self.last_ps_enabled != Some(ps.enabled) {
             unsafe {
@@ -1960,6 +2029,7 @@ impl TxProcessor {
             curve_status: [info[0], info[1], info[2], info[3]],
             solution_check: info[6],
             state: info[15],
+            cal_count: info[5],
         }
     }
 
@@ -2590,7 +2660,19 @@ fn run(
     // VOX level (see vox.rs): fed from the idle mic/radio-mic buffers below and from each keyed chunk.
     let mut vox_detector = crate::vox::VoxDetector::new();
 
+    // "Enable PureSignal" switched off: the engine must be reset (see TxProcessor::ps_disable), like piHPSDR tx_ps_onoff(0).
+    let mut ps_was_on = puresignal_enabled.load(Ordering::Relaxed);
+
     while !stop.load(Ordering::Relaxed) {
+        {
+            let ps_on_now = puresignal_enabled.load(Ordering::Relaxed);
+            if ps_was_on && !ps_on_now {
+                processor.ps_disable();
+                ps_rx_feedback_iq.lock().unwrap().clear();
+                ps_tx_feedback_iq.lock().unwrap().clear();
+            }
+            ps_was_on = ps_on_now;
+        }
         if !mox.load(Ordering::Relaxed) {
             // VOX: measure what the microphone hears while idle, before the buffers are dropped.
             {
@@ -3346,10 +3428,24 @@ fn run(
 
         if puresignal_enabled.load(Ordering::Relaxed) {
             // Pairs, not raw floats -- iq is interleaved I,Q,I,Q,...
-            let pairs_needed = iq.len() / 2;
-            if let Some((itx, qtx, irx, qrx)) =
+            // One TX chunk lasts iq.len()/2 / duc_rate seconds; the feedback streams deliver that many seconds at their own rate.
+            let (fb_rate, fb_iscal) = {
+                let p = ps_params.lock().unwrap();
+                (p.feedback_rate, p.tx_feedback_iscal)
+            };
+            let pairs_needed = if fb_rate > 0 && duc_rate > 0 {
+                (iq.len() / 2) * fb_rate as usize / duc_rate as usize
+            } else {
+                iq.len() / 2
+            };
+            if let Some((mut itx, mut qtx, irx, qrx)) =
                 drain_ps_feedback(&ps_tx_feedback_iq, &ps_rx_feedback_iq, pairs_needed)
             {
+                if fb_iscal != 1.0 {
+                    for v in itx.iter_mut().chain(qtx.iter_mut()) {
+                        *v *= fb_iscal;
+                    }
+                }
                 processor.feed_ps(&itx, &qtx, &irx, &qrx);
             }
             // else: feedback hasn't caught up yet (real network latency
@@ -3842,6 +3938,24 @@ impl TxHandle {
     }
     pub fn set_ps_tx_delay_ns(&self, tx_delay_ns: f64) {
         self.ps_params.lock().unwrap().tx_delay_ns = tx_delay_ns.max(0.0);
+    }
+    /// See PsParams::tx_feedback_iscal's doc comment (set every frame on the Hermes Lite 2, Protocol 1).
+    pub fn set_ps_tx_iscal(&self, v: f32) {
+        let mut p = self.ps_params.lock().unwrap();
+        if p.tx_feedback_iscal != v {
+            p.tx_feedback_iscal = v;
+        }
+    }
+    /// See PsParams::feedback_rate's doc comment (Protocol 1: the session RX sample rate, every frame; 0 = same as the TX IQ).
+    pub fn set_ps_feedback_rate(&self, rate: i32) {
+        let mut p = self.ps_params.lock().unwrap();
+        if p.feedback_rate != rate {
+            p.feedback_rate = rate;
+        }
+    }
+    /// See PsParams::tolerance_mode's doc comment.
+    pub fn set_ps_tolerance(&self, mode: u8) {
+        self.ps_params.lock().unwrap().tolerance_mode = mode.min(2);
     }
     /// See PsParams::oneshot's doc comment.
     pub fn set_ps_oneshot(&self, oneshot: bool) {

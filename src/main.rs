@@ -4736,6 +4736,22 @@ impl eframe::App for HpsdrApp {
                         connected.max_tx_power_watts,
                     );
                 connected.session.pa_gain_db.store(gain_db.to_bits(), std::sync::atomic::Ordering::Relaxed);
+                // PureSignal, Protocol 1: the feedback DDCs run at the session RX sample rate while the TX IQ is fixed at 48 kHz,
+                // so the PS engine must know that rate (SetPSFeedbackRate and the number of feedback pairs per TX chunk).
+                if connected.device.protocol == 1 {
+                    if let Some(tx) = &connected.tx_handle {
+                        tx.set_ps_feedback_rate(connected.sample_rate as i32);
+                        // Hermes Lite 2: the TX IQ is scaled digitally for the lower drive levels (radio.rs
+                        // hl2_drive_level_and_scale); piHPSDR undoes that scale on the TX-DAC feedback it gives to PureSignal:
+                        // drive_iscal = 0.9999 / drive_scale (radio.c radio_calc_drive_level).
+                        if matches!(connected.device.board, Boards::HermesLite | Boards::HermesLite2) {
+                            let watts = connected.session.tx_power_watts.load(std::sync::atomic::Ordering::Relaxed);
+                            let level = radio::drive_byte_for_watts(watts as f32, gain_db);
+                            let (_, scale) = radio::hl2_drive_level_and_scale(level);
+                            tx.set_ps_tx_iscal(0.9999 / scale.max(0.01));
+                        }
+                    }
+                }
                 // See RadioSession::tune_active's doc comment -- P1/
                 // HermesLite2-only (harmless no-op to also store this on
                 // every other board/protocol rather than special-casing

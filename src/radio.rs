@@ -3495,7 +3495,7 @@ pub(crate) fn drive_byte_for_watts(watts: f32, gain_db: f32) -> u8 {
 /// compensates down through it, keeping effective output continuous
 /// across attenuator-step transitions. See this function's call site
 /// (p1_build_packet) for the real-hardware report this fixes.
-fn hl2_drive_level_and_scale(level: u8) -> (u8, f32) {
+pub(crate) fn hl2_drive_level_and_scale(level: u8) -> (u8, f32) {
     let d = level as f32;
     if level > 240 {
         (240, d * 0.0039215)
@@ -4023,6 +4023,24 @@ fn p1_build_packet(
     // per-command below, not silently guessed.
     let freq = frequency_hz as i32;
     let tx_freq = tx_frequency_hz as i32;
+    // Hermes Lite 2: the PureSignal feedback attenuation (-29..+31, stored as its two's-complement byte in
+    // `ps_tx_attenuation`). On the HL2 the feedback gain is the chip's RX gain while transmitting, so (piHPSDR
+    // old_protocol.c, HL2 branches of commands 4 and 6): rxgain = 31 - attenuation, limited to 0..60.
+    let hl2_ps_att = ps_tx_attenuation as i8 as i32;
+    // The HL2 TX-time LNA register (command 0x1C, C3: bit 7 enable TX att, bit 6 enable the 6-bit value, bits 5..0 = LNA
+    // + 12 dB). It is written by command 6 AND command 11 below; both used to send different values for the same register,
+    // so it flipped between them. One value now: the PureSignal feedback gain while PS is on (piHPSDR sends no other value),
+    // otherwise the receiver's own gain without the PA, or the user's "LNA during TX" with the PA.
+    let hl2_tx_att_c3: u8 = {
+        let rxgain: i32 = if puresignal_enabled {
+            31 - hl2_ps_att
+        } else if disable_pa {
+            rx_attenuation as i32
+        } else {
+            lna_tx_db.clamp(-12, 48) + 12
+        };
+        0xC0 | (rxgain.clamp(0, 60) as u8 & 0x3F)
+    };
     let (c0b, c1b, c2b, c3b, c4b) = match *ozy_command {
         1 => {
             // TX frequency. Still no independent split-VFO control (no
@@ -4062,10 +4080,14 @@ fn p1_build_packet(
                 // doc comment.
                 freq
             } else {
+                // A receiver slot with no tracked frequency of its own is one of the PureSignal feedback DDCs (they sit
+                // after the real receivers, see ps_feedback_config): they must be tuned to the TX frequency, like
+                // piHPSDR's channel_freq() (every channel beyond RX1/RX2 gets the DUC frequency). They used to get the RX
+                // dial frequency, which is only right when TX and RX are on the same frequency (not with CTUN, split, XIT).
                 extra_frequencies_hz
                     .get(rx_index as usize - 1)
                     .map(|f| f.load(Ordering::Relaxed) as i32)
-                    .unwrap_or(freq)
+                    .unwrap_or(tx_freq)
             };
             let rx_wire = apply_ppm(rx_freq as i64) as i32; // calibrated, wire only
             (c0, (rx_wire >> 24) as u8, (rx_wire >> 16) as u8, (rx_wire >> 8) as u8, rx_wire as u8)
@@ -4232,7 +4254,14 @@ fn p1_build_packet(
             let c4: u8 = if is_hermes_lite {
                 // piHPSDR (old_protocol.c, HL2 RX gain): the RX gain is dropped to the minimum while transmitting only
                 // when the PA is in use (`pa_enabled && !txband->disablePA`); without the PA the receiver keeps its gain.
-                0x40 | (if mox_on && !disable_pa { 0 } else { rx_attenuation & 0x3F })
+                // With PureSignal on, the feedback gain replaces both (rxgain = 31 - attenuation, see hl2_ps_att).
+                0x40 | (if mox_on && puresignal_enabled {
+                    (31 - hl2_ps_att).clamp(0, 60) as u8
+                } else if mox_on && !disable_pa {
+                    0
+                } else {
+                    rx_attenuation & 0x3F
+                })
             } else {
                 0x20 | (rx_attenuation & 0x1F)
             };
@@ -4276,7 +4305,10 @@ fn p1_build_packet(
             if adc_opts.random {
                 c3 |= 0x10;
             }
-            (0x14, c1, 0x00, c3, c4)
+            // C2 bit 6 (0x40) = PureSignal on (piHPSDR old_protocol.c command 4: `if (transmitter->puresignal) buffer[C2] |= 0x40`).
+            // Without it the radio does not send the TX-DAC feedback stream, which stays all zeros: the WDSP engine then sits in
+            // COLLECT forever with a measured TX peak of 0.
+            (0x14, c1, if puresignal_enabled { 0x40 } else { 0x00 }, c3, c4)
         }
         5 => {
             // CW keyer settings (C2-C4) -- this project has no CW
@@ -4394,7 +4426,8 @@ fn p1_build_packet(
             // radio only actually applies it during TX, per the
             // reference's own comment) -- matches this byte's mox-
             // independent send here too.
-            (0x1C, c1, 0x00, ps_tx_attenuation & 0x1F, 0x00)
+            // HL2: the very same register value command 11 sends (see hl2_tx_att_c3), never a second, different one.
+            (0x1C, c1, 0x00, if is_hermes_lite { hl2_tx_att_c3 } else { ps_tx_attenuation & 0x1F }, 0x00)
         }
         7 => {
             // CW mode bit (C1) + sidetone volume/PTT delay (C2/C3).
@@ -4566,13 +4599,7 @@ fn p1_build_packet(
                 // Without the PA (PA enable off / transverter) the HL2 must keep receiving while it transmits (duplex): the
                 // TX LNA then follows the RX gain instead of the usual -12 dB, which the gateware applies the moment MOX is
                 // set and which took ~30 dB off the receiver in duplex (piHPSDR never programs this register at all).
-                let clamped = if disable_pa {
-                    (rx_attenuation as i32 - 12).clamp(-12, 48)
-                } else {
-                    lna_tx_db.clamp(-12, 48)
-                };
-                let c3 = (((clamped + 12) as u8) & 0x3F) | 0xC0;
-                (0x1C, 0x00, 0x00, c3, 0x00)
+                (0x1C, 0x00, 0x00, hl2_tx_att_c3, 0x00)
             } else {
                 (0x2E, 0x00, 0x00, PTT_HANG_TIME_MS, TX_LATENCY_MS) // same as the default catch-all below
             }
