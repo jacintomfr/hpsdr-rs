@@ -236,6 +236,8 @@ const ALC_DECAY_DEFAULT_MS: i32 = 10;
 
 #[derive(Copy, Clone, Default)]
 pub struct TxDisplay {
+    /// Average mic level in dB (TXA_MIC_AV), for the deskHPSDR-style meter's Mic | ALC bars.
+    pub mic_av: f64,
     /// Peak mic input level, roughly 0.0-1.0-ish (units not confirmed
     /// -- see module note). For a simple TX level bar in the UI.
     pub mic_pk: f64,
@@ -3566,12 +3568,13 @@ fn run(
         }
 
         let mic_pk = processor.meter(wdsp::txaMeterType_TXA_MIC_PK);
+        let mic_av = processor.meter(wdsp::txaMeterType_TXA_MIC_AV);
         let alc_av = processor.meter(match ALC_MODE.load(Ordering::Relaxed) {
             0 => wdsp::txaMeterType_TXA_ALC_PK,
             2 => wdsp::txaMeterType_TXA_ALC_GAIN,
             _ => wdsp::txaMeterType_TXA_ALC_AV,
         });
-        *display.lock().unwrap() = TxDisplay { mic_pk, alc_av };
+        *display.lock().unwrap() = TxDisplay { mic_pk, alc_av, mic_av };
 
         next_chunk += chunk_interval;
         let now = Instant::now();

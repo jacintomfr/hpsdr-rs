@@ -220,3 +220,7 @@ Drawing code of the spectrum/waterfall (all in `src/main.rs`):
 
 Left: pixel count = widget width (deskHPSDR has one sample per pixel), bilinear stretch of the waterfall texture, HiDPI floor (y is floored to
 physical pixels), the "weak" (inactive receiver) gradient/fill colours.
+
+## Meter: "Analog (deskHPSDR)" (src/meter_vintage.rs)
+
+Third meter style (tap the meter -> Meter type): deskHPSDR's analog meter (meter.c `analog_meter`) ported drawing for drawing: cream face (vertical gradient + soft glow, rounded corners), dark scale, red alarm arc from S9, dark red needle, the S-word table (HF/VHF), the dBm / Peak-Average / RX n texts, the TX scale in W with SWR and ALC, the Mic | ALC (VOX | ALC) bar graph and the "sedated" needle ballistics (CNTMAX 5, 0.75/0.25). Drawn on meter.c's 250-unit-wide surface and scaled to the meter box; the face is a cached texture; the font is FreeSansBold when installed. The "Analog" and "Digital" styles are unchanged.

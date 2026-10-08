@@ -30,6 +30,7 @@ mod oc_window;
 mod pa_window;
 mod ps_window;
 mod menu_window;
+mod meter_vintage;
 mod toolbar_window;
 mod display_window;
 mod cw_window;
@@ -11039,6 +11040,35 @@ Waterfall rebuilds: {prof_wf_n:.0}/s, {prof_wf_ms:.1} ms each."
                                     connected.max_tx_power_watts as f32,
                                     connected.max_swr,
                                 ),
+                                MeterStyle::Vintage => {
+                                    let (watts_instant, _, _) = power_watts_and_swr(
+                                        raw_fwd,
+                                        raw_rev,
+                                        power_meter_board(connected.device.board, connected.device.mac),
+                                    );
+                                    let disp = connected.tx_handle.as_ref().map(|tx| *tx.display.lock().unwrap());
+                                    let cw = matches!(connected.spectrum.mode(), spectrum::Mode::Cwl | spectrum::Mode::Cwu);
+                                    let bars = disp.map(|d| meter_vintage::Bars {
+                                        mic_av_db: d.mic_av,
+                                        alc_db: d.alc_av,
+                                        vox_enabled: connected.vox_enabled,
+                                        vox_peak: connected.vox_level_shown as f64,
+                                        vox_threshold: connected.vox_threshold,
+                                    });
+                                    meter_vintage::draw_power_meter(
+                                        ui,
+                                        meter_rect,
+                                        &meter_vintage::TxInfo {
+                                            watts: watts_instant as f64,
+                                            swr: swr as f64,
+                                            swr_alarm: connected.max_swr as f64,
+                                            max_watts: connected.max_tx_power_watts,
+                                            alc_db: disp.map(|d| d.alc_av).unwrap_or(-100.0),
+                                            cw,
+                                            bars,
+                                        },
+                                    );
+                                }
                             }
                         } else {
                             // Reset so the next key-up's meter ramps from
@@ -11052,6 +11082,33 @@ Waterfall rebuilds: {prof_wf_n:.0}/s, {prof_wf_ms:.1} ms each."
                             match connected.meter_style {
                                 MeterStyle::Analog => draw_s_meter(ui, meter_rect, meter_db),
                                 MeterStyle::Digital => draw_digital_s_meter(ui, meter_rect, meter_db),
+                                MeterStyle::Vintage => {
+                                    let cw = matches!(connected.spectrum.mode(), spectrum::Mode::Cwl | spectrum::Mode::Cwu);
+                                    let disp = connected.tx_handle.as_ref().map(|tx| *tx.display.lock().unwrap());
+                                    let bars = if connected.vox_enabled && !cw {
+                                        disp.map(|d| meter_vintage::Bars {
+                                            mic_av_db: d.mic_av,
+                                            alc_db: d.alc_av,
+                                            vox_enabled: true,
+                                            vox_peak: connected.vox_level_shown as f64,
+                                            vox_threshold: connected.vox_threshold,
+                                        })
+                                    } else {
+                                        None
+                                    };
+                                    meter_vintage::draw_s_meter(
+                                        ui,
+                                        meter_rect,
+                                        &meter_vintage::SInfo {
+                                            dbm: meter_db,
+                                            freq_hz: connected.session.rx_frequency_hz.load(Ordering::Relaxed) as f64,
+                                            peak_mode: connected.smeter_mode == SMeterMode::Peak,
+                                            receivers: 1 + connected.extra_receivers.len(),
+                                            rx_id: 0,
+                                            bars,
+                                        },
+                                    );
+                                }
                             }
                         }
 
@@ -18705,6 +18762,17 @@ fn render_toolbar(ui: &mut egui::Ui, connected: &mut ConnectedState) {
     show_toolbar_chooser(ui.ctx(), connected, false);
 }
 
+/// Rounded boxes for the toolbar editor: every button (the 8x8 grid, the Choose Function list) gets radius 5 and a 1 px gray outline, like the
+/// other kiosk touch windows.
+pub(crate) fn rounded_boxes(ui: &mut egui::Ui) {
+    let stroke = egui::Stroke::new(1.0, egui::Color32::from_gray(95));
+    let w = &mut ui.visuals_mut().widgets;
+    for v in [&mut w.inactive, &mut w.hovered, &mut w.active, &mut w.open] {
+        v.corner_radius = egui::CornerRadius::same(5);
+        v.bg_stroke = stroke;
+    }
+}
+
 /// A toolbar button being reassigned: which one, what is highlighted in the list, and which window
 /// (main or Settings) opened it, so only that one draws the dialog.
 struct ToolbarChoose {
@@ -18742,6 +18810,7 @@ fn choose_function_dialog(
         .resizable(false)
         .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
         .show(ctx, |ui| {
+            rounded_boxes(ui);
             ui.horizontal(|ui| {
                 if ui.add_sized([110.0, 30.0], egui::Button::new("Choose")).clicked() {
                     action = Some(true);
@@ -24244,6 +24313,8 @@ impl WaterfallBake {
 pub enum MeterStyle {
     Analog,
     Digital,
+    /// deskHPSDR's analog meter (meter_vintage.rs): cream needle-instrument face.
+    Vintage,
 }
 
 impl MeterStyle {
@@ -24251,11 +24322,12 @@ impl MeterStyle {
         match self {
             MeterStyle::Analog => "Analog",
             MeterStyle::Digital => "Digital",
+            MeterStyle::Vintage => "Analog (deskHPSDR)",
         }
     }
 }
 
-const ALL_METER_STYLES: [MeterStyle; 2] = [MeterStyle::Analog, MeterStyle::Digital];
+const ALL_METER_STYLES: [MeterStyle; 3] = [MeterStyle::Analog, MeterStyle::Digital, MeterStyle::Vintage];
 
 /// What the S-meter shows: the peak or the average of the signal (deskHPSDR's "S-Meter Reading").
 #[derive(Copy, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
