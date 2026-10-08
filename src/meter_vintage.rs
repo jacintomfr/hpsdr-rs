@@ -359,11 +359,11 @@ pub fn draw_s_meter(ui: &mut egui::Ui, rect: Rect, info: &SInfo) {
             let (x2, y2) = sf.polar(cx, radius, angle);
             sf.line((x1, y1), (x2, y2), PAN_LINE_EXTRA, scale);
             let label = format!("{i}");
-            let w = sf.text_w(&label, 14.0);
+            let w = sf.text_w(&label, 17.5);
             let (mut x, y) = sf.polar(cx, radius + 6.0, angle);
             // At x=0, move left the whole width, at x==cx half of the width, and at x=2 cx do not move
             x += w * (x / (2.0 * cx) - 1.0);
-            sf.text(x, y, &label, 14.0, scale);
+            sf.text(x, y, &label, 17.5, scale);
         } else {
             let (x1, y1) = sf.polar(cx, radius + 2.0, angle);
             let (x2, y2) = sf.polar(cx, radius, angle);
@@ -376,10 +376,10 @@ pub fn draw_s_meter(ui: &mut egui::Ui, rect: Rect, info: &SInfo) {
         let (x2, y2) = sf.polar(cx, radius, angle);
         sf.line((x1, y1), (x2, y2), 2.0, scale);
         let label = format!("+{i}");
-        let w = sf.text_w(&label, 12.0);
+        let w = sf.text_w(&label, 15.0);
         let (mut x, y) = sf.polar(cx, radius + 7.0, angle);
         x += w * (x / (2.0 * cx) - 1.0);
-        sf.text(x, y, &label, 12.0, COLOUR_ALARM);
+        sf.text(x, y, &label, 15.0, COLOUR_ALARM);
     }
     // needle
     let angle = if info.freq_hz > 30_000_000.0 {
@@ -399,15 +399,13 @@ pub fn draw_s_meter(ui: &mut egui::Ui, rect: Rect, info: &SInfo) {
     // The two big readings sit near the bottom edge of the face (deskHPSDR's own surface is about 95 units high, so its y = cx - radius + 64
     // lands 6 units above the bottom); keep that distance from the bottom whatever the height of the box.
     let y_read = sf.vh - 6.0;
-    sf.text(cx + 10.0, y_read, &format!("{current} dBm"), 18.0, col);
-    sf.text(cx - 90.0, y_read, DBM2SMETER[get_swert(current, info.freq_hz)], 18.0, col);
-    if info.peak_mode {
-        sf.text(cx - 20.0, cx - radius + 20.0, "Peak", 12.0, COLOUR_BLACK);
-    } else {
-        sf.text(cx - 25.0, cx - radius + 20.0, "Average", 12.0, COLOUR_BLACK);
-    }
+    sf.text(cx + 10.0, y_read, &format!("{current} dBm"), 22.0, col);
+    sf.text(cx - 90.0, y_read, DBM2SMETER[get_swert(current, info.freq_hz)], 22.0, col);
+    let mode_txt = if info.peak_mode { "Peak" } else { "Average" };
+    let mode_w = sf.text_w(mode_txt, 14.5);
+    sf.text(cx - mode_w / 2.0, cx - radius + 22.0, mode_txt, 14.5, COLOUR_BLACK);
     if info.receivers > 1 {
-        sf.text(cx - 115.0, cx - radius - 3.0, &format!("RX{}", info.rx_id + 1), 12.0, COLOUR_BLACK);
+        sf.text(cx - 115.0, cx - radius - 3.0, &format!("RX{}", info.rx_id + 1), 14.5, COLOUR_BLACK);
     }
     if let Some(bars) = &info.bars {
         draw_bars(&sf, bars, PAN_LINE_ZEIGER);
@@ -478,10 +476,10 @@ pub fn draw_power_meter(ui: &mut egui::Ui, rect: Rect, info: &TxInfo) {
                     // "1000" overwrites the right margin, replace by "1K"
                     if p == 1000 { "1K".to_string() } else { format!("{p}") }
                 };
-                let w = sf.text_w(&label, 14.0);
+                let w = sf.text_w(&label, 17.5);
                 let (mut x, y) = sf.polar(cx, radius + 5.0, angle);
                 x += w * (x / (2.0 * cx) - 1.0);
-                sf.text(x, y, &label, 14.0, scale);
+                sf.text(x, y, &label, 17.5, scale);
             }
         }
     }
