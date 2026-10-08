@@ -330,6 +330,11 @@ pub struct PsParams {
     pub tx_feedback_iscal: f32,
     /// deskHPSDR "PS Stability": 0 = Strict (SetPSDeadlockMinFrac 0.06), 1 = Medium (0.04), 2 = Relaxed (0.02, the default).
     pub tolerance_mode: u8,
+    /// deskHPSDR "MON": the TX spectrum shows the PureSignal feedback (the signal that comes back from the PA) instead of the transmitted
+    /// signal, so the effect of the correction can be seen. Display only. `monitor_gain_db` is deskHPSDR's fixed level offset
+    /// (17 dB for the HL2 on Protocol 1, 12 dB other Protocol 1 boards, 15 dB Protocol 2).
+    pub monitor: bool,
+    pub monitor_gain_db: f32,
 }
 
 impl Default for PsParams {
@@ -347,6 +352,8 @@ impl Default for PsParams {
             feedback_rate: 0,
             tx_feedback_iscal: 1.0,
             tolerance_mode: 2,
+            monitor: false,
+            monitor_gain_db: 17.0,
         }
     }
 }
@@ -477,6 +484,10 @@ pub struct TxParams {
     /// exactly why every reference PS implementation calibrates with a
     /// two-tone generator, never a steady carrier.
     pub two_tone: bool,
+    /// deskHPSDR PureSignal menu "Noise": Gaussian noise generated BEFORE the TX chain (WDSP PreGen, mode 2), so the normal TX
+    /// band-pass limits it to the transmit passband; level -12..+3 dB. A PS calibration source, like Two Tone.
+    pub noise: bool,
+    pub noise_level_db: i32,
     /// See spectrum::EqualizerParams's doc comment -- same type, TXA side.
     pub eq: EqualizerParams,
     /// WDSP's Leveler stage (SetTXALevelerSt) -- a slower average-level
@@ -790,6 +801,8 @@ impl Default for TxParams {
             width_hz: crate::spectrum::default_width_hz(Mode::Usb),
             tune: false,
             two_tone: false,
+            noise: false,
+            noise_level_db: 0,
             eq: EqualizerParams::default_tx(),
             // Off by default -- matches this project's and piHPSDR's own
             // prior behavior exactly (open()'s SetTXALevelerSt(channel, 0)
@@ -870,6 +883,8 @@ struct TxProcessor {
     last_ps_feedback_rate: Option<i32>,
     /// PsParams::tolerance_mode last sent to WDSP (the channel is opened with 0.02 = mode 2).
     last_ps_tolerance: Option<u8>,
+    /// (on, level) last sent to the WDSP PreGen noise generator.
+    last_noise: Option<(bool, i32)>,
     last_ps_calibrate_request: Option<u32>,
     last_ps_hw_peak: Option<f64>,
     last_ps_mox_delay: Option<f64>,
@@ -1314,6 +1329,7 @@ impl TxProcessor {
             last_ps_calibrate_request: Some(0),
             last_ps_feedback_rate: None,
             last_ps_tolerance: Some(2),
+            last_noise: None,
             last_ps_hw_peak: None,
             last_ps_mox_delay: None,
             last_ps_loop_delay: None,
@@ -1739,6 +1755,24 @@ impl TxProcessor {
         self.last_ps_loop_delay = None;
         self.last_ps_tx_delay_ns = None;
         self.ps_ratio_baseline = None;
+    }
+
+    /// deskHPSDR tx_set_noise / tx_set_noise_level: the PreGen noise source (see TxParams::noise). Edge-triggered.
+    fn apply_noise(&mut self, on: bool, level_db: i32) {
+        let key = (on, level_db.clamp(-12, 3));
+        if self.last_noise == Some(key) {
+            return;
+        }
+        unsafe {
+            if on {
+                wdsp::SetTXAPreGenNoiseMag(self.channel, 10f64.powf(0.05 * key.1 as f64));
+                wdsp::SetTXAPreGenMode(self.channel, 2);
+                wdsp::SetTXAPreGenRun(self.channel, 1);
+            } else {
+                wdsp::SetTXAPreGenRun(self.channel, 0);
+            }
+        }
+        self.last_noise = Some(key);
     }
 
     fn set_ps_mox(&mut self, mox_on: bool) {
@@ -3392,6 +3426,7 @@ fn run(
             && !matches!(p.mode, Mode::Cwl | Mode::Cwu)
             && !(rade.tx_armed() || rtty.tx_armed() || sstv.tx_armed());
         vox_detector.decide(vox_peak, &mox, vox_allowed);
+        processor.apply_noise(p.noise, p.noise_level_db);
         let (iq, exch_error) = processor.process(
             &chunk,
             p.mode,
@@ -3426,13 +3461,17 @@ fn run(
             exch_errors_this_window = 0;
         }
 
+        // MON: the feedback (decimated to the TX IQ rate, with deskHPSDR's level offset) replaces the TX IQ in the TX spectrum.
+        let mut mon_active = false;
+        let mut mon_pairs: Vec<(f32, f32)> = Vec::new();
         if puresignal_enabled.load(Ordering::Relaxed) {
             // Pairs, not raw floats -- iq is interleaved I,Q,I,Q,...
             // One TX chunk lasts iq.len()/2 / duc_rate seconds; the feedback streams deliver that many seconds at their own rate.
-            let (fb_rate, fb_iscal) = {
+            let (fb_rate, fb_iscal, mon_on, mon_gain_db) = {
                 let p = ps_params.lock().unwrap();
-                (p.feedback_rate, p.tx_feedback_iscal)
+                (p.feedback_rate, p.tx_feedback_iscal, p.monitor, p.monitor_gain_db)
             };
+            mon_active = mon_on;
             let pairs_needed = if fb_rate > 0 && duc_rate > 0 {
                 (iq.len() / 2) * fb_rate as usize / duc_rate as usize
             } else {
@@ -3447,6 +3486,18 @@ fn run(
                     }
                 }
                 processor.feed_ps(&itx, &qtx, &irx, &qrx);
+                if mon_on {
+                    let factor = if fb_rate > 0 && duc_rate > 0 { ((fb_rate / duc_rate).max(1)) as usize } else { 1 };
+                    let g = 10f32.powf(mon_gain_db / 20.0);
+                    for k in 0..irx.len() / factor {
+                        let (mut si, mut sq) = (0.0f32, 0.0f32);
+                        for j in 0..factor {
+                            si += irx[k * factor + j];
+                            sq += qrx[k * factor + j];
+                        }
+                        mon_pairs.push((si / factor as f32 * g, sq / factor as f32 * g));
+                    }
+                }
             }
             // else: feedback hasn't caught up yet (real network latency
             // behind this chunk's TX audio, most likely right after
@@ -3464,14 +3515,24 @@ fn run(
 
         {
             let mut spec = tx_spectrum_iq.lock().unwrap();
-            for pair in iq.chunks_exact(2) {
-                if spec.len() >= TX_SPECTRUM_IQ_CAPACITY {
-                    spec.pop_front();
+            if mon_active {
+                // MON: only feedback goes to the spectrum (nothing when none arrived this chunk).
+                for &(fi, fq) in &mon_pairs {
+                    if spec.len() >= TX_SPECTRUM_IQ_CAPACITY {
+                        spec.pop_front();
+                    }
+                    spec.push_back(IqSample { i: (fi * PS_IQ_NORM) as i32, q: (fq * PS_IQ_NORM) as i32 });
                 }
-                spec.push_back(IqSample {
-                    i: (pair[0] * PS_IQ_NORM) as i32,
-                    q: (pair[1] * PS_IQ_NORM) as i32,
-                });
+            } else {
+                for pair in iq.chunks_exact(2) {
+                    if spec.len() >= TX_SPECTRUM_IQ_CAPACITY {
+                        spec.pop_front();
+                    }
+                    spec.push_back(IqSample {
+                        i: (pair[0] * PS_IQ_NORM) as i32,
+                        q: (pair[1] * PS_IQ_NORM) as i32,
+                    });
+                }
             }
         }
 
@@ -3785,6 +3846,13 @@ impl TxHandle {
     pub fn set_two_tone(&self, two_tone: bool) {
         self.params.lock().unwrap().two_tone = two_tone;
     }
+    /// See TxParams::noise's doc comment.
+    pub fn set_noise(&self, on: bool) {
+        self.params.lock().unwrap().noise = on;
+    }
+    pub fn set_noise_level(&self, db: i32) {
+        self.params.lock().unwrap().noise_level_db = db.clamp(-12, 3);
+    }
 
     /// See spectrum::EqualizerParams's doc comment.
     pub fn eq(&self) -> EqualizerParams {
@@ -3951,6 +4019,16 @@ impl TxHandle {
         let mut p = self.ps_params.lock().unwrap();
         if p.feedback_rate != rate {
             p.feedback_rate = rate;
+        }
+    }
+    /// See PsParams::monitor's doc comment.
+    pub fn set_ps_monitor(&self, on: bool, gain_db: f32) {
+        let mut p = self.ps_params.lock().unwrap();
+        if p.monitor != on {
+            p.monitor = on;
+        }
+        if p.monitor_gain_db != gain_db {
+            p.monitor_gain_db = gain_db;
         }
     }
     /// See PsParams::tolerance_mode's doc comment.

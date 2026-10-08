@@ -1163,6 +1163,12 @@ pub struct TxUiExtra {
     /// PureSignal menu: OneShot and PS Stability (0 Strict, 1 Medium, 2 Relaxed), saved like deskHPSDR (ps_oneshot, ps_tolerance_mode).
     pub ps_oneshot: bool,
     pub ps_stability: u8,
+    /// PureSignal menu "MON" (deskHPSDR `feedback`): the TX spectrum shows the feedback signal.
+    pub ps_mon: bool,
+    /// "Don't show this warning again" of the PureSignal TX attenuation warning (deskHPSDR ps_zero_att_warning, inverted).
+    pub ps_hide_zero_att: bool,
+    /// PureSignal menu "Noise" level in dB (-12..+3), saved like deskHPSDR noise_level_db.
+    pub ps_noise_db: i32,
 }
 
 impl Default for TxUiExtra {
@@ -1197,6 +1203,9 @@ impl Default for TxUiExtra {
             tx_extra: None,
             ps_oneshot: false,
             ps_stability: 2,
+            ps_mon: false,
+            ps_hide_zero_att: false,
+            ps_noise_db: 0,
         }
     }
 }

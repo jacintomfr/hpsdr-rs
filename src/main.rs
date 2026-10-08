@@ -1621,12 +1621,34 @@ fn dispatch_midi_binding(
             // reconnect-required). A no-op if PureSignal itself isn't
             // enabled this session or there's no live tx_handle yet,
             // same as the checkbox being hidden entirely in that case.
-            if !connected.puresignal_enabled {
+            // Toolbar / MIDI "PS": switches PureSignal itself on and shows the PS bar (the PureSignal menu in its "Hide" size: feedback,
+            // correcting, Two Tone, MON, OFF, Restart), ready to work; pressed again it switches PureSignal off and closes the bar.
+            if connected.tx_handle.is_none() {
                 return;
             }
-            let Some(tx) = &connected.tx_handle else { return };
-            connected.ps_enabled = !connected.ps_enabled;
-            tx.set_ps_enabled(connected.ps_enabled);
+            if connected.diversity_enabled {
+                connected.status_message = Some("PureSignal is not available while Diversity is on".to_string());
+                return;
+            }
+            let on = !connected.puresignal_enabled;
+            connected.puresignal_enabled = on;
+            connected.session.set_puresignal_enabled(on);
+            if let Some(tx) = &connected.tx_handle {
+                tx.set_puresignal_enabled(on);
+                if on {
+                    connected.ps_enabled = true;
+                    tx.set_ps_enabled(true);
+                }
+            }
+            if on {
+                menu_window::close_overlays(connected);
+                connected.ps_window_open = true;
+                ps_window::show_bar();
+                ps_window::maybe_warn(connected);
+            } else {
+                connected.ps_window_open = false;
+            }
+            connected.settings_dirty.store(true, Ordering::Relaxed);
         }
         MidiAction::DiversityGainAdjust => {
             // Mirrors Settings -> Diversity's own Gain slider -- see its
@@ -2804,6 +2826,17 @@ struct ConnectedState {
     ps_oneshot: bool,
     /// PureSignal menu "PS Stability": 0 Strict, 1 Medium, 2 Relaxed (see tx::PsParams::tolerance_mode).
     ps_stability: u8,
+    /// PureSignal menu "MON" (see tx::PsParams::monitor).
+    ps_mon: bool,
+    /// The PureSignal TX attenuation warning window is open, and "don't show again" was ticked (saved).
+    ps_zero_att_popup: bool,
+    ps_hide_zero_att: bool,
+    /// PureSignal menu "Noise" (deskHPSDR tx_set_noise): running, its level (saved), a request from the menu, and "start Two Tone
+    /// when the noise has stopped" (Two Tone and Noise exclude each other).
+    noise_active: bool,
+    noise_level_db: i32,
+    noise_request: Option<bool>,
+    two_tone_after_noise: bool,
     /// The PureSignal menu (ps_window.rs) is open.
     ps_window_open: bool,
     ps_hw_peak: f64,
@@ -4273,6 +4306,14 @@ fn connect_to_device(device: Device, cfg: &Config) -> Result<ConnectedState, Str
                 ps_enabled,
                 ps_oneshot: cfg.tx_ui.ps_oneshot,
                 ps_stability: cfg.tx_ui.ps_stability.min(2),
+                ps_mon: cfg.tx_ui.ps_mon,
+                // deskHPSDR also shows the warning at start-up when PureSignal was left on with 0 dB of attenuation.
+                ps_zero_att_popup: cfg.puresignal_enabled.unwrap_or(false) && cfg.ps_tx_attenuation.unwrap_or(20) == 0 && !cfg.tx_ui.ps_hide_zero_att,
+                ps_hide_zero_att: cfg.tx_ui.ps_hide_zero_att,
+                noise_active: false,
+                noise_level_db: cfg.tx_ui.ps_noise_db.clamp(-12, 3),
+                noise_request: None,
+                two_tone_after_noise: false,
                 ps_window_open: false,
                 ps_hw_peak,
                 ps_mox_delay,
@@ -4758,6 +4799,12 @@ impl eframe::App for HpsdrApp {
                         connected.max_tx_power_watts,
                     );
                 connected.session.pa_gain_db.store(gain_db.to_bits(), std::sync::atomic::Ordering::Relaxed);
+                // PureSignal "MON": the TX spectrum shows the feedback; deskHPSDR adds a fixed level offset (HL2 17 dB, other Protocol 1 12 dB, Protocol 2 15 dB).
+                if let Some(tx) = &connected.tx_handle {
+                    let off = if connected.device.protocol == 1 { if matches!(connected.device.board, Boards::HermesLite | Boards::HermesLite2) { 17.0 } else { 12.0 } } else { 15.0 };
+                    tx.set_ps_monitor(connected.ps_mon, off);
+                    tx.set_noise_level(connected.noise_level_db);
+                }
                 // PureSignal, Protocol 1: the feedback DDCs run at the session RX sample rate while the TX IQ is fixed at 48 kHz,
                 // so the PS engine must know that rate (SetPSFeedbackRate and the number of feedback pairs per TX chunk).
                 if connected.device.protocol == 1 {
@@ -6908,6 +6955,7 @@ impl eframe::App for HpsdrApp {
                     }
                     // PureSignal menu (deskHPSDR ps_menu.c), see ps_window.rs. The Auto Attenuate timer runs even when it is closed.
                     ps_window::auto_tick(connected, ui.ctx());
+                    ps_window::warning_window(ui, connected);
                     if connected.ps_window_open {
                         let (close_now, changed) = ps_window::ps_window(ui, connected);
                         if changed {
@@ -8538,6 +8586,62 @@ impl eframe::App for HpsdrApp {
                                 connected.two_tone_active = false;
                             }
 
+                            // PureSignal menu "Noise" (deskHPSDR tx_set_noise): Gaussian noise through the TX chain as a PS calibration
+                            // source, keyed like Two Tone (same power rule). Exclusive with Two Tone.
+                            if let Some(want) = connected.noise_request.take() {
+                                if want && !connected.noise_active {
+                                    let was_two_tone = connected.two_tone_active;
+                                    let may = connected.tx_handle.is_some()
+                                        && !connected.tune_active
+                                        && !connected.cw_text_sending
+                                        && (was_two_tone || !connected.session.mox_active())
+                                        && tx_frequency_allowed(
+                                            connected.session.tx_frequency_hz.load(Ordering::Relaxed),
+                                            connected.allow_out_of_band_tx.load(Ordering::Relaxed),
+                                        );
+                                    if may {
+                                        if let Some(tx) = &connected.tx_handle {
+                                            if was_two_tone {
+                                                // Stays keyed at the same power; only the signal source changes.
+                                                tx.set_two_tone(false);
+                                                connected.two_tone_active = false;
+                                            }
+                                            tx.set_noise(true);
+                                        }
+                                        if !was_two_tone {
+                                            let current_watts = connected.session.tx_power_watts.load(Ordering::Relaxed);
+                                            connected.pre_tune_power_watts = Some(current_watts);
+                                            let tune_watts = tune_watts_for(connected, current_watts);
+                                            connected.session.tx_power_watts.store(tune_watts, Ordering::Relaxed);
+                                            connected.session.set_mox(true);
+                                        }
+                                        connected.noise_active = true;
+                                    }
+                                } else if !want && connected.noise_active {
+                                    if let Some(tx) = &connected.tx_handle {
+                                        tx.set_noise(false);
+                                    }
+                                    connected.session.set_mox(false);
+                                    if let Some(prev) = connected.pre_tune_power_watts.take() {
+                                        connected.session.tx_power_watts.store(prev, Ordering::Relaxed);
+                                    }
+                                    connected.noise_active = false;
+                                    if std::mem::take(&mut connected.two_tone_after_noise) {
+                                        connected.toolbar_two_tone_request = true;
+                                    }
+                                }
+                            }
+                            // Safety net: MOX was dropped elsewhere while the noise was on.
+                            if connected.noise_active && !connected.session.mox_active() {
+                                if let Some(tx) = &connected.tx_handle {
+                                    tx.set_noise(false);
+                                }
+                                if let Some(prev) = connected.pre_tune_power_watts.take() {
+                                    connected.session.tx_power_watts.store(prev, Ordering::Relaxed);
+                                }
+                                connected.noise_active = false;
+                            }
+
                             // CW text send -- see tx::TxHandle::
                             // send_cw_text's doc comment for the actual
                             // generation mechanism. Requires a CW mode
@@ -9540,7 +9644,7 @@ impl eframe::App for HpsdrApp {
                         // TX line/fill colour (Settings -> Display -> Peak Blobs & Hold, deskHPSDR tx_pan_fill_col); RX keeps its colours.
                         let (trace_line_col, trace_fill_col) = if transmitting {
                             let c = connected.tx_ui.tx_pan_col.map(|v| (v.clamp(0.0, 1.0) * 255.0).round() as u8);
-                            (egui::Color32::from_rgb(c[0], c[1], c[2]), egui::Color32::from_rgba_unmultiplied(c[0], c[1], c[2], 110))
+                            (egui::Color32::from_rgb(c[0], c[1], c[2]), egui::Color32::from_rgba_unmultiplied(c[0], c[1], c[2], (connected.tx_ui.tx_pan_col[3].clamp(0.0, 1.0) * 255.0).round() as u8))
                         } else {
                             // RX flat (Gradient off): deskHPSDR strokes with the same source as the fill: COLOUR_PAN_FILL2 (white,
                             // alpha 0.50 = 128) when filled, COLOUR_PAN_FILL3 (white, alpha 0.75 = 191) when not filled.
@@ -9576,7 +9680,9 @@ impl eframe::App for HpsdrApp {
                                 egui::Stroke::new(w, trace_line_col).into()
                             }
                         };
-                        if connected.spectrum_filled {
+                        // TX: "Fill TX Panadapter" (TX menu) -- filled with the flat TX colour (deskHPSDR tx_panadapter.c: cairo_fill with tx_pan_fill_col,
+                        // green by default, then a thin stroke), otherwise just the thick line. RX keeps its own Fill option and gradient.
+                        if (if transmitting { connected.tx_ui.tx_display_filled } else { connected.spectrum_filled }) {
                             // Gouraud-shaded quad strip from the trace
                             // down to the plot baseline, matching
                             // deskHPSDR's cairo_fill_preserve under the
@@ -9594,7 +9700,7 @@ impl eframe::App for HpsdrApp {
                             // gradient can key off real dB distance from
                             // the noise floor instead of screen fraction.
                             let color_at = |y: f32| -> egui::Color32 {
-                                if connected.spectrum_gradient {
+                                if connected.spectrum_gradient && !grad_tx {
                                     gradient_at_y(y, 190)
                                 } else {
                                     trace_fill_col
@@ -15499,6 +15605,9 @@ Waterfall rebuilds: {prof_wf_n:.0}/s, {prof_wf_ms:.1} ms each."
                             tx_extra: connected.tx_handle.as_ref().map(|t| t.tx_extra()),
                             ps_oneshot: connected.ps_oneshot,
                             ps_stability: connected.ps_stability,
+                            ps_mon: connected.ps_mon,
+                            ps_hide_zero_att: connected.ps_hide_zero_att,
+                            ps_noise_db: connected.noise_level_db,
                             ..connected.tx_ui
                         },
                         mic_gain: Some(connected.mic_gain),
@@ -18348,6 +18457,7 @@ fn toolbar_fn_active(connected: &ConnectedState, f: toolbar::ToolbarFn) -> bool 
         ToolbarFn::Midi(MidiAction::RxMenu) => connected.rx_window_open,
         ToolbarFn::Midi(MidiAction::SdrMenu) => connected.sdr_window_open,
         ToolbarFn::Midi(MidiAction::NewMenu) => connected.menu_window_open,
+        ToolbarFn::Midi(MidiAction::PureSignalRunningToggle) => connected.puresignal_enabled,
         ToolbarFn::Midi(MidiAction::ToolbarFuncList) => connected.fnc_list_open,
         ToolbarFn::Midi(MidiAction::RxEqToggle) => connected.spectrum.eq().enabled,
         _ => false,
@@ -18892,6 +19002,9 @@ fn render_status_row(
             }
         }
         connected.ps_was_correcting = correcting_now;
+        // Under VFO A: "PS" while idle (ready), then while transmitting "PS Correcting" (green) or "PS no corr." (red). A fixed slot, so
+        // nothing around it moves when the text changes.
+        let live = status.is_some() && connected.session.mox_active();
         let (color, hover) = match status {
             Some(s) if s.correcting => (
                 egui::Color32::from_rgb(80, 200, 80),
@@ -18903,7 +19016,16 @@ fn render_status_row(
             ),
             None => (egui::Color32::GRAY, "PureSignal: enabled".to_string()),
         };
-        ui.colored_label(color, "PS").on_hover_text(hover);
+        let (text, color) = if !live {
+            ("PS", egui::Color32::GRAY)
+        } else if correcting_now {
+            ("PS Correcting", egui::Color32::from_rgb(80, 200, 80))
+        } else {
+            ("PS no corr.", egui::Color32::from_rgb(230, 70, 70))
+        };
+        ui.allocate_ui_with_layout(egui::vec2(120.0, 18.0), egui::Layout::left_to_right(egui::Align::Center), |ui| {
+            ui.colored_label(color, text).on_hover_text(hover);
+        });
     }
 
     // RADE status -- see draw_rade_status_row's own doc comment. Right

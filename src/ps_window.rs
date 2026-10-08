@@ -17,8 +17,16 @@ use std::time::{Duration, Instant};
 
 const ROW_H: f32 = 48.0;
 
+/// Gap between the bottom of the PS menu / bar and the top of the toolbar, in px (the toolbar height and margin are added to it).
+const BOTTOM_GAP_PX: f32 = 10.0;
+
 /// The menu is reduced to a small bar (button "Hide") so the spectrum and the waterfall can be seen.
 static HIDDEN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Opens in the small bar size (the toolbar / MIDI "PS" key).
+pub(crate) fn show_bar() {
+    HIDDEN.store(true, Ordering::Relaxed);
+}
 
 /// Called when the menu is opened from the Menu: always starts in full size.
 pub(crate) fn show_full() {
@@ -32,6 +40,8 @@ const ENABLE_HELP: &str = "Enable PureSignal [ADP = Adaptive Predistortion].";
 const AUTO_HELP: &str = "Automatically adjusts the TX attenuation during PS calibration (needs Two Tone).";
 const STABILITY_HELP: &str = "PureSignal 3 compression/deadlock check threshold.\nStrict: 0.06 (highest solution validation)\nMedium: 0.04 (balanced stability and output power)\nRelaxed: 0.02 (more tolerant of highly compressed power amplifiers)";
 const ONESHOT_HELP: &str = "One calibration, then the correction is only applied (for constant-envelope digital modes).";
+const NOISE_HELP: &str = "Transmit band-limited Gaussian noise at the selected generator level (-12 to +3 dB), a calibration signal for PureSignal like Two Tone. The normal TX filter limits the noise to the transmit passband. Use short test periods: the average PA power is high. Changes of the level take effect at once.";
+const MON_HELP: &str = "Show the received PureSignal feedback signal (what comes back from the amplifier) on the TX spectrum instead of the transmitted signal. Use it with OFF and Restart to see the effect of the correction. This only changes the display and does not affect the correction.";
 const PEAK_HELP: &str = "GetPk: the largest TX envelope WDSP has measured.\nSetPk: the hardware peak the engine assumes for this radio (0.01 to 1.01); a change restarts the calibration.";
 const ATT_HELP: &str = "Attenuation of the feedback path during transmit. On the Hermes Lite 2 it sets the receiver gain while transmitting (-29 to +31). Aim for a Feedback Lvl of 140 to 165; Auto Attenuate does that for you.";
 
@@ -76,9 +86,51 @@ fn label(ui: &mut egui::Ui, text: &str, w: f32) {
 
 /// A read-only value box.
 fn value_box(ui: &mut egui::Ui, text: &str, color: egui::Color32) {
-    let (rect, _) = ui.allocate_exact_size(egui::vec2(BOX_W, 40.0), egui::Sense::hover());
+    value_box_w(ui, text, color, BOX_W);
+}
+
+/// A read-only value box of a given width (the small bar uses narrower ones).
+fn value_box_w(ui: &mut egui::Ui, text: &str, color: egui::Color32, w: f32) {
+    let (rect, _) = ui.allocate_exact_size(egui::vec2(w, 40.0), egui::Sense::hover());
     ui.painter().rect(rect, 5.0, egui::Color32::from_gray(22), egui::Stroke::new(1.0, egui::Color32::from_gray(95)), egui::StrokeKind::Inside);
     ui.painter().text(rect.center(), egui::Align2::CENTER_CENTER, text, egui::FontId::monospace(20.0), color);
+}
+
+/// Two Tone pressed: Two Tone and Noise exclude each other; with the noise running it is stopped first and Two Tone starts after it.
+fn two_tone_pressed(connected: &mut ConnectedState) {
+    if connected.noise_active {
+        connected.noise_request = Some(false);
+        connected.two_tone_after_noise = true;
+    } else {
+        connected.toolbar_two_tone_request = true;
+    }
+}
+
+/// OFF: reset only (SetPSControl reset=1), the correction stops being applied.
+fn do_off(connected: &mut ConnectedState) {
+    connected.ps_enabled = false;
+    if let Some(tx) = &connected.tx_handle {
+        tx.set_ps_enabled(false);
+    }
+}
+
+/// Restart (ps_menu.c resume_cb): with Two Tone and Auto Attenuate the attenuation starts again from 0.
+fn do_restart(connected: &mut ConnectedState) {
+    if connected.two_tone_active && connected.ps_auto_attenuate {
+        att_set(connected, 0);
+        auto_reset();
+    }
+    connected.ps_enabled = true;
+    if let Some(tx) = &connected.tx_handle {
+        tx.set_ps_enabled(true);
+        tx.ps_calibrate();
+    }
+}
+
+/// MON: the TX spectrum shows the feedback (display only, saved).
+fn do_mon(connected: &mut ConnectedState, on: bool) {
+    connected.ps_mon = on;
+    connected.settings_dirty.store(true, Ordering::Relaxed);
 }
 
 /// Returns (close, changed).
@@ -87,6 +139,8 @@ pub fn ps_window(ui: &mut egui::Ui, connected: &mut ConnectedState) -> (bool, bo
     let mut changed = false;
     let status = connected.tx_handle.as_ref().map(|t| *t.ps_status.lock().unwrap()).unwrap_or_default();
     let ps_on = connected.puresignal_enabled;
+    // The engine only updates its readings while keyed, so they are shown only then (the last values would otherwise stay on screen).
+    let tx_live = ps_on && connected.session.mox_active();
     let hl2 = is_hl2(connected);
     let (att_lo, att_hi) = att_range(connected);
     let att = att_get(connected);
@@ -99,6 +153,12 @@ pub fn ps_window(ui: &mut egui::Ui, connected: &mut ConnectedState) -> (bool, bo
     let mut auto: Option<bool> = None;
     let mut off = false;
     let mut restart = false;
+    let mut mon: Option<bool> = None;
+    let mut noise_toggle = false;
+    let mut noise_level: Option<i32> = None;
+    let noise_now = connected.noise_active;
+    let noise_db = connected.noise_level_db;
+    let mon_now = connected.ps_mon;
     let mut oneshot: Option<bool> = None;
     let mut stability: Option<u8> = None;
     let mut new_peak: Option<f64> = None;
@@ -119,18 +179,19 @@ pub fn ps_window(ui: &mut egui::Ui, connected: &mut ConnectedState) -> (bool, bo
         egui::Window::new("ps_menu_bar")
             .id(egui::Id::new("ps_menu_bar_window"))
             .title_bar(false)
+            // No window shadow: it would darken the top of the toolbar this window sits right above (same as the NEW MENU).
+            .frame(egui::Frame::window(ui.style()).corner_radius(0.0).shadow(egui::Shadow::NONE))
             .collapsible(false)
             .resizable(false)
-            .anchor(egui::Align2::CENTER_BOTTOM, egui::vec2(0.0, -58.0))
+            .anchor(egui::Align2::CENTER_BOTTOM, egui::vec2(0.0, -(crate::TOOLBAR_HEIGHT + crate::TOOLBAR_MARGIN + BOTTOM_GAP_PX)))
             .show(ui.ctx(), |ui| {
                 ui.spacing_mut().item_spacing = egui::vec2(GAP, GAP);
                 ui.horizontal(|ui| {
                     if crate::kiosk_accent_button(ui, "Show").clicked() {
                         show = true;
                     }
-                    label(ui, "Feedback", 100.0);
-                    value_box(ui, &format!("{}", status.feedback_level), if ps_on { level_color(status.feedback_level) } else { egui::Color32::from_gray(120) });
-                    let (txt, col) = if !ps_on {
+                    value_box_w(ui, &if tx_live { format!("{}", status.feedback_level) } else { String::new() }, if tx_live { level_color(status.feedback_level) } else { egui::Color32::from_gray(120) }, 80.0);
+                    let (txt, col) = if !tx_live {
                         ("", egui::Color32::from_gray(120))
                     } else if status.correcting {
                         ("Correcting", egui::Color32::from_rgb(80, 200, 80))
@@ -138,8 +199,7 @@ pub fn ps_window(ui: &mut egui::Ui, connected: &mut ConnectedState) -> (bool, bo
                         ("no corr.", egui::Color32::from_rgb(230, 70, 70))
                     };
                     value_box(ui, txt, col);
-                    label(ui, "ATT", 60.0);
-                    value_box(ui, &att.to_string(), egui::Color32::WHITE);
+                    value_box_w(ui, &format!("ATT {att}"), egui::Color32::WHITE, 110.0);
                     let b = egui::Button::new(egui::RichText::new("Two Tone").color(if two_tone { egui::Color32::WHITE } else { egui::Color32::from_gray(210) }))
                         .fill(if two_tone { egui::Color32::from_rgb(230, 140, 20) } else { egui::Color32::from_gray(48) })
                         .min_size(egui::vec2(110.0, 40.0))
@@ -147,13 +207,45 @@ pub fn ps_window(ui: &mut egui::Ui, connected: &mut ConnectedState) -> (bool, bo
                     if ui.add(b).clicked() {
                         tt = true;
                     }
+                    let nbb = egui::Button::new(egui::RichText::new("Noise").color(if noise_now { egui::Color32::WHITE } else { egui::Color32::from_gray(210) }))
+                        .fill(if noise_now { egui::Color32::from_rgb(230, 140, 20) } else { egui::Color32::from_gray(48) })
+                        .min_size(egui::vec2(80.0, 40.0))
+                        .corner_radius(5.0);
+                    if ui.add(nbb).clicked() {
+                        noise_toggle = true;
+                    }
+                    let mb = egui::Button::new(egui::RichText::new("MON").color(if mon_now { egui::Color32::WHITE } else { egui::Color32::from_gray(210) }))
+                        .fill(if mon_now { egui::Color32::from_rgb(70, 150, 245) } else { egui::Color32::from_gray(48) })
+                        .min_size(egui::vec2(70.0, 40.0))
+                        .corner_radius(5.0);
+                    if ui.add(mb).clicked() {
+                        mon = Some(!mon_now);
+                    }
+                    if ui.add_enabled(ps_on, egui::Button::new("OFF").min_size(egui::vec2(60.0, 40.0))).clicked() {
+                        off = true;
+                    }
+                    if ui.add_enabled(ps_on, egui::Button::new("Restart").min_size(egui::vec2(90.0, 40.0))).clicked() {
+                        restart = true;
+                    }
                 });
             });
         if show {
             HIDDEN.store(false, Ordering::Relaxed);
         }
         if tt {
-            connected.toolbar_two_tone_request = true;
+            two_tone_pressed(connected);
+        }
+        if off {
+            do_off(connected);
+        }
+        if restart {
+            do_restart(connected);
+        }
+        if let Some(v) = mon {
+            do_mon(connected, v);
+        }
+        if noise_toggle {
+            connected.noise_request = Some(!noise_now);
         }
         return (false, false);
     }
@@ -161,10 +253,11 @@ pub fn ps_window(ui: &mut egui::Ui, connected: &mut ConnectedState) -> (bool, bo
     egui::Window::new("ps_menu")
         .id(egui::Id::new("ps_menu_window"))
         .title_bar(false)
+        .frame(egui::Frame::window(ui.style()).corner_radius(0.0).shadow(egui::Shadow::NONE))
         .collapsible(false)
         .resizable(false)
         // Same placement rule as the AGC / DSP menus: centred, anchored above the toolbar with a gap.
-        .anchor(egui::Align2::CENTER_BOTTOM, egui::vec2(0.0, -58.0))
+        .anchor(egui::Align2::CENTER_BOTTOM, egui::vec2(0.0, -(crate::TOOLBAR_HEIGHT + crate::TOOLBAR_MARGIN + BOTTOM_GAP_PX)))
         .show(ui.ctx(), |ui| {
             if ui.input(|i| i.key_pressed(egui::Key::Escape)) {
                 close_now = true;
@@ -179,6 +272,19 @@ pub fn ps_window(ui: &mut egui::Ui, connected: &mut ConnectedState) -> (bool, bo
                 if ui.add(egui::Button::new("Hide").min_size(egui::vec2(100.0, ROW_H))).clicked() {
                     hide_now = true;
                 }
+                ui.add_space(24.0);
+                let nb = egui::Button::new(egui::RichText::new("Noise").color(if noise_now { egui::Color32::WHITE } else { egui::Color32::from_gray(210) }))
+                    .fill(if noise_now { egui::Color32::from_rgb(230, 140, 20) } else { egui::Color32::from_gray(48) })
+                    .min_size(egui::vec2(100.0, ROW_H))
+                    .corner_radius(5.0);
+                if ui.add(nb).clicked() {
+                    noise_toggle = true;
+                }
+                let mut nv = noise_db as f64;
+                if spin_buttons_full(ui, "ps_noise_level", &mut nv, -12.0, 3.0, 1.0, 0, None, 52.0).changed() {
+                    noise_level = Some(nv.round() as i32);
+                }
+                help_button(ui, "ps_help_noise", NOISE_HELP);
             });
 
             // Row 1: Enable PS | Two Tone | Auto Attenuate | OFF | Restart.
@@ -209,6 +315,14 @@ pub fn ps_window(ui: &mut egui::Ui, connected: &mut ConnectedState) -> (bool, bo
                 if ui.add_enabled(ps_on, egui::Button::new("Restart").min_size(egui::vec2(100.0, 40.0))).clicked() {
                     restart = true;
                 }
+                let mb = egui::Button::new(egui::RichText::new("MON").color(if mon_now { egui::Color32::WHITE } else { egui::Color32::from_gray(210) }))
+                    .fill(if mon_now { egui::Color32::from_rgb(70, 150, 245) } else { egui::Color32::from_gray(48) })
+                    .min_size(egui::vec2(80.0, 40.0))
+                    .corner_radius(5.0);
+                if ui.add(mb).clicked() {
+                    mon = Some(!mon_now);
+                }
+                help_button(ui, "ps_help_mon", MON_HELP);
             });
 
             // Row 2: OneShot | PS Stability.
@@ -230,9 +344,9 @@ pub fn ps_window(ui: &mut egui::Ui, connected: &mut ConnectedState) -> (bool, bo
             // Row 3: Feedback Lvl | Correcting (coloured like deskHPSDR) and the optimal range.
             ui.horizontal(|ui| {
                 label(ui, "Feedback Lvl", LABEL_W);
-                value_box(ui, &format!("{}", status.feedback_level), if ps_on { level_color(status.feedback_level) } else { egui::Color32::from_gray(120) });
+                value_box(ui, &if tx_live { format!("{}", status.feedback_level) } else { String::new() }, if tx_live { level_color(status.feedback_level) } else { egui::Color32::from_gray(120) });
                 label(ui, "Correcting", LABEL_W);
-                let (txt, col) = if !ps_on {
+                let (txt, col) = if !tx_live {
                     ("", egui::Color32::from_gray(120))
                 } else if status.correcting {
                     ("yes", egui::Color32::from_rgb(80, 200, 80))
@@ -246,31 +360,16 @@ pub fn ps_window(ui: &mut egui::Ui, connected: &mut ConnectedState) -> (bool, bo
             ui.horizontal(|ui| {
                 let g = egui::Color32::from_gray(225);
                 label(ui, "feedbk", LABEL_W);
-                value_box(ui, &if ps_on { status.feedback_level.to_string() } else { String::new() }, g);
+                value_box(ui, &if tx_live { status.feedback_level.to_string() } else { String::new() }, g);
                 label(ui, "cor.cnt", LABEL_W);
-                value_box(ui, &if ps_on { status.cal_count.to_string() } else { String::new() }, g);
+                value_box(ui, &if tx_live { status.cal_count.to_string() } else { String::new() }, g);
                 label(ui, "sln.chk", LABEL_W);
-                value_box(ui, &if ps_on { status.solution_check.to_string() } else { String::new() }, g);
+                value_box(ui, &if tx_live { status.solution_check.to_string() } else { String::new() }, g);
             });
-            // Row 5: status.
+            // Row 5: status | TX ATT (the TX ATT used to have a row of its own; this row had nothing on the right).
             ui.horizontal(|ui| {
                 label(ui, "status", LABEL_W);
-                value_box(ui, &if ps_on { crate::tx::ps_state_name(status.state).to_string() } else { String::new() }, egui::Color32::from_gray(225));
-            });
-
-            ui.add_space(4.0);
-            // Row 6: GetPk | SetPk | TX ATT.
-            ui.horizontal(|ui| {
-                label(ui, "GetPk", LABEL_W);
-                value_box(ui, &if ps_on { format!("{:.3}", status.max_tx) } else { String::new() }, egui::Color32::from_gray(225));
-                help_button(ui, "ps_help_peak", PEAK_HELP);
-                ui.add_space(8.0);
-                label(ui, "SetPk", 90.0);
-                if spin_buttons_full(ui, "ps_setpk", &mut peak_value, 0.01, 1.01, 0.001, 3, None, 78.0).changed() {
-                    new_peak = Some(peak_value);
-                }
-            });
-            ui.horizontal(|ui| {
+                value_box(ui, &if tx_live { crate::tx::ps_state_name(status.state).to_string() } else { String::new() }, egui::Color32::from_gray(225));
                 label(ui, "TX ATT", LABEL_W);
                 if auto_on {
                     // Automatic: shown, not editable (deskHPSDR shows an entry instead of the spin).
@@ -279,8 +378,17 @@ pub fn ps_window(ui: &mut egui::Ui, connected: &mut ConnectedState) -> (bool, bo
                     new_att = Some(att_value.round() as i32);
                 }
                 help_button(ui, "ps_help_att", ATT_HELP);
-                if hl2 {
-                    ui.label("(HL2: -29..+31)");
+            });
+
+            // Row 6: GetPk | SetPk.
+            ui.horizontal(|ui| {
+                label(ui, "GetPk", LABEL_W);
+                value_box(ui, &if tx_live { format!("{:.3}", status.max_tx) } else { String::new() }, egui::Color32::from_gray(225));
+                help_button(ui, "ps_help_peak", PEAK_HELP);
+                ui.add_space(8.0);
+                label(ui, "SetPk", 90.0);
+                if spin_buttons_full(ui, "ps_setpk", &mut peak_value, 0.01, 1.01, 0.001, 3, None, 78.0).changed() {
+                    new_peak = Some(peak_value);
                 }
             });
         });
@@ -290,6 +398,13 @@ pub fn ps_window(ui: &mut egui::Ui, connected: &mut ConnectedState) -> (bool, bo
     }
     if close_now {
         HIDDEN.store(false, Ordering::Relaxed);
+        // ps_menu.c cleanup(): closing the menu stops Two Tone and Noise.
+        if connected.noise_active {
+            connected.noise_request = Some(false);
+        }
+        if connected.two_tone_active {
+            connected.toolbar_two_tone_request = true;
+        }
     }
     // ---- Apply the actions.
     if let Some(on) = enable {
@@ -303,10 +418,20 @@ pub fn ps_window(ui: &mut egui::Ui, connected: &mut ConnectedState) -> (bool, bo
                 tx.set_ps_enabled(true);
             }
         }
+        if on {
+            maybe_warn(connected);
+        }
         changed = true;
     }
     if toggle_two_tone {
-        connected.toolbar_two_tone_request = true;
+        two_tone_pressed(connected);
+    }
+    if noise_toggle {
+        connected.noise_request = Some(!noise_now);
+    }
+    if let Some(v) = noise_level {
+        connected.noise_level_db = v.clamp(-12, 3);
+        connected.settings_dirty.store(true, Ordering::Relaxed);
     }
     if let Some(a) = auto {
         connected.ps_auto_attenuate = a;
@@ -314,22 +439,13 @@ pub fn ps_window(ui: &mut egui::Ui, connected: &mut ConnectedState) -> (bool, bo
         changed = true;
     }
     if off {
-        // OFF: reset only (SetPSControl reset=1).
-        connected.ps_enabled = false;
-        if let Some(tx) = &connected.tx_handle {
-            tx.set_ps_enabled(false);
-        }
+        do_off(connected);
     }
     if restart {
-        // Restart (ps_menu.c resume_cb): with Two Tone and Auto Attenuate the attenuation starts again from 0.
-        if two_tone && connected.ps_auto_attenuate {
-            att_set(connected, 0);
-        }
-        connected.ps_enabled = true;
-        if let Some(tx) = &connected.tx_handle {
-            tx.set_ps_enabled(true);
-            tx.ps_calibrate();
-        }
+        do_restart(connected);
+    }
+    if let Some(v) = mon {
+        do_mon(connected, v);
     }
     if let Some(v) = oneshot {
         connected.ps_oneshot = v;
@@ -372,14 +488,18 @@ struct Auto {
     last_tick: Option<Instant>,
     old_level: i32,
     count: u32,
+    /// cor.cnt and time of the last attenuation change: the next decision waits for a new calibration (or 4 s).
+    cnt_at_change: i32,
+    changed_at: Option<Instant>,
 }
 
-static AUTO: Mutex<Auto> = Mutex::new(Auto { last_tick: None, old_level: -1, count: 0 });
+static AUTO: Mutex<Auto> = Mutex::new(Auto { last_tick: None, old_level: -1, count: 0, cnt_at_change: -1, changed_at: None });
 
 fn auto_reset() {
     let mut a = AUTO.lock().unwrap();
     a.old_level = -1;
     a.count = 0;
+    a.changed_at = None;
 }
 
 /// Every frame. While PureSignal is on, Two Tone is transmitting and Auto Attenuate is on, every 100 ms (deskHPSDR's timer):
@@ -389,7 +509,12 @@ pub(crate) fn auto_tick(connected: &mut ConnectedState, ctx: &egui::Context) {
     if !connected.ps_auto_attenuate || !connected.puresignal_enabled || !connected.two_tone_active || !connected.session.mox_active() {
         return;
     }
-    let Some(level) = connected.tx_handle.as_ref().map(|t| t.ps_status.lock().unwrap().feedback_level) else { return };
+    let Some((level, cal_cnt)) = connected.tx_handle.as_ref().map(|t| {
+        let s = t.ps_status.lock().unwrap();
+        (s.feedback_level, s.cal_count)
+    }) else {
+        return;
+    };
     ctx.request_repaint_after(Duration::from_millis(100));
     let mut a = AUTO.lock().unwrap();
     if a.last_tick.is_some_and(|t| t.elapsed() < Duration::from_millis(100)) {
@@ -404,6 +529,9 @@ pub(crate) fn auto_tick(connected: &mut ConnectedState, ctx: &egui::Context) {
         a.count += 1;
         false
     };
+    // After a change, the old level is stale until the engine has finished a new calibration: wait for cor.cnt to move (or 4 s).
+    let fresh = a.changed_at.map_or(true, |t| cal_cnt != a.cnt_at_change || t.elapsed() > Duration::from_secs(4));
+    let newcal = newcal && fresh;
     drop(a);
     let (lo, hi) = att_range(connected);
     let att = att_get(connected);
@@ -418,9 +546,69 @@ pub(crate) fn auto_tick(connected: &mut ConnectedState, ctx: &egui::Context) {
         let new_att = (att + delta).clamp(lo, hi);
         if new_att != att {
             att_set(connected, new_att);
+            {
+                let mut a = AUTO.lock().unwrap();
+                a.cnt_at_change = cal_cnt;
+                a.changed_at = Some(Instant::now());
+            }
             if let Some(tx) = &connected.tx_handle {
                 tx.ps_calibrate(); // reset, then resume
             }
         }
+    }
+}
+
+// ---- Warning: PureSignal switched on with 0 dB of TX attenuation (ps_menu.c ps_zero_att_warning_show) -----------------------
+
+/// Shows the warning when PureSignal is on with 0 dB of attenuation and "Don't show this warning again" has not been ticked.
+pub(crate) fn maybe_warn(connected: &mut ConnectedState) {
+    if att_get(connected) == 0 && !connected.ps_hide_zero_att {
+        connected.ps_zero_att_popup = true;
+    }
+}
+
+/// The warning window (drawn every frame, on top of everything).
+pub(crate) fn warning_window(ui: &mut egui::Ui, connected: &mut ConnectedState) {
+    if !connected.ps_zero_att_popup {
+        return;
+    }
+    let dont_id = egui::Id::new("ps_zero_att_dont_show");
+    let mut dont: bool = ui.ctx().data(|d| d.get_temp(dont_id)).unwrap_or(false);
+    let mut ok = false;
+    egui::Window::new("ps_zero_att_warning")
+        .id(egui::Id::new("ps_zero_att_warning_win"))
+        .title_bar(false)
+        .collapsible(false)
+        .resizable(false)
+        .order(egui::Order::Foreground)
+        .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
+        .show(ui.ctx(), |ui| {
+            ui.set_max_width(600.0);
+            ui.vertical_centered(|ui| {
+                ui.label(egui::RichText::new("PureSignal TX Attenuation").color(egui::Color32::from_rgb(230, 40, 40)).strong().size(22.0));
+            });
+            ui.add_space(8.0);
+            ui.label("TX attenuation is currently set very low (0 dB).");
+            ui.add_space(6.0);
+            ui.label("Please verify that the PureSignal feedback level is appropriate or execute a new PS calibration.");
+            ui.add_space(6.0);
+            ui.label("A feedback level that is too high may cause ADC overload.");
+            ui.add_space(6.0);
+            ui.label("Note: External attenuation in the feedback path may make 0 dB a valid setting.");
+            ui.add_space(10.0);
+            std_checkbox(ui, &mut dont, "Don't show this warning again");
+            ui.add_space(10.0);
+            if ui.add(egui::Button::new("OK").min_size(egui::vec2(560.0, 44.0))).clicked() {
+                ok = true;
+            }
+        });
+    ui.ctx().data_mut(|d| d.insert_temp(dont_id, dont));
+    if ok {
+        connected.ps_zero_att_popup = false;
+        if dont {
+            connected.ps_hide_zero_att = true;
+            connected.settings_dirty.store(true, Ordering::Relaxed);
+        }
+        ui.ctx().data_mut(|d| d.insert_temp(dont_id, false));
     }
 }
