@@ -11048,13 +11048,7 @@ Waterfall rebuilds: {prof_wf_n:.0}/s, {prof_wf_ms:.1} ms each."
                                     );
                                     let disp = connected.tx_handle.as_ref().map(|tx| *tx.display.lock().unwrap());
                                     let cw = matches!(connected.spectrum.mode(), spectrum::Mode::Cwl | spectrum::Mode::Cwu);
-                                    let bars = disp.map(|d| meter_vintage::Bars {
-                                        mic_av_db: d.mic_av,
-                                        alc_db: d.alc_av,
-                                        vox_enabled: connected.vox_enabled,
-                                        vox_peak: connected.vox_level_shown as f64,
-                                        vox_threshold: connected.vox_threshold,
-                                    });
+                                    let bars: Option<meter_vintage::Bars> = None;
                                     meter_vintage::draw_power_meter(
                                         ui,
                                         meter_rect,
@@ -11085,17 +11079,8 @@ Waterfall rebuilds: {prof_wf_n:.0}/s, {prof_wf_ms:.1} ms each."
                                 MeterStyle::Vintage => {
                                     let cw = matches!(connected.spectrum.mode(), spectrum::Mode::Cwl | spectrum::Mode::Cwu);
                                     let disp = connected.tx_handle.as_ref().map(|tx| *tx.display.lock().unwrap());
-                                    let bars = if connected.vox_enabled && !cw {
-                                        disp.map(|d| meter_vintage::Bars {
-                                            mic_av_db: d.mic_av,
-                                            alc_db: d.alc_av,
-                                            vox_enabled: true,
-                                            vox_peak: connected.vox_level_shown as f64,
-                                            vox_threshold: connected.vox_threshold,
-                                        })
-                                    } else {
-                                        None
-                                    };
+                                    let _ = (cw, disp);
+                                    let bars: Option<meter_vintage::Bars> = None;
                                     meter_vintage::draw_s_meter(
                                         ui,
                                         meter_rect,

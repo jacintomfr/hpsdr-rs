@@ -499,15 +499,13 @@ pub fn draw_power_meter(ui: &mut egui::Ui, rect: Rect, info: &TxInfo) {
     } else {
         format!("{}W", (b.max_pwr + 0.5) as i32)
     };
-    sf.text(cx - 20.0, cx - radius + 30.0, &txt, 18.0, scale);
+    // The watts and the SWR: larger than meter.c's 18 / 14 (the deskHPSDR screen shows them about 1.2x that) and centred, lower in the face.
+    // The Mic | ALC bars and the ALC text are not shown (the main window already has MIC / ALC).
+    let w_txt = sf.text_w(&txt, 22.0);
+    sf.text(cx - w_txt / 2.0, sf.vh * 0.595, &txt, 22.0, scale);
     let swr_col = if info.swr > info.swr_alarm { COLOUR_ALARM } else { scale };
-    sf.text(cx - 40.0, cx - radius + 50.0, &format!("SWR {:.1}:1", info.swr), 14.0, swr_col);
-    if !info.cw {
-        sf.text(cx + 30.0, cx - radius + 65.0, &format!("ALC {:.1} dB", b.max_alc), 14.0, scale);
-    }
-    if !info.cw {
-        if let Some(bars) = &info.bars {
-            draw_bars(&sf, bars, PAN_LINE_EXTRA);
-        }
-    }
+    let swr_txt = format!("SWR {:.1}:1", info.swr);
+    let w_swr = sf.text_w(&swr_txt, 17.0);
+    sf.text(cx - w_swr / 2.0, sf.vh * 0.79, &swr_txt, 17.0, swr_col);
+    let _ = (info.cw, &info.bars, b.max_alc);
 }
