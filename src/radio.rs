@@ -3474,7 +3474,7 @@ pub const DEFAULT_PA_GAIN_DB: f32 = 38.8;
 /// DEFAULT_PA_GAIN_DB for any band the user hasn't calibrated) --
 /// real per-band calibration varies with the actual amplifier's
 /// response per band, which no fixed constant here can capture.
-fn drive_byte_for_watts(watts: f32, gain_db: f32) -> u8 {
+pub(crate) fn drive_byte_for_watts(watts: f32, gain_db: f32) -> u8 {
     let watts = watts.max(0.01); // avoid log10(0)/log10(negative)
     let target_dbm = 10.0 * (watts * 1000.0).log10() - gain_db;
     let target_volts = (10.0_f32.powf(target_dbm * 0.1) * 0.05).sqrt();

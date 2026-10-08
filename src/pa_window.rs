@@ -142,7 +142,10 @@ pub fn pa_window(ui: &mut egui::Ui, connected: &mut ConnectedState) -> (bool, bo
     let popup_id = egui::Id::new("pa_window_popup");
     let msg_id = egui::Id::new("pa_window_msg");
 
-    let frame = egui::Frame::window(ui.style()).inner_margin(egui::Margin::symmetric(24, 4)).corner_radius(0.0);
+    // Like the NEW MENU: not full screen, it stops above the bottom toolbar (MOX, TUNE, ...) which stays visible and usable, and has no
+    // shadow (it would darken the top of the toolbar). The frame adds 8 px to the height.
+    let win_h = screen.height() - (crate::TOOLBAR_HEIGHT + crate::TOOLBAR_MARGIN) - 11.0;
+    let frame = egui::Frame::window(ui.style()).inner_margin(egui::Margin::symmetric(24, 4)).corner_radius(0.0).shadow(egui::Shadow::NONE);
     egui::Window::new("PA Calibration")
         .id(egui::Id::new("pa_window"))
         .title_bar(false)
@@ -151,14 +154,14 @@ pub fn pa_window(ui: &mut egui::Ui, connected: &mut ConnectedState) -> (bool, bo
         .frame(frame)
         .fixed_pos(screen.min)
         .constrain_to(screen)
-        .fixed_size(screen.size() - egui::vec2(58.0, 10.0))
+        .fixed_size(egui::vec2(screen.width() - 58.0, win_h))
         .show(ui.ctx(), |ui| {
             if ui.input(|i| i.key_pressed(egui::Key::Escape)) {
                 close_now = true;
             }
             let w = screen.width() - 58.0;
             ui.set_width(w);
-            ui.set_min_height(screen.height() - 10.0);
+            ui.set_min_height(win_h);
             ui.spacing_mut().item_spacing = egui::vec2(6.0, 0.0);
             let (tr, _) = ui.allocate_exact_size(egui::vec2(w, 22.0), egui::Sense::hover());
             ui.painter().text(tr.center(), egui::Align2::CENTER_CENTER, "hpsdr-rs - PA Calibration", egui::FontId::proportional(16.0), egui::Color32::from_gray(225));
@@ -675,6 +678,23 @@ fn linearization_page(ui: &mut egui::Ui, connected: &mut ConnectedState, w: f32)
     }
     // Entry row: measured watts + Next.
     let row = new_row(ui, w, ROW_H);
+    if !active {
+        // Live view of what the drive code is using right now, so the effect of the spins can be followed (and a TUNE at a
+        // low power, whose whole-watt result can be 0 W, is easy to spot).
+        let freq = connected.session.tx_frequency_hz.load(Ordering::Relaxed);
+        let watts_now = connected.session.tx_power_watts.load(Ordering::Relaxed);
+        let adj = crate::resolved_pa_drive_adjust_db(&connected.pa_drive_adjust, freq, watts_now, max);
+        let gain = crate::resolved_pa_gain_db(&connected.pa_calibration, freq) - adj;
+        let drive = crate::radio::drive_byte_for_watts(watts_now as f32, gain);
+        let band_txt = crate::band_for_frequency(freq).map(|b| b.name).unwrap_or("outside the bands");
+        let text = format!(
+            "Now: {band_txt}, {watts_now} W = {:.1} % of {max} W{}, correction {adj:+.1} dB, PA gain {gain:.1} dB, drive {drive}/255",
+            watts_now as f32 / max as f32 * 100.0,
+            if connected.tune_active { " (TUNE)" } else { "" },
+        );
+        let font = egui::FontId::proportional(14.0);
+        ui.painter().text(egui::pos2(row.left() + 4.0, row.center().y), egui::Align2::LEFT_CENTER, text, font, egui::Color32::from_gray(170));
+    }
     if active {
         let font = egui::TextStyle::Body.resolve(ui.style());
         let color = ui.visuals().text_color();

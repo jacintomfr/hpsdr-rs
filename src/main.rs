@@ -8385,7 +8385,7 @@ impl eframe::App for HpsdrApp {
                                     // (see below, no more add_enabled_ui
                                     // wrapper) rather than fighting a
                                     // per-frame override.
-                                    let tune_watts = current_watts * connected.tune_power_percent / 100;
+                                    let tune_watts = tune_watts_for(connected, current_watts);
                                     connected.session.tx_power_watts.store(tune_watts, Ordering::Relaxed);
                                     if let Some(tx) = &connected.tx_handle {
                                         tx.set_tune(true);
@@ -8467,7 +8467,7 @@ impl eframe::App for HpsdrApp {
                                     let current_watts =
                                         connected.session.tx_power_watts.load(Ordering::Relaxed);
                                     connected.pre_tune_power_watts = Some(current_watts);
-                                    let tune_watts = current_watts * connected.tune_power_percent / 100;
+                                    let tune_watts = tune_watts_for(connected, current_watts);
                                     connected.session.tx_power_watts.store(tune_watts, Ordering::Relaxed);
                                     if let Some(tx) = &connected.tx_handle {
                                         tx.set_two_tone(true);
@@ -22908,6 +22908,17 @@ fn sdr_device_window(ui: &mut egui::Ui, connected: &mut ConnectedState) -> (bool
     (close_now, changed)
 }
 
+/// The power TUNE transmits at, for a TX Power of `current_watts`. "Tune Drive = TX drive" (TX menu, deskHPSDR tune_use_drive): the TX
+/// power itself. Otherwise the Tune Drive level percentage of it, rounded (it used to be an integer division: 6 W x 20 % = 1 W and
+/// 2 W x 20 % = 0 W) and never below 1 W while that percentage is above 0.
+fn tune_watts_for(connected: &ConnectedState, current_watts: u32) -> u32 {
+    if connected.tx_ui.tune_use_drive {
+        return current_watts;
+    }
+    let w = (current_watts as f32 * connected.tune_power_percent as f32 / 100.0).round() as u32;
+    if connected.tune_power_percent > 0 && current_watts > 0 { w.max(1) } else { w }
+}
+
 /// Starts or stops TUNE like the TUNE button (also used by the external AutoTune input): see `tune_may_start` for why
 /// Two-Tone/CW-text-sending and an externally keyed transmission block it.
 fn tune_set(connected: &mut ConnectedState, want: bool) {
@@ -22933,7 +22944,7 @@ fn tune_set(connected: &mut ConnectedState, want: bool) {
         if tune_may_start {
             let current_watts = connected.session.tx_power_watts.load(Ordering::Relaxed);
             connected.pre_tune_power_watts = Some(current_watts);
-            let tune_watts = current_watts * connected.tune_power_percent / 100;
+            let tune_watts = tune_watts_for(connected, current_watts);
             connected.session.tx_power_watts.store(tune_watts, Ordering::Relaxed);
             if let Some(tx) = &connected.tx_handle {
                 tx.set_tune(true);
