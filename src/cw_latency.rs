@@ -55,8 +55,11 @@ pub fn enabled() -> bool {
 }
 
 fn log(what: &str, ns: u64) {
+    // One write per line: several threads log, and separate writes would interleave.
+    let line = format!("cw: [{:9.3}] {what} {:.1} ms
+", now_ns() as f64 / 1e9, ns as f64 / 1e6);
     if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(LOG_FILE) {
-        let _ = writeln!(f, "cw: [{:9.3}] {what} {:.1} ms", now_ns() as f64 / 1e9, ns as f64 / 1e6);
+        let _ = f.write_all(line.as_bytes());
     }
 }
 
@@ -195,4 +198,13 @@ pub fn text_mox_off() {
 #[inline]
 pub fn sidetone_pending() -> bool {
     SIDETONE_PENDING.load(Ordering::Relaxed)
+}
+
+/// MIDI thread: a CW key event from the driver callback reached the host keyer (the time since the driver callback).
+pub fn midi_to_keyer() {
+    if let Some(d) = since(&MIDI_NS) {
+        if enabled() {
+            log("midi->keyer", d);
+        }
+    }
 }

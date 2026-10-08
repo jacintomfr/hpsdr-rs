@@ -215,6 +215,13 @@ pub enum MidiAction {
     CwMacro3,
     CwMacro4,
     CwMacro5,
+    /// MIDI CW keying (piHPSDR CW_LEFT/CW_RIGHT/CW_KEYER_KEYDOWN/CW_KEYER_PTT, deskHPSDR CW_STRAIGHT_KEY), handled on the MIDI thread by cw_keyer.rs --
+    /// press AND release matter, whatever the "momentary" flag says. Paddles and the straight key need "CW handled in Radio" OFF (CW menu).
+    CwLeft,
+    CwRight,
+    CwStraightKey,
+    CwKeyerKeydown,
+    CwKeyerPtt,
     /// The on-screen toolbar boxes (kiosk), named like piHPSDR's TOOLBAR1-7 and FUNCTION: ToolBar1-7
     /// run the function currently assigned to that box, Function steps to the next layer -- so
     /// physical switches can drive the toolbar.
@@ -330,6 +337,11 @@ impl MidiAction {
             MidiAction::CwMacro3 => "Send CW Message 3",
             MidiAction::CwMacro4 => "Send CW Message 4",
             MidiAction::CwMacro5 => "Send CW Message 5",
+            MidiAction::CwLeft => "CW Left (paddle)",
+            MidiAction::CwRight => "CW Right (paddle)",
+            MidiAction::CwStraightKey => "CW Straight Key",
+            MidiAction::CwKeyerKeydown => "CW Key (Keyer)",
+            MidiAction::CwKeyerPtt => "PTT (CW Keyer)",
             MidiAction::Toolbar1 => "ToolBar1",
             MidiAction::Toolbar2 => "ToolBar2",
             MidiAction::Toolbar3 => "ToolBar3",
@@ -414,6 +426,11 @@ pub const KEY_ACTIONS: &[MidiAction] = &[
     MidiAction::CwMacro3,
     MidiAction::CwMacro4,
     MidiAction::CwMacro5,
+    MidiAction::CwLeft,
+    MidiAction::CwRight,
+    MidiAction::CwStraightKey,
+    MidiAction::CwKeyerKeydown,
+    MidiAction::CwKeyerPtt,
     MidiAction::Toolbar1,
     MidiAction::Toolbar2,
     MidiAction::Toolbar3,
@@ -810,6 +827,7 @@ fn connect(
     let callback = move |_stamp_us: u64, bytes: &[u8], _: &mut ()| {
         let Some(ev) = parse_midi_bytes(bytes) else { return };
         crate::cw_latency::midi_event();
+        crate::cw_keyer::midi_event(&ev);
         if let Ok(mut q) = events.lock() {
             if q.len() >= QUEUE_CAPACITY {
                 q.pop_front();

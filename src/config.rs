@@ -336,6 +336,12 @@ pub struct Config {
     /// (a config saved before this existed) falls back to off.
     #[serde(default)]
     pub cw_pc_sidetone_enabled: Option<bool>,
+    /// CW menu: "CW handled in Radio" (the radio's own keyer keys CW; off = the host keyer, MIDI paddles) and "CW Break-In". See cw_keyer.rs.
+    /// `None` (older config) = on / on.
+    #[serde(default)]
+    pub cw_keyer_internal: Option<bool>,
+    #[serde(default)]
+    pub cw_breakin: Option<bool>,
     /// Up to 5 saved CW text messages (Settings -> CW), sent via the
     /// main window's Send CW control at whatever speed/weight is
     /// currently set above -- see tx::TxHandle::send_cw_text's doc

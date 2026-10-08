@@ -904,9 +904,11 @@ fn run(
         // once active it drops straight back to the tight 2ms cadence
         // this loop always used.
         // No `mox` here any more: the sidetone has its own output, and `mox` is raised from the UI frame (late) after the radio keys.
-        let could_key = enabled.load(Ordering::Relaxed) && cw_mode_active.load(Ordering::Relaxed);
+        // Host CW keying (cw_keyer.rs, MIDI keyer): the sidetone follows the host key state directly.
+        let host_cw = crate::cw_keyer::host_mode();
+        let could_key = enabled.load(Ordering::Relaxed) && (cw_mode_active.load(Ordering::Relaxed) || host_cw);
         let idle = !could_key && gain <= 0.0;
-        thread::sleep(Duration::from_millis(if idle { 20 } else { 2 }));
+        thread::sleep(Duration::from_millis(if idle { 20 } else if host_cw { 1 } else { 2 }));
         let now = Instant::now();
         let elapsed = now.duration_since(last);
         last = now;
@@ -935,7 +937,9 @@ fn run(
         // relative to real paddle events between mode changes.
         let mode_a = mode != CW_KEYER_MODE_IAMBIC_B;
         let iambic_keyed = iambic.step(samples_needed as u32, dot, dash, mode_a, dot_samples, dash_samples);
-        let radio_keyed = if mode == CW_KEYER_MODE_IAMBIC_A || mode == CW_KEYER_MODE_IAMBIC_B {
+        let radio_keyed = if host_cw {
+            crate::cw_keyer::local_key()
+        } else if mode == CW_KEYER_MODE_IAMBIC_A || mode == CW_KEYER_MODE_IAMBIC_B {
             iambic_keyed
         } else {
             cw_ptt_active.load(Ordering::Relaxed)

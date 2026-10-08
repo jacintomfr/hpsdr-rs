@@ -2523,6 +2523,8 @@ fn run(
 ) {
     let mut processor = TxProcessor::open(channel, protocol, mic_rate, duc_rate, ps_corr_path);
     let mut cw_text_gen = CwTextGen::new(Arc::clone(&cw_text_elements), Arc::clone(&cw_text_active), Arc::clone(&cw_text_busy));
+    // Host CW keying (MIDI keyer, cw_keyer.rs): plays the key event ring, in 128-sample slices (2.7 ms) so a key edge waits little.
+    let mut host_key_gen = crate::cw_keyer::HostKeyGen::new();
     let mut cw_iq_scratch: Vec<f32> = Vec::new();
     let mut cw_mono_scratch: Vec<f32> = Vec::new();
     let duc_ratio = ((duc_rate / mic_rate).max(1)) as usize;
@@ -2851,14 +2853,18 @@ fn run(
             // MOX last dropped.
             last_read_at = None;
             read_max_gap = Duration::ZERO;
-            thread::sleep(Duration::from_millis(20));
+            host_key_gen.reset();
+            // Waits for the next MOX request (the host CW keyer wakes this) or 20 ms.
+            crate::cw_keyer::tx_idle_wait(Duration::from_millis(20));
             // Resync so the first chunk after PTT is produced against a
             // fresh schedule, not delayed by however long MOX was off --
             // same reasoning as p2_tx_iq_loop's own resync here.
             next_chunk = Instant::now();
             continue;
         }
-        if cw_text_gen.is_active() {
+        let cw_text_now = cw_text_gen.is_active();
+        let host_key_now = !cw_text_now && crate::cw_keyer::tx_branch_wanted();
+        if cw_text_now || host_key_now {
             // See CwTextGen's own doc comment -- bypasses source
             // selection and WDSP entirely; a plain shaped on-frequency
             // carrier, not something fexchange0's SSB-modulation chain
@@ -2868,7 +2874,12 @@ fn run(
             // scalar as audio.rs's CwSidetone -- the Sidetone Level
             // slider governs this monitor tone too.
             let sidetone_volume = (cw_keyer.sidetone_volume.load(Ordering::Relaxed).min(255) as f32) / 255.0;
-            cw_text_gen.fill(out_iq_pairs, duc_rate as u32, sidetone_freq_hz, sidetone_volume, &mut cw_iq_scratch, &mut cw_mono_scratch);
+            if cw_text_now {
+                cw_text_gen.fill(out_iq_pairs, duc_rate as u32, sidetone_freq_hz, sidetone_volume, &mut cw_iq_scratch, &mut cw_mono_scratch);
+            } else {
+                crate::cw_keyer::tx_set_ready(true);
+                host_key_gen.fill((out_iq_pairs / 4).max(1), duc_rate as u32, sidetone_freq_hz, sidetone_volume, &mut cw_iq_scratch, &mut cw_mono_scratch);
+            }
 
             {
                 let mut spec = tx_spectrum_iq.lock().unwrap();
@@ -2904,7 +2915,7 @@ fn run(
                 }
             }
 
-            next_chunk += chunk_interval;
+            next_chunk += if host_key_now { chunk_interval / 4 } else { chunk_interval };
             let now = Instant::now();
             if next_chunk > now {
                 thread::sleep(next_chunk - now);

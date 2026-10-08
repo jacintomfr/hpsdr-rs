@@ -17,6 +17,7 @@ mod bootloader_ui;
 mod cat;
 mod config;
 mod cw_decoder;
+mod cw_keyer;
 mod cw_latency;
 mod cw_encoder;
 mod debug_log;
@@ -1711,6 +1712,12 @@ fn dispatch_midi_binding(
             connected.toolbar_layer = (connected.toolbar_layer + toolbar::LAYERS - 1) % toolbar::LAYERS;
             connected.settings_dirty.store(true, Ordering::Relaxed);
         }
+        // MIDI CW keying is handled on the MIDI thread (cw_keyer.rs); nothing to do in the UI frame.
+        MidiAction::CwLeft
+        | MidiAction::CwRight
+        | MidiAction::CwStraightKey
+        | MidiAction::CwKeyerKeydown
+        | MidiAction::CwKeyerPtt => {}
         MidiAction::CwMacro1
         | MidiAction::CwMacro2
         | MidiAction::CwMacro3
@@ -4048,6 +4055,9 @@ fn connect_to_device(device: Device, cfg: &Config) -> Result<ConnectedState, Str
                 Arc::clone(&session.cw_keyer),
             );
             cw_sidetone.enabled.store(cfg.cw_pc_sidetone_enabled.unwrap_or(false), Ordering::Relaxed);
+            cw_keyer::attach(Arc::clone(&session.mox), Arc::clone(&session.cw_keyer), Arc::clone(&session.cw_ptt_active));
+            cw_keyer::set_internal(cfg.cw_keyer_internal.unwrap_or(true));
+            cw_keyer::set_breakin(cfg.cw_breakin.unwrap_or(true));
             let midi = MidiWorker::start();
             midi.enabled.store(cfg.midi_enabled.unwrap_or(false), Ordering::Relaxed);
             // Migrate a pre-multi-device config's single midi_device_name
@@ -4882,7 +4892,19 @@ impl eframe::App for HpsdrApp {
                 // over the radio's internal keyer once it's armed, so
                 // this is what actually makes the radio's own FPGA drop
                 // PTT on its own.
-                let cw_mode_now = cw_mode_selected && !connected.cw_stuck_key_lockout;
+                // Host CW keying (MIDI keyer, cw_keyer.rs): armed in CW mode when TX is allowed; while the host keyer is in charge the radio's
+                // own internal keyer is disarmed (cw_mode_active false), like piHPSDR's "CW handled in Radio" off / MIDI_cw_is_active.
+                cw_keyer::sync_bindings(&connected.midi_bindings);
+                cw_keyer::set_armed(
+                    cw_mode_selected
+                        && !connected.tune_active
+                        && !connected.two_tone_active
+                        && tx_frequency_allowed(
+                            connected.session.tx_frequency_hz.load(Ordering::Relaxed),
+                            connected.allow_out_of_band_tx.load(Ordering::Relaxed),
+                        ),
+                );
+                let cw_mode_now = cw_mode_selected && !connected.cw_stuck_key_lockout && !cw_keyer::host_mode();
                 connected.session.cw_mode_active.store(cw_mode_now, std::sync::atomic::Ordering::Relaxed);
                 // CW break-in: mirror the radio's own real-time keyed/
                 // PTT status (session.cw_ptt_active) directly into
@@ -15681,6 +15703,8 @@ Waterfall rebuilds: {prof_wf_n:.0}/s, {prof_wf_ms:.1} ms each."
                             connected.session.cw_keyer.hang_time_ms.load(Ordering::Relaxed),
                         ),
                         cw_pc_sidetone_enabled: Some(connected.cw_sidetone.enabled.load(Ordering::Relaxed)),
+                        cw_keyer_internal: Some(cw_keyer::internal()),
+                        cw_breakin: Some(cw_keyer::breakin()),
                         cw_text_messages: connected.cw_text_messages.clone().map(|m| if m.is_empty() { None } else { Some(m) }),
                         cw_text_selected: Some(connected.cw_text_selected),
                         db_low: Some(connected.db_low),

@@ -24,6 +24,8 @@ const WEIGHT_HELP: &str = "Dot/dash timing ratio: 50 is the standard 1:3 ratio; 
 const KEYER_HELP: &str = "These settings are for the radio's own built-in keyer (a paddle wired directly into the radio), not for a paddle connected to this PC. Speed and Weight also set the CW text messages.";
 const PC_SIDETONE_HELP: &str = "Also play the sidetone through this PC's own audio output (with the Sidetone Level and Frequency above), in addition to what the radio's own keyer does on its local output. Useful when the radio has no local audio output, or for remote operation.";
 const MESSAGES_HELP: &str = "Up to 5 saved messages, sent as real CW from the main window's Send control, at the Speed and Weight set on the Keyer page, through the radio's own transmitter (this program generates the CW carrier directly).";
+const INTERNAL_HELP: &str = "ON: the radio's own keyer does the CW keying (a paddle or key wired into the radio). OFF: this program does it (the host keyer): a MIDI CW interface with paddles or a straight key. \"PTT (CW Keyer)\" + \"CW Key (Keyer)\" MIDI notes (an external keyer with its own PTT) work in both cases.";
+const BREAKIN_ON_HELP: &str = "The host keyer switches to TX when a key or paddle is hit and back to RX after the Break-in Delay (Keyer page). Off: switch to TX yourself (MOX) before sending.";
 
 fn label_box(ui: &mut egui::Ui, text: &str, w: f32) {
     let (rect, _) = ui.allocate_exact_size(egui::vec2(w, ROW_H), egui::Sense::hover());
@@ -72,7 +74,7 @@ pub fn cw_window(ui: &mut egui::Ui, connected: &mut ConnectedState) -> (bool, bo
                 }
                 ui.label("CW");
                 ui.add_space(12.0);
-                for (i, label) in ["Keyer", "Messages"].iter().enumerate() {
+                for (i, label) in ["Keyer", "Messages", "Host Keyer"].iter().enumerate() {
                     let active = tab == i as u8;
                     let btn = egui::Button::new(egui::RichText::new(*label).color(if active { egui::Color32::WHITE } else { egui::Color32::from_gray(210) }))
                         .fill(if active { egui::Color32::from_rgb(70, 150, 245) } else { egui::Color32::from_gray(48) })
@@ -153,6 +155,26 @@ pub fn cw_window(ui: &mut egui::Ui, connected: &mut ConnectedState) -> (bool, bo
                         changed = true;
                     }
                     help_button(ui, "cw_pc_sidetone_help", PC_SIDETONE_HELP);
+                });
+            } else if tab == 2 {
+                // Host keyer (cw_keyer.rs): MIDI paddles / straight key / external keyer.
+                ui.horizontal(|ui| {
+                    label_box(ui, "CW handled in Radio", LABEL_W);
+                    let mut on = crate::cw_keyer::internal();
+                    if std_checkbox(ui, &mut on, "On").changed() {
+                        crate::cw_keyer::set_internal(on);
+                        changed = true;
+                    }
+                    help_button(ui, "cw_internal_help", INTERNAL_HELP);
+                });
+                ui.horizontal(|ui| {
+                    label_box(ui, "CW Break-In", LABEL_W);
+                    let mut on = crate::cw_keyer::breakin();
+                    if std_checkbox(ui, &mut on, "On").changed() {
+                        crate::cw_keyer::set_breakin(on);
+                        changed = true;
+                    }
+                    help_button(ui, "cw_breakin_help", BREAKIN_ON_HELP);
                 });
             } else {
                 ui.horizontal(|ui| {
