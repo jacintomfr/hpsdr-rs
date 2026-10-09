@@ -24,7 +24,8 @@ pub fn rx_window(ui: &mut egui::Ui, connected: &mut ConnectedState) -> (bool, bo
     let rui0 = rui;
     let adc = connected.session.adc.load(Ordering::Relaxed);
 
-    let frame = egui::Frame::window(ui.style()).inner_margin(egui::Margin::symmetric(24, 4)).corner_radius(0.0);
+    let win_h = screen.height() - (crate::TOOLBAR_HEIGHT + crate::TOOLBAR_MARGIN) - 11.0;
+    let frame = egui::Frame::window(ui.style()).inner_margin(egui::Margin::symmetric(24, 4)).corner_radius(0.0).shadow(egui::Shadow::NONE);
     egui::Window::new("Receive")
         .id(egui::Id::new("rx_window"))
         .title_bar(false)
@@ -33,14 +34,14 @@ pub fn rx_window(ui: &mut egui::Ui, connected: &mut ConnectedState) -> (bool, bo
         .frame(frame)
         .fixed_pos(screen.min)
         .constrain_to(screen)
-        .fixed_size(screen.size() - egui::vec2(58.0, 10.0))
+        .fixed_size(egui::vec2(screen.width() - 58.0, win_h))
         .show(ui.ctx(), |ui| {
             if ui.input(|i| i.key_pressed(egui::Key::Escape)) {
                 close_now = true;
             }
             let w = screen.width() - 58.0;
             ui.set_width(w);
-            ui.set_min_height(screen.height() - 10.0);
+            ui.set_min_height(win_h);
             ui.spacing_mut().item_spacing = egui::vec2(6.0, 0.0);
             let title = if tab == 0 { format!("hpsdr-rs - Receive - RX1 - ADC{adc}") } else { "hpsdr-rs - Receive - Options".to_string() };
             let (tr, _) = ui.allocate_exact_size(egui::vec2(w, 22.0), egui::Sense::hover());

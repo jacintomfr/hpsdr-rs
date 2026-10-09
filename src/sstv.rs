@@ -859,6 +859,9 @@ pub struct SstvRx {
     // Length of the current line, cached because `step_image` runs per sample.
     line_samples: u64,
     // Robot 4:2:0 chroma carried between lines.
+    // Tuning error (Hz) measured on the 1200 Hz sync pulses and subtracted from every pixel frequency: a transmitter and a receiver a few Hz apart
+    // would otherwise tint the colour of the Robot modes (their chroma sits around 1900 Hz).
+    afc_hz: f64,
     last_cr: Vec<u8>,
     last_cb: Vec<u8>,
 
@@ -945,6 +948,7 @@ impl SstvRx {
             line: 0,
             line_start: 0,
             line_samples: 0,
+            afc_hz: 0.0,
             last_cr: Vec::new(),
             last_cb: Vec::new(),
             expected: None,
@@ -968,6 +972,7 @@ impl SstvRx {
         self.line = 0;
         self.line_start = 0;
         self.line_samples = 0;
+        self.afc_hz = 0.0;
         self.last_cr.clear();
         self.last_cb.clear();
         self.sync_run = 0;
@@ -1314,6 +1319,7 @@ impl SstvRx {
         self.line_start = first_line_start;
         self.line_samples = self.line_period_samples(mode, 0) as u64;
         let (w, _) = mode.dimensions();
+        self.afc_hz = 0.0;
         self.last_cr = vec![128u8; (w / 2) as usize];
         self.last_cb = vec![128u8; (w / 2) as usize];
         self.sync_run = 0;
@@ -1404,6 +1410,27 @@ impl SstvRx {
         }
     }
 
+    /// Robot 36 sends R-Y (separator 1500 Hz) on one line and B-Y (2300 Hz) on the next, and which comes first depends on where the receiver
+    /// started: read the separator tone of this line instead of trusting the line count, otherwise a picture that is picked up one line
+    /// "off" comes out with red and blue swapped. Returns the line number whose parity matches what was sent (`line` when it cannot tell).
+    fn robot36_line_parity(&self, w: u16, line: u16, start: u64) -> u16 {
+        // Sync 9 ms + porch 3 ms + Y scan, then the 4.5 ms separator.
+        let sep_start = start as f64 + (0.009 + 0.003 + w as f64 * 0.000_275) * self.rate;
+        let from = (sep_start + 0.001 * self.rate) as u64;
+        let to = (sep_start + 0.0035 * self.rate) as u64;
+        if to <= from {
+            return line;
+        }
+        let mean = (from..to).map(|i| self.hz_at(i)).sum::<f64>() / (to - from) as f64;
+        if mean < 1700.0 {
+            0
+        } else if mean > 2100.0 {
+            1
+        } else {
+            line
+        }
+    }
+
     /// Decode one transmitted line into its picture rows: one for every mode
     /// but the PD family, two for that.
     fn decode_line(&mut self, mode: SstvMode, w: u16, line: u16, start: u64) -> Vec<Vec<u8>> {
@@ -1419,15 +1446,37 @@ impl SstvRx {
             cb = vec![128u8; w as usize];
         }
 
+        // Tuning error from this line's sync pulse (its middle 60 %, where the tone is steady): follow it with a little smoothing, ignore
+        // anything implausible.
+        {
+            let (soff, sdur) = self.sync_span(mode, w, line);
+            let centre = start as f64 + soff + sdur * 0.5;
+            let (from, to) = ((centre - sdur * 0.3) as u64, (centre + sdur * 0.3) as u64);
+            if to > from {
+                let (mut sum, mut cnt) = (0.0f64, 0u32);
+                for i in from..to {
+                    let hz = self.hz_at(i);
+                    if hz < 1400.0 {
+                        sum += hz;
+                        cnt += 1;
+                    }
+                }
+                if cnt as f64 > (to - from) as f64 * 0.7 {
+                    let measured = (sum / cnt as f64 - SYNC_HZ).clamp(-120.0, 120.0);
+                    self.afc_hz = if self.afc_hz == 0.0 { measured } else { self.afc_hz * 0.6 + measured * 0.4 };
+                }
+            }
+        }
         let mut t = start as f64;
-        for seg in line_segments(mode, w, line) {
+        let seg_line = if mode == SstvMode::Robot36 { self.robot36_line_parity(w, line, start) } else { line };
+        for seg in line_segments(mode, w, seg_line) {
             match seg {
                 Seg::Tone { dur, .. } => t += dur * self.rate,
                 Seg::Scan { chan, width, px } => {
                     let step = px * self.rate;
                     for x in 0..width as usize {
                         let idx = (t + (x as f64 + 0.5) * step) as u64;
-                        let v = hz_to_value(self.hz_at(idx));
+                        let v = hz_to_value(self.hz_at(idx) - self.afc_hz);
                         let cri = x.min(cr.len().saturating_sub(1));
                         let cbi = x.min(cb.len().saturating_sub(1));
                         match chan {

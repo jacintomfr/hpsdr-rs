@@ -795,7 +795,7 @@ impl DiscoveryWindow {
 
                 ui.horizontal(|ui| {
                     if ui
-                        .add_enabled(!discovering, egui::Button::new("Rediscover"))
+                        .add_enabled(!discovering, touch_button("Rediscover", kiosk, 140.0))
                         .clicked()
                     {
                         self.selected = None;
@@ -805,12 +805,15 @@ impl DiscoveryWindow {
                     ui.separator();
 
                     ui.label("Manual IP:");
-                    ui.add_enabled(
-                        !discovering,
-                        egui::TextEdit::singleline(&mut self.manual_ip).desired_width(120.0),
-                    );
+                    // The text box as tall as the buttons beside it on the touch kiosk.
+                    ui.scope(|ui| {
+                        if kiosk {
+                            ui.spacing_mut().interact_size.y = 46.0;
+                        }
+                        ui.add_enabled(!discovering, egui::TextEdit::singleline(&mut self.manual_ip).desired_width(150.0).margin(egui::Margin::symmetric(6, if kiosk { 13 } else { 4 })));
+                    });
                     if ui
-                        .add_enabled(!discovering, egui::Button::new("Add"))
+                        .add_enabled(!discovering, touch_button("Add", kiosk, 80.0))
                         .clicked()
                     {
                         match self.manual_ip.trim().parse::<IpAddr>() {
@@ -846,19 +849,19 @@ impl DiscoveryWindow {
                         .map(device_available)
                         .unwrap_or(false);
 
-                    if ui.add_enabled(can_start, egui::Button::new("Start")).clicked() {
+                    if ui.add_enabled(can_start, touch_button("Start", kiosk, 100.0)).clicked() {
                         if let Some(dev) = self.selected.and_then(|i| devices_snapshot.get(i)) {
                             action = DiscoveryAction::Start(*dev, self.juice_console.clone(), self.sim_handle.take());
                         }
                     }
 
-                    if ui.button("Cancel").clicked() {
+                    if ui.add(touch_button("Cancel", kiosk, 100.0)).clicked() {
                         action = DiscoveryAction::Cancelled;
                     }
 
                     ui.separator();
 
-                    if ui.button("Firmware Update...").on_hover_text(
+                    if ui.add(touch_button("Firmware Update...", kiosk, 210.0)).on_hover_text(
                         "Update FPGA firmware or change the static IP of a radio in bootloader mode \
                          (Metis/Hermes/Hermes2/Angelia/Orion/Orion2). The radio must already be \
                          physically switched into bootloader mode and power-cycled.",
@@ -1309,5 +1312,15 @@ impl DiscoveryWindow {
         }
 
         action
+    }
+}
+
+/// A button for the Discovery page: on the touch kiosk a 46 px high one of at least `min_w`, like the CLOSE / EXIT buttons; the normal size elsewhere.
+fn touch_button(label: &str, kiosk: bool, min_w: f32) -> egui::Button<'_> {
+    let button = egui::Button::new(label);
+    if kiosk {
+        button.min_size(egui::vec2(min_w, 46.0)).corner_radius(5.0)
+    } else {
+        button
     }
 }

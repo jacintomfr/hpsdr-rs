@@ -13,12 +13,47 @@ use std::time::Duration;
 
 const TAB_ID: &str = "sstv_inapp_tab";
 const ZOOM_ID: &str = "digital_inapp_prev_zoom";
-/// Spectrum zoom while the panel is open: 6 kHz of a 96 kHz span, shifted so it covers 0..6 kHz of audio above (below, for LSB) the dial like
+/// Spectrum zoom while the panel is open (x16 is the limit): 3 kHz of audio at the 48 kHz RX rate used meanwhile, shifted to start at the dial (below it for LSB)
 /// MMSSTV's frequency display -- SSTV's 1.2..2.3 kHz is about a fifth of it.
 const SSTV_ZOOM: i32 = 16;
-/// Where the view is centred, in Hz from the dial (the middle of the 0..6 kHz audio range).
-const VIEW_CENTER_HZ: f64 = 3000.0;
+/// Where the view is centred, in Hz from the dial: the middle of the SSTV tone band (1200..2300 Hz), so the signal sits mid-screen, clear of the dB ruler and the AGC lines at the left edge.
+const VIEW_CENTER_HZ: f64 = 1500.0;
+/// RX sample rate while the panel is open: at 48 kHz the zoom x16 shows exactly 3 kHz of audio (the MMSSTV view); the rate in use before is put back on close.
+const SSTV_RATE: u32 = 48_000;
+/// The sample rate to restore (0 = the rate was not changed). Also read when the configuration is saved, so a crash or exit with the panel open does not
+/// leave 48 kHz as the saved rate.
+static PREV_RATE: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
+/// The sample rate to write to the configuration: the one before the panel changed it, if it did.
+pub(crate) fn persisted_rate(current: u32) -> u32 {
+    match PREV_RATE.load(std::sync::atomic::Ordering::Relaxed) {
+        0 => current,
+        prev => prev,
+    }
+}
+
+/// The zoom / pan before the panel changed them (0 / NaN-free sentinel: zoom 0 = not changed), so the configuration keeps the user's own view.
+static PREV_ZOOM: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(0);
+static PREV_PAN_BITS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
+pub(crate) fn persisted_zoom(current: i32) -> i32 {
+    match PREV_ZOOM.load(std::sync::atomic::Ordering::Relaxed) {
+        0 => current,
+        prev => prev,
+    }
+}
+
+pub(crate) fn persisted_pan(current: f32) -> f32 {
+    if PREV_ZOOM.load(std::sync::atomic::Ordering::Relaxed) == 0 {
+        current
+    } else {
+        f32::from_bits(PREV_PAN_BITS.load(std::sync::atomic::Ordering::Relaxed))
+    }
+}
 /// Height of the control strip under the spectrum / waterfall and the picture window.
+/// The control strip (RX / TX tabs, Quick Tune, Decode, Lead, Slant, Load Picture ...) is kept but hidden for now: the layout is a bare picture window
+/// next to a full-height spectrum / waterfall, and the controls get their place later. CLOSE is not needed: the DIGITAL button and the MIDI function toggle.
+const SHOW_STRIP: bool = false;
 const STRIP_HEIGHT_RX: f32 = 100.0;
 const STRIP_HEIGHT_TX: f32 = 100.0;
 /// Width of the picture (RX) window at the right; the spectrum and the waterfall take what is left.
@@ -41,7 +76,18 @@ pub(crate) fn sync_zoom(connected: &mut ConnectedState, ctx: &egui::Context) {
                 d.insert_temp(id, connected.spectrum_zoom);
                 d.insert_temp(pan_id, connected.spectrum_pan);
             });
+            // Opening the Digital window already saved the user's own view (and put its own zoom 6 in): that is the one to keep in the configuration.
+            let (orig_zoom, orig_pan) = match &connected.pre_digital_filters {
+                Some(f) => (f.zoom, f.pan),
+                None => (connected.spectrum_zoom, connected.spectrum_pan),
+            };
+            PREV_PAN_BITS.store(orig_pan.to_bits(), std::sync::atomic::Ordering::Relaxed);
+            PREV_ZOOM.store(orig_zoom.max(1), std::sync::atomic::Ordering::Relaxed);
             connected.spectrum_zoom = SSTV_ZOOM;
+            if connected.sample_rate > SSTV_RATE && connected.device.board != crate::Boards::Rx888 && PREV_RATE.load(std::sync::atomic::Ordering::Relaxed) == 0 {
+                PREV_RATE.store(connected.sample_rate, std::sync::atomic::Ordering::Relaxed);
+                crate::change_sample_rate(connected, SSTV_RATE);
+            }
         }
         // Keep the 0..6 kHz audio range in view (the sign follows the sideband).
         let half = connected.sample_rate as f64 / 2.0;
@@ -50,9 +96,21 @@ pub(crate) fn sync_zoom(connected: &mut ConnectedState, ctx: &egui::Context) {
         let center = if lower { -VIEW_CENTER_HZ } else { VIEW_CENTER_HZ };
         connected.spectrum_pan = if max_pan > 0.0 { (center / max_pan).clamp(-1.0, 1.0) as f32 } else { 0.0 };
     } else if let Some(z) = prev {
-        connected.spectrum_zoom = z;
-        if let Some(p) = ctx.data(|d| d.get_temp::<f32>(pan_id)) {
-            connected.spectrum_pan = p;
+        // Closing the Digital window has put the user's own zoom and pan back already (restore_pre_digital_filters): leave them alone. Only when the
+        // window stays open (another digital mode took over) the Digital window's own zoom is restored.
+        let digital_still_open = connected.pre_digital_filters.is_some();
+        if digital_still_open {
+            connected.spectrum_zoom = z;
+        }
+        PREV_ZOOM.store(0, std::sync::atomic::Ordering::Relaxed);
+        let prev_rate = PREV_RATE.swap(0, std::sync::atomic::Ordering::Relaxed);
+        if prev_rate != 0 && connected.sample_rate != prev_rate {
+            crate::change_sample_rate(connected, prev_rate);
+        }
+        if digital_still_open {
+            if let Some(p) = ctx.data(|d| d.get_temp::<f32>(pan_id)) {
+                connected.spectrum_pan = p;
+            }
         }
         ctx.data_mut(|d| {
             d.remove_temp::<i32>(id);
@@ -130,9 +188,10 @@ pub(crate) fn panel(ui: &mut egui::Ui, connected: &mut ConnectedState, win: egui
             ui.spacing_mut().item_spacing = egui::vec2(8.0, 4.0);
             // The picture takes everything but two thin vertical bars (Sync, Level) at its right and the status line under it.
             let bars_w = 104.0f32;
-            let status_h = if tab_now == 1 { 100.0f32 } else { 0.0f32 };
+            // TX: one line at the very bottom (Load Picture, Mode, Callsign banner) and Send / Abort in the right column, so the picture gets the rest.
+            let bottom_h = if tab_now == 1 { 50.0f32 } else { 0.0f32 };
             let pic_w = inner_w - bars_w - 8.0;
-            let pic_h = if status_h > 0.0 { inner_h - status_h - 4.0 } else { inner_h };
+            let pic_h = inner_h - bottom_h;
             let sync_color = if snap.sync_quality > 0.7 {
                 green
             } else if snap.sync_quality > 0.3 {
@@ -140,6 +199,7 @@ pub(crate) fn panel(ui: &mut egui::Ui, connected: &mut ConnectedState, win: egui
             } else {
                 egui::Color32::from_rgb(140, 140, 140)
             };
+            let y0 = ui.cursor().top();
             ui.horizontal_top(|ui| {
                 ui.allocate_ui_with_layout(egui::vec2(pic_w, pic_h), egui::Layout::top_down(egui::Align::Min), |ui| {
                     ui.set_width(pic_w);
@@ -177,14 +237,20 @@ pub(crate) fn panel(ui: &mut egui::Ui, connected: &mut ConnectedState, win: egui
                 ui.allocate_ui_with_layout(egui::vec2(bars_w, pic_h), egui::Layout::top_down(egui::Align::Min), |ui| {
                     ui.set_max_width(bars_w);
                     ui.spacing_mut().item_spacing = egui::vec2(4.0, 2.0);
-                    let bar_h = (pic_h - 22.0 - 64.0).max(40.0);
-                    let (area, _) = ui.allocate_exact_size(egui::vec2(bars_w, bar_h + 22.0), egui::Sense::hover());
+                    let bar_h = (pic_h - 22.0 - 64.0 - if tab_now == 1 { 104.0 } else { 0.0 }).max(40.0);
+                    let (area, _) = ui.allocate_exact_size(egui::vec2(bars_w, if tab_now == 1 { 0.0 } else { bar_h + 22.0 }), egui::Sense::hover());
                     let pct = format!("{:.0}%", snap.progress * 100.0);
-                    let bars = [
-                        ("Sync", snap.sync_quality, sync_color),
-                        ("Lvl", snap.level, egui::Color32::from_rgb(90, 160, 230)),
-                        (pct.as_str(), snap.progress, egui::Color32::from_rgb(230, 150, 50)),
-                    ];
+                    // The receiver is idle while sending, so on the TX tab the bars are the transmission's: its progress, and whether it is on air.
+                    let tx_tab = tab_now == 1;
+                                        let bars: Vec<(&str, f32, egui::Color32)> = if tx_tab {
+                        Vec::new()
+                    } else {
+                        vec![
+                            ("Sync", snap.sync_quality, sync_color),
+                            ("Lvl", snap.level, egui::Color32::from_rgb(90, 160, 230)),
+                            (pct.as_str(), snap.progress, egui::Color32::from_rgb(230, 150, 50)),
+                        ]
+                    };
                     for (i, (label, value, color)) in bars.iter().enumerate() {
                         let x = area.left() + i as f32 * 36.0;
                         let track = egui::Rect::from_min_size(egui::pos2(x, area.top()), egui::vec2(28.0, bar_h));
@@ -194,13 +260,23 @@ pub(crate) fn panel(ui: &mut egui::Ui, connected: &mut ConnectedState, win: egui
                         ui.painter().rect_stroke(track, 4.0, egui::Stroke::new(1.0, egui::Color32::from_gray(70)), egui::StrokeKind::Inside);
                         ui.painter().text(egui::pos2(track.center().x, track.bottom() + 11.0), egui::Align2::CENTER_CENTER, label, egui::FontId::proportional(13.0), egui::Color32::from_gray(190));
                     }
+                    if tx_tab {
+                        // The transmission's progress, horizontal, at the top of the right column.
+                        ui.add(egui::ProgressBar::new(sstv.tx_progress().clamp(0.0, 1.0)).desired_width(bars_w - 4.0).desired_height(24.0).fill(egui::Color32::from_rgb(230, 70, 70)).text(format!("{:.0}%", sstv.tx_progress() * 100.0)));
+                    }
                     ui.horizontal(|ui| {
                         let (r, _) = ui.allocate_exact_size(egui::vec2(12.0, 12.0), egui::Sense::hover());
-                        ui.painter().circle_filled(r.center(), 5.0, if snap.receiving { green } else { amber });
-                        ui.add(egui::Label::new(match snap.detected {
-                            Some(m) => format!("{}\n{}", m.label(), if snap.receiving { "(receiving)" } else { "(last)" }),
-                            None => "hunting...".to_string(),
-                        }).wrap());
+                        if tx_tab {
+                            let on_air = sstv.tx_active();
+                            ui.painter().circle_filled(r.center(), 5.0, if on_air { egui::Color32::from_rgb(230, 70, 70) } else { amber });
+                            ui.add(egui::Label::new(if on_air { "ON AIR" } else { "ready" }).wrap());
+                        } else {
+                            ui.painter().circle_filled(r.center(), 5.0, if snap.receiving { green } else { amber });
+                            ui.add(egui::Label::new(match snap.detected {
+                                Some(m) => format!("{}\n{}", m.label(), if snap.receiving { "(receiving)" } else { "(last)" }),
+                                None => "hunting...".to_string(),
+                            }).wrap());
+                        }
                     });
                     if let Some(id) = &snap.rx_id {
                         ui.add(egui::Label::new(format!("Station: {id}")).wrap());
@@ -208,10 +284,30 @@ pub(crate) fn panel(ui: &mut egui::Ui, connected: &mut ConnectedState, win: egui
                     if let Some(u) = &snap.unsupported {
                         ui.add(egui::Label::new(egui::RichText::new(format!("{u}: not decoded")).color(amber)).wrap());
                     }
+                    if tx_tab {
+                        // Send keys MOX and plays the prepared picture; Abort stops it. The receiver tab never needs them.
+                        let ready = connected.sstv_tx_prepared.is_some();
+                        let size = egui::vec2(bars_w - 4.0, 40.0);
+                        if ui.add_enabled(ready && tx_available && !sstv.tx_active(), egui::Button::new(egui::RichText::new("Send").size(22.0).strong()).min_size(egui::vec2(size.x, 46.0))).clicked() {
+                            if let Some((w, h, rgb)) = connected.sstv_tx_prepared.as_ref() {
+                                sstv.set_image(connected.sstv_tx_mode, rgb, *w, *h, connected.own_callsign.as_str());
+                                sstv.set_tx_armed(true);
+                                mox_request = Some(true);
+                            }
+                        }
+                        ui.add_space(40.0);
+                        if ui.add_enabled(sstv.tx_active(), egui::Button::new(egui::RichText::new("Abort").size(22.0).strong()).min_size(egui::vec2(size.x, 46.0))).clicked() {
+                            sstv.abort_tx();
+                            mox_request = Some(false);
+                        }
+                    }
                 });
             });
             if tab_now == 1 {
-                // TX: the picture-file row (Load Picture, Mode, banner, Send / Abort) under the preview.
+                // TX: the picture-file line (Load Picture, Mode, banner) at the very bottom of the window; Send / Abort are in the right column above.
+                let used = ui.cursor().top() - y0;
+                ui.add_space((inner_h - used - 46.0).max(0.0));
+                ui.allocate_ui_with_layout(egui::vec2(inner_w, 44.0), egui::Layout::top_down(egui::Align::Min), |ui| {
                 let (f, q, m) = crate::render_sstv_panel(
                     ui,
                     &sstv,
@@ -225,34 +321,51 @@ pub(crate) fn panel(ui: &mut egui::Ui, connected: &mut ConnectedState, win: egui
                     &mut connected.own_callsign,
                     tx_available,
                     mox,
-                    SstvPart::TxSend,
+                    SstvPart::TxFile,
                 );
                 fit |= f;
                 quick = quick.or(q);
                 mox_request = mox_request.or(m);
+                });
             } else {
             }
         });
     });
 
     // ---- The control strip: the header (CLOSE, mode chips, RX | TX) and the controls of the open tab.
-    egui::Area::new(egui::Id::new("digital_inapp_strip")).fixed_pos(strip.min).constrain(false).show(ui, |ui| {
-        let frame = egui::Frame::group(ui.style());
+    // ---- OPTIONS: a button at the bottom left of the waterfall; open, the controls fill the waterfall (the spectrum stays in view for tuning).
+    let opt_id = egui::Id::new("digital_inapp_options_open");
+    let mut options_open: bool = ui.ctx().data(|d| d.get_temp(opt_id)).unwrap_or(false);
+    if !options_open {
+        egui::Area::new(egui::Id::new("digital_inapp_options_button"))
+            .order(egui::Order::Foreground)
+            .fixed_pos(egui::pos2(strip.left() + 6.0, strip.bottom() - 46.0 + 2.0))
+            .constrain(false)
+            .show(ui, |ui| {
+                crate::apply_kiosk_touch_style(ui);
+                // A centred-and-justified cell, so the label sits in the middle of the box.
+                let clicked = ui
+                    .allocate_ui_with_layout(egui::vec2(120.0, 40.0), egui::Layout::centered_and_justified(egui::Direction::LeftToRight), |ui| {
+                        ui.add(chip_button("OPTIONS", false).min_size(egui::vec2(120.0, 40.0))).clicked()
+                    })
+                    .inner;
+                if clicked {
+                    options_open = true;
+                }
+            });
+    }
+    if options_open {
+    egui::Area::new(egui::Id::new("digital_inapp_strip")).fixed_pos(egui::pos2(strip.left(), strip.bottom() - 2.0)).pivot(egui::Align2::LEFT_BOTTOM).order(egui::Order::Foreground).constrain(false).show(ui, |ui| {
+        let frame = egui::Frame::group(ui.style()).fill(ui.visuals().panel_fill);
         let margin = frame.total_margin().sum();
-        let (inner_w, inner_h) = (strip.width() - margin.x, strip.height() - margin.y - 2.0);
+        let inner_w = strip.width() - margin.x;
         frame.show(ui, |ui| {
             ui.set_width(inner_w);
-            ui.set_height(inner_h);
             crate::apply_kiosk_touch_style(ui);
             ui.spacing_mut().item_spacing = egui::vec2(6.0, 4.0);
             ui.horizontal(|ui| {
-                let close = egui::Button::new(egui::RichText::new("CLOSE").strong().color(egui::Color32::BLACK))
-                    .fill(egui::Color32::from_rgb(235, 195, 40))
-                    .stroke(egui::Stroke::new(1.0, egui::Color32::from_rgb(250, 225, 120)))
-                    .corner_radius(5.0)
-                    .min_size(egui::vec2(96.0, 40.0));
-                if ui.add(close).clicked() {
-                    close_now = true;
+                if ui.add(chip_button("OPTIONS", true).min_size(egui::vec2(120.0, 40.0))).clicked() {
+                    options_open = false;
                 }
                 ui.add_space(6.0);
                 for (i, label) in ["RX", "TX"].iter().enumerate() {
@@ -308,6 +421,8 @@ pub(crate) fn panel(ui: &mut egui::Ui, connected: &mut ConnectedState, win: egui
             mox_request = mox_request.or(m);
         });
     });
+    }
+    ui.ctx().data_mut(|d| d.insert_temp(opt_id, options_open));
     ui.ctx().data_mut(|d| d.insert_temp(egui::Id::new(TAB_ID), tab_now));
     ui.ctx().request_repaint_after(Duration::from_millis(300));
 
@@ -342,7 +457,9 @@ pub(crate) fn panel(ui: &mut egui::Ui, connected: &mut ConnectedState, win: egui
 
 /// Height of the control strip: the receive tab needs two lines, the transmit tab three.
 pub(crate) fn strip_height(ctx: &egui::Context) -> f32 {
-    if tab(ctx) == 1 {
+    if !SHOW_STRIP {
+        0.0
+    } else if tab(ctx) == 1 {
         STRIP_HEIGHT_TX
     } else {
         STRIP_HEIGHT_RX

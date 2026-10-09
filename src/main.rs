@@ -7540,8 +7540,8 @@ impl eframe::App for HpsdrApp {
                     // fine.
 
                     // Kiosk: no mode buttons (the band row has the mode indicator, the toolbar changes mode), so this
-                    // whole row goes away -- unless PureSignal needs its indicator here -- and everything below moves up.
-                    if !lcd_kiosk_mode() || connected.puresignal_enabled {
+                    // whole row goes away (the PureSignal badge sits beside Filter width now) and everything below moves up.
+                    if !lcd_kiosk_mode() {
                     ui.horizontal_wrapped(|ui| {
                         if !lcd_kiosk_mode() {
                         for mode in ALL_MODES {
@@ -9097,7 +9097,7 @@ impl eframe::App for HpsdrApp {
                         below_waterfall_reserve
                     };
                     // SSTV in-app layout: the control strip takes the bottom of the area, under the spectrum / waterfall.
-                    let digital_strip_h = if digital_inapp::active(connected) { digital_inapp::strip_height(ui.ctx()) + 6.0 } else { 0.0 };
+                    let digital_strip_h = if digital_inapp::active(connected) { { let h = digital_inapp::strip_height(ui.ctx()); if h > 0.0 { h + 6.0 } else { 0.0 } } } else { 0.0 };
                     let spectrum_waterfall_height =
                         (ui.available_height() - below_waterfall_reserve - digital_strip_h).max(if digital_strip_h > 0.0 { 100.0 } else { 200.0 });
                     // Waterfall disabled (Settings -> Spectrum): give the
@@ -9609,7 +9609,7 @@ impl eframe::App for HpsdrApp {
                         for (x, color, width) in [
                             (x_sync, egui::Color32::from_rgb(180, 90, 220), 1.5),
                             (x_white, egui::Color32::from_rgb(180, 90, 220), 1.5),
-                            (x_black, egui::Color32::from_rgb(70, 170, 255), 1.0),
+                            (x_black, egui::Color32::from_rgb(70, 170, 255), 2.5),
                         ] {
                             ui.painter().line_segment(
                                 [egui::pos2(x, rect.top()), egui::pos2(x, rect.bottom())],
@@ -9637,7 +9637,7 @@ impl eframe::App for HpsdrApp {
                         for (x, color, width) in [
                             (x_low, egui::Color32::from_rgb(90, 200, 220), 1.5),
                             (x_high, egui::Color32::from_rgb(90, 200, 220), 1.5),
-                            (x_center, egui::Color32::from_rgb(70, 170, 255), 1.0),
+                            (x_center, egui::Color32::from_rgb(70, 170, 255), 2.5),
                         ] {
                             ui.painter().line_segment(
                                 [egui::pos2(x, rect.top()), egui::pos2(x, rect.bottom())],
@@ -10498,7 +10498,7 @@ impl eframe::App for HpsdrApp {
                             for (x, color, width) in [
                                 (x_sync, egui::Color32::from_rgb(180, 90, 220), 1.5),
                                 (x_white, egui::Color32::from_rgb(180, 90, 220), 1.5),
-                                (x_black, egui::Color32::from_rgb(70, 170, 255), 1.0),
+                                (x_black, egui::Color32::from_rgb(70, 170, 255), 2.5),
                             ] {
                                 ui.painter().line_segment(
                                     [egui::pos2(x, rect.top()), egui::pos2(x, rect.bottom())],
@@ -10521,7 +10521,7 @@ impl eframe::App for HpsdrApp {
                             for (x, color, width) in [
                                 (x_low, egui::Color32::from_rgb(90, 200, 220), 1.5),
                                 (x_high, egui::Color32::from_rgb(90, 200, 220), 1.5),
-                                (x_center, egui::Color32::from_rgb(70, 170, 255), 1.0),
+                                (x_center, egui::Color32::from_rgb(70, 170, 255), 2.5),
                             ] {
                                 ui.painter().line_segment(
                                     [egui::pos2(x, rect.top()), egui::pos2(x, rect.bottom())],
@@ -10630,6 +10630,8 @@ impl eframe::App for HpsdrApp {
                             ),
                         );
                     } else if sstv_panel_visible {
+                        // The Menu and the windows it opens sit above the layout: the in-app panel steps aside while any of them is open.
+                        if !connected.menu_window_open && !menu_window::any_overlay_open(connected) {
                         digital_inapp::panel(
                             ui,
                             connected,
@@ -10638,10 +10640,11 @@ impl eframe::App for HpsdrApp {
                                 egui::pos2(spectrum_right + CW_PANEL_GAP + panel_w, waterfall_bottom + digital_inapp::strip_height(ui.ctx())),
                             ),
                             egui::Rect::from_min_max(
-                                egui::pos2(spectrum_rect.left(), waterfall_bottom + 6.0),
-                                egui::pos2(spectrum_right, waterfall_bottom + digital_inapp::strip_height(ui.ctx())),
+                                egui::pos2(spectrum_rect.left(), waterfall_bottom - 138.0),
+                                egui::pos2(spectrum_right, waterfall_bottom),
                             ),
                         );
+                        }
                     } else if rade_panel_visible {
                         let mut fit = false;
                         let mut tune = None;
@@ -15888,7 +15891,7 @@ Waterfall rebuilds: {prof_wf_n:.0}/s, {prof_wf_ms:.1} ms each."
                         frequency_hz: Some(
                             connected.session.frequency_hz.load(std::sync::atomic::Ordering::Relaxed),
                         ),
-                        sample_rate: Some(connected.sample_rate),
+                        sample_rate: Some(digital_inapp::persisted_rate(connected.sample_rate)),
                         mode: Some(connected.spectrum.mode()),
                         width_hz: Some(connected.spectrum.width_hz()),
                         rtty: Some(connected.rtty.settings()),
@@ -16025,8 +16028,8 @@ Waterfall rebuilds: {prof_wf_n:.0}/s, {prof_wf_ms:.1} ms each."
                         alc_mode: Some(connected.alc_mode),
                         spectrum_waterfall_ratio: Some(connected.dsp_saved_ratio.unwrap_or(connected.spectrum_waterfall_ratio)),
                         waterfall_enabled: Some(connected.waterfall_enabled),
-                        spectrum_zoom: Some(connected.spectrum_zoom),
-                        spectrum_pan: Some(connected.spectrum_pan),
+                        spectrum_zoom: Some(digital_inapp::persisted_zoom(connected.spectrum_zoom)),
+                        spectrum_pan: Some(digital_inapp::persisted_pan(connected.spectrum_pan)),
                         adc: Some(connected.session.adc.load(std::sync::atomic::Ordering::Relaxed) as u8),
                         // Legacy field, no longer written -- see Config::
                         // antenna's doc comment. antenna_settings (below)
@@ -17536,6 +17539,8 @@ pub(crate) enum SstvPart {
     Tx,
     /// Only the picture-file row (Load Picture, Mode, banner, Send, Abort), shown under the TX preview.
     TxSend,
+    /// Only Load Picture, Mode and Callsign banner (no Send / Abort), for the bottom line of the picture window on the TX tab.
+    TxFile,
 }
 
 /// The in-app strip's Quick Tune: one button that opens the calling frequencies in a popup above it.
@@ -17758,9 +17763,9 @@ fn render_sstv_panel(
     // banner, then key MOX/PTT the same way RTTY/RADE's own "armed"
     // toggle works: this only decides what the mic input gets replaced
     // with while transmitting, the operator still does the actual keying.
-    let sstv_wide = part != SstvPart::All && ui.available_width() > 400.0;
+    let sstv_wide = part != SstvPart::All && part != SstvPart::TxFile && ui.available_width() > 400.0;
     if part != SstvPart::Rx {
-    if !tx_available && part != SstvPart::TxSend {
+    if !tx_available && !matches!(part, SstvPart::TxSend | SstvPart::TxFile) {
         ui.weak("TX unavailable (transmit disabled or no mic input device).");
     }
     // FSK ID and TX Lead. Kiosk: on the first TX line between My Call and TX Slant; elsewhere in the row below.
@@ -17896,7 +17901,7 @@ fn render_sstv_panel(
                 sstv_slant_controls!(ui);
             }
         };
-        if part == SstvPart::TxSend {
+        if matches!(part, SstvPart::TxSend | SstvPart::TxFile) {
         } else if lcd_kiosk_mode() && part == SstvPart::Tx {
             // The in-app strip draws the TX toggle and FSK ID in its header row; here only Lead and Slant, on one line.
             ui.horizontal_wrapped(|ui| {
@@ -17917,7 +17922,7 @@ fn render_sstv_panel(
         } else {
             ui.horizontal(first_tx_row);
         }
-        if lcd_kiosk_mode() && part != SstvPart::All && !sstv_wide {
+        if lcd_kiosk_mode() && part != SstvPart::All && part != SstvPart::TxFile && !sstv_wide {
             // The narrow in-app panel: FSK ID, Lead and Slant each get their own line.
             ui.horizontal_wrapped(|ui| {
                 let mut fsk_id = sstv.tx_fsk_id_enabled();
@@ -17976,7 +17981,7 @@ fn render_sstv_panel(
                     }
                 });
             let banner_changed =
-                std_checkbox(ui, tx_banner, "Callsign banner").on_hover_text(
+                { if part == SstvPart::TxFile { ui.add_space(48.0); } std_checkbox(ui, tx_banner, if part == SstvPart::TxFile { "Banner" } else { "Callsign banner" }) }.on_hover_text(
                     "Burns \"My Call\" into the top-left corner of the picture before sending"
                 ).changed();
             if (mode_changed || banner_changed) && tx_source.is_some() {
@@ -17988,7 +17993,7 @@ fn render_sstv_panel(
             }
         });
         }
-        if lcd_kiosk_mode() && part != SstvPart::All && !sstv_wide {
+        if lcd_kiosk_mode() && part != SstvPart::All && part != SstvPart::TxFile && !sstv_wide {
             ui.horizontal_wrapped(|ui| {
                 sstv_send_controls!(ui);
             });
