@@ -28,7 +28,7 @@ static PREV_RATE: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::n
 pub(crate) fn persisted_rate(current: u32) -> u32 {
     match PREV_RATE.load(std::sync::atomic::Ordering::Relaxed) {
         0 => current,
-        prev => prev,
+        _ => 1, // leaving the panel always goes back to zoom x1, so that is what the configuration keeps
     }
 }
 
@@ -39,7 +39,7 @@ static PREV_PAN_BITS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU3
 pub(crate) fn persisted_zoom(current: i32) -> i32 {
     match PREV_ZOOM.load(std::sync::atomic::Ordering::Relaxed) {
         0 => current,
-        prev => prev,
+        _ => 1, // leaving the panel always goes back to zoom x1, so that is what the configuration keeps
     }
 }
 
@@ -47,7 +47,7 @@ pub(crate) fn persisted_pan(current: f32) -> f32 {
     if PREV_ZOOM.load(std::sync::atomic::Ordering::Relaxed) == 0 {
         current
     } else {
-        f32::from_bits(PREV_PAN_BITS.load(std::sync::atomic::Ordering::Relaxed))
+        0.0
     }
 }
 /// Height of the control strip under the spectrum / waterfall and the picture window.

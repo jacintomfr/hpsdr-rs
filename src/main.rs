@@ -901,6 +901,10 @@ fn apply_band_extra(rx: &mut ExtraReceiver, band: &Band) {
 /// `apply_band` above.
 fn apply_mode(connected: &mut ConnectedState, mode: spectrum::Mode, dial_freq_hz: u32) {
     connected.spectrum.set_mode(mode);
+    // A normal mode picked while a digital layout (SSTV / RTTY / RADE) is open leaves it completely.
+    if !matches!(mode, spectrum::Mode::Digu | spectrum::Mode::Digl) {
+        leave_digital_on_mode_change(connected);
+    }
     let mode_width_hz = width_for_mode(&connected.width_memory, mode);
     connected.spectrum.set_width_hz(mode_width_hz);
     if let Some(tx) = &connected.tx_handle {
@@ -23780,6 +23784,24 @@ fn enter_digital_mode_filters(connected: &mut ConnectedState) {
     connected.spectrum_pan = 0.0;
 }
 
+/// A mode other than DIGU / DIGL was picked (Mode window, MODE+ / MODE-, ...) while a digital layout is open: leave the digital mode completely -- passband, filters
+/// and zoom x1 as on a normal close -- but keep the mode that was just picked (no return to the mode from before).
+fn leave_digital_on_mode_change(connected: &mut ConnectedState) {
+    if connected.pre_digital_filters.is_none() && !connected.show_digital_window {
+        return;
+    }
+    connected.spectrum.set_explicit_passband(None);
+    if let Some(tx) = &connected.tx_handle {
+        tx.set_explicit_passband(None);
+    }
+    connected.show_digital_window = false;
+    connected.pre_digital_mode = None;
+    restore_pre_digital_filters(connected);
+    connected.spectrum_zoom = 1;
+    connected.spectrum_pan = 0.0;
+    connected.settings_dirty.store(true, std::sync::atomic::Ordering::Relaxed);
+}
+
 /// Undo `enter_digital_mode_filters` -- see that function's and
 /// ConnectedState::pre_digital_filters' own doc comments. A no-op if
 /// nothing was saved (e.g. the Digital Modes window closing a second
@@ -23797,8 +23819,10 @@ fn restore_pre_digital_filters(connected: &mut ConnectedState) {
             eq.enabled = f.tx_eq;
             tx.set_eq(eq);
         }
-        connected.spectrum_zoom = f.zoom;
-        connected.spectrum_pan = f.pan;
+        // Leaving a digital mode always goes back to the whole spectrum (zoom x1), not to the zoom from before: on the full screen the point is to see everything.
+        let _ = (f.zoom, f.pan);
+        connected.spectrum_zoom = 1;
+        connected.spectrum_pan = 0.0;
     }
 }
 
