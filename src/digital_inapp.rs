@@ -88,6 +88,9 @@ pub(crate) fn sync_zoom(connected: &mut ConnectedState, ctx: &egui::Context) {
                 PREV_RATE.store(connected.sample_rate, std::sync::atomic::Ordering::Relaxed);
                 crate::change_sample_rate(connected, SSTV_RATE);
             }
+            // Narrow the RX and TX passband to the SSTV tone band, like the Digital window did on opening. After the rate change: that rebuilds the
+            // receiver (a new SpectrumHandle), which would drop an explicit passband set before it.
+            fit_filter(connected);
         }
         // Keep the 0..6 kHz audio range in view (the sign follows the sideband).
         let half = connected.sample_rate as f64 / 2.0;
