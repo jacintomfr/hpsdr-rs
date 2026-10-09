@@ -28,7 +28,7 @@ static PREV_RATE: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::n
 pub(crate) fn persisted_rate(current: u32) -> u32 {
     match PREV_RATE.load(std::sync::atomic::Ordering::Relaxed) {
         0 => current,
-        _ => 1, // leaving the panel always goes back to zoom x1, so that is what the configuration keeps
+        prev => prev,
     }
 }
 
@@ -60,9 +60,9 @@ const STRIP_HEIGHT_TX: f32 = 100.0;
 pub(crate) const PANEL_WIDTH: f32 = 496.0;
 const PAN_ID: &str = "digital_inapp_prev_pan";
 
-/// True while the SSTV tab of the Digital window is open in the kiosk: the in-app layout is used instead of the viewport.
+/// True while the SSTV or RTTY tab of the Digital window is open in the kiosk: the in-app layout is used instead of the viewport.
 pub(crate) fn active(connected: &ConnectedState) -> bool {
-    lcd_kiosk_mode() && connected.show_digital_window && connected.digital_mode == DigitalMode::Sstv
+    lcd_kiosk_mode() && connected.show_digital_window && matches!(connected.digital_mode, DigitalMode::Sstv | DigitalMode::Rtty)
 }
 
 /// Every frame: zoom (and shift) the spectrum when the panel opens and put the previous zoom / pan back when it closes.
@@ -126,11 +126,11 @@ fn tab(ctx: &egui::Context) -> u8 {
     ctx.data(|d| d.get_temp::<u8>(egui::Id::new(TAB_ID))).unwrap_or(0)
 }
 
-/// Narrow the RX / TX passband to the SSTV tone band (sync 1200 Hz .. white 2300 Hz, plus a margin), as the window's Fit Filter.
+/// Narrow the RX / TX passband to the tones of the open mode (SSTV: sync 1200 Hz .. white 2300 Hz; RTTY: the mark / space pair), plus a margin, as the window's Fit Filter.
 fn fit_filter(connected: &mut ConnectedState) {
     let mode = connected.spectrum.mode();
-    let (low, high) = (1200.0 - 100.0, 2300.0 + 100.0);
-    let passband = if matches!(mode, crate::spectrum::Mode::Lsb | crate::spectrum::Mode::Digl) { (-high, -low) } else { (low, high) };
+    let s = connected.rtty.settings();
+    let passband = crate::digital_fit_passband(connected.digital_mode, mode, s.center_hz, s.shift_hz);
     connected.spectrum.set_explicit_passband(Some(passband));
     if let Some(tx) = &connected.tx_handle {
         tx.set_explicit_passband(Some(passband));
@@ -163,12 +163,20 @@ fn close_window(connected: &mut ConnectedState) {
     crate::restore_pre_digital_filters(connected);
 }
 
-/// The panel: the picture window pinned to `win` (right of the spectrum and the waterfall) and the control strip pinned to `strip` (under both, the
-/// full width). One tab at a time: RX shows the received picture and the receive controls, TX the picture to send and the transmit controls.
+/// The panel of the open mode: SSTV (the picture window) or RTTY (the text window), pinned to `win`, with the OPTIONS controls over the waterfall at `strip`.
 pub(crate) fn panel(ui: &mut egui::Ui, connected: &mut ConnectedState, win: egui::Rect, strip: egui::Rect) {
+    match connected.digital_mode {
+        DigitalMode::Rtty => rtty_panel(ui, connected, win, strip),
+        _ => sstv_panel(ui, connected, win, strip),
+    }
+}
+
+/// The SSTV panel: the picture window pinned to `win` (right of the spectrum and the waterfall) and the control strip pinned to `strip` (under both, the
+/// full width). One tab at a time: RX shows the received picture and the receive controls, TX the picture to send and the transmit controls.
+fn sstv_panel(ui: &mut egui::Ui, connected: &mut ConnectedState, win: egui::Rect, strip: egui::Rect) {
     let mut close_now = false;
     let mut switch_to: Option<DigitalMode> = None;
-    let mut tab_now = tab(ui.ctx());
+    let mut tab_now = tab(ui.ctx()).min(1);
     let sstv = connected.sstv.clone();
     let tx_available = connected.tx_enabled && connected.tx_handle.is_some();
     let mox = connected.session.mox.load(std::sync::atomic::Ordering::Relaxed);
@@ -466,5 +474,253 @@ pub(crate) fn strip_height(ctx: &egui::Context) -> f32 {
         STRIP_HEIGHT_TX
     } else {
         STRIP_HEIGHT_RX
+    }
+}
+
+/// The RTTY panel, same pattern as SSTV: the text window at the right (the lock status and the decoded text; on the TX tab also the line to send)
+/// and an OPTIONS button at the bottom left of the waterfall that opens the controls (RX tab: Center, Baud, Shift, Reverse / AFC / Squelch, Clear RX, Fit Filter;
+/// TX tab: TX ON, CALL CQ, CLEAR, Send on Return) over the waterfall. The spectrum above shows 3 kHz of audio with the mark / space cursors.
+fn rtty_panel(ui: &mut egui::Ui, connected: &mut ConnectedState, win: egui::Rect, strip: egui::Rect) {
+    let rtty = connected.rtty.clone();
+    let mut tab_now = tab(ui.ctx());
+    let tx_available = connected.tx_enabled && connected.tx_handle.is_some();
+    let mox = connected.session.mox.load(std::sync::atomic::Ordering::Relaxed);
+    let st = rtty.rx_status();
+    let mut s = rtty.settings();
+    let s0 = s;
+    let mode = connected.spectrum.mode();
+    let mut fit = false;
+    let mut mox_request: Option<bool> = None;
+    let mut send_on_return = connected.rtty_send_on_return;
+    let callsign = connected.own_callsign.clone();
+    let mut new_tx_input: Option<String> = None;
+    let amber = egui::Color32::from_rgb(230, 150, 50);
+    let red = egui::Color32::from_rgb(220, 50, 50);
+    let green = egui::Color32::from_rgb(40, 190, 70);
+
+    // ---- The text window: status, decoded text and, on the TX tab, the line to send.
+    egui::Area::new(egui::Id::new("digital_inapp_window")).fixed_pos(win.min).constrain(false).show(ui, |ui| {
+        let frame = egui::Frame::group(ui.style());
+        let margin = frame.total_margin().sum();
+        let (inner_w, inner_h) = (win.width() - margin.x, win.height() - margin.y - 2.0);
+        frame.show(ui, |ui| {
+            ui.set_width(inner_w);
+            ui.set_height(inner_h);
+            crate::apply_kiosk_touch_style(ui);
+            ui.spacing_mut().item_spacing = egui::vec2(8.0, 6.0);
+            ui.horizontal(|ui| {
+                let (r, _) = ui.allocate_exact_size(egui::vec2(14.0, 14.0), egui::Sense::hover());
+                let color = if st.lock >= 1.0 { green } else if st.lock > 0.0 { amber } else { red };
+                ui.painter().circle_filled(r.center(), 6.0, color);
+                ui.label(if st.lock >= 1.0 { "LOCK" } else { "no lock" });
+                ui.add(egui::ProgressBar::new(st.confidence.clamp(0.0, 1.0)).desired_width(150.0).desired_height(20.0).text(format!("conf {:.0}%", st.confidence * 100.0)));
+                if s.afc {
+                    ui.label(format!("AFC {:+.0} Hz", st.afc_offset_hz));
+                }
+            });
+            if !matches!(mode, crate::spectrum::Mode::Usb | crate::spectrum::Mode::Digu | crate::spectrum::Mode::Lsb | crate::spectrum::Mode::Digl) {
+                ui.colored_label(amber, "RTTY needs USB/DIGU (or LSB/DIGL with Reverse).");
+            }
+            let tx_tab = tab_now == 1;
+            let tx_h = if tx_tab { 128.0 } else { 0.0 };
+            let rx_h = (ui.available_height() - tx_h - 4.0).max(60.0);
+            egui::ScrollArea::vertical().id_salt("rtty_inapp_rx").max_height(rx_h).auto_shrink([false, false]).stick_to_bottom(true).show(ui, |ui| {
+                ui.label(egui::RichText::new(rtty.rx_text()).monospace().size(15.0));
+            });
+            if tx_tab {
+                ui.separator();
+                ui.horizontal(|ui| {
+                    let (sent, total) = rtty.tx_progress();
+                    ui.label(format!("Sent {sent}/{total}"));
+                    if mox {
+                        ui.colored_label(red, "ON AIR");
+                    }
+                    if !tx_available {
+                        ui.weak("TX unavailable");
+                    }
+                });
+                ui.add_enabled_ui(tx_available, |ui| {
+                    ui.horizontal(|ui| {
+                        // Return sends the line (Send on Return): consumed before the text box is built, or it would become a newline.
+                        let tx_id = ui.id().with("rtty_inapp_tx_edit");
+                        let enter = send_on_return && ui.memory(|m| m.has_focus(tx_id)) && ui.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Enter));
+                        let box_w = (ui.available_width() - 100.0).max(100.0);
+                        egui::Frame::new()
+                            .stroke(egui::Stroke::new(1.0, ui.visuals().widgets.inactive.bg_stroke.color))
+                            .corner_radius(5.0)
+                            .inner_margin(egui::Margin::symmetric(4, 3))
+                            .show(ui, |ui| {
+                                ui.set_width(box_w);
+                                egui::ScrollArea::vertical().id_salt("rtty_inapp_tx_scroll").max_height(64.0).auto_shrink([false, false]).stick_to_bottom(true).show(ui, |ui| {
+                                    ui.add(
+                                        egui::TextEdit::multiline(&mut connected.rtty_tx_input)
+                                            .id(tx_id)
+                                            .desired_rows(3)
+                                            .desired_width(f32::INFINITY)
+                                            .hint_text(if send_on_return { "Type a line, Return sends it..." } else { "Text to send" }),
+                                    );
+                                });
+                            });
+                        let send = ui.add(egui::Button::new(egui::RichText::new("Send").size(20.0).strong()).min_size(egui::vec2(88.0, 46.0))).clicked();
+                        if (send || enter) && !connected.rtty_tx_input.is_empty() {
+                            rtty.send_text(&connected.rtty_tx_input);
+                            connected.rtty_tx_input.clear();
+                            mox_request = Some(true);
+                        }
+                    });
+                });
+            }
+        });
+    });
+
+    // ---- OPTIONS: a button at the bottom left of the waterfall; open, the controls fill the waterfall (the spectrum stays in view for tuning).
+    let opt_id = egui::Id::new("digital_inapp_options_open");
+    let mut options_open: bool = ui.ctx().data(|d| d.get_temp(opt_id)).unwrap_or(false);
+    if !options_open {
+        egui::Area::new(egui::Id::new("digital_inapp_options_button"))
+            .order(egui::Order::Foreground)
+            .fixed_pos(egui::pos2(strip.left() + 6.0, strip.bottom() - 46.0 + 2.0))
+            .constrain(false)
+            .show(ui, |ui| {
+                crate::apply_kiosk_touch_style(ui);
+                let clicked = ui
+                    .allocate_ui_with_layout(egui::vec2(120.0, 40.0), egui::Layout::centered_and_justified(egui::Direction::LeftToRight), |ui| {
+                        ui.add(chip_button("OPTIONS", false).min_size(egui::vec2(120.0, 40.0))).clicked()
+                    })
+                    .inner;
+                if clicked {
+                    options_open = true;
+                }
+            });
+    }
+    if options_open {
+        egui::Area::new(egui::Id::new("digital_inapp_strip"))
+            .fixed_pos(egui::pos2(strip.left(), strip.bottom() - 2.0))
+            .pivot(egui::Align2::LEFT_BOTTOM)
+            .order(egui::Order::Foreground)
+            .constrain(false)
+            .show(ui, |ui| {
+                let frame = egui::Frame::group(ui.style()).fill(ui.visuals().panel_fill);
+                let margin = frame.total_margin().sum();
+                let inner_w = strip.width() - margin.x;
+                frame.show(ui, |ui| {
+                    ui.set_width(inner_w);
+                    crate::apply_kiosk_touch_style(ui);
+                    ui.spacing_mut().item_spacing = egui::vec2(6.0, 6.0);
+                    ui.horizontal(|ui| {
+                        if ui.add(chip_button("OPTIONS", true).min_size(egui::vec2(120.0, 40.0))).clicked() {
+                            options_open = false;
+                        }
+                        ui.add_space(6.0);
+                        for (i, label) in ["RX", "TX", "SET"].iter().enumerate() {
+                            if ui.add(chip_button(label, tab_now == i as u8).min_size(egui::vec2(52.0, 40.0))).clicked() {
+                                tab_now = i as u8;
+                            }
+                        }
+                        ui.add_space(6.0);
+                        if tab_now == 1 {
+                            let label = if mox { "TX ON" } else { "TX" };
+                            if ui.add_enabled(tx_available, egui::Button::selectable(mox, egui::RichText::new(label).strong()).min_size(egui::vec2(80.0, 40.0))).on_hover_text("Click to key / unkey PTT directly").clicked() {
+                                mox_request = Some(!mox);
+                            }
+                            if mox {
+                                ui.colored_label(red, "ON AIR");
+                            }
+                        }
+                    });
+                    match tab_now {
+                        0 => {
+                            ui.horizontal(|ui| {
+                                if ui.add(egui::Button::new("Clear RX").min_size(egui::vec2(96.0, 40.0))).clicked() {
+                                    rtty.clear_rx_text();
+                                }
+                                if ui.add(egui::Button::new("Fit Filter").min_size(egui::vec2(96.0, 40.0))).on_hover_text("Fit the RX / TX filter to the mark / space pair").clicked() {
+                                    fit = true;
+                                }
+                            });
+                            ui.horizontal(|ui| {
+                                crate::std_checkbox(ui, &mut s.reverse, "Reverse");
+                                crate::std_checkbox(ui, &mut s.afc, "AFC");
+                                crate::std_checkbox(ui, &mut s.squelch, "Squelch").on_hover_text("Discard decoded text while the signal is too noise-dominated to trust");
+                            });
+                        }
+                        1 => {
+                            ui.horizontal(|ui| {
+                                if ui.add_enabled(tx_available, egui::Button::new("CALL CQ").min_size(egui::vec2(96.0, 40.0))).on_hover_text("Queue the CQ call and key PTT").clicked() {
+                                    let call = if callsign.trim().is_empty() { "NOCALL".to_string() } else { callsign.clone() };
+                                    let cq = format!("CQ CQ CQ DE {call} {call} {call} PSE K\n");
+                                    rtty.clear_tx();
+                                    rtty.send_text(&cq);
+                                    new_tx_input = Some(cq);
+                                    mox_request = Some(true);
+                                }
+                                if ui.add(egui::Button::new("CLEAR").min_size(egui::vec2(80.0, 40.0))).on_hover_text("Drop whatever is still queued - TX itself stays as it was").clicked() {
+                                    rtty.clear_tx();
+                                    new_tx_input = Some(String::new());
+                                }
+                            });
+                            ui.horizontal(|ui| {
+                                crate::std_checkbox(ui, &mut send_on_return, "Send on Return");
+                            });
+                        }
+                        _ => {
+                            // SET: the tone pair. Center first (with Fit Filter to re-fit after changing it), then baud and shift on one row.
+                            ui.horizontal(|ui| {
+                                ui.label("Center:");
+                                crate::spin_buttons_full(ui, "rtty_inapp_center", &mut s.center_hz, 300.0, 3000.0, 10.0, 0, None, 64.0);
+                                ui.label("Hz");
+                                ui.add_space(8.0);
+                                if ui.add(egui::Button::new("Fit Filter").min_size(egui::vec2(96.0, 40.0))).on_hover_text("Fit the RX / TX filter to the mark / space pair").clicked() {
+                                    fit = true;
+                                }
+                            });
+                            ui.horizontal(|ui| {
+                                ui.spacing_mut().button_padding = egui::vec2(5.0, 6.0);
+                                ui.spacing_mut().item_spacing.x = 4.0;
+                                ui.label("Baud");
+                                for b in crate::rtty_link::BAUD_CHOICES {
+                                    if ui.add(chip_button(&format!("{b}"), s.baud == b).min_size(egui::vec2(38.0, 40.0))).clicked() {
+                                        s.baud = b;
+                                    }
+                                }
+                                ui.add_space(6.0);
+                                ui.label("Shift");
+                                for sh in crate::rtty_link::SHIFT_CHOICES {
+                                    if ui.add(chip_button(&format!("{sh:.0}"), s.shift_hz == sh).min_size(egui::vec2(38.0, 40.0))).clicked() {
+                                        s.shift_hz = sh;
+                                    }
+                                }
+                            });
+                        }
+                    }
+                });
+            });
+    }
+    ui.ctx().data_mut(|d| d.insert_temp(opt_id, options_open));
+    ui.ctx().data_mut(|d| d.insert_temp(egui::Id::new(TAB_ID), tab_now));
+    ui.ctx().request_repaint_after(Duration::from_millis(300));
+
+    let mut changed = false;
+    if s != s0 {
+        rtty.set_settings(s);
+        changed = true;
+    }
+    if send_on_return != connected.rtty_send_on_return {
+        connected.rtty_send_on_return = send_on_return;
+        changed = true;
+    }
+    if let Some(t) = new_tx_input {
+        connected.rtty_tx_input = t;
+    }
+    if fit {
+        fit_filter(connected);
+        changed = true;
+    }
+    if let Some(want) = mox_request {
+        // A persistent hold the operator controls directly (no auto-drop), like the Digital window's TX row.
+        connected.session.set_mox(want);
+    }
+    if changed {
+        connected.settings_dirty.store(true, std::sync::atomic::Ordering::Relaxed);
     }
 }

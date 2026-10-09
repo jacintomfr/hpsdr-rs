@@ -3501,7 +3501,10 @@ fn connect_to_device(device: Device, cfg: &Config) -> Result<ConnectedState, Str
         settings.frequency_hz = f;
     }
     if let Some(sr) = cfg.sample_rate {
-        settings.sample_rate = sr;
+        // A saved rate that is not one of the radio's presets (a corrupt or hand-edited file) would crash the receiver on start: keep the default then.
+        if matches!(sr, 48_000 | 96_000 | 192_000 | 384_000 | 768_000 | 1_536_000) {
+            settings.sample_rate = sr;
+        }
     }
     // RX-888: a saved rate only sticks if it's actually one of
     // rx888::ddc_params_for_output_rate's supported presets -- otherwise
@@ -19122,7 +19125,7 @@ pub(crate) fn render_toolbar_config(ui: &mut egui::Ui, connected: &mut Connected
     const LABEL_W: f32 = 62.0;
     let cell_w = ((ui.available_width() - LABEL_W - 8.0) / 8.0 - 5.0).clamp(56.0, 120.0).floor();
     let current_layer = connected.toolbar_layer;
-    egui::Grid::new("toolbar_config_grid").spacing([5.0, 5.0]).show(ui, |ui| {
+    egui::Grid::new("toolbar_config_grid").spacing([5.0, if lcd_kiosk_mode() { 12.0 } else { 5.0 }]).show(ui, |ui| {
         for layer in 0..toolbar::LAYERS {
             // The layer of the bottom toolbar right now is highlighted.
             let (txt_col, strong) = if layer == current_layer {
@@ -19134,11 +19137,11 @@ pub(crate) fn render_toolbar_config(ui: &mut egui::Ui, connected: &mut Connected
             if strong {
                 label = label.strong();
             }
-            ui.add_sized([LABEL_W, 34.0], egui::Label::new(label));
+            ui.add_sized([LABEL_W, if lcd_kiosk_mode() { 40.0 } else { 34.0 }], egui::Label::new(label));
             for slot in 0..toolbar::BUTTONS {
                 let f = connected.toolbar_layers[layer][slot];
                 let text = if f == toolbar::ToolbarFn::None { "None" } else { f.short_label() };
-                if ui.add_sized([cell_w, 34.0], egui::Button::new(text)).clicked() {
+                if ui.add_sized([cell_w, if lcd_kiosk_mode() { 40.0 } else { 34.0 }], egui::Button::new(text)).clicked() {
                     open_slot = Some((layer, slot));
                 }
             }
