@@ -2899,6 +2899,8 @@ struct ConnectedState {
     bandstack_window_open: bool,
     /// The compact Digital chooser (RTTY / SSTV / RADE) opened from the New Menu.
     digital_chooser_open: bool,
+    /// The small About window (menu_window::about_window).
+    about_window_open: bool,
     /// deskHPSDR OCfull_tune_time / OCmemory_tune_time (ms): how long the Tune OC outputs stay on after an armed TUNE. 0 = no limit.
     oc_full_tune_ms: u32,
     oc_memory_tune_ms: u32,
@@ -4395,6 +4397,7 @@ fn connect_to_device(device: Device, cfg: &Config) -> Result<ConnectedState, Str
                 bandstacks: cfg.bandstacks.clone(),
                 bandstack_window_open: false,
                 digital_chooser_open: false,
+                about_window_open: false,
                 oc_full_tune_ms: cfg.oc_full_tune_time,
                 oc_memory_tune_ms: cfg.oc_memory_tune_time,
                 oc_prev_tune: false,
@@ -7122,6 +7125,11 @@ impl eframe::App for HpsdrApp {
                         }
                     }
 
+                    // About window (New Menu -> About).
+                    if connected.about_window_open {
+                        menu_window::about_window(ui, connected);
+                    }
+
                     // Digital chooser (New Menu -> DIGITAL).
                     if connected.digital_chooser_open {
                         menu_window::digital_chooser(ui, connected);
@@ -9675,6 +9683,36 @@ impl eframe::App for HpsdrApp {
                         }
                     }
 
+                    // Kiosk: ADC overload and TX FIFO warnings in the top right corner of the spectrum, one chip under the other.
+                    if lcd_kiosk_mode() {
+                        let adc0_ov = connected.session.adc0_overload.load(Ordering::Relaxed);
+                        let adc1_ov = connected.session.adc1_overload.load(Ordering::Relaxed);
+                        let mut corner = egui::pos2(rect.right() - 8.0, rect.top() + 6.0);
+                        let font = egui::FontId::proportional(13.0);
+                        if adc0_ov || adc1_ov {
+                            let text = if adc0_ov && adc1_ov {
+                                "ADC0+ADC1 OVERLOAD"
+                            } else if adc0_ov {
+                                "ADC0 OVERLOAD"
+                            } else {
+                                "ADC1 OVERLOAD"
+                            };
+                            corner.y += draw_warning_chip_corner(ui, corner, text, font.clone()) + 4.0;
+                        }
+                        if connected.tx_fifo_warning_until.is_some_and(|until| Instant::now() < until) {
+                            let under = connected.session.tx_fifo_underrun.load(Ordering::Relaxed);
+                            let over = connected.session.tx_fifo_overrun.load(Ordering::Relaxed);
+                            let text = if under && over {
+                                "TX Underrun/Overrun"
+                            } else if over {
+                                "TX Overrun"
+                            } else {
+                                "TX Underrun"
+                            };
+                            draw_warning_chip_corner(ui, corner, text, font);
+                        }
+                    }
+
                     // Label shown in RF space when a transverter is active
                     // (see xvtr_rf_offset_hz's doc comment above) -- tick
                     // x positions stay in real IF space, only the printed
@@ -11320,7 +11358,10 @@ Waterfall rebuilds: {prof_wf_n:.0}/s, {prof_wf_ms:.1} ms each."
                             } else {
                                 "ADC1 OVERLOAD"
                             };
-                            draw_warning_chip(ui, row_rect.center(), text, warn_font.clone());
+                            // Kiosk: shown in the top right corner of the spectrum instead (see where the spectrum is drawn).
+                            if !lcd_kiosk_mode() {
+                                draw_warning_chip(ui, row_rect.center(), text, warn_font.clone());
+                            }
                         }
 
                         // TX FIFO overrun/underrun -- see
@@ -11352,7 +11393,9 @@ Waterfall rebuilds: {prof_wf_n:.0}/s, {prof_wf_ms:.1} ms each."
                                 } else {
                                     "TX Overrun"
                                 };
-                                draw_warning_chip(ui, fifo_row_rect.center(), text, warn_font.clone());
+                                if !lcd_kiosk_mode() {
+                                    draw_warning_chip(ui, fifo_row_rect.center(), text, warn_font.clone());
+                                }
                             } else {
                                 connected.tx_fifo_warning_until = None;
                             }
@@ -11847,6 +11890,7 @@ Waterfall rebuilds: {prof_wf_n:.0}/s, {prof_wf_ms:.1} ms each."
                                                 | SettingsTab::Toolbar
                                                 | SettingsTab::Cw
                                                 | SettingsTab::Xvtr
+                                                | SettingsTab::About
                                         )
                                     {
                                         continue;
@@ -12825,122 +12869,7 @@ Waterfall rebuilds: {prof_wf_n:.0}/s, {prof_wf_ms:.1} ms each."
                                 }
 
                                 SettingsTab::About => {
-                                    ui.add_space(4.0);
-                                    egui::Grid::new("about_grid").num_columns(2).spacing([12.0, 6.0]).show(ui, |ui| {
-                                        ui.label("Board:");
-                                        ui.label(connected.device.board_label());
-                                        ui.end_row();
-
-                                        ui.label("Protocol:");
-                                        ui.label(format!("{}", connected.device.protocol));
-                                        ui.end_row();
-
-                                        ui.label("Protocol Version:");
-                                        ui.label(format!(
-                                            "{}.{}",
-                                            connected.device.version / 10,
-                                            connected.device.version % 10
-                                        ));
-                                        ui.end_row();
-
-                                        let is_usb_board = matches!(connected.device.board, Boards::Ozy | Boards::Rx888);
-                                        ui.label("IP Address:");
-                                        ui.label(if is_usb_board {
-                                            "USB".to_string()
-                                        } else {
-                                            format!("{}", connected.device.address.ip())
-                                        });
-                                        ui.end_row();
-
-                                        if !is_usb_board {
-                                            ui.label("MAC Address:");
-                                            let mac = connected.device.mac;
-                                            ui.label(format!(
-                                                "{:02X}:{:02X}:{:02X}:{:02X}:{:02X}:{:02X}",
-                                                mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]
-                                            ));
-                                            ui.end_row();
-                                        }
-
-                                        ui.label("Interface:");
-                                        ui.label(if is_usb_board {
-                                            "USB".to_string()
-                                        } else {
-                                            connected.interface_name.clone().unwrap_or_else(|| "unknown".to_string())
-                                        });
-                                        ui.end_row();
-
-                                        // See ozy_i2c_loop's doc comment (radio.rs) -- read once
-                                        // at connect time via I2C, not available for any other
-                                        // board.
-                                        if let Some(versions) = &connected.session.ozy_versions {
-                                            ui.label("Ozy FX2 Version:");
-                                            ui.label(&versions.ozy_fx2);
-                                            ui.end_row();
-
-                                            ui.label("Mercury FW:");
-                                            ui.label(
-                                                versions
-                                                    .mercury
-                                                    .iter()
-                                                    .map(|v| v.map(|n| n.to_string()).unwrap_or_else(|| "-".to_string()))
-                                                    .collect::<Vec<_>>()
-                                                    .join(" / "),
-                                            );
-                                            ui.end_row();
-
-                                            ui.label("Penny FW:");
-                                            ui.label(
-                                                versions.penny.map(|n| n.to_string()).unwrap_or_else(|| "-".to_string()),
-                                            );
-                                            ui.end_row();
-                                        }
-                                    });
-
-                                    ui.add_space(16.0);
-                                    ui.separator();
-                                    ui.add_space(8.0);
-                                    // ROOT CAUSE FIX for a real report: this used to show
-                                    // CARGO_PKG_VERSION (Cargo.toml's own version), which
-                                    // tracks THIS FORK's own, independently-bumped version
-                                    // number, not the original upstream project's -- wrongly
-                                    // implying the credit line just below is for whatever
-                                    // version this fork happens to be at. Hardcoded to the
-                                    // last known real upstream release instead (g0orx/
-                                    // hpsdr-rs's own v0.7.0, github.com/g0orx/hpsdr-rs/
-                                    // releases) -- a real request, accepting that it goes
-                                    // stale whenever upstream cuts a new release, since
-                                    // there's no live way to track that without a network
-                                    // call this About screen shouldn't be making.
-                                    ui.label("hpsdr-rs v0.7.0");
-                                    ui.label("John Melton G0ORX");
-                                    ui.hyperlink_to(
-                                        "john.d.melton@googlemail.com",
-                                        "mailto:john.d.melton@googlemail.com",
-                                    );
-                                    // Personal fork attribution -- a real
-                                    // request, kept separate from (below)
-                                    // the original project's own credit
-                                    // just above, not replacing it. The
-                                    // build-note line is compiled in from
-                                    // HPSDR_RS_BUILD_NOTE (option_env!, so
-                                    // it's absent -- no blank line -- on a
-                                    // normal build that doesn't set it),
-                                    // meant for a one-line label on a
-                                    // special build, e.g. "Ubuntu 24.04
-                                    // LTS" or "Windows without AVX2", set
-                                    // like:
-                                    //   HPSDR_RS_BUILD_NOTE="Windows without AVX2" cargo build --release
-                                    // -- same one-off-env-var pattern as
-                                    // HPSDR_RS_NO_MARCH_NATIVE, meant to be
-                                    // reused this same way going forward.
-                                    ui.add_space(8.0);
-                                    ui.label(format!("hpsdr-rs {}", env!("CARGO_PKG_VERSION")));
-                                    ui.label("mods by Jacinto Rebelo CU2ED");
-                                    ui.label("This is just for personal use");
-                                    if let Some(note) = option_env!("HPSDR_RS_BUILD_NOTE") {
-                                        ui.label(note);
-                                    }
+                                    render_about_info(ui, connected);
                                 }
 
                                 SettingsTab::Audio => {
@@ -19697,6 +19626,14 @@ fn switch_button(label: &str, on: bool) -> egui::Button<'static> {
 
 /// Warning message (ADC OVERLOAD, TX Underrun/Overrun) as a chip: white text on
 /// a red rounded box with a thin lighter outline, centred on `center`.
+/// Like draw_warning_chip, but with the chip'"'"'s top right corner at `right_top`; returns its height.
+fn draw_warning_chip_corner(ui: &egui::Ui, right_top: egui::Pos2, text: &str, font: egui::FontId) -> f32 {
+    let galley = ui.painter().layout_no_wrap(text.to_string(), font.clone(), egui::Color32::WHITE);
+    let size = galley.size() + egui::vec2(12.0, 4.0);
+    draw_warning_chip(ui, egui::pos2(right_top.x - size.x / 2.0, right_top.y + size.y / 2.0), text, font);
+    size.y
+}
+
 fn draw_warning_chip(ui: &egui::Ui, center: egui::Pos2, text: &str, font: egui::FontId) {
     let red = egui::Color32::from_rgb(200, 40, 40);
     let galley = ui.painter().layout_no_wrap(text.to_string(), font, egui::Color32::WHITE);
@@ -25346,5 +25283,125 @@ mod xvtr_tests {
         assert_eq!((x.frequency_min_hz, x.frequency_max_hz), (430_000_000, 432_000_000));
         let off = xvtr_rf_offset(&x);
         assert_eq!(x.frequency_min_hz as i64 - off, 28_000_000);
+    }
+}
+
+/// The About information (board, protocol, address, credits): shown by the kiosk About window and by the desktop Settings -> About tab.
+fn render_about_info(ui: &mut egui::Ui, connected: &mut ConnectedState) {
+    ui.add_space(4.0);
+    egui::Grid::new("about_grid").num_columns(2).spacing([12.0, 6.0]).show(ui, |ui| {
+        ui.label("Board:");
+        ui.label(connected.device.board_label());
+        ui.end_row();
+
+        ui.label("Protocol:");
+        ui.label(format!("{}", connected.device.protocol));
+        ui.end_row();
+
+        ui.label("Protocol Version:");
+        ui.label(format!(
+            "{}.{}",
+            connected.device.version / 10,
+            connected.device.version % 10
+        ));
+        ui.end_row();
+
+        let is_usb_board = matches!(connected.device.board, Boards::Ozy | Boards::Rx888);
+        ui.label("IP Address:");
+        ui.label(if is_usb_board {
+            "USB".to_string()
+        } else {
+            format!("{}", connected.device.address.ip())
+        });
+        ui.end_row();
+
+        if !is_usb_board {
+            ui.label("MAC Address:");
+            let mac = connected.device.mac;
+            ui.label(format!(
+                "{:02X}:{:02X}:{:02X}:{:02X}:{:02X}:{:02X}",
+                mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]
+            ));
+            ui.end_row();
+        }
+
+        ui.label("Interface:");
+        ui.label(if is_usb_board {
+            "USB".to_string()
+        } else {
+            connected.interface_name.clone().unwrap_or_else(|| "unknown".to_string())
+        });
+        ui.end_row();
+
+        // See ozy_i2c_loop's doc comment (radio.rs) -- read once
+        // at connect time via I2C, not available for any other
+        // board.
+        if let Some(versions) = &connected.session.ozy_versions {
+            ui.label("Ozy FX2 Version:");
+            ui.label(&versions.ozy_fx2);
+            ui.end_row();
+
+            ui.label("Mercury FW:");
+            ui.label(
+                versions
+                    .mercury
+                    .iter()
+                    .map(|v| v.map(|n| n.to_string()).unwrap_or_else(|| "-".to_string()))
+                    .collect::<Vec<_>>()
+                    .join(" / "),
+            );
+            ui.end_row();
+
+            ui.label("Penny FW:");
+            ui.label(
+                versions.penny.map(|n| n.to_string()).unwrap_or_else(|| "-".to_string()),
+            );
+            ui.end_row();
+        }
+    });
+
+    ui.add_space(16.0);
+    ui.separator();
+    ui.add_space(8.0);
+    // ROOT CAUSE FIX for a real report: this used to show
+    // CARGO_PKG_VERSION (Cargo.toml's own version), which
+    // tracks THIS FORK's own, independently-bumped version
+    // number, not the original upstream project's -- wrongly
+    // implying the credit line just below is for whatever
+    // version this fork happens to be at. Hardcoded to the
+    // last known real upstream release instead (g0orx/
+    // hpsdr-rs's own v0.7.0, github.com/g0orx/hpsdr-rs/
+    // releases) -- a real request, accepting that it goes
+    // stale whenever upstream cuts a new release, since
+    // there's no live way to track that without a network
+    // call this About screen shouldn't be making.
+    ui.label("hpsdr-rs v0.7.0");
+    ui.label("John Melton G0ORX");
+    ui.hyperlink_to(
+        "john.d.melton@googlemail.com",
+        "mailto:john.d.melton@googlemail.com",
+    );
+    // Personal fork attribution -- a real
+    // request, kept separate from (below)
+    // the original project's own credit
+    // just above, not replacing it. The
+    // build-note line is compiled in from
+    // HPSDR_RS_BUILD_NOTE (option_env!, so
+    // it's absent -- no blank line -- on a
+    // normal build that doesn't set it),
+    // meant for a one-line label on a
+    // special build, e.g. "Ubuntu 24.04
+    // LTS" or "Windows without AVX2", set
+    // like:
+    //   HPSDR_RS_BUILD_NOTE="Windows without AVX2" cargo build --release
+    // -- same one-off-env-var pattern as
+    // HPSDR_RS_NO_MARCH_NATIVE, meant to be
+    // reused this same way going forward.
+    ui.add_space(8.0);
+    ui.label(format!("hpsdr-rs {}", env!("CARGO_PKG_VERSION")));
+    ui.label("mods by Jacinto Rebelo CU2ED");
+    ui.label("This is just for personal use");
+    if let Some(note) = option_env!("HPSDR_RS_BUILD_NOTE") {
+        ui.label(note);
     }
 }

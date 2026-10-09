@@ -7,7 +7,7 @@ use crate::tx_window::{child, new_row};
 use crate::{help_button, kiosk_accent_button, ConnectedState, FrequencyEntry, SettingsTab};
 
 /// Button height and gaps (see docs/menu-screen.md for the height budget).
-const BTN_H: f32 = 48.0;
+const BTN_H: f32 = 62.0;
 const GAP_X: f32 = 12.0;
 const GAP_Y: f32 = 12.0;
 const COLS: usize = 6;
@@ -31,6 +31,8 @@ enum Target {
     Xvtr,
     /// The compact Digital chooser (RTTY / SSTV / RADE).
     Digital,
+    /// The small information window (board, address, credits).
+    About,
     /// The MIDI window (midi_window.rs).
     Midi,
     /// The BandStack window (bandstack.rs).
@@ -62,8 +64,8 @@ enum Target {
     Grey,
 }
 
-/// (label, target), rows top to bottom, 6 columns; `None` = empty cell.
-const GRID: [[Option<(&str, Target)>; COLS]; 6] = [
+/// (label, target), rows top to bottom, 6 columns x 5 rows: every cell is used, About included.
+const GRID: [[Option<(&str, Target)>; COLS]; 5] = [
     [
         Some(("SDR Device", Target::Sdr)),
         Some(("VFO", Target::Vfo)),
@@ -94,17 +96,16 @@ const GRID: [[Option<(&str, Target)>; COLS]; 6] = [
         Some(("AGC", Target::Agc)),
         Some(("PS", Target::Ps)),
         Some(("OC Output", Target::Oc)),
-        None,
+        Some(("XVTR", Target::Xvtr)),
     ],
     [
-        Some(("XVTR", Target::Xvtr)),
-        Some(("Memory", Target::Grey)),
         Some(("DIGITAL", Target::Digital)),
-        None,
+        Some(("CW", Target::Cw)),
+        Some(("Discovery", Target::Discovery)),
+        Some(("Memory", Target::Grey)),
         Some(("Extras", Target::Grey)),
-        None,
+        Some(("About", Target::About)),
     ],
-    [Some(("Discovery", Target::Discovery)), None, None, Some(("CW", Target::Cw)), None, None],
 ];
 
 /// Closes every overlay that could share the screen with the Menu: the full-screen windows, the compact popups and the
@@ -123,6 +124,7 @@ pub(crate) fn close_overlays(c: &mut ConnectedState) {
     c.ant_window_open = false;
     c.xvtr_window_open = false;
     c.digital_chooser_open = false;
+    c.about_window_open = false;
     c.midi_window_open = false;
     c.bandstack_window_open = false;
     c.noise_window_open = false;
@@ -151,6 +153,7 @@ pub(crate) fn any_overlay_open(c: &ConnectedState) -> bool {
         || c.ant_window_open
         || c.xvtr_window_open
         || c.digital_chooser_open
+        || c.about_window_open
         || c.midi_window_open
         || c.bandstack_window_open
         || c.noise_window_open
@@ -213,6 +216,7 @@ fn open(c: &mut ConnectedState, target: Target) {
         Target::Ant => c.ant_window_open = true,
         Target::Xvtr => c.xvtr_window_open = true,
         Target::Digital => c.digital_chooser_open = true,
+        Target::About => c.about_window_open = true,
         Target::Midi => c.midi_window_open = true,
         Target::BandStack => c.bandstack_window_open = true,
         Target::Ps => {
@@ -263,7 +267,7 @@ pub fn menu_window(ui: &mut egui::Ui, connected: &mut ConnectedState) -> (bool, 
 
     // Not full screen: the window covers the spectrum/waterfall area and stops above the bottom toolbar (TOOLBAR_HEIGHT + TOOLBAR_MARGIN) and
     // the grey strip between them (the frame adds 8 px to this height: the window ends 553 px from the top of a 600 px screen, where the waterfall ends), so the toolbar stays
-    // visible and usable. The buttons keep BTN_H; the space below About is simply empty.
+    // visible and usable. Five rows of BTN_H buttons (About is one of them) under the header row.
     let btn_h = BTN_H;
     let win_h = screen.height() - (crate::TOOLBAR_HEIGHT + crate::TOOLBAR_MARGIN) - 11.0;
     // No window shadow: it would darken the top of the bottom toolbar, which this window deliberately leaves visible.
@@ -340,20 +344,6 @@ pub fn menu_window(ui: &mut egui::Ui, connected: &mut ConnectedState) -> (bool, 
                 }
                 ui.add_space(GAP_Y);
             }
-
-            // About, centred under the grid (wider button).
-            let row = new_row(ui, w, btn_h);
-            let aw = 2.0 * cell_w + GAP_X;
-            let rect = egui::Rect::from_min_size(egui::pos2(row.center().x - aw / 2.0, row.top()), egui::vec2(aw, btn_h));
-            let mut c = ui.new_child(egui::UiBuilder::new().max_rect(rect).layout(egui::Layout::centered_and_justified(egui::Direction::LeftToRight)));
-            let about = egui::Button::new(egui::RichText::new("About").size(22.0).color(egui::Color32::from_gray(205)))
-                .fill(crate::chip_idle_fill())
-                .stroke(egui::Stroke::new(1.0, egui::Color32::from_gray(95)))
-                .corner_radius(5.0)
-                .min_size(rect.size());
-            if c.add(about).clicked() {
-                picked = Some(Target::Tab(SettingsTab::About));
-            }
         });
 
     if let Some(t) = picked {
@@ -405,5 +395,38 @@ pub(crate) fn digital_chooser(ui: &mut egui::Ui, c: &mut ConnectedState) {
         crate::toggle_digital_mode(c, mode);
     } else if close_now {
         c.digital_chooser_open = false;
+    }
+}
+
+/// The About window (New Menu -> About): purely informational, so a small rounded overlay above the toolbar with only a CLOSE button, not a full-screen
+/// window. Closing it brings the Menu back.
+pub(crate) fn about_window(ui: &mut egui::Ui, c: &mut ConnectedState) {
+    let mut close_now = false;
+    egui::Window::new("About")
+        .id(egui::Id::new("about_window"))
+        .title_bar(false)
+        .collapsible(false)
+        .resizable(false)
+        .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, -20.0))
+        .show(ui.ctx(), |ui| {
+            if ui.input(|i| i.key_pressed(egui::Key::Escape)) {
+                close_now = true;
+            }
+            ui.set_width(520.0);
+            ui.spacing_mut().item_spacing = egui::vec2(8.0, 6.0);
+            ui.vertical_centered(|ui| {
+                ui.label(egui::RichText::new("About").strong().size(20.0));
+            });
+            ui.separator();
+            crate::render_about_info(ui, c);
+            ui.add_space(8.0);
+            ui.vertical_centered(|ui| {
+                if kiosk_accent_button(ui, "CLOSE").clicked() {
+                    close_now = true;
+                }
+            });
+        });
+    if close_now {
+        c.about_window_open = false;
     }
 }
