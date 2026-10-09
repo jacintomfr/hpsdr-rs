@@ -39,6 +39,13 @@ pub(crate) fn choice_combo_h(ui: &mut egui::Ui, id: &str, width: f32, selected: 
     let mut picked = None;
     ui.spacing_mut().interact_size.y = height;
     ui.spacing_mut().button_padding = egui::vec2(12.0, 8.0);
+    // Rounded corners like the other kiosk boxes (the closed box and the entries of its list).
+    {
+        let w = &mut ui.visuals_mut().widgets;
+        for s in [&mut w.inactive, &mut w.hovered, &mut w.active, &mut w.open] {
+            s.corner_radius = egui::CornerRadius::same(5);
+        }
+    }
     egui::ComboBox::from_id_salt(id)
         .width(width)
         // Tall enough for the whole list (the default 200 px cut the 6 ports of the Ant window after four).

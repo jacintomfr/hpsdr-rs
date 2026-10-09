@@ -27,6 +27,8 @@ enum Target {
     Oc,
     /// The Ant window (ant_window.rs).
     Ant,
+    /// The XVTR window (xvtr_window.rs).
+    Xvtr,
     /// The MIDI window (midi_window.rs).
     Midi,
     /// The BandStack window (bandstack.rs).
@@ -93,7 +95,7 @@ const GRID: [[Option<(&str, Target)>; COLS]; 6] = [
         None,
     ],
     [
-        Some(("XVTR", Target::Tab(SettingsTab::Xvtr))),
+        Some(("XVTR", Target::Xvtr)),
         Some(("Memory", Target::Grey)),
         None,
         Some(("RADE", Target::Rade)),
@@ -117,6 +119,7 @@ pub(crate) fn close_overlays(c: &mut ConnectedState) {
     c.cw_window_open = false;
     c.oc_window_open = false;
     c.ant_window_open = false;
+    c.xvtr_window_open = false;
     c.midi_window_open = false;
     c.bandstack_window_open = false;
     c.noise_window_open = false;
@@ -143,6 +146,7 @@ pub(crate) fn any_overlay_open(c: &ConnectedState) -> bool {
         || c.cw_window_open
         || c.oc_window_open
         || c.ant_window_open
+        || c.xvtr_window_open
         || c.midi_window_open
         || c.bandstack_window_open
         || c.noise_window_open
@@ -203,6 +207,7 @@ fn open(c: &mut ConnectedState, target: Target) {
         Target::Cw => c.cw_window_open = true,
         Target::Oc => c.oc_window_open = true,
         Target::Ant => c.ant_window_open = true,
+        Target::Xvtr => c.xvtr_window_open = true,
         Target::Midi => c.midi_window_open = true,
         Target::BandStack => c.bandstack_window_open = true,
         Target::Ps => {

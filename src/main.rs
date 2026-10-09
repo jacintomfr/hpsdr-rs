@@ -28,6 +28,7 @@ mod eq_window;
 mod noise_window;
 mod oc_window;
 mod ant_window;
+mod xvtr_window;
 mod bandstack;
 mod digital_inapp;
 mod pa_window;
@@ -2883,6 +2884,8 @@ struct ConnectedState {
     oc_window_open: bool,
     /// The Ant window (ant_window.rs).
     ant_window_open: bool,
+    /// The XVTR window (xvtr_window.rs).
+    xvtr_window_open: bool,
     /// The MIDI window (midi_window.rs).
     midi_window_open: bool,
     /// Band stacks (bandstack.rs): per band a short list of frequency + mode entries with the current one.
@@ -4379,6 +4382,7 @@ fn connect_to_device(device: Device, cfg: &Config) -> Result<ConnectedState, Str
                 cw_window_open: false,
                 oc_window_open: false,
                 ant_window_open: false,
+                xvtr_window_open: false,
                 midi_window_open: false,
                 bandstacks: cfg.bandstacks.clone(),
                 bandstack_window_open: false,
@@ -7117,6 +7121,17 @@ impl eframe::App for HpsdrApp {
                         }
                         if close_now {
                             connected.ant_window_open = false;
+                        }
+                    }
+
+                    // XVTR window (deskHPSDR xvtr_menu.c), see xvtr_window.rs.
+                    if connected.xvtr_window_open {
+                        let (close_now, changed) = xvtr_window::xvtr_window(ui, connected);
+                        if changed {
+                            settings_changed = true;
+                        }
+                        if close_now {
+                            connected.xvtr_window_open = false;
                         }
                     }
 
@@ -11806,6 +11821,7 @@ Waterfall rebuilds: {prof_wf_n:.0}/s, {prof_wf_ms:.1} ms each."
                                                 | SettingsTab::Equalizer
                                                 | SettingsTab::Toolbar
                                                 | SettingsTab::Cw
+                                                | SettingsTab::Xvtr
                                         )
                                     {
                                         continue;
@@ -23337,12 +23353,28 @@ fn render_sdr_device(ui: &mut egui::Ui, connected: &mut ConnectedState, settings
                             *settings_changed = true;
                         }
                     }
+                    ui.add_space(2.0);
+                    ui.horizontal(|ui| {
+                        ui.label("IARU Region:");
+                        help_button(ui, "sdr_iaru", "Selects the IARU region for the general band limits: 1 = Europe, Africa, Middle East; 2 = Americas; 3 = Asia-Pacific. It changes the 160 m, 80 m and 40 m edges used to name the band, to allow transmitting and to draw the band edges.");
+                    });
+                    ui.horizontal(|ui| {
+                        let cur = iaru_region();
+                        for r in 1..=3u8 {
+                            if ui.add(egui::Button::selectable(cur == r, r.to_string()).min_size(egui::vec2(64.0, btn_h))).clicked() && cur != r {
+                                set_iaru_region(r);
+                                *settings_changed = true;
+                            }
+                        }
+                    });
                 }
 
                 // ---- column 3: switches
                 {
                     let ui = &mut cols[2];
                     ui.colored_label(egui::Color32::from_rgb(90, 160, 255), egui::RichText::new("AUDIO / HARDWARE").strong());
+                    // Clear of the CLOSE box at the top right (it must keep its distance from the screen edge for touch).
+                    ui.add_space(20.0);
                     let mut send_rx_audio = connected.session.send_rx_audio_to_radio.load(Ordering::Relaxed);
                     if ui
                         .horizontal(|ui| {
@@ -23421,20 +23453,6 @@ fn render_sdr_device(ui: &mut egui::Ui, connected: &mut ConnectedState, settings
                     {
                         *settings_changed = true;
                     }
-                    ui.add_space(2.0);
-                    ui.horizontal(|ui| {
-                        ui.label("IARU Region:");
-                        help_button(ui, "sdr_iaru", "Selects the IARU region for the general band limits: 1 = Europe, Africa, Middle East; 2 = Americas; 3 = Asia-Pacific. It changes the 160 m, 80 m and 40 m edges used to name the band, to allow transmitting and to draw the band edges.");
-                    });
-                    ui.horizontal(|ui| {
-                        let cur = iaru_region();
-                        for r in 1..=3u8 {
-                            if ui.add(egui::Button::selectable(cur == r, r.to_string()).min_size(egui::vec2(64.0, btn_h))).clicked() && cur != r {
-                                set_iaru_region(r);
-                                *settings_changed = true;
-                            }
-                        }
-                    });
                     // Moved here (under IARU Region) from the TRANSMIT column, which is now full.
                     ui.add_space(2.0);
                     ui.horizontal(|ui| {
@@ -23457,7 +23475,8 @@ fn sdr_device_window(ui: &mut egui::Ui, connected: &mut ConnectedState) -> (bool
     let screen = ui.ctx().content_rect();
     let mut close_now = false;
     let mut changed = false;
-    let frame = egui::Frame::window(ui.style()).inner_margin(egui::Margin::symmetric(24, 4)).corner_radius(0.0);
+    let win_h = screen.height() - (TOOLBAR_HEIGHT + TOOLBAR_MARGIN) - 11.0;
+    let frame = egui::Frame::window(ui.style()).inner_margin(egui::Margin::symmetric(24, 4)).corner_radius(0.0).shadow(egui::Shadow::NONE);
     egui::Window::new("SDR Device Settings")
         .id(egui::Id::new("sdr_device_window"))
         .title_bar(false)
@@ -23466,13 +23485,13 @@ fn sdr_device_window(ui: &mut egui::Ui, connected: &mut ConnectedState) -> (bool
         .frame(frame)
         .fixed_pos(screen.min)
         .constrain_to(screen)
-        .fixed_size(screen.size() - egui::vec2(58.0, 10.0))
+        .fixed_size(egui::vec2(screen.width() - 58.0, win_h))
         .show(ui.ctx(), |ui| {
             if ui.input(|i| i.key_pressed(egui::Key::Escape)) {
                 close_now = true;
             }
             ui.set_width(screen.width() - 58.0);
-            ui.set_min_height(screen.height() - 10.0);
+            ui.set_min_height(win_h);
             ui.spacing_mut().item_spacing = egui::vec2(6.0, 0.0);
             let title = format!("hpsdr-rs - SDR Device Settings [{}]", connected.device.board_label());
             let (tr, _) = ui.allocate_exact_size(egui::vec2(ui.available_width(), 24.0), egui::Sense::hover());
@@ -23480,7 +23499,7 @@ fn sdr_device_window(ui: &mut egui::Ui, connected: &mut ConnectedState) -> (bool
             render_sdr_device(ui, connected, &mut changed);
             egui::Area::new(egui::Id::new("sdr_window_close"))
                 .order(egui::Order::Foreground)
-                .anchor(egui::Align2::RIGHT_BOTTOM, egui::vec2(-24.0, -26.0))
+                .anchor(egui::Align2::RIGHT_TOP, egui::vec2(-24.0, 26.0))
                 .show(ui.ctx(), |ui| {
                     if kiosk_accent_button(ui, "CLOSE").clicked() {
                         close_now = true;
