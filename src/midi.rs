@@ -139,6 +139,10 @@ pub enum MidiAction {
     Rade,
     /// Opens/closes the Digital window (the DIGITAL button at the top right).
     DigitalMenu,
+    /// SSTV on/off in one press: opens the SSTV layout (or closes it), leaving the Menu or another digital mode first.
+    SstvMenu,
+    /// RTTY on/off in one press, like SstvMenu.
+    RttyMenu,
     FilterWidthUp,
     FilterWidthDown,
     VfoStepUp,
@@ -268,6 +272,8 @@ impl MidiAction {
             MidiAction::BandDown => "Band Down",
             MidiAction::BandMenu => "Band Menu",
             MidiAction::DigitalMenu => "Digital Menu",
+            MidiAction::SstvMenu => "SSTV On/Off",
+            MidiAction::RttyMenu => "RTTY On/Off",
             MidiAction::ModeMenu => "Mode Menu",
             MidiAction::FilterMenu => "RX Filter Menu",
             MidiAction::Rade => "RADE On/Off",
@@ -395,6 +401,8 @@ pub const KEY_ACTIONS: &[MidiAction] = &[
     MidiAction::BandDown,
     MidiAction::BandMenu,
     MidiAction::DigitalMenu,
+    MidiAction::SstvMenu,
+    MidiAction::RttyMenu,
     MidiAction::ModeMenu,
     MidiAction::FilterMenu,
     MidiAction::Rade,

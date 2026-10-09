@@ -18,11 +18,17 @@ pub(crate) fn toggle(c: &mut ConnectedState) {
     if c.fnc_list_open {
         c.fnc_list_open = false;
     } else {
+        // The Menu or a full-screen window is up: step out of it back to the radio screen, then show the list.
+        if covered(c) {
+            c.menu_window_open = false;
+            c.menu_return = false;
+            crate::menu_window::close_overlays(c);
+        }
         c.band_window_open = false;
         c.mode_window_open = false;
         c.filter_window_open = false;
         c.agc_window_open = false;
-        c.fnc_list_open = !covered(c);
+        c.fnc_list_open = true;
     }
 }
 

@@ -114,6 +114,8 @@ impl ToolbarFn {
                 MidiAction::BandDown => "BAND-",
                 MidiAction::BandMenu => "BAND",
                 MidiAction::DigitalMenu => "DIGITAL",
+                MidiAction::SstvMenu => "SSTV",
+                MidiAction::RttyMenu => "RTTY",
                 MidiAction::ModeMenu => "MODE",
                 MidiAction::FilterMenu => "FILTER",
                 MidiAction::Rade => "RADE",

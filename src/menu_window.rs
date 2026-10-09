@@ -29,6 +29,8 @@ enum Target {
     Ant,
     /// The XVTR window (xvtr_window.rs).
     Xvtr,
+    /// The compact Digital chooser (RTTY / SSTV / RADE).
+    Digital,
     /// The MIDI window (midi_window.rs).
     Midi,
     /// The BandStack window (bandstack.rs).
@@ -97,8 +99,8 @@ const GRID: [[Option<(&str, Target)>; COLS]; 6] = [
     [
         Some(("XVTR", Target::Xvtr)),
         Some(("Memory", Target::Grey)),
+        Some(("DIGITAL", Target::Digital)),
         None,
-        Some(("RADE", Target::Rade)),
         Some(("Extras", Target::Grey)),
         None,
     ],
@@ -120,6 +122,7 @@ pub(crate) fn close_overlays(c: &mut ConnectedState) {
     c.oc_window_open = false;
     c.ant_window_open = false;
     c.xvtr_window_open = false;
+    c.digital_chooser_open = false;
     c.midi_window_open = false;
     c.bandstack_window_open = false;
     c.noise_window_open = false;
@@ -147,6 +150,7 @@ pub(crate) fn any_overlay_open(c: &ConnectedState) -> bool {
         || c.oc_window_open
         || c.ant_window_open
         || c.xvtr_window_open
+        || c.digital_chooser_open
         || c.midi_window_open
         || c.bandstack_window_open
         || c.noise_window_open
@@ -208,6 +212,7 @@ fn open(c: &mut ConnectedState, target: Target) {
         Target::Oc => c.oc_window_open = true,
         Target::Ant => c.ant_window_open = true,
         Target::Xvtr => c.xvtr_window_open = true,
+        Target::Digital => c.digital_chooser_open = true,
         Target::Midi => c.midi_window_open = true,
         Target::BandStack => c.bandstack_window_open = true,
         Target::Ps => {
@@ -359,4 +364,46 @@ pub fn menu_window(ui: &mut egui::Ui, connected: &mut ConnectedState) -> (bool, 
         ui.ctx().request_repaint_of(egui::ViewportId::ROOT);
     }
     (close_now, false)
+}
+
+/// The compact Digital chooser (New Menu -> DIGITAL): RTTY, SSTV and RADE as toggle buttons in a small rounded window above the toolbar, the one in
+/// use lit. A button does what the toolbar / MIDI function of the same name does (enter, leave, or switch from the other digital mode).
+pub(crate) fn digital_chooser(ui: &mut egui::Ui, c: &mut ConnectedState) {
+    use crate::DigitalMode;
+    let mut close_now = false;
+    let mut pick: Option<DigitalMode> = None;
+    egui::Window::new("Digital")
+        .id(egui::Id::new("digital_chooser_window"))
+        .title_bar(false)
+        .collapsible(false)
+        .resizable(false)
+        .anchor(egui::Align2::CENTER_BOTTOM, egui::vec2(0.0, -58.0))
+        .show(ui.ctx(), |ui| {
+            if ui.input(|i| i.key_pressed(egui::Key::Escape)) {
+                close_now = true;
+            }
+            ui.spacing_mut().item_spacing = egui::vec2(8.0, 8.0);
+            ui.horizontal(|ui| {
+                if crate::touch_close_button(ui, 46.0).clicked() {
+                    close_now = true;
+                }
+                ui.label("Digital modes");
+            });
+            ui.horizontal(|ui| {
+                for (mode, label) in [(DigitalMode::Rtty, "RTTY"), (DigitalMode::Sstv, "SSTV"), (DigitalMode::Rade, "RADE")] {
+                    let on = crate::digital_mode_active(c, mode);
+                    if ui.add(crate::chip_button(label, on).min_size(egui::vec2(150.0, 54.0))).clicked() {
+                        pick = Some(mode);
+                    }
+                }
+            });
+        });
+    if let Some(mode) = pick {
+        // A pick leaves the Menu for good (no return to it); the chooser itself is closed first so the layout is not left covered.
+        c.digital_chooser_open = false;
+        c.menu_return = false;
+        crate::toggle_digital_mode(c, mode);
+    } else if close_now {
+        c.digital_chooser_open = false;
+    }
 }

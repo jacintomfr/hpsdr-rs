@@ -1218,8 +1218,10 @@ fn dispatch_midi_binding(
             connected.mode_window_open = false;
             connected.filter_window_open = open;
         }
-        MidiAction::Rade => toggle_rade_direct(connected),
+        MidiAction::Rade => toggle_digital_mode(connected, DigitalMode::Rade),
         MidiAction::DigitalMenu => toggle_digital_window(connected),
+        MidiAction::SstvMenu => toggle_digital_mode(connected, DigitalMode::Sstv),
+        MidiAction::RttyMenu => toggle_digital_mode(connected, DigitalMode::Rtty),
         MidiAction::BandUp | MidiAction::BandDown => {
             let reachable: Vec<&'static Band> = BANDS
                 .iter()
@@ -2891,6 +2893,8 @@ struct ConnectedState {
     /// Band stacks (bandstack.rs): per band a short list of frequency + mode entries with the current one.
     bandstacks: std::collections::HashMap<String, bandstack::BandStack>,
     bandstack_window_open: bool,
+    /// The compact Digital chooser (RTTY / SSTV / RADE) opened from the New Menu.
+    digital_chooser_open: bool,
     /// deskHPSDR OCfull_tune_time / OCmemory_tune_time (ms): how long the Tune OC outputs stay on after an armed TUNE. 0 = no limit.
     oc_full_tune_ms: u32,
     oc_memory_tune_ms: u32,
@@ -4386,6 +4390,7 @@ fn connect_to_device(device: Device, cfg: &Config) -> Result<ConnectedState, Str
                 midi_window_open: false,
                 bandstacks: cfg.bandstacks.clone(),
                 bandstack_window_open: false,
+                digital_chooser_open: false,
                 oc_full_tune_ms: cfg.oc_full_tune_time,
                 oc_memory_tune_ms: cfg.oc_memory_tune_time,
                 oc_prev_tune: false,
@@ -7111,6 +7116,11 @@ impl eframe::App for HpsdrApp {
                         if close_now {
                             connected.bandstack_window_open = false;
                         }
+                    }
+
+                    // Digital chooser (New Menu -> DIGITAL).
+                    if connected.digital_chooser_open {
+                        menu_window::digital_chooser(ui, connected);
                     }
 
                     // Ant window (deskHPSDR ant_menu.c), see ant_window.rs.
@@ -10646,17 +10656,28 @@ impl eframe::App for HpsdrApp {
                         );
                     } else if sstv_panel_visible {
                         // The Menu and the windows it opens sit above the layout: the in-app panel steps aside while any of them is open.
-                        if !connected.menu_window_open && !menu_window::any_overlay_open(connected) {
+                        // While transmitting the waterfall (and its divider) is not drawn, so waterfall_bottom moves up by the divider: keep the panel where it is
+                        // with the waterfall, so there is no gap above the toolbar.
+                        let digital_bottom = {
+                            let id = egui::Id::new("digital_inapp_rx_bottom");
+                            if waterfall_effectively_enabled {
+                                ui.ctx().data_mut(|d| d.insert_temp(id, waterfall_bottom));
+                                waterfall_bottom
+                            } else {
+                                ui.ctx().data(|d| d.get_temp::<f32>(id)).unwrap_or(waterfall_bottom + 15.0)
+                            }
+                        };
+                        if !connected.menu_window_open && !connected.fnc_list_open && !menu_window::any_overlay_open(connected) {
                         digital_inapp::panel(
                             ui,
                             connected,
                             egui::Rect::from_min_max(
                                 egui::pos2(spectrum_right + CW_PANEL_GAP, spectrum_top),
-                                egui::pos2(spectrum_right + CW_PANEL_GAP + panel_w, waterfall_bottom + digital_inapp::strip_height(ui.ctx())),
+                                egui::pos2(spectrum_right + CW_PANEL_GAP + panel_w, digital_bottom + digital_inapp::strip_height(ui.ctx())),
                             ),
                             egui::Rect::from_min_max(
-                                egui::pos2(spectrum_rect.left(), waterfall_bottom - 138.0),
-                                egui::pos2(spectrum_right, waterfall_bottom),
+                                egui::pos2(spectrum_rect.left(), digital_bottom - 138.0),
+                                egui::pos2(spectrum_right, digital_bottom),
                             ),
                         );
                         }
@@ -18839,7 +18860,7 @@ fn run_toolbar_fn(
             dispatch_midi_binding(connected, binding, ev, freq_hz, sample_rate, passband);
         }
         ToolbarFn::TwoTone => connected.toolbar_two_tone_request = true,
-        ToolbarFn::Rade => toggle_rade_direct(connected),
+        ToolbarFn::Rade => toggle_digital_mode(connected, DigitalMode::Rade),
         ToolbarFn::ZoomIn => connected.spectrum_zoom = (connected.spectrum_zoom + 1).min(16),
         ToolbarFn::ZoomOut => connected.spectrum_zoom = (connected.spectrum_zoom - 1).max(1),
         ToolbarFn::ZoomReset => {
@@ -18930,6 +18951,8 @@ fn toolbar_fn_active(connected: &ConnectedState, f: toolbar::ToolbarFn) -> bool 
         ToolbarFn::Midi(MidiAction::TuneMemory) => connected.tune_memory_armed,
         ToolbarFn::Midi(MidiAction::Vox) => connected.vox_enabled,
         ToolbarFn::Midi(MidiAction::DigitalMenu) => connected.show_digital_window,
+        ToolbarFn::Midi(MidiAction::SstvMenu) => digital_mode_active(connected, DigitalMode::Sstv),
+        ToolbarFn::Midi(MidiAction::RttyMenu) => digital_mode_active(connected, DigitalMode::Rtty),
         ToolbarFn::Midi(MidiAction::VoxMenu) => connected.vox_window_open,
         ToolbarFn::Midi(MidiAction::EqMenu) => connected.eq_window_open,
         ToolbarFn::Midi(MidiAction::AgcMenu) => connected.agc_window_open,
@@ -23597,9 +23620,67 @@ fn vox_tick(ctx: &egui::Context, connected: &mut ConnectedState) {
     }
 }
 
+/// Whether the digital mode `mode` is the one in use now (RADE runs with its window hidden, RTTY and SSTV with the Digital layout open).
+fn digital_mode_active(connected: &ConnectedState, mode: DigitalMode) -> bool {
+    if mode == DigitalMode::Rade {
+        rade_is_running(connected)
+    } else {
+        connected.show_digital_window && connected.digital_mode == mode
+    }
+}
+
+/// The RTTY / SSTV / RADE functions (toolbar boxes, MIDI keys and the New Menu chooser): one press enters the mode, another leaves it. With the Menu
+/// or a window from it up, the first press steps out to the radio screen (and an already open layout is only uncovered). Pressing another digital
+/// mode while one is open switches to it.
+fn toggle_digital_mode(connected: &mut ConnectedState, mode: DigitalMode) {
+    if connected.menu_window_open || menu_window::any_overlay_open(connected) {
+        connected.menu_window_open = false;
+        connected.menu_return = false;
+        menu_window::close_overlays(connected);
+        if digital_mode_active(connected, mode) {
+            return;
+        }
+    }
+    if digital_mode_active(connected, mode) {
+        if mode == DigitalMode::Rade {
+            toggle_rade_direct(connected);
+        } else {
+            toggle_digital_window(connected);
+        }
+        return;
+    }
+    // Entering `mode`: RADE is a different state (layout hidden); leave it first.
+    if rade_is_running(connected) {
+        toggle_rade_direct(connected);
+    }
+    if mode == DigitalMode::Rade {
+        toggle_rade_direct(connected);
+        return;
+    }
+    if connected.show_digital_window {
+        // Another digital layout is open: switch in place (the Digital window refits its passband).
+        connected.digital_mode = mode;
+        connected.digital_refit = true;
+        connected.settings_dirty.store(true, std::sync::atomic::Ordering::Relaxed);
+        return;
+    }
+    connected.digital_mode = mode;
+    toggle_digital_window(connected);
+}
+
 /// Opens or closes the Digital window (the DIGITAL button and the MIDI/toolbar `Digital` function): auto-switches to
 /// DIGU/DIGL on open and restores mode, passband and filters on close.
 fn toggle_digital_window(connected: &mut ConnectedState) {
+    // The Menu or a window opened from it is up: go back to the radio screen and show the Digital layout (open it if it is not already; an open one
+    // is only uncovered, not toggled off).
+    if connected.menu_window_open || menu_window::any_overlay_open(connected) {
+        connected.menu_window_open = false;
+        connected.menu_return = false;
+        menu_window::close_overlays(connected);
+        if connected.show_digital_window {
+            return;
+        }
+    }
     let opening = !connected.show_digital_window;
     connected.show_digital_window = opening;
     // See ConnectedState::pre_digital_mode's
