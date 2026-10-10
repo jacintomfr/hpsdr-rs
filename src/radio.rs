@@ -1540,8 +1540,10 @@ impl RadioSession {
     /// with `true` when the operator actually intends to transmit --
     /// this method itself does no license/band/power-limit checking
     /// whatsoever.
+    #[track_caller]
     pub fn set_mox(&self, on: bool) {
-        self.mox.store(on, Ordering::Relaxed);
+        let prev = self.mox.swap(on, Ordering::Relaxed);
+        crate::tx_diag::note_set_mox(prev, on, std::panic::Location::caller());
     }
 
     pub fn mox_active(&self) -> bool {

@@ -2,16 +2,12 @@
 //! lists the eight layers with the functions of their eight boxes; while it is open the bottom toolbar shows
 //! FNC(1)..FNC(8) and pressing box k (screen or MIDI) selects layer k and closes the list.
 //!
-//! Size budget (1024x600): layer column 78 px + 8 cells x 108 px = 942 px of rows (+ window frame ~ 16 px = ~958 px, inside 1024 - 2 x 24 = 976);
-//! height CLOSE row 46 + 8 rows x 30 px + 8 gaps x 10 px = ~370 px, anchored 72 px above the bottom edge.
+//! Size (1024x600): the window fills the space between the VFO block and the toolbar (anchored 72 px above the bottom edge), 8 rows of about 43 px with 6 px gaps and
+//! the boxes as wide as the screen allows (no CLOSE row; it closes on a pick, with FNC's again or Escape).
 
-use crate::{toolbar, touch_close_button, ConnectedState};
+use crate::{toolbar, ConnectedState};
 
-const ROW_H: f32 = 30.0;
-const GAP: f32 = 10.0;
-const LAYER_W: f32 = 78.0;
-const CELL_W: f32 = 108.0;
-const FONT: f32 = 15.0;
+const GAP: f32 = 6.0;
 
 /// FNC's pressed: open or close the list. Opening closes the other compact popups that share its place.
 pub(crate) fn toggle(c: &mut ConnectedState) {
@@ -67,6 +63,13 @@ pub(crate) fn covered(c: &ConnectedState) -> bool {
 pub fn fnc_window(ui: &mut egui::Ui, connected: &mut ConnectedState) -> bool {
     let mut close_now = false;
     let mut picked = None;
+    // Fills the space between the VFO block (about 124 px from the top) and the toolbar (the window ends 72 px above the bottom edge), as large as fits: the
+    // screen is read from 50-70 cm. No CLOSE row: the list closes when a layer is picked, with the FNC's box again or with Escape.
+    let screen = ui.ctx().content_rect();
+    let row_h = ((screen.height() - 72.0 - 124.0 - 16.0 - 7.0 * GAP) / toolbar::LAYERS as f32).clamp(30.0, 56.0).floor();
+    let layer_w = 92.0f32;
+    let cell_w = ((screen.width() - 48.0 - 26.0 - layer_w) / toolbar::BUTTONS as f32).clamp(80.0, 130.0).floor();
+    let font = 19.0f32;
     egui::Window::new("fnc_list")
         .id(egui::Id::new("fnc_list_window"))
         .title_bar(false)
@@ -78,16 +81,10 @@ pub fn fnc_window(ui: &mut egui::Ui, connected: &mut ConnectedState) -> bool {
                 close_now = true;
             }
             ui.spacing_mut().item_spacing = egui::vec2(GAP, GAP);
-            ui.horizontal(|ui| {
-                if touch_close_button(ui, 46.0).clicked() {
-                    close_now = true;
-                }
-                ui.label("FNC's: jump to a layer");
-            });
             for layer in 0..toolbar::LAYERS {
                 let current = layer == connected.toolbar_layer;
                 let (rect, resp) =
-                    ui.allocate_exact_size(egui::vec2(LAYER_W + CELL_W * toolbar::BUTTONS as f32, ROW_H), egui::Sense::click());
+                    ui.allocate_exact_size(egui::vec2(layer_w + cell_w * toolbar::BUTTONS as f32, row_h), egui::Sense::click());
                 let fill = if current { egui::Color32::from_gray(112) } else { egui::Color32::from_gray(48) };
                 let fg = if current { egui::Color32::WHITE } else { egui::Color32::from_gray(190) };
                 let p = ui.painter();
@@ -96,20 +93,20 @@ pub fn fnc_window(ui: &mut egui::Ui, connected: &mut ConnectedState) -> bool {
                     egui::pos2(rect.left() + 8.0, rect.center().y),
                     egui::Align2::LEFT_CENTER,
                     format!("FNC({})", layer + 1),
-                    egui::FontId::proportional(FONT),
+                    egui::FontId::proportional(font),
                     egui::Color32::from_rgb(235, 195, 40),
                 );
                 for b in 0..toolbar::BUTTONS {
                     let f = connected.toolbar_layers[layer][b];
                     let text = if f == toolbar::ToolbarFn::None { "-" } else { f.short_label() };
                     let cell = egui::Rect::from_min_size(
-                        egui::pos2(rect.left() + LAYER_W + CELL_W * b as f32, rect.top()),
-                        egui::vec2(CELL_W, ROW_H),
+                        egui::pos2(rect.left() + layer_w + cell_w * b as f32, rect.top()),
+                        egui::vec2(cell_w, row_h),
                     );
-                    let mut size = FONT;
+                    let mut size = font;
                     let mut galley = p.layout_no_wrap(text.to_string(), egui::FontId::proportional(size), fg);
-                    if galley.size().x > CELL_W - 10.0 {
-                        size *= (CELL_W - 10.0) / galley.size().x;
+                    if galley.size().x > cell_w - 10.0 {
+                        size *= (cell_w - 10.0) / galley.size().x;
                         galley = p.layout_no_wrap(text.to_string(), egui::FontId::proportional(size), fg);
                     }
                     p.with_clip_rect(cell).galley(cell.center() - galley.size() / 2.0, galley, fg);

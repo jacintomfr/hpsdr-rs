@@ -19,6 +19,7 @@ mod config;
 mod cw_decoder;
 mod cw_keyer;
 mod cw_latency;
+mod tx_diag;
 mod cw_encoder;
 mod debug_log;
 mod discovery;
@@ -1041,7 +1042,54 @@ fn midi_wheel_step(ev: RawMidiEvent, binding: &MidiBinding, unit_per_message: f6
 /// TCI frequency-request reconciliation just above this call site already
 /// resolved, so tuning actions respect CTUN identically to every other
 /// tuning path in this app.
+/// Noise guard for MIDI keys. A controller whose inputs pick up noise (RF or ground noise when the TX relay and the PA switch) sends a storm of Note On / Off for
+/// many keys at once, every few milliseconds -- which toggles MOX, TUNE, the toolbar functions ... at random. A person cannot press four different keys within
+/// 150 ms, so when that many distinct keys change in that time every key event is ignored until the storm has been quiet for 1.5 s. Wheels, knobs and the CW
+/// paddles are not affected. Returns true when `ev` must be ignored.
+fn midi_noise_storm_blocks(ev: &RawMidiEvent) -> bool {
+    use std::sync::Mutex;
+    static STORM: Mutex<(Vec<(Instant, u8, u8)>, Option<Instant>)> = Mutex::new((Vec::new(), None));
+    if !matches!(ev.kind, midi::MidiEventKind::NoteKey) {
+        return false;
+    }
+    let now = Instant::now();
+    let mut g = STORM.lock().unwrap();
+    g.0.retain(|(t, _, _)| now.duration_since(*t) < Duration::from_millis(150));
+    g.0.push((now, ev.channel, ev.number));
+    let mut distinct: Vec<(u8, u8)> = g.0.iter().map(|(_, c, n)| (*c, *n)).collect();
+    distinct.sort_unstable();
+    distinct.dedup();
+    if distinct.len() >= 4 {
+        if g.1.map_or(true, |u| now >= u) {
+            let msg = format!("MIDI noise storm: {} different keys within 150 ms -- ignoring key events until it stops", distinct.len());
+            eprintln!("{msg}");
+            if tx_diag::enabled() {
+                tx_diag::log(&msg);
+            }
+        }
+        g.1 = Some(now + Duration::from_millis(1500));
+    }
+    g.1.is_some_and(|u| now < u)
+}
+
 fn dispatch_midi_event(connected: &mut ConnectedState, ev: RawMidiEvent, freq_hz: u32, sample_rate: u32, passband: (f64, f64)) {
+    // Diagnostics (while /tmp/hpsdr_diag.enable exists): every MIDI message received, with the action it is bound to, so stray messages from a
+    // controller picking up RF / ground noise while transmitting can be seen next to the TX state changes (tx_diag.rs).
+    if tx_diag::enabled() {
+        let bound = connected.midi_bindings.iter().find(|b| b.matches(&ev)).map(|b| format!("{:?}", b.action)).unwrap_or_else(|| "(unbound)".to_string());
+        tx_diag::log(&format!(
+            "MIDI {:?} ch={} num={} val={} off={} -> {bound} | mox={}",
+            ev.kind,
+            ev.channel,
+            ev.number,
+            ev.value,
+            ev.off as u8,
+            connected.session.mox_active() as u8
+        ));
+    }
+    if midi_noise_storm_blocks(&ev) {
+        return;
+    }
     let Some(binding) = connected.midi_bindings.iter().find(|b| b.matches(&ev)).copied() else {
         // Previously silent -- a real gap while testing a new controller
         // or a freshly-imported binding set (see midi_import.rs): there
@@ -1121,6 +1169,18 @@ fn dispatch_midi_binding(
             // comment. Only gates the transition TO keyed; unkeying
             // (ev.off / already-on -> off) always goes through.
             let want_on = if binding.momentary { !ev.off } else { !connected.session.mox_active() };
+            if tx_diag::enabled() {
+                tx_diag::log(&format!(
+                    "MOX event from {}: event={:?} channel={:?} number={} off={} value={} momentary={} -> want_on={want_on}",
+                    if binding.number == 0 && binding.channel.is_none() { "the toolbar / a screen box" } else { "a MIDI key" },
+                    binding.event,
+                    binding.channel,
+                    binding.number,
+                    ev.off,
+                    ev.value,
+                    binding.momentary
+                ));
+            }
             if !want_on
                 || tx_frequency_allowed(
                     connected.session.tx_frequency_hz.load(Ordering::Relaxed),
@@ -4815,6 +4875,7 @@ impl eframe::App for HpsdrApp {
                     .session
                     .frequency_hz
                     .load(std::sync::atomic::Ordering::Relaxed);
+                tx_diag::tick(&connected.session);
                 // Diagnostics (temporary): while /tmp/hpsdr_diag.enable exists, one line per second in /tmp/hpsdr_perf.log
                 // with the UI frame rate and the DSP / display counters.
                 {
@@ -23089,6 +23150,7 @@ fn digital_fit_passband(
 /// by the main MOX button's own click handler and the RADE panel's
 /// TALK (PTT) button, so both take the transmitter down the same
 /// graceful path rather than one of them cutting RF mid-burst.
+#[track_caller]
 fn set_rade_aware_mox(connected: &mut ConnectedState, want_on: bool) {
     if !want_on && connected.rade.tx_armed() {
         connected.rade.set_unkeying(true);
