@@ -10773,7 +10773,12 @@ impl eframe::App for HpsdrApp {
                                 ui.ctx().data(|d| d.get_temp::<f32>(id)).unwrap_or(waterfall_bottom + 15.0)
                             }
                         };
-                        if !connected.menu_window_open && !connected.fnc_list_open && !menu_window::any_overlay_open(connected) {
+                        if !connected.menu_window_open
+                            && !connected.fnc_list_open
+                            && connected.toolbar_choose.is_none()
+                            && connected.frequency_entry.is_none()
+                            && !menu_window::any_overlay_open(connected)
+                        {
                         digital_inapp::panel(
                             ui,
                             connected,
@@ -16427,6 +16432,9 @@ fn draw_freq_axis_ticks(
     let range_end = view_center_hz + visible_half_span_hz;
     let edge_margin_hz = 2.0 * visible_half_span_hz * 0.03;
     let mut f = (range_start / step_hz).ceil() * step_hz;
+    // Right edge of the last label drawn: a label is kept inside the plot (a narrow plot, like the in-app digital layout, would let the last one run out
+    // over the window beside it) and one that would overlap the previous label is skipped.
+    let mut last_label_right = f32::NEG_INFINITY;
     while f <= range_end {
         let frac = ((f - range_start) / (2.0 * visible_half_span_hz)) as f32;
         let x = rect.left() + frac * rect.width();
@@ -16441,13 +16449,12 @@ fn draw_freq_axis_ticks(
             } else {
                 format!("{:.1}", label_freq / 1000.0)
             };
-            painter.text(
-                egui::pos2(x + 2.0, rect.bottom() - 2.0),
-                egui::Align2::LEFT_BOTTOM,
-                label,
-                egui::FontId::monospace(16.0),
-                egui::Color32::GRAY,
-            );
+            let galley = painter.layout_no_wrap(label, egui::FontId::monospace(16.0), egui::Color32::GRAY);
+            let text_x = (x + 2.0).min(rect.right() - galley.size().x - 2.0).max(rect.left() + 2.0);
+            if text_x >= last_label_right + 6.0 {
+                painter.galley(egui::pos2(text_x, rect.bottom() - 2.0 - galley.size().y), galley.clone(), egui::Color32::GRAY);
+                last_label_right = text_x + galley.size().x;
+            }
         }
         f += step_hz;
     }
