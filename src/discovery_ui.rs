@@ -911,40 +911,6 @@ impl DiscoveryWindow {
                 }
 
                 ui.add_space(8.0);
-                egui::CollapsingHeader::new("Ozy USB setup").show(ui, |ui| {
-                    ui.label(
-                        "Classic Ozy/Mercury/Penny hardware needs these two files \
-                         to connect. hpsdr-rs bundles its own copies (sourced from \
-                         piHPSDR) -- only use Choose... below to override with a \
-                         different/custom build.",
-                    );
-                    ui.horizontal(|ui| {
-                        ui.label("FX2 firmware (.hex):");
-                        ui.label(effective_path_label(&self.ozy_firmware_path, crate::ozy::default_firmware_path));
-                        if ui.button("Choose...").clicked() {
-                            if let Some(path) =
-                                rfd::FileDialog::new().add_filter("Ozy FX2 firmware", &["hex"]).pick_file()
-                            {
-                                self.ozy_firmware_path = Some(path.display().to_string());
-                                self.save_ozy_paths();
-                            }
-                        }
-                    });
-                    ui.horizontal(|ui| {
-                        ui.label("FPGA bitstream (.rbf):");
-                        ui.label(effective_path_label(&self.ozy_fpga_path, crate::ozy::default_fpga_path));
-                        if ui.button("Choose...").clicked() {
-                            if let Some(path) =
-                                rfd::FileDialog::new().add_filter("FPGA firmware", &["rbf"]).pick_file()
-                            {
-                                self.ozy_fpga_path = Some(path.display().to_string());
-                                self.save_ozy_paths();
-                            }
-                        }
-                    });
-                });
-
-                ui.add_space(8.0);
                 // The help text is a tooltip on the header (three lines of it under the header got in the way every time).
                 let juice_header = egui::CollapsingHeader::new("Radioberry Juice setup").show(ui, |ui| {
                     ui.horizontal(|ui| {
@@ -1196,6 +1162,40 @@ impl DiscoveryWindow {
                      Point this at your built juice executable, launch it, and pick\n\
                      the FPGA variant fitted to your board.",
                 );
+
+                ui.add_space(8.0);
+                egui::CollapsingHeader::new("Ozy USB setup").show(ui, |ui| {
+                    ui.label(
+                        "Classic Ozy/Mercury/Penny hardware needs these two files \
+                         to connect. hpsdr-rs bundles its own copies (sourced from \
+                         piHPSDR) -- only use Choose... below to override with a \
+                         different/custom build.",
+                    );
+                    ui.horizontal(|ui| {
+                        ui.label("FX2 firmware (.hex):");
+                        ui.label(effective_path_label(&self.ozy_firmware_path, crate::ozy::default_firmware_path));
+                        if ui.button("Choose...").clicked() {
+                            if let Some(path) =
+                                rfd::FileDialog::new().add_filter("Ozy FX2 firmware", &["hex"]).pick_file()
+                            {
+                                self.ozy_firmware_path = Some(path.display().to_string());
+                                self.save_ozy_paths();
+                            }
+                        }
+                    });
+                    ui.horizontal(|ui| {
+                        ui.label("FPGA bitstream (.rbf):");
+                        ui.label(effective_path_label(&self.ozy_fpga_path, crate::ozy::default_fpga_path));
+                        if ui.button("Choose...").clicked() {
+                            if let Some(path) =
+                                rfd::FileDialog::new().add_filter("FPGA firmware", &["rbf"]).pick_file()
+                            {
+                                self.ozy_fpga_path = Some(path.display().to_string());
+                                self.save_ozy_paths();
+                            }
+                        }
+                    });
+                });
 
                 egui::CollapsingHeader::new("RX-888 USB setup").show(ui, |ui| {
                     ui.label(

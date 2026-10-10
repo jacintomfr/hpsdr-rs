@@ -20,6 +20,7 @@ mod cw_decoder;
 mod cw_keyer;
 mod cw_latency;
 mod tx_diag;
+mod synop;
 mod cw_encoder;
 mod debug_log;
 mod discovery;

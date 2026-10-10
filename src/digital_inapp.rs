@@ -12,6 +12,9 @@ use crate::{chip_button, lcd_kiosk_mode, touch_close_button, ConnectedState, Dig
 use std::time::Duration;
 
 const TAB_ID: &str = "sstv_inapp_tab";
+
+/// The plain-language translation of the SYNOP reports in the RTTY text (the DEC button): one buffer for the one RTTY panel.
+static SYNOP_VIEW: std::sync::Mutex<Option<crate::synop::SynopView>> = std::sync::Mutex::new(None);
 const ZOOM_ID: &str = "digital_inapp_prev_zoom";
 /// Spectrum zoom while the panel is open (x16 is the limit): 3 kHz of audio at the 48 kHz RX rate used meanwhile, shifted to start at the dial (below it for LSB)
 /// MMSSTV's frequency display -- SSTV's 1.2..2.3 kHz is about a fifth of it.
@@ -477,6 +480,59 @@ pub(crate) fn strip_height(ctx: &egui::Context) -> f32 {
     }
 }
 
+/// The DEC window of the RTTY panel: the SYNOP reports of the received text in plain language, large enough to read like a commercial decoder (not full
+/// screen: the toolbar stays visible). Returns false when CLOSE was pressed.
+fn weather_window(ui: &mut egui::Ui, raw_text: &str, win: egui::Rect, strip: egui::Rect) -> bool {
+    let mut open = true;
+    let amber = egui::Color32::from_rgb(230, 150, 50);
+    let screen = ui.ctx().content_rect();
+    let width = (screen.width() - 2.0 * 60.0).min(860.0);
+    let height = (strip.bottom().max(win.bottom()) - 56.0).clamp(300.0, screen.height() - 130.0);
+    let rect = egui::Rect::from_min_size(egui::pos2(screen.center().x - width / 2.0, 56.0), egui::vec2(width, height));
+    let mut guard = SYNOP_VIEW.lock().unwrap();
+    let view = guard.get_or_insert_with(Default::default);
+    if view.update(raw_text) {
+        ui.ctx().request_repaint_after(Duration::from_millis(120));
+    }
+    egui::Area::new(egui::Id::new("digital_inapp_weather_window")).order(egui::Order::Foreground).fixed_pos(rect.min).constrain(false).show(ui, |ui| {
+        let frame = egui::Frame::popup(ui.style()).stroke(egui::Stroke::new(1.5, ui.visuals().widgets.active.bg_stroke.color));
+        let margin = frame.total_margin().sum();
+        frame.show(ui, |ui| {
+            ui.set_width(rect.width() - margin.x);
+            ui.set_height(rect.height() - margin.y);
+            crate::apply_kiosk_touch_style(ui);
+            ui.spacing_mut().item_spacing = egui::vec2(8.0, 8.0);
+            ui.label(egui::RichText::new("Weather reports (SYNOP) in plain language").strong().size(26.0));
+            ui.separator();
+            let list_h = ui.available_height() - 62.0;
+            egui::ScrollArea::vertical().id_salt("rtty_weather_list").max_height(list_h).auto_shrink([false, false]).stick_to_bottom(true).show(ui, |ui| {
+                ui.set_width(ui.available_width());
+                if view.lines().is_empty() {
+                    ui.add(egui::Label::new(egui::RichText::new("Waiting for a weather report (AAXX / BBXX) ...").size(24.0).color(amber)).wrap());
+                }
+                for line in view.lines() {
+                    if line.starts_with("---") {
+                        ui.add_space(4.0);
+                        ui.add(egui::Label::new(egui::RichText::new(line.trim_matches('-').trim()).strong().size(26.0).color(amber)).wrap());
+                    } else if let Some((head, rest)) = line.split_once(": ") {
+                        ui.add(egui::Label::new(egui::RichText::new(head).strong().size(26.0)).wrap());
+                        ui.add(egui::Label::new(egui::RichText::new(rest.replace(", ", "  \u{b7}  ")).size(24.0)).wrap());
+                        ui.separator();
+                    } else {
+                        ui.add(egui::Label::new(egui::RichText::new(line).size(24.0)).wrap());
+                    }
+                }
+            });
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if ui.add(egui::Button::new(egui::RichText::new("CLOSE").size(22.0).strong()).min_size(egui::vec2(150.0, 50.0))).clicked() {
+                    open = false;
+                }
+            });
+        });
+    });
+    open
+}
+
 /// The RTTY panel, same pattern as SSTV: the text window at the right (the lock status and the decoded text; on the TX tab also the line to send)
 /// and an OPTIONS button at the bottom left of the waterfall that opens the controls (RX tab: Center, Baud, Shift, Reverse / AFC / Squelch, Clear RX, Fit Filter;
 /// TX tab: TX ON, CALL CQ, CLEAR, Send on Return) over the waterfall. The spectrum above shows 3 kHz of audio with the mark / space cursors.
@@ -492,6 +548,10 @@ fn rtty_panel(ui: &mut egui::Ui, connected: &mut ConnectedState, win: egui::Rect
     let mut fit = false;
     let mut mox_request: Option<bool> = None;
     let mut send_on_return = connected.rtty_send_on_return;
+    // DEC: a window with the weather reports in plain language; it is not remembered, CLOSE (or leaving the panel) turns DEC off.
+    let dec_id = egui::Id::new("digital_inapp_dec_open");
+    let mut decode: bool = ui.ctx().data(|d| d.get_temp(dec_id)).unwrap_or(false);
+    let raw_text = rtty.rx_text();
     let callsign = connected.own_callsign.clone();
     let mut new_tx_input: Option<String> = None;
     let amber = egui::Color32::from_rgb(230, 150, 50);
@@ -517,6 +577,16 @@ fn rtty_panel(ui: &mut egui::Ui, connected: &mut ConnectedState, win: egui::Rect
                 if s.afc {
                     ui.label(format!("AFC {:+.0} Hz", st.afc_offset_hz));
                 }
+                // DEC at the right end of the status row: opens the weather window (its CLOSE turns it off again).
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if ui
+                        .add(chip_button("DEC", decode).min_size(egui::vec2(64.0, 36.0)))
+                        .on_hover_text("Translate the weather reports (SYNOP) into plain language in a larger window")
+                        .clicked()
+                    {
+                        decode = true;
+                    }
+                });
             });
             if !matches!(mode, crate::spectrum::Mode::Usb | crate::spectrum::Mode::Digu | crate::spectrum::Mode::Lsb | crate::spectrum::Mode::Digl) {
                 ui.colored_label(amber, "RTTY needs USB/DIGU (or LSB/DIGL with Reverse).");
@@ -525,7 +595,7 @@ fn rtty_panel(ui: &mut egui::Ui, connected: &mut ConnectedState, win: egui::Rect
             let tx_h = if tx_tab { 128.0 } else { 0.0 };
             let rx_h = (ui.available_height() - tx_h - 4.0).max(60.0);
             egui::ScrollArea::vertical().id_salt("rtty_inapp_rx").max_height(rx_h).auto_shrink([false, false]).stick_to_bottom(true).show(ui, |ui| {
-                ui.label(egui::RichText::new(rtty.rx_text()).monospace().size(15.0));
+                ui.label(egui::RichText::new(&raw_text).monospace().size(15.0));
             });
             if tx_tab {
                 ui.separator();
@@ -576,7 +646,11 @@ fn rtty_panel(ui: &mut egui::Ui, connected: &mut ConnectedState, win: egui::Rect
     // ---- OPTIONS: a button at the bottom left of the waterfall; open, the controls fill the waterfall (the spectrum stays in view for tuning).
     let opt_id = egui::Id::new("digital_inapp_options_open");
     let mut options_open: bool = ui.ctx().data(|d| d.get_temp(opt_id)).unwrap_or(false);
-    if !options_open {
+    // The weather window is in front of the OPTIONS button and strip: they step aside while it is open.
+    if decode {
+        options_open = false;
+    }
+    if !options_open && !decode {
         egui::Area::new(egui::Id::new("digital_inapp_options_button"))
             .order(egui::Order::Foreground)
             .fixed_pos(egui::pos2(strip.left() + 6.0, strip.bottom() - 46.0 + 2.0))
@@ -633,6 +707,7 @@ fn rtty_panel(ui: &mut egui::Ui, connected: &mut ConnectedState, win: egui::Rect
                             ui.horizontal(|ui| {
                                 if ui.add(egui::Button::new("Clear RX").min_size(egui::vec2(96.0, 40.0))).clicked() {
                                     rtty.clear_rx_text();
+                                    *SYNOP_VIEW.lock().unwrap() = None;
                                 }
                                 if ui.add(egui::Button::new("Fit Filter").min_size(egui::vec2(96.0, 40.0))).on_hover_text("Fit the RX / TX filter to the mark / space pair").clicked() {
                                     fit = true;
@@ -696,6 +771,12 @@ fn rtty_panel(ui: &mut egui::Ui, connected: &mut ConnectedState, win: egui::Rect
                 });
             });
     }
+    if decode {
+        decode = weather_window(ui, &raw_text, win, strip);
+    } else {
+        *SYNOP_VIEW.lock().unwrap() = None;
+    }
+    ui.ctx().data_mut(|d| d.insert_temp(dec_id, decode));
     ui.ctx().data_mut(|d| d.insert_temp(opt_id, options_open));
     ui.ctx().data_mut(|d| d.insert_temp(egui::Id::new(TAB_ID), tab_now));
     ui.ctx().request_repaint_after(Duration::from_millis(300));
