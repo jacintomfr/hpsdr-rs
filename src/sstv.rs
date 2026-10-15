@@ -831,6 +831,9 @@ pub struct SstvRx {
     prev: Complex32,
     // Instantaneous frequency (Hz), lightly smoothed.
     inst_hz: f64,
+    // Heavier-smoothed frequency for the VIS / sync-pulse detectors only
+    // (see DET_ALPHA); pixels still use `inst_hz`.
+    det_hz: f64,
     // Smoothed raw-input level (mean |audio|) for the UI activity meter.
     in_level: f32,
     have_prev: bool,
@@ -923,6 +926,20 @@ impl VisState {
     }
 }
 
+/// Local addition (not upstream): smoothing of the frequency the VIS and
+/// sync-pulse detectors look at (one-pole, ~1 ms at 48 kHz). With only the
+/// per-sample `inst_hz` (0.5) a single noisy sample breaks a 1200 Hz run,
+/// so nothing locked below ~15 dB SNR (2.5 kHz); with 0.02 synthetic
+/// Martin / Scottie / Robot / PD / SC2 pictures lock down to ~3 dB and a
+/// real weak Martin 2 off the air decodes. Tuned with FREERUN_MIN_HITS on
+/// synthetic pictures + noise, an hour of plain noise (no false lock) and
+/// that recording.
+const DET_ALPHA: f64 = 0.02;
+
+/// Line-cadence matches needed before free-run locks (upstream: 2). With
+/// the smoother detector, 3 cuts false locks on noise and wrong-mode locks.
+const FREERUN_MIN_HITS: u32 = 3;
+
 impl SstvRx {
     pub fn new(rate: f64) -> Self {
         let mix_hz = 1900.0f32;
@@ -935,6 +952,7 @@ impl SstvRx {
             lpf: ComplexFir::new(bandpass_taps(129, -1100.0, 1100.0, rate)),
             prev: Complex32::new(0.0, 0.0),
             inst_hz: 1900.0,
+            det_hz: 1900.0,
             in_level: 0.0,
             have_prev: false,
             phase: RxPhase::Hunt,
@@ -1043,6 +1061,7 @@ impl SstvRx {
             self.prev = z;
             self.have_prev = true;
             self.inst_hz += 0.5 * (raw_hz - self.inst_hz);
+            self.det_hz += DET_ALPHA * (raw_hz - self.det_hz);
 
             self.push_hist(self.inst_hz);
             self.sample_idx += 1;
@@ -1148,8 +1167,8 @@ impl SstvRx {
     fn step_hunt(&mut self, out: &mut Vec<SstvEvent>) {
         self.step_fsk_id(out);
         let near = |a: f64, b: f64| (a - b).abs() < 90.0;
-        let is_leader = near(self.inst_hz, VIS_LEADER_HZ);
-        let is_sync = near(self.inst_hz, SYNC_HZ);
+        let is_leader = near(self.det_hz, VIS_LEADER_HZ);
+        let is_sync = near(self.det_hz, SYNC_HZ);
         if is_leader {
             self.vis_state.leader = (self.vis_state.leader + 1).min((self.rate) as u32);
             if self.vis_state.leader as f64 > 0.12 * self.rate {
@@ -1266,7 +1285,7 @@ impl SstvRx {
     /// cadence, start decoding (no VIS needed -- handles tuning into a
     /// picture already in progress).
     fn try_freerun(&mut self, out: &mut Vec<SstvEvent>) {
-        let is_sync = self.inst_hz > 1050.0 && self.inst_hz < 1350.0;
+        let is_sync = self.det_hz > 1050.0 && self.det_hz < 1350.0;
         if is_sync {
             self.sync_run += 1;
             return;
@@ -1283,12 +1302,12 @@ impl SstvRx {
         }
 
         let locked = match self.expected {
-            Some(m) => (self.cadence_hits(m) >= 2).then_some(m),
+            Some(m) => (self.cadence_hits(m) >= FREERUN_MIN_HITS).then_some(m),
             None => {
                 let mut best: Option<SstvMode> = None;
                 let mut best_err = f64::INFINITY;
                 for &m in &SstvMode::ALL {
-                    if self.cadence_hits(m) < 2 {
+                    if self.cadence_hits(m) < FREERUN_MIN_HITS {
                         continue;
                     }
                     let (_, sdur) = self.sync_span(m, m.dimensions().0, 0);
