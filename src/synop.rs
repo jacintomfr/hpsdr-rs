@@ -174,8 +174,8 @@ fn decode_ship(tokens: &[&str]) -> Vec<String> {
         }
     }
     let groups = if rest.is_empty() { rest } else { &rest[1..] };
-    let parts = decode_groups(groups, knots);
-    vec![if parts.is_empty() { format!("{head}: sem dados legíveis") } else { format!("{head}: {}", parts.join(", ")) }]
+    let (parts, quality) = decode_groups(groups, knots);
+    vec![if parts.is_empty() { format!("{head}: sem dados legíveis") } else { format_report(&head, &parts, &quality) }]
 }
 
 fn parse_header(h: &str) -> Option<Context> {
@@ -420,18 +420,85 @@ fn decode_report(tokens: &[&str], ctx: &Context) -> Option<String> {
     if tokens.get(1).is_some_and(|t| t.eq_ignore_ascii_case("NIL")) {
         return Some(format!("{head}: sem dados (NIL)"));
     }
-    let parts = decode_groups(&tokens[1..], ctx.knots);
+    let (parts, quality) = decode_groups(&tokens[1..], ctx.knots);
     if parts.is_empty() {
         return None;
     }
-    Some(format!("{head}: {}", parts.join(", ")))
+    Some(format_report(&head, &parts, &quality))
+}
+
+/// How much of a report could be read: groups read, groups that were damaged, and glued groups that were split again.
+#[derive(Default)]
+struct Quality {
+    read: usize,
+    bad: usize,
+    repaired: usize,
+}
+
+/// Marks the end of the translation and the start of the reception quality in a line (the panel draws the quality smaller).
+pub const QUALITY_MARK: char = '\u{1}';
+
+fn format_report(head: &str, parts: &[String], q: &Quality) -> String {
+    let mut line = format!("{head}: {}", parts.join(", "));
+    let total = q.read + q.bad;
+    if total > 0 {
+        let mut text = format!("lidos {} de {total} grupos", q.read);
+        if q.bad > 0 {
+            text.push_str(&format!(", {} ilegíve{}", q.bad, if q.bad == 1 { "l" } else { "is" }));
+        }
+        if q.repaired > 0 {
+            text.push_str(&format!(", {} reparado{}", q.repaired, if q.repaired == 1 { "" } else { "s" }));
+        }
+        line.push(QUALITY_MARK);
+        line.push_str(&text);
+    }
+    line
+}
+
+/// A block of digits that is a whole number of groups long (10, 15 ...) is groups whose spaces were lost: split it again.
+fn repair<'a>(groups: &[&'a str]) -> (Vec<&'a str>, usize) {
+    let mut out = Vec::with_capacity(groups.len());
+    let mut repaired = 0;
+    for g in groups {
+        if g.len() >= 10 && g.len() % 5 == 0 && g.bytes().all(|c| c.is_ascii_digit() || c == b'/') {
+            for k in (0..g.len()).step_by(5) {
+                out.push(&g[k..k + 5]);
+            }
+            repaired += 1;
+        } else {
+            out.push(*g);
+        }
+    }
+    (out, repaired)
+}
+
+/// Counts the groups of a report that are well formed and the ones that are damaged (up to the national section or ICE).
+fn count_groups(groups: &[&str]) -> (usize, usize) {
+    let (mut read, mut bad) = (0, 0);
+    for g in groups {
+        match *g {
+            "555" | "ICE" | "ice" => break,
+            "333" | "222" | "444" | "NIL" => continue,
+            _ => {}
+        }
+        if is_group(g) {
+            read += 1;
+        } else {
+            bad += 1;
+        }
+    }
+    (read, bad)
 }
 
 /// The groups of one report after the station identification, translated one by one (section 1, then 222 sea / 333 regional; 555 and ICE end it).
-fn decode_groups(groups: &[&str], knots: bool) -> Vec<String> {
+fn decode_groups(groups_in: &[&str], knots: bool) -> (Vec<String>, Quality) {
+    let (groups_vec, repaired) = repair(groups_in);
+    let groups = &groups_vec[..];
     if groups.len() < 2 {
-        return Vec::new();
+        return (Vec::new(), Quality::default());
     }
+    let (read, bad) = count_groups(groups);
+    let quality = Quality { read, bad, repaired };
     let mut parts: Vec<String> = Vec::new();
     let mut i = 0;
     // iRiXhVV: precipitation / station indicators, cloud base height, visibility.
@@ -474,7 +541,6 @@ fn decode_groups(groups: &[&str], knots: bool) -> Vec<String> {
             _ => {}
         }
     } else if section_one_started && groups.get(i).is_some() {
-        parts.push(format!("grupo de vento ilegível ({})", groups[i]));
         i += 1;
     }
     // The numbered groups; after "333" the regional section (Tx, Tn, precipitation), after "555" the national one (not translated).
@@ -499,7 +565,6 @@ fn decode_groups(groups: &[&str], knots: bool) -> Vec<String> {
             continue;
         }
         if !is_group(g) {
-            parts.push(format!("grupo ilegível ({g})"));
             continue;
         }
         let first = g.as_bytes()[0];
@@ -584,7 +649,7 @@ fn decode_groups(groups: &[&str], knots: bool) -> Vec<String> {
             _ => {}
         }
     }
-    parts
+    (parts, quality)
 }
 
 /// How long a translated line waits before it is shown, and the minimum gap between two lines appearing.
@@ -686,7 +751,9 @@ mod tests {
     fn a_corrupted_group_is_marked_not_guessed() {
         let out = run("10338 41/// ///// 10147 20112 401:1 50019=");
         let l = &out[0];
-        assert!(l.contains("grupo ilegível (401:1)"), "{l}");
+        assert!(!l.contains("401:1"), "{l}");
+        assert!(l.contains("1 ilegível"), "{l}");
+        assert!(l.contains("lidos 5 de 6 grupos"), "{l}");
         assert!(l.contains("temperatura 14,7 °C"), "{l}");
     }
 
@@ -745,7 +812,8 @@ mod tests {
         let l = &out[0];
         assert!(l.contains("Navio/bóia PDGW"), "{l}");
         assert!(l.contains("temperatura 6,4 °C"), "{l}");
-        assert!(l.contains("grupo ilegível (2001840083)"), "{l}");
+        assert!(l.contains("1 reparado"), "{l}");
+        assert!(l.contains("lidos "), "{l}");
     }
 
     #[test]
@@ -756,6 +824,25 @@ UFNP 10001 99809 10738 41/92 91906 10017=");
         assert_eq!(out.len(), 2, "{out:?}");
         assert!(out[0].contains("BBXX"), "{}", out[0]);
         assert!(out[1].contains("UFNP"), "{}", out[1]);
+    }
+
+    #[test]
+    fn glued_groups_are_split_again() {
+        let out = run("10338 41/// ///// 10147 2011240131=");
+        let l = &out[0];
+        assert!(l.contains("ponto de orvalho 11,2 °C"), "{l}");
+        assert!(l.contains("pressão ao nível do mar 1013,1 hPa"), "{l}");
+        assert!(l.contains("1 reparado"), "{l}");
+        assert!(!l.contains("ilegív"), "{l}");
+    }
+
+    #[test]
+    fn damaged_groups_are_counted_not_listed() {
+        let out = run("10338 41/// ///// 10147 118 8 21#5 20112=");
+        let l = &out[0];
+        assert!(l.contains("3 ilegíveis"), "{l}");
+        assert!(!l.contains("21#5"), "{l}");
+        assert!(l.contains(&QUALITY_MARK.to_string()), "{l}");
     }
 
     #[test]

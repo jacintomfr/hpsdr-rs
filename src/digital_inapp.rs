@@ -515,8 +515,14 @@ fn weather_window(ui: &mut egui::Ui, raw_text: &str, win: egui::Rect, strip: egu
                         ui.add_space(4.0);
                         ui.add(egui::Label::new(egui::RichText::new(line.trim_matches('-').trim()).strong().size(26.0).color(amber)).wrap());
                     } else if let Some((head, rest)) = line.split_once(": ") {
+                        // The reception quality (groups read / damaged / repaired) comes after a mark: smaller, amber when groups were lost.
+                        let (body, quality) = rest.split_once(crate::synop::QUALITY_MARK).unwrap_or((rest, ""));
                         ui.add(egui::Label::new(egui::RichText::new(head).strong().size(26.0)).wrap());
-                        ui.add(egui::Label::new(egui::RichText::new(rest.replace(", ", "  \u{b7}  ")).size(24.0)).wrap());
+                        ui.add(egui::Label::new(egui::RichText::new(body.replace(", ", "  \u{b7}  ")).size(24.0)).wrap());
+                        if !quality.is_empty() {
+                            let color = if quality.contains("ilegív") { amber } else { egui::Color32::from_gray(150) };
+                            ui.add(egui::Label::new(egui::RichText::new(quality).size(18.0).color(color)).wrap());
+                        }
                         ui.separator();
                     } else {
                         ui.add(egui::Label::new(egui::RichText::new(line).size(24.0)).wrap());
