@@ -1,6 +1,6 @@
 //! Digital modes in the kiosk without the full-screen Digital window, so the spectrum and the waterfall stay in view while tuning (SSTV first).
 //!
-//! The spectrum and waterfall keep the top left (zoomed to x16 and shifted to show 0..6 kHz of audio like MMSSTV, restored when the window closes);
+//! The spectrum and waterfall keep the top left (zoomed to x32 and shifted to show 0..6 kHz of audio like MMSSTV, restored when the window closes);
 //! the top right is the picture window (the received picture, or the one to send on the TX tab, with its status); under both, the full width, is a
 //! control strip: CLOSE, the mode chips RTTY | SSTV | RADE, the RX | TX tabs and the controls of the open tab (`render_sstv_panel`, drawn in two
 //! parts: `SstvPart::Rx` / `SstvPart::Tx`) -- RX or TX, never both, so everything fits.
@@ -16,15 +16,15 @@ const TAB_ID: &str = "sstv_inapp_tab";
 /// The plain-language translation of the SYNOP reports in the RTTY text (the DEC button): one buffer for the one RTTY panel.
 static SYNOP_VIEW: std::sync::Mutex<Option<crate::synop::SynopView>> = std::sync::Mutex::new(None);
 const ZOOM_ID: &str = "digital_inapp_prev_zoom";
-/// Spectrum zoom while the panel is open (x16 is the limit): 3 kHz of audio at the 48 kHz RX rate used meanwhile, shifted to start at the dial (below it for LSB)
+/// Spectrum zoom while the panel is open: 3 kHz of audio at the 96 kHz RX rate used meanwhile (x32; the radio hardware of this kiosk does not take 48 kHz), shifted to start at the dial (below it for LSB)
 /// MMSSTV's frequency display -- SSTV's 1.2..2.3 kHz is about a fifth of it.
-const SSTV_ZOOM: i32 = 16;
+const SSTV_ZOOM: i32 = 32;
 /// Where the view is centred, in Hz from the dial: the middle of the SSTV tone band (1200..2300 Hz), so the signal sits mid-screen, clear of the dB ruler and the AGC lines at the left edge.
 const VIEW_CENTER_HZ: f64 = 1500.0;
-/// RX sample rate while the panel is open: at 48 kHz the zoom x16 shows exactly 3 kHz of audio (the MMSSTV view); the rate in use before is put back on close.
-const SSTV_RATE: u32 = 48_000;
+/// RX sample rate while the panel is open: at 96 kHz the zoom x32 shows exactly 3 kHz of audio (the MMSSTV view); the rate in use before is put back on close.
+const SSTV_RATE: u32 = 96_000;
 /// The sample rate to restore (0 = the rate was not changed). Also read when the configuration is saved, so a crash or exit with the panel open does not
-/// leave 48 kHz as the saved rate.
+/// leave 96 kHz as the saved rate.
 static PREV_RATE: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
 
 /// The sample rate to write to the configuration: the one before the panel changed it, if it did.
