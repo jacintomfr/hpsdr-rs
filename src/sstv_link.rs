@@ -278,6 +278,14 @@ impl SstvHandle {
                     snap.unsupported =
                         Some(name.map(|n| n.to_string()).unwrap_or_else(|| format!("VIS ${code:02X}")));
                 }
+                SstvEvent::LockDropped => {
+                    // false lock abandoned: no picture, back to "hunting"
+                    snap.image_id = snap.image_id.wrapping_add(1);
+                    snap.w = 0;
+                    snap.h = 0;
+                    snap.rgb.clear();
+                    snap.detected = None;
+                }
             }
         }
     }

@@ -811,6 +811,10 @@ pub enum SstvEvent {
     /// A header arrived, with good parity, for a mode this decoder does not
     /// have. `name` is the mode name where the code is an assigned one.
     UnsupportedMode { code: u8, name: Option<&'static str> },
+    /// Local addition (not upstream): the image just started was a false
+    /// lock (no sync pulses on its first lines) and was abandoned; the
+    /// receiver is hunting again. Nothing was completed.
+    LockDropped,
 }
 
 #[derive(PartialEq)]
@@ -884,6 +888,9 @@ pub struct SstvRx {
     // operator is tuned correctly; a weak or absent one means to nudge the
     // VFO).
     last_sync_quality: f32,
+    // Lock check (see LOCK_CHECK_LINES): line calls seen / with a sync pulse
+    check_n: u32,
+    check_good: u32,
 }
 
 /// The hunt for an FSK ID: what has been seen of one so far.
@@ -940,6 +947,15 @@ const DET_ALPHA: f64 = 0.02;
 /// the smoother detector, 3 cuts false locks on noise and wrong-mode locks.
 const FREERUN_MIN_HITS: u32 = 3;
 
+/// Local addition (not upstream): after a lock (VIS or free-run), the first
+/// LOCK_CHECK_LINES lines must show a sync pulse (mean below LOCK_CHECK_HZ)
+/// at least LOCK_CHECK_MIN times, or the lock was noise and is dropped
+/// (band-limited RX noise false-locked Robot 36 / SC2 / Martin a few times
+/// an hour, and auto-save kept the noise pictures).
+const LOCK_CHECK_LINES: u32 = 8;
+const LOCK_CHECK_MIN: u32 = 4;
+const LOCK_CHECK_HZ: f64 = 1450.0;
+
 impl SstvRx {
     pub fn new(rate: f64) -> Self {
         let mix_hz = 1900.0f32;
@@ -973,6 +989,8 @@ impl SstvRx {
             sync_run: 0,
             sync_hist: Vec::new(),
             last_sync_quality: 0.0,
+            check_n: 0,
+            check_good: 0,
         }
     }
 
@@ -1343,6 +1361,8 @@ impl SstvRx {
         self.last_cb = vec![128u8; (w / 2) as usize];
         self.sync_run = 0;
         self.sync_hist.clear();
+        self.check_n = 0;
+        self.check_good = 0;
         out.push(SstvEvent::ModeDetected(mode));
     }
 
@@ -1357,6 +1377,22 @@ impl SstvRx {
         // and clock slant on real off-air signals).
         let (w, h) = self.mode.dimensions();
         let start = self.realign_sync(self.line_start, self.mode, w, self.line);
+        if self.check_n < LOCK_CHECK_LINES {
+            self.check_n += 1;
+            if self.sync_present(start, self.mode, w, self.line) {
+                self.check_good += 1;
+            }
+            if self.check_n == LOCK_CHECK_LINES && self.check_good < LOCK_CHECK_MIN {
+                // no sync pulses where the lines should have them: a false
+                // lock on noise -- back to hunting, nothing completed / saved
+                self.phase = RxPhase::Hunt;
+                self.vis_state = VisState::reset();
+                self.sync_hist.clear();
+                self.sync_run = 0;
+                out.push(SstvEvent::LockDropped);
+                return;
+            }
+        }
         for (n, rgb) in self.decode_line(self.mode, w, self.line, start).into_iter().enumerate() {
             let y = self.line + n as u16;
             if y < h {
@@ -1392,6 +1428,23 @@ impl SstvRx {
             }
         }
         (0.0, 0.009 * self.rate)
+    }
+
+    /// Local addition (not upstream): is there a 1200 Hz sync pulse where this
+    /// line has one? Mean frequency over the middle of the pulse (pixels are
+    /// 1500 - 2300 Hz, so noise or picture averages well above it).
+    fn sync_present(&self, start: u64, mode: SstvMode, w: u16, line: u16) -> bool {
+        let (soff, sdur) = self.sync_span(mode, w, line);
+        let from = start as f64 + soff + 0.2 * sdur;
+        let to = start as f64 + soff + 0.8 * sdur;
+        let (mut sum, mut n) = (0.0f64, 0u32);
+        let mut i = from.max(0.0) as u64;
+        while (i as f64) < to {
+            sum += self.hz_at(i);
+            n += 1;
+            i += 1;
+        }
+        n > 0 && sum / (n as f64) < LOCK_CHECK_HZ
     }
 
     /// Correct the line-start sample index by locking to the line's 1200 Hz
@@ -1780,7 +1833,7 @@ mod tests {
                 match e {
                     SstvEvent::ModeDetected(m) => detected = Some(m),
                     SstvEvent::Line { .. } => lines += 1,
-                    SstvEvent::ImageComplete | SstvEvent::FskId(_) | SstvEvent::UnsupportedMode { .. } => {}
+                    SstvEvent::ImageComplete | SstvEvent::FskId(_) | SstvEvent::UnsupportedMode { .. } | SstvEvent::LockDropped => {}
                 }
             }
             guard += 1;
@@ -2009,7 +2062,7 @@ mod tests {
                 match e {
                     SstvEvent::ModeDetected(m) => detected = Some(m),
                     SstvEvent::Line { .. } => lines += 1,
-                    SstvEvent::ImageComplete | SstvEvent::FskId(_) | SstvEvent::UnsupportedMode { .. } => {}
+                    SstvEvent::ImageComplete | SstvEvent::FskId(_) | SstvEvent::UnsupportedMode { .. } | SstvEvent::LockDropped => {}
                 }
             }
         }
